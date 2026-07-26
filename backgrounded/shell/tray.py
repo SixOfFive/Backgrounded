@@ -95,6 +95,8 @@ ID_SHOW_WINDOW = 1001
 ID_WALLPAPER = 1002
 ID_PAUSE = 1003
 ID_RESET = 1004
+ID_NEW_TERRAIN = 1044
+ID_CLEAR_GRAVES = 1045
 ID_SAVE = 1005
 ID_EXIT = 1006
 ID_SCENE_BASE = 2000
@@ -727,7 +729,11 @@ class Tray:
 
         user32.AppendMenuW(menu, flag(bool(state["paused"])), ID_PAUSE, "Pause")
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-        user32.AppendMenuW(menu, MF_STRING, ID_RESET, "New World (reset)")
+        user32.AppendMenuW(menu, MF_STRING, ID_NEW_TERRAIN,
+                           "New Landscape (keep the colony)")
+        user32.AppendMenuW(menu, MF_STRING, ID_CLEAR_GRAVES, "Clear Graves")
+        user32.AppendMenuW(menu, MF_STRING, ID_RESET,
+                           "Start Over (new world and colony)")
         user32.AppendMenuW(menu, MF_STRING, ID_SAVE, "Save Now")
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(menu, MF_STRING, ID_EXIT, "Exit")
@@ -774,6 +780,10 @@ class Tray:
             self._emit("toggle_pause", None)
         elif cmd == ID_RESET:
             self._emit("reset", None)
+        elif cmd == ID_NEW_TERRAIN:
+            self._emit("new_terrain", None)
+        elif cmd == ID_CLEAR_GRAVES:
+            self._emit("clear_graves", None)
         elif cmd == ID_SAVE:
             self._emit("save", None)
         elif cmd == ID_EXIT:

@@ -15,11 +15,16 @@ died getting there.
 
 ## Running it
 
+Double-click **`Backgrounded.bat`**. It checks Python and the three packages,
+offers to install them if they're missing, then starts the app with no console
+window. Running it twice is harmless - the second copy sees the single-instance
+mutex and exits.
+
+Or from a terminal:
+
 ```bash
 python run.pyw
-```
-
-Double-click `run.pyw` to start it with no console window. It lives in the
+``` It lives in the
 system tray; the live view window is shown by default.
 
 Useful flags while poking at it:
@@ -46,7 +51,10 @@ Right-click the tray icon:
 - **Scene** — force a specific scene
 - **Speed** — 0.5× / 1× / 2× / 4×
 - **Pause**
-- **New World** — regenerate terrain and start a fresh colony
+- **New Landscape** — new terrain and scenery, same people (they keep their
+  names, colours and history; buildings don't survive the move)
+- **Clear Graves** — sweep the headstones away
+- **Start Over** — brand new world *and* colony
 - **Save Now**
 - **Exit** — restores your original wallpaper on the way out
 
@@ -71,9 +79,12 @@ huddle at the fire, talk to each other, celebrate finished buildings, and mourn
 at gravestones.
 
 They also die: falls from cliffs, lightning strikes, wildfires, mudslides,
-floods. When one dies a grave is placed, the others mourn, and a new
-stickman arrives with a new name and a new colour, one generation later. The
-running history is kept in `chronicle.txt` next to the save file.
+floods, drowning, meteor strikes, and — if the colony truly runs out — hunger
+and cold. When one dies a grave is placed, the others mourn, and a new stickman
+arrives with a new name and colour, one generation later. Only the ten most
+recent headstones stay standing; older ones weather away, so a world left
+running overnight doesn't turn into a cemetery. The running history is kept in
+`chronicle.txt` next to the save file.
 
 ## Where it keeps things
 

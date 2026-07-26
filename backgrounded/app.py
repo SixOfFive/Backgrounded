@@ -192,6 +192,12 @@ class App:
             self.renderer.show_stats = not self.renderer.show_stats
             cfg.show_stats = self.renderer.show_stats
             self._save_config("show_stats")
+        elif kind == "new_terrain":
+            self.world.randomise_terrain()
+            persist.save_world(self.world)
+        elif kind == "clear_graves":
+            n = self.world.clear_graves()
+            log.info("cleared %d graves", n)
         elif kind == "save":
             persist.save_world(self.world)
         elif kind == "reset":

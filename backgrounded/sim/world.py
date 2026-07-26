@@ -33,6 +33,11 @@ log = logging.getLogger(__name__)
 
 CHRONICLE_MAX = 400
 
+#: How many headstones stay standing. Older ones weather away. Graves were
+#: permanent, so a long run turned the map into a cemetery - 35 of them after
+#: 25 minutes, on a world 1280px wide.
+MAX_GRAVES = 10
+
 
 class World:
     """Everything that persists across a restart."""
@@ -220,6 +225,75 @@ class World:
                 self.population.agents.remove(a)
             except ValueError:
                 pass
+
+        self._weather_graves(dt)
+
+    def _weather_graves(self, dt: float) -> None:
+        """Let old headstones fall back into the ground.
+
+        Graves are permanent otherwise, and a long-running world becomes a
+        graveyard: measured 35 headstones after 25 minutes of mudslide, on a
+        world only 1280px wide. Keeping the most recent MAX_GRAVES means the
+        colony's losses stay legible - you can see they have buried people
+        recently - without the map silently turning into a cemetery.
+        """
+        try:
+            graves = self.props.all_of("grave")
+        except Exception:
+            return
+        for g in graves:
+            g.state["age"] = float(g.state.get("age", 0.0)) + dt
+        if len(graves) <= MAX_GRAVES:
+            return
+        # Oldest first, drop the excess.
+        graves.sort(key=lambda g: float(g.state.get("age", 0.0)), reverse=True)
+        for g in graves[MAX_GRAVES:]:
+            try:
+                self.props.remove(g)
+            except Exception:
+                pass
+
+    def clear_graves(self) -> int:
+        """Remove every headstone. Exposed to the tray as 'Clear Graves'."""
+        removed = 0
+        try:
+            for g in list(self.props.all_of("grave")):
+                try:
+                    self.props.remove(g)
+                    removed += 1
+                except Exception:
+                    pass
+        except Exception:
+            log.exception("clear_graves failed")
+        if removed:
+            self.log_event(f"The old graves are lost to the weather.")
+        return removed
+
+    def randomise_terrain(self) -> None:
+        """New landscape and scenery, same colony.
+
+        Distinct from a full reset: the people, their names, generations and
+        the chronicle all carry over - they wake up somewhere new. Structures
+        go, because a hut half-way up the old cliff has nowhere to stand.
+        """
+        try:
+            self.seed = int(self.pyrng.randrange(1 << 30))
+            self.rng = np.random.default_rng(self.seed)
+            self.terrain = Terrain.generate(self.seed, style=self._pick_style())
+            self.props = scatter(self.terrain, self.rng,
+                                 {"tree": 14, "rock": 8, "bush": 10, "boulder": 3})
+            self.structures = StructureRegistry()
+            self.build_queue = []
+            for a in self.population.agents:
+                a.x = float(self.rng.uniform(RENDER_W * 0.15, RENDER_W * 0.85))
+                a.y = self.terrain.ground_y(a.x)
+                a.vx = a.vy = 0.0
+                a.on_ground = True
+                a.action = None
+            self.log_event("The land changes shape beneath them.")
+            log.info("terrain randomised (seed=%d)", self.seed)
+        except Exception:
+            log.exception("randomise_terrain failed")
 
     def _spawn_replacement(self) -> None:
         used = {a.name for a in self.population.agents}
