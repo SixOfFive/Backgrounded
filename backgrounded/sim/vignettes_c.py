@@ -211,15 +211,6 @@ VIGNETTES: list[Vignette] = [
         speech="!",
         motion="hop",
     ),
-    Vignette(
-        key="c_pat_on_back",
-        label="pats somebody on the back",
-        pose="idle",
-        dur=(1.5, 2.4),
-        weight=1.0,
-        tags=("social",),
-        motion="still",
-    ),
 
     # ================================================================== #
     #  Showing and telling.

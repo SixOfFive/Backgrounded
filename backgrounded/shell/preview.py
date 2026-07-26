@@ -63,6 +63,10 @@ class Preview:
         self.cam: list[float] = [self.size[0] / 2.0, self.size[1] / 2.0]
         self._panning: bool = False
         self._pan_from: tuple[int, int] | None = None
+        # (x, y, w, h) of the image inside the window, set by present().
+        # Pointer maths must use this, not the raw window size, or zoom
+        # anchoring drifts by the width of the letterbox bars.
+        self._letterbox: tuple[int, int, int, int] | None = None
 
     # ---------------------------------------------------------------- misc --
 
@@ -168,11 +172,19 @@ class Preview:
     ZOOM_MAX = 8.0
     ZOOM_STEP = 1.18
 
-    def _centre_px(self) -> tuple[int, int]:
+    def _image_rect(self) -> tuple[int, int, int, int]:
+        """Where the scene actually sits inside the window, letterbox aside."""
+        lb = getattr(self, "_letterbox", None)
+        if lb:
+            return lb
         if self._screen is None:
-            return (self.size[0] // 2, self.size[1] // 2)
-        w, h = self._screen.get_size()
-        return (w // 2, h // 2)
+            return (0, 0, self.size[0], self.size[1])
+        sw, sh = self._screen.get_size()
+        return (0, 0, sw, sh)
+
+    def _centre_px(self) -> tuple[int, int]:
+        ox, oy, dw, dh = self._image_rect()
+        return (ox + dw // 2, oy + dh // 2)
 
     def _clamp_cam(self) -> None:
         """Keep the visible rect inside the world, so you can never scroll off
@@ -191,10 +203,12 @@ class Preview:
             if abs(self.zoom - old) < 1e-6:
                 return self.zoom
             if mouse_px and self._screen is not None:
-                sw, sh = self._screen.get_size()
+                ox, oy, dw, dh = self._image_rect()
                 # where the cursor points, in world coords, before the zoom
-                fx = (mouse_px[0] / max(1, sw)) - 0.5
-                fy = (mouse_px[1] / max(1, sh)) - 0.5
+                fx = ((mouse_px[0] - ox) / max(1, dw)) - 0.5
+                fy = ((mouse_px[1] - oy) / max(1, dh)) - 0.5
+                fx = min(max(fx, -0.5), 0.5)
+                fy = min(max(fy, -0.5), 0.5)
                 wx = self.cam[0] + fx * (self.size[0] / old)
                 wy = self.cam[1] + fy * (self.size[1] / old)
                 # move the camera so that same world point lands under it again
@@ -212,9 +226,9 @@ class Preview:
         if self.zoom <= self.ZOOM_MIN + 1e-6 or self._screen is None:
             return
         try:
-            sw, sh = self._screen.get_size()
-            self.cam[0] -= dx_px * (self.size[0] / self.zoom) / max(1, sw)
-            self.cam[1] -= dy_px * (self.size[1] / self.zoom) / max(1, sh)
+            _, _, dw, dh = self._image_rect()
+            self.cam[0] -= dx_px * (self.size[0] / self.zoom) / max(1, dw)
+            self.cam[1] -= dy_px * (self.size[1] / self.zoom) / max(1, dh)
             self._clamp_cam()
         except Exception:
             pass
@@ -312,7 +326,6 @@ class Preview:
         if screen is None or surface is None:
             return
         try:
-            target = screen.get_size()
             if self.zoom > self.ZOOM_MIN + 1e-6:
                 try:
                     view = self._view_rect().clip(surface.get_rect())
@@ -320,13 +333,29 @@ class Preview:
                         surface = surface.subsurface(view)
                 except Exception:
                     pass
-            if surface.get_size() == target:
-                screen.blit(surface, (0, 0))
+
+            # Letterbox rather than stretch. The window is resizable, so its
+            # aspect rarely matches the 16:10 render surface, and scaling
+            # straight onto it distorts everything - most visibly the stats
+            # panel, whose text and bars go out of proportion. (The wallpaper
+            # never showed this because the desktop is 16:10 too.)
+            sw, sh = screen.get_size()
+            iw, ih = surface.get_size()
+            k = min(sw / iw, sh / ih)
+            dw, dh = max(1, int(iw * k)), max(1, int(ih * k))
+            ox, oy = (sw - dw) // 2, (sh - dh) // 2
+
+            if (dw, dh) != (sw, sh):
+                screen.fill((0, 0, 0))
+            if (dw, dh) == (iw, ih):
+                screen.blit(surface, (ox, oy))
             else:
                 try:
-                    pygame.transform.smoothscale(surface, target, screen)
+                    scaled = pygame.transform.smoothscale(surface, (dw, dh))
                 except Exception:
-                    screen.blit(pygame.transform.scale(surface, target), (0, 0))
+                    scaled = pygame.transform.scale(surface, (dw, dh))
+                screen.blit(scaled, (ox, oy))
+            self._letterbox = (ox, oy, dw, dh)
             pygame.display.flip()
         except Exception as exc:
             log.warning("preview: present failed: %s", exc)
