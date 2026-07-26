@@ -24,8 +24,9 @@ Or from a terminal:
 
 ```bash
 python run.pyw
-``` It lives in the
-system tray; the live view window is shown by default.
+```
+
+It lives in the system tray; the live view window is shown by default.
 
 Useful flags while poking at it:
 
@@ -57,6 +58,24 @@ Right-click the tray icon:
 - **Start Over** — brand new world *and* colony
 - **Save Now**
 - **Exit** — restores your original wallpaper on the way out
+
+## Reading the stats panel
+
+Top-right. Colony summary first — scene, day, clock, population, generation,
+structures built, losses — then the stockpile (`wd` wood, `st` stone, `fd`
+food, `ck` cooked, `fb` fibre), then one row per stickman.
+
+Each row is their identity colour, name, what they're doing right now, and
+three need bars. **A full bar is bad:**
+
+| Bar | Meaning |
+|---|---|
+| `hun` | hungry — they'll go and eat |
+| `tir` | tired — they'll find a hut and sleep |
+| `cld` | cold — they'll huddle at the fire |
+
+A ring around the colour dot marks whoever is carrying the candle. The bottom
+line is the most recent entry in the chronicle.
 
 ## Your wallpaper
 

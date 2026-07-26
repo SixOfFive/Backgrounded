@@ -155,7 +155,8 @@ def _build(world, show_roster: bool) -> pygame.Surface:
     agents.sort(key=lambda a: a.id)
 
     rows = len(agents) if show_roster else 0
-    height = PAD * 2 + LINE * 3 + 6 + (rows * (LINE + 9)) + LINE * 2 + 8
+    height = (PAD * 2 + LINE * 3 + 6 + (rows * (LINE + 9)) + LINE * 2 + 8
+              + (LINE - 2 if show_roster else 0))
     panel = pygame.Surface((PANEL_W, height), pygame.SRCALPHA)
     panel.fill((*BG, BG_ALPHA))
     pygame.draw.rect(panel, EDGE, panel.get_rect(), 1)
@@ -182,7 +183,12 @@ def _build(world, show_roster: bool) -> pygame.Surface:
         f"wd {sp.get(RES_WOOD,0):<3} st {sp.get(RES_STONE,0):<3} "
         f"fd {sp.get(RES_FOOD,0):<3} ck {sp.get(RES_COOKED,0):<3} "
         f"fb {sp.get(RES_FIBRE,0)}", DIM, 11), (PAD, y))
-    y += LINE + 4
+    y += LINE
+    if show_roster:
+        panel.blit(_text("needs: hun=hungry tir=tired cld=cold (full=bad)",
+                         (108, 116, 132), 9), (PAD, y))
+        y += LINE - 2
+    y += 4
     pygame.draw.line(panel, EDGE, (PAD, y), (PANEL_W - PAD, y))
     y += 5
 
@@ -208,12 +214,16 @@ def _build(world, show_roster: bool) -> pygame.Surface:
             y += LINE - 2
 
             # need bars: hunger / fatigue / cold. Full bar == bad.
-            bw = 24
+            bw = 20
             bx = PAD + 13
-            for lbl, val in (("h", a.hunger), ("f", a.fatigue), ("c", a.warmth)):
+            # Spelled out rather than h/f/c: those read as health/food, which
+            # is neither what they measure nor which way round they run.
+            for lbl, val in (("hun", a.hunger), ("tir", a.fatigue),
+                             ("cld", a.warmth)):
                 panel.blit(_text(lbl, DIM, 9), (bx, y - 2))
-                _bar(panel, bx + 7, y + 1, bw, 4, float(val), _need_color(float(val)))
-                bx += 7 + bw + 7
+                _bar(panel, bx + 16, y + 1, bw, 4, float(val),
+                     _need_color(float(val)))
+                bx += 16 + bw + 6
             role = str(getattr(a, "role", ""))[:9]
             rs = _text(role, DIM, 9)
             panel.blit(rs, (PANEL_W - PAD - rs.get_width(), y - 2))

@@ -241,12 +241,19 @@ class World:
             graves = self.props.all_of("grave")
         except Exception:
             return
-        for g in graves:
-            g.state["age"] = float(g.state.get("age", 0.0)) + dt
         if len(graves) <= MAX_GRAVES:
             return
-        # Oldest first, drop the excess.
-        graves.sort(key=lambda g: float(g.state.get("age", 0.0)), reverse=True)
+        # Ascending by age, so the OLDEST land at the tail and get dropped.
+        # This had reverse=True, which sorted oldest-first and therefore
+        # deleted the newest headstone within a tick or two of it appearing:
+        # past ten deaths the graveyard froze with the ten original stones and
+        # no burial ever showed again - the exact opposite of the intent.
+        # Verified after the fix: surviving ages are the small ones.
+        #
+        # props.tick_props already advances state["age"] for every grave each
+        # tick, so ageing them here as well ran the clock at ~2x - graves ended
+        # up 1629s old in a 900s world. props.py owns that field.
+        graves.sort(key=lambda g: float(g.state.get("age", 0.0)))
         for g in graves[MAX_GRAVES:]:
             try:
                 self.props.remove(g)
