@@ -1,0 +1,12 @@
+# Normalise to LF in the repository; Git checks out native line endings.
+# Without this, every commit from Windows logs a CRLF conversion warning.
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.pyw   text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+
+*.png   binary
+*.bmp   binary
+*.ico   binary
