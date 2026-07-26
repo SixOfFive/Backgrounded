@@ -97,6 +97,7 @@ ID_PAUSE = 1003
 ID_RESET = 1004
 ID_NEW_TERRAIN = 1044
 ID_CLEAR_GRAVES = 1045
+ID_NAMES = 1046
 ID_SAVE = 1005
 ID_EXIT = 1006
 ID_SCENE_BASE = 2000
@@ -727,6 +728,8 @@ class Tray:
                     ID_SPEED_BASE + active, MF_BYCOMMAND)
             user32.AppendMenuW(menu, MF_STRING | MF_POPUP, speed_menu, "Speed")
 
+        user32.AppendMenuW(menu, flag(bool(state.get("show_names", True))),
+                           ID_NAMES, "Show Names")
         user32.AppendMenuW(menu, flag(bool(state["paused"])), ID_PAUSE, "Pause")
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(menu, MF_STRING, ID_NEW_TERRAIN,
@@ -784,6 +787,8 @@ class Tray:
             self._emit("new_terrain", None)
         elif cmd == ID_CLEAR_GRAVES:
             self._emit("clear_graves", None)
+        elif cmd == ID_NAMES:
+            self._emit("toggle_names", None)
         elif cmd == ID_SAVE:
             self._emit("save", None)
         elif cmd == ID_EXIT:

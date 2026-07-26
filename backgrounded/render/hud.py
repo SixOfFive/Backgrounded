@@ -69,6 +69,34 @@ def _text(s: str, color: tuple[int, int, int], size: int = 11,
     return surf
 
 
+def name_tag(name: str, color: tuple[int, int, int],
+             dim: float = 1.0) -> pygame.Surface:
+    """A small name plate for drawing above a stickman.
+
+    Reuses this module's glyph cache, so a colony of ten costs ten cache hits
+    per frame rather than ten font renders. `dim` fades the whole tag for
+    agents standing outside any light, so the labels do not undo the darkness
+    the night scene is built on.
+    """
+    d = 0.30 if dim < 0.30 else (1.0 if dim > 1.0 else dim)
+    col = (int(color[0] * d), int(color[1] * d), int(color[2] * d))
+    key = ("__tag__", name, col)
+    surf = _text_cache.get(key)
+    if surf is None:
+        if len(_text_cache) > _TEXT_CACHE_MAX:
+            _text_cache.clear()
+        glyphs = _font(10, bold=True).render(name, True, col)
+        pad = 2
+        surf = pygame.Surface((glyphs.get_width() + pad * 2,
+                               glyphs.get_height() + pad), pygame.SRCALPHA)
+        # A faint plate behind the text so a pale name still reads against
+        # snow, and a dark one still reads against a lightning flash.
+        surf.fill((0, 0, 0, int(110 * d)))
+        surf.blit(glyphs, (pad, 0))
+        _text_cache[key] = surf
+    return surf
+
+
 def _need_color(v: float) -> tuple[int, int, int]:
     return GOOD if v < 0.45 else (WARN if v < 0.75 else BAD)
 

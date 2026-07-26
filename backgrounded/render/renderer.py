@@ -40,6 +40,7 @@ class Renderer:
 
         self.show_stats: bool = True
         self.show_roster: bool = True
+        self.show_names: bool = True
         self._terrain_cache: pygame.Surface | None = None
         self._terrain_fingerprint: tuple | None = None
         self._frame = 0
@@ -259,6 +260,28 @@ class Renderer:
                 draw_stickman(s, a, world.world_time, alpha_color=silhouette)
             except Exception:
                 log.exception("stickman draw failed for %s", getattr(a, "name", "?"))
+            if self.show_names and a.alive:
+                self._draw_name(s, a, lit)
+
+    def _draw_name(self, s: pygame.Surface, a, lit: float) -> None:
+        """Name plate above the head, in that stickman's identity colour.
+
+        Faded with local light so labels do not flatten the night scene - an
+        unlit figure gets a dim tag, matching the silhouette it is drawn as.
+        """
+        try:
+            dim = 0.42 + 0.58 * max(0.0, min(1.0, float(lit)))
+            tag = hud.name_tag(str(a.name)[:12], tuple(a.color), dim)
+            r = tag.get_rect()
+            # AGENT_HEIGHT above the feet, plus clearance for the speech bubble
+            r.midbottom = (int(a.x), int(a.y) - 32)
+            if a.speech:
+                r.top -= 10
+            r.left = max(1, min(r.left, RENDER_W - r.width - 1))
+            r.top = max(1, r.top)
+            s.blit(tag, r)
+        except Exception:
+            pass
 
     # -------------------------------------------------------------- light --
     def _composite_light(self, s: pygame.Surface, world) -> None:

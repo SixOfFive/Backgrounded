@@ -110,6 +110,7 @@ class App:
         self.preview.ensure_window(self.cfg.show_window)
         self.renderer = Renderer()
         self.renderer.show_stats = getattr(self.cfg, "show_stats", True)
+        self.renderer.show_names = getattr(self.cfg, "show_names", True)
 
         # --- threads -----------------------------------------------------
         self.wallpaper = WallpaperWriter(_screen_size())
@@ -135,6 +136,7 @@ class App:
             "sim_speed": self.cfg.sim_speed,
             "wallpaper_enabled": self.cfg.wallpaper_enabled,
             "show_stats": getattr(self.cfg, "show_stats", True),
+            "show_names": getattr(self.cfg, "show_names", True),
         }
 
     def _drain_commands(self) -> None:
@@ -192,6 +194,10 @@ class App:
             self.renderer.show_stats = not self.renderer.show_stats
             cfg.show_stats = self.renderer.show_stats
             self._save_config("show_stats")
+        elif kind == "toggle_names":
+            self.renderer.show_names = not self.renderer.show_names
+            cfg.show_names = self.renderer.show_names
+            self._save_config("show_names")
         elif kind == "new_terrain":
             self.world.randomise_terrain()
             persist.save_world(self.world)

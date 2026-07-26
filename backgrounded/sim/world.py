@@ -18,8 +18,10 @@ from typing import Any
 import numpy as np
 
 from ..constants import (
-    AI_TICKS, ALL_RESOURCES, DAY_LENGTH_SEC, RENDER_H, RENDER_W,
-    RES_FOOD, RES_STONE, RES_WOOD, SCENE_NIGHT_STORM, SAVE_VERSION,
+    AI_TICKS, ALL_RESOURCES, DAY_LENGTH_SEC, FOOD_PER_HEAD_TO_GROW,
+    MAX_POP, MIN_POP, MORALE_TO_GROW, POP_BIRTH_COOLDOWN, POP_PER_HUT,
+    REGROW_MAX, REGROW_PER_HEAD, RENDER_H, RENDER_W,
+    RES_COOKED, RES_FOOD, RES_STONE, RES_WOOD, SCENE_NIGHT_STORM, SAVE_VERSION,
 )
 from . import behavior, names
 from .animals import AnimalRegistry
@@ -102,6 +104,11 @@ class World:
             alive[0].role = "elder"
         self.log_event(f"A group of {n} arrives in a new land.")
 
+    @property
+    def agents(self) -> list:
+        """The roster, under the name duck-typed helpers look for first."""
+        return self.population.agents
+
     # --------------------------------------------------------------- time --
     @property
     def day_fraction(self) -> float:
@@ -127,6 +134,7 @@ class World:
         self._guarded("lights", self._rebuild_lights)
         self._guarded("lighting", lambda: self.lighting.tick(dt))
         self._guarded("colony", lambda: self._tick_colony(dt))
+        self._guarded("population", lambda: self._tick_population(dt))
 
     def _guarded(self, name: str, fn) -> None:
         """Run a subsystem step, disabling it if it ever raises.
@@ -250,7 +258,12 @@ class World:
                 cause=agent.death_cause or "the dark",
                 x=agent.x,
             ))
-            self._spawn_replacement()
+            # Deaths are NOT replaced one-for-one any more. A fixed headcount
+            # made every disaster free: lose four to a wildfire and four walk
+            # in. The colony is allowed to shrink, and grows back on its own
+            # when it has food, shelter and morale - see _tick_population.
+            if len(self.population.alive_agents()) < MIN_POP:
+                self._spawn_replacement()
 
         # Retire buried corpses off the roster. Leaving them on it meant
         # Population.agents only ever grew - measured 11 -> 41 entries over
@@ -344,7 +357,14 @@ class World:
         except Exception:
             log.exception("randomise_terrain failed")
 
-    def _spawn_replacement(self) -> None:
+    def _spawn_replacement(self, born: bool = False) -> None:
+        # Hard cap at the single choke point. Every growth path funnels through
+        # here, but the UFO also hands abductees back, which bypassed the check
+        # in _tick_population - a long run peaked at 11 against a MAX_POP of 10.
+        # The below-MIN_POP rescue is the one exemption and cannot collide with
+        # this, since MIN_POP < MAX_POP.
+        if len(self.population.alive_agents()) >= MAX_POP:
+            return
         used = {a.name for a in self.population.agents}
         gen = self.population.generation + 1
         self.population.generation = gen
@@ -362,8 +382,8 @@ class World:
         # "arrived", not "arrival" - the latter is not a template key and fell
         # through to the generic line, so every replacement was announced as
         # "Something happened." rather than by name.
-        self.log_event(names.describe_event("arrived", name=s.name,
-                                            generation=gen))
+        self.log_event(names.describe_event("born" if born else "arrived",
+                                            name=s.name, generation=gen))
 
     def _rebuild_lights(self) -> None:
         """Lights are derived state - rebuilt from scratch every tick."""
@@ -414,6 +434,50 @@ class World:
                 self.stats["trees_felled"] += 1
             elif etype == "prop_burned_out" and ev.get("kind") == "tree":
                 self.log_event(f"A tree burned to nothing.")
+
+    # ---------------------------------------------------------- population --
+    def regrowth_factor(self) -> float:
+        """How fast the wild recovers, scaled by headcount.
+
+        Deliberately the inverse of the usual depletion curve: more hands means
+        faster regrowth. Without it a colony of ten strips the map and starves,
+        which collapses the population back down and makes the whole range
+        pointless.
+        """
+        n = len(self.population.alive_agents())
+        return float(min(REGROW_MAX, 1.0 + max(0, n - MIN_POP) * REGROW_PER_HEAD))
+
+    def _tick_population(self, dt: float) -> None:
+        """Let the colony grow when it is genuinely thriving."""
+        self._birth_cd = getattr(self, "_birth_cd", POP_BIRTH_COOLDOWN) - dt
+        alive = self.population.alive_agents()
+        n = len(alive)
+
+        # Never let the line die out entirely.
+        if n < MIN_POP:
+            self._spawn_replacement()
+            self._birth_cd = POP_BIRTH_COOLDOWN
+            return
+
+        if n >= MAX_POP or self._birth_cd > 0.0:
+            return
+
+        food = self.stockpile.get(RES_FOOD, 0) + self.stockpile.get(RES_COOKED, 0)
+        if food < FOOD_PER_HEAD_TO_GROW * n:
+            return
+        try:
+            morale = sum(float(a.morale) for a in alive) / max(1, n)
+        except Exception:
+            morale = 0.0
+        if morale < MORALE_TO_GROW:
+            return
+        # Somewhere to sleep, or nobody wants to bring anyone into it.
+        huts = self.structures.count("hut")
+        if huts <= 0 or n >= huts * POP_PER_HUT:
+            return
+
+        self._birth_cd = POP_BIRTH_COOLDOWN
+        self._spawn_replacement(born=True)
 
     def _tick_colony(self, dt: float) -> None:
         # stats["built"] was declared but never written by anything, so it read

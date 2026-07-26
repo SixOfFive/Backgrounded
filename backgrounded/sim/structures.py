@@ -1,8 +1,16 @@
 """Multi-stage buildable structures and the colony structure registry.
 
 Pure python: no pygame, no rendering. The renderer *reads* ``kind``, ``stage``,
-``progress``, ``variant`` and ``state`` to decide what to draw and must never
-write to them.
+``progress``, ``variant``, ``state`` and :meth:`Structure.scale` to decide what
+to draw and must never write to them.
+
+A finished hut is not a fixed object. It keeps a ``standing_t`` (seconds spent
+standing, finished) and a derived ``growth`` 0..1 blended from that age and from
+how full the colony's stores are. ``growth`` drives :meth:`Structure.scale` and
+:meth:`Structure.capacity`, so a long-lived, well-fed camp becomes a settlement
+of bigger huts that house more people - and one that eats its stores down
+visibly contracts again. Growth is eased, never snapped: a single haul arriving
+must not pop a building bigger.
 
 A structure is built in ``max_stage`` visible stages. Each stage has its own
 slice of the total resource cost; builders haul that slice to the site
@@ -18,6 +26,12 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 from ..constants import (
+    HUT_AGE_WEIGHT,
+    HUT_GROWTH_AGE_SEC,
+    HUT_GROWTH_STORE_REF,
+    HUT_SCALE_MAX,
+    HUT_SCALE_MIN,
+    HUT_STORE_WEIGHT,
     RENDER_H,
     RENDER_W,
     RES_FIBRE,
@@ -49,6 +63,16 @@ FIRE_FUEL_BURN = 1.0 / 240.0   # a full firepit burns for ~4 minutes
 FIRE_STOKE_PER_WOOD = 0.34
 RUIN_LINGER = 240.0         # seconds a collapsed structure stays as rubble
 
+#: Sleepers a hut holds at growth 0 and at growth 1. A well-established hut in
+#: a well-stocked camp really is a bigger building, so it houses more people.
+HUT_CAPACITY_MIN = 2
+HUT_CAPACITY_MAX = 5
+#: Fraction of the remaining gap `growth` closes toward its target per second.
+#: Deliberately slow: a single haul arriving must not pop the building bigger,
+#: and running the stores down has to read as a settlement contracting rather
+#: than a building blinking. ~5%/s is a ~20 s time constant.
+GROWTH_LERP_RATE = 0.05
+
 
 @dataclass(frozen=True)
 class StructureSpec:
@@ -73,6 +97,9 @@ STRUCTURE_SPECS: dict[str, StructureSpec] = {
         width=28.0, height=12.0, capacity=0, flammable=False,
         build_time=5.0, spacing=54.0, variants=2,
     ),
+    # A finished hut ignores `capacity` below - see Structure.capacity(), which
+    # scales it HUT_CAPACITY_MIN..MAX with the hut's growth. The value is kept
+    # only as the fallback for a hut that somehow has no growth state.
     "hut": StructureSpec(
         "hut", 4, 130.0, {RES_WOOD: 18, RES_STONE: 4, RES_FIBRE: 6},
         width=46.0, height=38.0, capacity=3, flammable=True,
@@ -204,6 +231,13 @@ class Structure:
     occupants: list[int] = field(default_factory=list)
     state: dict[str, Any] = field(default_factory=dict)
     variant: int = 0
+    #: Seconds this structure has stood *finished*. Only advances once `built`,
+    #: and pauses while it is rubble. Persisted - it is the settlement's age.
+    standing_t: float = 0.0
+    #: 0..1 derived from `standing_t` and how well stocked the colony is.
+    #: Recomputed (eased) every :meth:`update`; persisted only so a reload does
+    #: not visibly re-inflate every hut from nothing.
+    growth: float = 0.0
 
     # ------------------------------------------------------------ factories --
     @classmethod
@@ -255,9 +289,31 @@ class Structure:
     def spec(self) -> StructureSpec:
         return structure_spec(self.kind)
 
-    @property
     def capacity(self) -> int:
-        return int(self.state.get("capacity", self.spec.capacity))
+        """How many occupants this holds *now*.
+
+        A hut's capacity rides its `growth`: HUT_CAPACITY_MIN sleepers when it
+        is a fresh box, HUT_CAPACITY_MAX once it has stood a long time in a
+        well-stocked camp. Every other kind keeps its flat spec capacity.
+        An explicit ``state["capacity"]`` still overrides everything.
+
+        A shrinking hut never evicts: capacity only gates :meth:`has_room`, so
+        someone already asleep is not yanked out of a running action mid-state.
+        """
+        override = self.state.get("capacity")
+        if isinstance(override, (int, float)) and not isinstance(override, bool):
+            try:
+                return max(0, int(override))
+            except (TypeError, ValueError):
+                pass
+        if self.kind != "hut":
+            return int(self.spec.capacity)
+        span = HUT_CAPACITY_MAX - HUT_CAPACITY_MIN
+        return int(HUT_CAPACITY_MIN + math.floor(_clamp01(self.growth) * span + 0.5))
+
+    def scale(self) -> float:
+        """Linear size multiplier from `growth`. 1.0 for anything but a hut."""
+        return float(HUT_SCALE_MIN + _clamp01(self.growth) * (HUT_SCALE_MAX - HUT_SCALE_MIN))
 
     def completion(self) -> float:
         """Overall build completion, 0..1."""
@@ -270,12 +326,16 @@ class Structure:
     def width_now(self) -> float:
         w = self.state.get("w")
         if isinstance(w, (int, float)) and w > 0:
-            return float(w)
-        return float(self.spec.width)
+            return float(w) * self.scale()
+        return float(self.spec.width) * self.scale()
 
     def height_now(self) -> float:
-        """Current visible height - grows with build stage."""
-        h = float(self.spec.height)
+        """Current visible height - grows with build stage, then with `growth`.
+
+        `scale()` is 1.0 until a hut is finished (growth only accrues on the
+        finished form), so the build-stage ramp below is untouched.
+        """
+        h = float(self.spec.height) * self.scale()
         if self.is_ruined:
             return h * 0.28
         return h * max(0.18, self.completion())
@@ -541,7 +601,7 @@ class Structure:
         return (
             self.built
             and not self.is_ruined
-            and len(self.occupants) < self.capacity
+            and len(self.occupants) < self.capacity()
         )
 
     def enter(self, agent_id: int) -> bool:
@@ -559,32 +619,97 @@ class Structure:
         except (ValueError, TypeError):
             pass
 
+    # --------------------------------------------------------------- growth --
+    def _store_fraction(self, world: Any | None) -> float:
+        """0..1 for how well stocked the colony is, against HUT_GROWTH_STORE_REF.
+
+        Cached in `state` so a tick that arrives without a world (the smoke
+        tests, a disabled subsystem) does not read as an empty larder and start
+        shrinking every hut in the settlement.
+        """
+        total: float | None = None
+        sp = getattr(world, "stockpile", None) if world is not None else None
+        if isinstance(sp, dict):
+            total = 0.0
+            for v in sp.values():
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(fv) and fv > 0.0:
+                    total += fv
+        if total is None:
+            return _clamp01(_as_float(self.state, "store_f", 0.0))
+        ref = float(HUT_GROWTH_STORE_REF)
+        f = _clamp01(total / ref) if ref > 0.0 else 0.0
+        self.state["store_f"] = f
+        return f
+
+    def growth_target(self, world: Any | None = None) -> float:
+        """Where `growth` is heading right now: part age, part full storehouse."""
+        if self.kind != "hut" or not self.built or self.is_ruined:
+            return 0.0
+        age_ref = float(HUT_GROWTH_AGE_SEC)
+        age_f = _clamp01(self.standing_t / age_ref) if age_ref > 0.0 else 1.0
+        return _clamp01(
+            HUT_AGE_WEIGHT * age_f + HUT_STORE_WEIGHT * self._store_fraction(world)
+        )
+
+    def _tick_growth(self, dt: float, world: Any | None) -> None:
+        """Age the finished form and ease `growth` toward its target.
+
+        Easing rather than snapping is the whole point: growth falls again when
+        the stores are spent, and neither direction is allowed to happen inside
+        one frame.
+        """
+        if self.built and not self.is_ruined:
+            self.standing_t = max(0.0, self.standing_t + float(dt))
+        target = self.growth_target(world)
+        k = GROWTH_LERP_RATE * float(dt)
+        if k >= 1.0:
+            self.growth = target
+        else:
+            self.growth = _clamp01(self.growth + (target - self.growth) * k)
+
     # ----------------------------------------------------------------- tick --
     def update(self, dt: float, world: Any | None = None) -> None:
-        """Per-tick upkeep: fire fuel, burning damage, ruin ageing. Never raises."""
+        """Per-tick upkeep: fire fuel, burning damage, ruin ageing, hut growth.
+
+        Never raises. Growth is ticked separately from - and after - the upkeep
+        pass so that an early return (rubble, or a structure that burned down on
+        this very tick) still lets the building settle back toward its target.
+        """
         try:
-            if dt <= 0.0:
-                return
-            self.state["hurt_t"] = float(self.state.get("hurt_t", 9.9)) + dt
-            if self.is_ruined:
-                self.state["ruin_t"] = float(self.state.get("ruin_t", 0.0)) + dt
-                return
-            if self.state.get("burning"):
-                self.state["burn_t"] = float(self.state.get("burn_t", 0.0)) + dt
-                if self.damage(BURN_DPS * dt, "fire"):
-                    self._chronicle(world, f"The {self.kind} burned to the ground.")
-                    return
-            if self.kind == "firepit" and self.state.get("lit"):
-                fuel = float(self.state.get("fuel", 0.0)) - FIRE_FUEL_BURN * dt
-                if fuel <= 0.0:
-                    self.state["fuel"] = 0.0
-                    self.state["lit"] = False
-                else:
-                    self.state["fuel"] = fuel
-            if self.kind == "totem" and self.built:
-                self.state["glow"] = _clamp01(float(self.state.get("glow", 1.0)))
+            self._tick_upkeep(dt, world)
         except Exception:  # pragma: no cover
             log.debug("structure update failed %s#%s", self.kind, self.id, exc_info=True)
+        try:
+            if dt > 0.0:
+                self._tick_growth(dt, world)
+        except Exception:  # pragma: no cover
+            log.debug("structure growth failed %s#%s", self.kind, self.id, exc_info=True)
+
+    def _tick_upkeep(self, dt: float, world: Any | None = None) -> None:
+        if dt <= 0.0:
+            return
+        self.state["hurt_t"] = float(self.state.get("hurt_t", 9.9)) + dt
+        if self.is_ruined:
+            self.state["ruin_t"] = float(self.state.get("ruin_t", 0.0)) + dt
+            return
+        if self.state.get("burning"):
+            self.state["burn_t"] = float(self.state.get("burn_t", 0.0)) + dt
+            if self.damage(BURN_DPS * dt, "fire"):
+                self._chronicle(world, f"The {self.kind} burned to the ground.")
+                return
+        if self.kind == "firepit" and self.state.get("lit"):
+            fuel = float(self.state.get("fuel", 0.0)) - FIRE_FUEL_BURN * dt
+            if fuel <= 0.0:
+                self.state["fuel"] = 0.0
+                self.state["lit"] = False
+            else:
+                self.state["fuel"] = fuel
+        if self.kind == "totem" and self.built:
+            self.state["glow"] = _clamp01(float(self.state.get("glow", 1.0)))
 
     @staticmethod
     def _chronicle(world: Any | None, text: str) -> None:
@@ -616,6 +741,8 @@ class Structure:
             "occupants": [int(a) for a in self.occupants],
             "state": _json_safe(self.state) or {},
             "variant": int(self.variant),
+            "standing_t": float(self.standing_t),
+            "growth": float(self.growth),
         }
 
     @classmethod
@@ -661,10 +788,24 @@ class Structure:
             occupants=occupants,
             state=state,
             variant=max(0, _as_int(d, "variant", 0)),
+            standing_t=max(0.0, _as_float(d, "standing_t", 0.0)),
         )
         if s.built:
             s.stage = max_stage
             s.progress = 0.0
+        # A save from before hut growth existed has no `growth`. Seeding it from
+        # the age term (the store term is not knowable until the world hands us
+        # a stockpile) stops every hut in an old colony visibly re-inflating
+        # from scratch on load.
+        if "growth" in d:
+            s.growth = _clamp01(_as_float(d, "growth", 0.0))
+        else:
+            s.growth = _clamp01(s.growth_target(None))
+        # Growth only exists on the finished form. A hand-edited or corrupt save
+        # must not load a giant half-built hut (or giant rubble) and then ease
+        # back down over the next minute in full view.
+        if s.kind != "hut" or not s.built or s.is_ruined:
+            s.growth = 0.0
         return s
 
 
@@ -944,3 +1085,86 @@ if __name__ == "__main__":  # pragma: no cover - smoke test
     again = StructureRegistry.from_dict(blob)
     print("round trip:", len(again), "count huts", again.count("hut"))
     print("junk load:", len(StructureRegistry.from_dict({"items": [{"kind": "???"}, 5]})))
+
+    # ---------------------------------------------- hut growth, real World --
+    from .world import World  # noqa: PLC0415 - smoke test only
+
+    w = World(seed=7)
+    h = w.structures.create("hut", 620.0, w.terrain.ground_y(620.0), built=True)
+    firepit = w.structures.create("firepit", 660.0, w.terrain.ground_y(660.0), built=True)
+
+    def sweep(seconds: float, dt: float = 1.0 / 30.0) -> None:
+        for _ in range(int(seconds / dt)):
+            h.update(dt, w)
+            firepit.update(dt, w)
+
+    def row(tag: str) -> None:
+        print(f"  {tag:<26} store={sum(w.stockpile.values()):>3}"
+              f" stand={h.standing_t:7.1f}s growth={h.growth:.3f}"
+              f" target={h.growth_target(w):.3f}"
+              f" scale={h.scale():.3f} cap={h.capacity()}"
+              f" wxh={h.width_now():.1f}x{h.height_now():.1f}")
+
+    print("hut growth against a real World:")
+    row("fresh, empty stores")
+    w.stockpile[RES_WOOD] = 60          # one big haul: must NOT pop the hut
+    h.update(1.0 / 30.0, w)
+    row("+60 wood, 1 tick")
+    sweep(5.0)
+    row("+5s")
+    sweep(55.0)
+    row("+60s")
+    sweep(240.0)
+    row("+300s")
+    sweep(600.0)
+    row("+900s (age maxed)")
+    w.stockpile[RES_WOOD] = 0           # stores spent: settlement contracts
+    sweep(1.0)
+    row("stores spent, 1s")
+    sweep(119.0)
+    row("stores spent, 120s")
+    sweep(480.0)
+    row("stores spent, 600s")
+
+    # capacity really gates occupancy
+    w.stockpile[RES_WOOD] = 60
+    sweep(900.0)
+    row("restocked, grown back")
+    ids = [i for i in range(1, 9) if h.enter(i)]
+    print("  capacity", h.capacity(), "-> admitted", len(ids), "of 8; occupants", h.occupants)
+    print("  firepit untouched: growth", firepit.growth, "scale", firepit.scale(),
+          "cap", firepit.capacity())
+
+    # unfinished huts must not grow, ruins must shrink back
+    unbuilt = w.structures.create("hut", 700.0, w.terrain.ground_y(700.0))
+    for _ in range(300):
+        unbuilt.update(1.0, w)
+    print("  unbuilt hut after 300s: standing_t", unbuilt.standing_t,
+          "growth", unbuilt.growth, "scale", unbuilt.scale(), "cap", unbuilt.capacity())
+    grown_scale = h.scale()
+    h.collapse("test")
+    for _ in range(120):
+        h.update(1.0, w)
+    print(f"  ruined hut: scale {grown_scale:.3f} -> {h.scale():.3f}"
+          f" growth {h.growth:.3f} standing_t {h.standing_t:.1f}")
+
+    # persistence
+    w.stockpile[RES_WOOD] = 60
+    h2 = w.structures.create("hut", 520.0, w.terrain.ground_y(520.0), built=True)
+    sweep_t = 0.0
+    while sweep_t < 600.0:
+        h2.update(1.0 / 30.0, w)
+        sweep_t += 1.0 / 30.0
+    d = h2.to_dict()
+    back = Structure.from_dict(d)
+    print(f"  round trip: standing_t {h2.standing_t:.1f}->{back.standing_t:.1f}"
+          f" growth {h2.growth:.3f}->{back.growth:.3f} scale {back.scale():.3f}")
+    legacy = dict(d)
+    legacy.pop("growth")
+    legacy.pop("state")
+    print(f"  legacy save (no growth/store cache): growth {Structure.from_dict(legacy).growth:.3f}"
+          f" scale {Structure.from_dict(legacy).scale():.3f}")
+    print("  world tick with growth wired:", end=" ")
+    for _ in range(60):
+        w.tick(1.0 / 30.0)
+    print("ok, disabled subsystems:", w._disabled or "none")

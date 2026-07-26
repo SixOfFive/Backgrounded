@@ -287,6 +287,25 @@ def food_in_store(world: Any) -> tuple[str | None, int]:
 
 # ----------------------------------------------------------------- agents ---
 def agents_of(world: Any) -> list[Any]:
+    """Every agent on the roster, however the world happens to store them.
+
+    World keeps them at ``world.population.agents``, which none of the old
+    duck-typed names matched, so this returned [] on the real World. Everything
+    downstream that counts people therefore saw a colony of zero: the build
+    director never wanted a second hut (want_huts = max(1, 0)), and walls,
+    watchtowers and totems - all gated on pop >= 4/5/8 - were unreachable for
+    the entire life of the project. Check the real location first.
+    """
+    pop = getattr(world, "population", None)
+    if pop is not None:
+        roster = getattr(pop, "agents", None)
+        if isinstance(roster, (list, tuple)):
+            return list(roster)
+        if roster is not None and hasattr(roster, "__iter__"):
+            try:
+                return list(roster)
+            except Exception:
+                pass
     for name in ("agents", "stickmen", "people"):
         v = getattr(world, name, None)
         if isinstance(v, (list, tuple)):

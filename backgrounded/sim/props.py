@@ -37,6 +37,18 @@ does not care about::
 Actions call the mutators directly: :func:`chop`, :func:`mine`,
 :func:`harvest_berries`, :func:`ignite`, :func:`nudge`, :func:`plant_sapling`,
 :func:`place_grave`, :func:`place_scorch`.
+
+Headcount-scaled recovery
+-------------------------
+``reg.tick(world, dt)`` reads ``world.regrowth_factor()`` (1.0 at MIN_POP,
+rising to REGROW_MAX) and multiplies every **natural recovery** rate by it:
+sapling growth, berry regrow, and the reseeding in :func:`_regrow`.  A colony
+of ten therefore repopulates the map roughly three times as fast as a pair,
+which is what stops ten mouths from stripping the world and starving.
+
+Nothing *destructive* is scaled - fire spread, burn-out, tree falls, boulders
+and scorch fading all run at their own fixed rate regardless of headcount.
+Call shapes without a world (``reg.tick(terrain, rng, dt)``) simply use 1.0.
 """
 from __future__ import annotations
 
@@ -47,6 +59,11 @@ from typing import TYPE_CHECKING, Callable, Iterator
 import numpy as np
 
 from ..constants import MAT_ASH, MAT_DIRT, MAT_GRASS, MAT_SAND, MAT_STONE
+
+try:  # pragma: no cover - constants predate the population director
+    from ..constants import REGROW_MAX as _REGROW_MAX
+except ImportError:  # pragma: no cover
+    _REGROW_MAX = 3.0
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle free at runtime
     from .terrain import Terrain
@@ -65,6 +82,7 @@ __all__ = [
     "plant_sapling",
     "place_grave",
     "place_scorch",
+    "growth_factor",
     "KINDS",
     "FLAMMABLE",
     "DEFAULT_COUNTS",
@@ -130,10 +148,22 @@ WATER_MAX_DEPTH = 24.0
 # source: a world left running goes permanently bald in under an hour and
 # features 2/4/17 become impossible.  So the land slowly reseeds itself back
 # up to - never past - the density :func:`scatter` was asked for.
+#
+# Every rate here is multiplied by the colony's regrowth factor (see
+# ``world.regrowth_factor()``), so the same map that goes bald under ten
+# gatherers also grows back roughly three times as fast for them.
 REGROW_CHECK_SEC = 12.0        # how often the check even runs
 REGROW_TREE_SEC = 90.0         # mean gap between new saplings when short
 REGROW_BUSH_SEC = 60.0         # mean gap between new bushes when short
 REGROW_TRIES = 24              # candidate columns examined per attempt
+
+#: Hard ceiling on the recovery multiplier, whatever a caller hands us.  Keeps
+#: a bad ``regrowth_factor`` (or a future constant change) from turning the map
+#: into a jungle in one tick.
+try:
+    GROWTH_FACTOR_MAX = max(1.0, float(_REGROW_MAX))
+except (TypeError, ValueError):  # pragma: no cover - constants gone weird
+    GROWTH_FACTOR_MAX = 3.0
 
 #: Used by :func:`scatter` when the caller does not supply counts.
 DEFAULT_COUNTS: dict[str, int] = {
@@ -177,6 +207,35 @@ def _i(v: object, default: int = 0) -> int:
         return int(v)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return default
+
+
+def growth_factor(source: object) -> float:
+    """Natural-recovery multiplier from a World, a bare number, or nothing.
+
+    ``source`` is normally the World: we look for ``regrowth_factor`` and call
+    it if it is callable, tolerate it being a plain attribute, and fall back to
+    ``1.0`` for anything else (including an old World without the method, a
+    stub used by a test, or a call that raises).  Clamped to
+    ``[0.0, GROWTH_FACTOR_MAX]`` so nothing here can run away.
+    """
+    if source is None:
+        return 1.0
+    raw: object = source
+    if not isinstance(source, (int, float)) or isinstance(source, bool):
+        fn = getattr(source, "regrowth_factor", None)
+        if fn is None:
+            return 1.0
+        if callable(fn):
+            try:
+                raw = fn()
+            except Exception:
+                return 1.0
+        else:
+            raw = fn
+    val = _f(raw, 1.0)
+    if val <= 0.0:
+        return 0.0
+    return min(val, GROWTH_FACTOR_MAX)
 
 
 def _json_safe(v: object) -> object:
@@ -369,6 +428,9 @@ class PropRegistry:
         #: Vegetation density to reseed back toward, set by :func:`scatter`.
         self.targets: dict[str, int] = {}
         self._regrow_t: float = 0.0
+        #: Last recovery multiplier applied, for debugging/inspection only.
+        #: Derived from the World every tick, so it is not persisted.
+        self.growth: float = 1.0
 
     # -- container ---------------------------------------------------------
 
@@ -517,22 +579,32 @@ class PropRegistry:
             KIND_SAPLING, x, y, scale=0.32, hp=SAPLING_HP, state={"growth": 0.0}
         )
 
-    def tick(self, *args: object) -> list[dict]:
+    def tick(self, *args: object, world: object = None) -> list[dict]:
         """Advance every prop behaviour.  See :func:`tick_props`.
 
-        Two call shapes are accepted::
+        Three call shapes are accepted::
 
-            reg.tick(terrain, rng, dt)   # direct, used by the sim tests
-            reg.tick(world, dt)          # World.tick style; pulls world.terrain
-                                         # and world.rng off the world object
+            reg.tick(terrain, rng, dt)          # direct, used by the sim tests
+            reg.tick(terrain, rng, dt, world)   # ...with headcount scaling
+            reg.tick(world, dt)                 # World.tick style; pulls
+                                                # world.terrain / world.rng and
+                                                # world.regrowth_factor() off it
+
+        Anything with a ``regrowth_factor`` (or a plain number) works as
+        ``world``; without one, natural recovery runs at 1.0.
         """
+        src: object = world
         if len(args) >= 3:
             terrain, rng, dt = args[0], args[1], args[2]
+            if src is None and len(args) >= 4:
+                src = args[3]
         elif len(args) == 2:
-            world = args[0]
-            terrain = getattr(world, "terrain", None)
-            rng = getattr(world, "rng", None)
+            w = args[0]
+            terrain = getattr(w, "terrain", None)
+            rng = getattr(w, "rng", None)
             dt = args[1]
+            if src is None:
+                src = w
         else:
             return []
         if terrain is None or not hasattr(terrain, "ground_y"):
@@ -541,7 +613,7 @@ class PropRegistry:
             if self._fallback_rng is None:
                 self._fallback_rng = np.random.default_rng()
             rng = self._fallback_rng
-        return tick_props(self, terrain, rng, _f(dt, 0.0))  # type: ignore[arg-type]
+        return tick_props(self, terrain, rng, _f(dt, 0.0), src)  # type: ignore[arg-type]
 
     # -- persistence -------------------------------------------------------
 
@@ -745,8 +817,13 @@ def tick_props(
     terrain: "Terrain",
     rng: np.random.Generator,
     dt: float,
+    world: object = None,
 ) -> list[dict]:
     """Advance every prop behaviour by ``dt`` seconds.
+
+    ``world`` is optional and only used for :func:`growth_factor`: sapling
+    growth, berry regrow and reseeding run ``factor`` times faster for a big
+    colony.  Burning, fire spread, falling and fading are untouched by it.
 
     Returns the event list documented in the module docstring.  Fails soft:
     a misbehaving prop is skipped, never allowed to kill the frame.
@@ -758,6 +835,12 @@ def tick_props(
     if step <= 0.0:
         return events
     step = min(step, 0.25)
+
+    grow = growth_factor(world)
+    try:
+        reg.growth = grow
+    except Exception:  # pragma: no cover - reg is ours, but never die for this
+        pass
 
     doomed: list[Prop] = []
     try:
@@ -777,9 +860,9 @@ def tick_props(
             if p.kind == KIND_TREE:
                 _tick_tree(p, step, events, doomed)
             elif p.kind == KIND_SAPLING:
-                _tick_sapling(p, rng, step, events)
+                _tick_sapling(p, rng, step, events, grow)
             elif p.kind == KIND_BUSH:
-                _tick_bush(p, step, events)
+                _tick_bush(p, step, events, grow)
             elif p.kind == KIND_ROCK:
                 if p.hp <= 0.0:
                     doomed.append(p)
@@ -801,7 +884,7 @@ def tick_props(
     except Exception:
         pass
     try:
-        _regrow(reg, terrain, rng, step, events)
+        _regrow(reg, terrain, rng, step, events, grow)
     except Exception:
         pass
 
@@ -833,8 +916,15 @@ def _tick_tree(p: Prop, dt: float, events: list[dict], doomed: list[Prop]) -> No
         events.append(_ev("tree_felled", p, wood=wood))
 
 
-def _tick_sapling(p: Prop, rng: np.random.Generator, dt: float, events: list[dict]) -> None:
-    g = _f(p.state.get("growth"), 0.0) + dt / SAPLING_GROW_SEC
+def _tick_sapling(
+    p: Prop,
+    rng: np.random.Generator,
+    dt: float,
+    events: list[dict],
+    grow: float = 1.0,
+) -> None:
+    # Natural growth, so it takes the colony's recovery multiplier.
+    g = _f(p.state.get("growth"), 0.0) + dt * max(0.0, grow) / SAPLING_GROW_SEC
     if g < 1.0:
         p.state["growth"] = g
         p.scale = 0.30 + 0.55 * g
@@ -848,15 +938,19 @@ def _tick_sapling(p: Prop, rng: np.random.Generator, dt: float, events: list[dic
     events.append(_ev("sapling_grown", p))
 
 
-def _tick_bush(p: Prop, dt: float, events: list[dict]) -> None:
+def _tick_bush(p: Prop, dt: float, events: list[dict], grow: float = 1.0) -> None:
     have = _i(p.state.get("berries_left"), 0)
     if have >= BUSH_MAX_BERRIES:
         p.state["berries_left"] = BUSH_MAX_BERRIES
         p.state["regrow_t"] = 0.0
         return
-    t = _f(p.state.get("regrow_t"), 0.0) + dt
+    # Berries are food regrowing: the whole point of the headcount scaling is
+    # that ten foragers do not out-eat the bushes.
+    t = _f(p.state.get("regrow_t"), 0.0) + dt * max(0.0, grow)
     if t >= BERRY_REGROW_SEC:
-        p.state["regrow_t"] = 0.0
+        # Carry the remainder so a high factor can add more than one berry per
+        # regrow window instead of silently throwing the overshoot away.
+        p.state["regrow_t"] = 0.0 if have + 1 >= BUSH_MAX_BERRIES else t - BERRY_REGROW_SEC
         p.state["berries_left"] = have + 1
         events.append(_ev("berries_grown", p, berries=have + 1))
     else:
@@ -966,18 +1060,44 @@ def _tick_boulder(
     events.append(_ev("boulder_impact", p, force=float(force)))
 
 
+def _ensure_targets(reg: PropRegistry) -> None:
+    """Adopt the standing vegetation as the reseed target if nobody set one.
+
+    :func:`scatter` normally records what it was asked for, and
+    :meth:`PropRegistry.from_dict` backfills it for old saves.  This covers the
+    remaining case - a registry assembled by hand (tests, vignettes) - so the
+    map it starts with is also the map it recovers to, and never more.
+    """
+    try:
+        if getattr(reg, "targets", None):
+            return
+        counts = reg.counts()
+        trees = counts.get(KIND_TREE, 0) + counts.get(KIND_SAPLING, 0)
+        bushes = counts.get(KIND_BUSH, 0)
+        if trees <= 0 and bushes <= 0:
+            return
+        reg.targets = {k: v for k, v in ((KIND_TREE, trees), (KIND_BUSH, bushes)) if v > 0}
+    except Exception:  # pragma: no cover - never worth a frame
+        pass
+
+
 def _regrow(
     reg: PropRegistry,
     terrain: "Terrain",
     rng: np.random.Generator,
     dt: float,
     events: list[dict],
+    grow: float = 1.0,
 ) -> None:
     """Slowly reseed vegetation back toward the density scatter() was asked for.
 
     Only ever tops *up* to the target, so this cannot run away; a world that is
-    already green does nothing but a cheap counter check.
+    already green does nothing but a cheap counter check.  ``grow`` is the
+    colony's recovery multiplier: a stripped map comes back about three times
+    faster for ten colonists than for two.  Silent by design - the events are
+    for the stats counters, not the chronicle.
     """
+    _ensure_targets(reg)
     targets = getattr(reg, "targets", None)
     if not targets:
         return
@@ -986,6 +1106,9 @@ def _regrow(
         return
     elapsed = reg._regrow_t
     reg._regrow_t = 0.0
+    factor = max(0.0, _f(grow, 1.0))
+    if factor <= 0.0:
+        return
 
     for kind, gap in ((KIND_TREE, REGROW_TREE_SEC), (KIND_BUSH, REGROW_BUSH_SEC)):
         target = _i(targets.get(kind), 0)
@@ -997,7 +1120,7 @@ def _regrow(
             have += len(reg.all_of(KIND_SAPLING))
         if have >= target:
             continue
-        if float(rng.random()) > min(1.0, elapsed / max(gap, 1e-3)):
+        if float(rng.random()) > min(1.0, elapsed * factor / max(gap, 1e-3)):
             continue
         x = _regrow_site(reg, terrain, rng, kind)
         if x is None:
@@ -1041,6 +1164,13 @@ def _regrow_site(
             continue
         if abs(terrain.slope(float(xi))) > limit:
             continue
+        # Belt and braces: the slope test above is per-column, is_cliff() is the
+        # terrain's own verdict on whether anything can stand there.
+        try:
+            if bool(terrain.is_cliff(float(xi))):
+                continue
+        except Exception:
+            pass
         if any(a - 6 <= xi <= b + 6 for a, b in ponds):
             continue
         near = False
@@ -1303,6 +1433,104 @@ if __name__ == "__main__":  # pragma: no cover - run with: python -m backgrounde
         _reg.tick(_terr, _rng, 1 / 30)
     print(f"boulder {_bx:.0f} -> {_b.x:.0f}  (y {_y0:.0f} -> {_b.y:.0f})")
     assert abs(_b.x - _bx) > 25.0 and _b.y >= _y0 - 1.0, "boulder did not roll downhill"
+
+    # ------------------------------------------------ headcount-scaled recovery
+    class _W:  # stands in for World: all props needs is regrowth_factor()
+        def __init__(self, f: float) -> None:
+            self._f = f
+
+        def regrowth_factor(self) -> float:
+            return self._f
+
+    assert growth_factor(None) == 1.0
+    assert growth_factor(_W(2.5)) == 2.5
+    assert growth_factor(object()) == 1.0                 # no such method
+    assert growth_factor(_W(float("nan"))) == 1.0         # garbage -> 1.0
+    assert growth_factor(_W(99.0)) == GROWTH_FACTOR_MAX   # clamped
+    assert growth_factor(2.0) == 2.0                      # a bare number works
+
+    # Saplings mature `factor` times faster.
+    def _mature_secs(factor: float) -> float:
+        t = _T.generate(3, "hills")
+        r = PropRegistry()
+        s = plant_sapling(r, t, 600.0, np.random.default_rng(3))
+        w = _W(factor)
+        g = np.random.default_rng(3)
+        secs = 0.0
+        while s.kind == "sapling" and secs < SAPLING_GROW_SEC * 2:
+            r.tick(t, g, 1 / 30, w)
+            secs += 1 / 30
+        return secs
+
+    _one, _three = _mature_secs(1.0), _mature_secs(3.0)
+    print(f"sapling matures: x1 {_one:.0f}s  x3 {_three:.0f}s")
+    assert abs(_one - SAPLING_GROW_SEC) < 1.0, _one
+    assert abs(_three - SAPLING_GROW_SEC / 3.0) < 1.0, _three
+
+    # Berries too.
+    def _berries(factor: float) -> int:
+        t = _T.generate(3, "hills")
+        r = PropRegistry()
+        b = r.spawn("bush", 600.0, t.ground_y(600.0), state={"berries_left": 0})
+        g = np.random.default_rng(3)
+        for _ in range(int(BERRY_REGROW_SEC * 30)):
+            r.tick(t, g, 1 / 30, _W(factor))
+        return _i(b.state.get("berries_left"), 0)
+
+    assert _berries(1.0) == 1 and _berries(3.0) == 3, (_berries(1.0), _berries(3.0))
+
+    # A stripped map reseeds itself, faster for a big colony than a small one.
+    def _stripped(seed: int) -> tuple:
+        t = _T.generate(seed, "hills")
+        r = scatter(t, np.random.default_rng(seed),
+                    {"tree": 14, "bush": 10, "rock": 6, "boulder": 2, "sapling": 0})
+        for q in list(r):
+            if q.kind in ("tree", "sapling", "bush"):
+                r.remove(q)
+        return t, r
+
+    def _recover(factor: float, seconds: float, seed: int = 5) -> tuple[int, int]:
+        t, r = _stripped(seed)
+        w = _W(factor)
+        g = np.random.default_rng(seed ^ 0xA5)
+        for _ in range(int(seconds * 30)):
+            r.tick(t, g, 1 / 30, w)
+        c = r.counts()
+        return c.get("tree", 0) + c.get("sapling", 0), c.get("bush", 0)
+
+    _slow = _recover(1.0, 400.0)
+    _fast = _recover(2.76, 400.0)
+    print(f"stripped map after 400s: pop2 {_slow[0]} trees {_slow[1]} bushes | "
+          f"pop10 {_fast[0]} trees {_fast[1]} bushes")
+    assert _slow[0] > 0 and _slow[1] > 0, "a stripped map never recovered at all"
+    assert _fast[0] >= _slow[0] and _fast[1] >= _slow[1], "factor did not speed recovery"
+    assert sum(_fast) > sum(_slow), "recovery ignored the headcount factor"
+
+    # ...and never past the density it started with.
+    _cap_t, _cap_r = _stripped(5)
+    _cap_g = np.random.default_rng(99)
+    for _ in range(int(2400 * 30)):
+        _cap_r.tick(_cap_t, _cap_g, 1 / 30, _W(3.0))
+    _cap = _cap_r.counts()
+    assert _cap.get("tree", 0) + _cap.get("sapling", 0) <= 14, _cap
+    assert _cap.get("bush", 0) <= 10, _cap
+
+    # Destruction must NOT scale: a tree burns for BURN_SEC either way.
+    def _burn_secs(factor: float) -> float:
+        t = _T.generate(7, "hills")
+        r = PropRegistry()
+        v = r.spawn("tree", 600.0, t.ground_y(600.0), hp=TREE_HP)
+        ignite(v)
+        g = np.random.default_rng(7)
+        secs = 0.0
+        while r.get(v.id) is not None and secs < BURN_SEC["tree"] * 3:
+            r.tick(t, g, 1 / 30, _W(factor))
+            secs += 1 / 30
+        return secs
+
+    _b1, _b3 = _burn_secs(1.0), _burn_secs(3.0)
+    print(f"tree burns out: x1 {_b1:.1f}s  x3 {_b3:.1f}s  (must match)")
+    assert abs(_b1 - _b3) < 0.1 and abs(_b1 - BURN_SEC["tree"]) < 0.2, (_b1, _b3)
 
     # Persistence round trip.
     _rt = PropRegistry.from_dict(_reg.to_dict())

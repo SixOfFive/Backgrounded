@@ -118,6 +118,40 @@ UFO_INTERVAL_MAX = 1500.0
 UFO_BEAM_SEC = 4.5                 # hover + beam before the lift completes
 UFO_RETURN_CHANCE = 0.25           # sometimes they get dropped back, dazed
 
+# -------------------------------------------------------------- population --
+#: The colony breathes between these. Deaths are no longer replaced one-for-one
+#: - the number is allowed to fall, and a colony with food, shelter and morale
+#: grows back on its own. A fixed headcount made every disaster consequence-free.
+MIN_POP = 2                     # below this, newcomers arrive to save the line
+MAX_POP = 10
+POP_BIRTH_COOLDOWN = 95.0       # min seconds between new arrivals
+#: Stored food per existing colonist needed before they will take on another
+#: mouth. Scales with headcount, so growth slows as the colony gets big.
+FOOD_PER_HEAD_TO_GROW = 5
+MORALE_TO_GROW = 0.45
+#: Sleeping space gates growth too: roughly this many people per finished hut.
+POP_PER_HUT = 3
+
+# ---------------------------------------------------------- hut growth ------
+#: A hut is not a fixed object. It grows with the time it has stood and with
+#: how well stocked the colony is, so a long-lived, well-fed camp visibly
+#: becomes a bigger settlement rather than staying four identical boxes.
+HUT_GROWTH_AGE_SEC = 900.0      # seconds of standing to reach full age credit
+HUT_GROWTH_STORE_REF = 60       # stockpile total that counts as "well stocked"
+HUT_SCALE_MIN = 1.0
+HUT_SCALE_MAX = 1.85
+#: Age and storage each contribute this share of the final growth value.
+HUT_AGE_WEIGHT = 0.55
+HUT_STORE_WEIGHT = 0.45
+
+# ------------------------------------------------------- resource regrowth --
+#: More hands, faster the wild recovers. Deliberately the opposite of the usual
+#: depletion curve: it is what keeps a colony of ten from stripping the map
+#: bare and starving, so population can actually range instead of collapsing.
+REGROW_BASE = 1.0               # multiplier at MIN_POP
+REGROW_PER_HEAD = 0.22          # added per colonist above MIN_POP
+REGROW_MAX = 3.0
+
 # ------------------------------------------------------------------ scenes --
 SCENE_NIGHT_STORM = "night_storm"
 SCENE_CLEAR = "clear"

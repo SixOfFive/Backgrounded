@@ -12,7 +12,14 @@ the night.
 
 Anchoring: every sprite's ground contact point is its **bottom centre**. Use
 :meth:`Atlas.anchor` (or :meth:`Atlas.blit`) rather than assuming, so tweaks to
-sprite padding cannot desync the renderer.
+sprite padding cannot desync the renderer. The renderer sets
+``rect.midbottom = (st.x, st.y + 2)``, so a taller sprite grows *upward* from the
+ground line - every baker keeps its ground contact at the canvas bottom.
+
+Huts are the one kind with real growth: :func:`hut_dims` recomputes the geometry
+per scale instead of upscaling the small drawing, and the result is cached in
+:data:`HUT_GROWTH_BUCKETS` buckets across ``HUT_SCALE_MIN..HUT_SCALE_MAX`` so a
+hut creeping up by 0.001 per tick still gets a cache hit every frame.
 """
 from __future__ import annotations
 
@@ -22,6 +29,11 @@ import time
 from typing import Any, Sequence
 
 import pygame
+
+try:                                            # pragma: no cover - import guard
+    from ..constants import HUT_SCALE_MAX, HUT_SCALE_MIN
+except Exception:                               # standalone / partial checkout
+    HUT_SCALE_MIN, HUT_SCALE_MAX = 1.0, 1.85
 
 Color = tuple[int, int, int]
 RGBA = tuple[int, int, int, int]
@@ -149,6 +161,104 @@ KIND_SIZE: dict[str, tuple[int, int]] = {
 }
 
 SCALE_BUCKET = 20.0              # scales quantise to 1/20 = 0.05 steps
+
+# --------------------------------------------------------------- hut growth --
+#: A hut's scale is a continuous sim value, so it must be quantised or the
+#: renderer re-bakes a sprite every frame. Eight buckets across the documented
+#: growth range is ~0.12 of scale per step: below the eye's ability to see a
+#: single step, well above the rate a hut actually grows.
+HUT_GROWTH_BUCKETS = 8
+#: Cache-key namespace for grown huts. Well clear of the generic scale buckets
+#: (capped at 160 in :meth:`Atlas.get`) so the two can never collide - a grown
+#: hut and a naively upscaled one must not share a key.
+HUT_BUCKET_KEY = 1000
+#: Requests past ``HUT_SCALE_MAX`` keep stepping on the same ladder rather than
+#: being clamped (which would silently lie about the sprite's size). The art
+#: detail saturates; only the geometry keeps growing.
+HUT_BUCKET_MAX = 23
+#: A grown hut gains a little more height than width - taller walls read as a
+#: more substantial building, where a uniform upscale just reads as "closer".
+HUT_HEIGHT_GAIN = 0.10
+
+
+def hut_bucket_step() -> float:
+    """Scale increment between adjacent hut growth buckets."""
+    span = float(HUT_SCALE_MAX) - float(HUT_SCALE_MIN)
+    if span <= 0.0:
+        return 0.0
+    return span / max(1, HUT_GROWTH_BUCKETS - 1)
+
+
+def hut_growth_bucket(scale: float) -> int:
+    """Quantise a hut *scale* to its bucket index (0 == ``HUT_SCALE_MIN``)."""
+    step = hut_bucket_step()
+    if step <= 0.0:
+        return 0
+    try:
+        idx = int(round((float(scale) - float(HUT_SCALE_MIN)) / step))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(idx, HUT_BUCKET_MAX))
+
+
+def hut_bucket_scale(idx: int) -> float:
+    """The representative scale actually drawn for bucket *idx*."""
+    return float(HUT_SCALE_MIN) + hut_bucket_step() * max(0, int(idx))
+
+
+def hut_growth(scale: float) -> float:
+    """0..1 growth for a hut *scale*, saturating at ``HUT_SCALE_MAX``.
+
+    This is the knob the art reads: it decides how many windows, whether there
+    is a stone footing, and whether the hut has gained a second doorway.
+    """
+    span = float(HUT_SCALE_MAX) - float(HUT_SCALE_MIN)
+    if span <= 0.0:
+        return 0.0
+    try:
+        return max(0.0, min(1.0, (float(scale) - float(HUT_SCALE_MIN)) / span))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def hut_scale_for(growth: float) -> float:
+    """Inverse of :func:`hut_growth`: map a 0..1 growth value onto a scale.
+
+    Offered so the call site can hand the atlas a growth fraction and get the
+    same mapping the art uses, instead of two places agreeing by accident.
+    """
+    g = 0.0
+    try:
+        g = max(0.0, min(1.0, float(growth)))
+    except (TypeError, ValueError):
+        g = 0.0
+    return float(HUT_SCALE_MIN) + (float(HUT_SCALE_MAX) - float(HUT_SCALE_MIN)) * g
+
+
+#: Fraction of the canvas width the walls occupy in the base drawing
+#: (``0.88 - 0.12``). Held fixed so growth widens the *building*, and the extra
+#: canvas width a grown hut gets is spent on roof overhang, not on the footprint.
+HUT_WALL_SPAN = 0.76
+
+
+def _hut_eave(s: float, g: float) -> int:
+    """Roof overhang past the wall, in pixels. Grows faster than the hut does."""
+    return max(1, int(round(6.0 * s + 5.0 * g * s)))
+
+
+def hut_dims(scale: float) -> tuple[int, int]:
+    """Canvas size of a hut at *scale*.
+
+    Height gains a little on width (:data:`HUT_HEIGHT_GAIN`) and width gains a
+    margin for the longer eaves, so a big roof is never clipped by its own
+    canvas. At ``scale == 1.0`` this is exactly ``KIND_SIZE["hut"]``.
+    """
+    s = max(0.05, float(scale))
+    g = hut_growth(s)
+    bw, bh = KIND_SIZE.get("hut", (78, 64))
+    w = max(4, int(round(bw * s)) + int(round(4.0 * g * s)))
+    h = max(4, int(round(bh * s * (1.0 + HUT_HEIGHT_GAIN * g))))
+    return (w, h)
 
 
 # ------------------------------------------------------------------- helpers --
@@ -408,69 +518,181 @@ def _bake_firepit(stage: int, rng: random.Random) -> pygame.Surface:
     return surf
 
 
-def _bake_hut(stage: int, rng: random.Random) -> pygame.Surface:
-    surf = _canvas("hut")
-    w, h = surf.get_size()
-    left, right = int(w * 0.12), int(w * 0.88)
-    base = h - 2
-    wall_top = int(h * 0.46)
-    ridge = int(h * 0.12)
+def _hut_window(surf: pygame.Surface, cx: float, cy: float, ww: float, wh: float,
+                s: float, mullion: bool = False) -> None:
+    """A dark opening with a timber lintel and sill, rim-lit on the upper left."""
+    unit = max(1, int(round(s)))
+    rect = pygame.Rect(int(cx - ww * 0.5), int(cy - wh * 0.5),
+                       max(2, int(round(ww))), max(2, int(round(wh))))
+    pygame.draw.rect(surf, _rgba((16, 12, 10), 230), rect)
+    _line(surf, WOOD, (rect.left - unit, rect.top - unit),
+          (rect.right + unit, rect.top - unit), max(1, int(round(1.6 * s))))
+    _line(surf, WOOD_DARK, (rect.left - unit, rect.bottom),
+          (rect.right + unit, rect.bottom), max(1, int(round(1.4 * s))))
+    _rim_line(surf, rect.topleft, rect.bottomleft, 95)
+    _rim_line(surf, (rect.left, rect.top - 1), (rect.right, rect.top - 1), 70)
+    if mullion:
+        _line(surf, WOOD, (rect.centerx, rect.top), (rect.centerx, rect.bottom), unit, 220)
+
+
+def _bake_hut(stage: int, rng: random.Random, scale: float = 1.0) -> pygame.Surface:
+    """Bake a hut at *scale*, geometry recomputed rather than upscaled.
+
+    Growth is not zoom. As ``scale`` climbs the walls take a bigger share of a
+    taller canvas, the eaves reach further past them, and the building earns
+    structure the small hut does not have: a stone footing, then a window, then a
+    second window and a smoke hole, and at the top of the range a second doorway
+    - two dwellings under one roof.
+
+    The caller seeds *rng* per ``(kind, variant, stage)``, so a hut keeps its own
+    jitter as it grows; details must not pop when it crosses a bucket. All
+    geometry is expressed in fractions of ``(w, h)`` and the ground contact stays
+    at the canvas bottom, because the renderer anchors ``midbottom`` - a taller
+    hut has to grow upward, not straddle the ground line.
+    """
+    s = max(0.05, float(scale))
+    g = hut_growth(s)
+    w, h = hut_dims(s)
+    surf = pygame.Surface((w, h), pygame.SRCALPHA)
+
+    def lw(n: float) -> int:
+        """A base-art line width in pixels, thickened with the sprite."""
+        return max(1, int(round(n * s)))
+
+    # Walls span a fixed fraction of the *base* width and sit centred, so the
+    # extra canvas width from hut_dims lands under the eaves instead of inside
+    # the building. At scale 1.0 this reproduces the original left=9, right=68.
+    bw = KIND_SIZE.get("hut", (78, 64))[0]
+    wall_span = max(4, int(round(HUT_WALL_SPAN * bw * s)))
+    left = max(1, (w - wall_span) // 2)
+    right = min(w - 2, left + wall_span)
+    base = h - lw(2)
+    # Walls claim more of the height as the hut grows (0.54h -> 0.60h) and the
+    # ridge lifts slightly, so the roof reads long and low instead of pointy.
+    wall_top = int(h * (0.46 - 0.06 * g))
+    ridge = int(h * (0.12 - 0.02 * g))
+    wall_h = max(2, base - wall_top)
     cx = w // 2
+    # Clamped to the canvas: a roof that overhangs past its own surface gets its
+    # corners sliced off, which is exactly the detail the rim highlight sells.
+    eave = max(1, min(_hut_eave(s, g), left - 1, w - right - 2))
+
+    def fx(t: float) -> int:
+        """Horizontal position as a fraction *across the walls*, not the canvas.
+
+        Wall-relative so the composition is identical at every scale even though
+        a grown canvas carries extra padding for its eaves.
+        """
+        return int(left + wall_span * t)
 
     if stage == 0:
-        for x in (left, int(w * 0.36), int(w * 0.64), right):
-            _line(surf, WOOD_DARK, (x, base), (x + rng.uniform(-1, 1), base - 14), 3)
-            _rim_line(surf, (x - 1, base - 2), (x - 1, base - 13), 80)
-        _ellipse(surf, EARTH, cx, base, w * 0.42, 3.0)
+        post_h = int(h * 0.22)
+        for x in (left, fx(0.32), fx(0.68), right):
+            _line(surf, WOOD_DARK, (x, base), (x + rng.uniform(-1, 1) * s, base - post_h), lw(3))
+            _rim_line(surf, (x - 1, base - lw(2)), (x - 1, base - post_h + lw(1)), 80)
+        _ellipse(surf, EARTH, cx, base, w * 0.42, 3.0 * s)
         return surf
 
     # posts
     for x in (left, right):
-        _line(surf, WOOD_DARK, (x, base), (x, wall_top), 4)
-    _line(surf, WOOD_DARK, (left, wall_top), (right, wall_top), 3)
+        _line(surf, WOOD_DARK, (x, base), (x, wall_top), lw(4))
+    _line(surf, WOOD_DARK, (left, wall_top), (right, wall_top), lw(3))
 
     if stage == 1:
         # frame only: rafters and a ridge beam
-        _line(surf, WOOD, (left, wall_top), (cx, ridge), 3)
-        _line(surf, WOOD, (right, wall_top), (cx, ridge), 3)
-        _line(surf, WOOD, (int(w * 0.3), wall_top), (cx, ridge + 6), 2)
-        _line(surf, WOOD, (int(w * 0.7), wall_top), (cx, ridge + 6), 2)
+        _line(surf, WOOD, (left, wall_top), (cx, ridge), lw(3))
+        _line(surf, WOOD, (right, wall_top), (cx, ridge), lw(3))
+        _line(surf, WOOD, (fx(0.25), wall_top), (cx, ridge + lw(6)), lw(2))
+        _line(surf, WOOD, (fx(0.75), wall_top), (cx, ridge + lw(6)), lw(2))
         _rim_line(surf, (left, wall_top - 1), (cx, ridge - 1), 100)
-        _ellipse(surf, EARTH, cx, base, w * 0.42, 3.0)
+        _ellipse(surf, EARTH, cx, base, w * 0.42, 3.0 * s)
         return surf
 
     # walls
     _poly(surf, WOOD_DARK, [(left, base), (left, wall_top), (right, wall_top), (right, base)])
-    for i in range(4):
-        y = wall_top + 5 + i * ((base - wall_top) // 5)
-        _line(surf, WOOD, (left + 2, y), (right - 2, y), 1, 150)
+    bands = 4 + int(round(2.0 * g))
+    span = max(2, wall_h // (bands + 1))
+    for i in range(bands):
+        y = wall_top + lw(5) + i * span
+        if y >= base - 1:
+            break
+        _line(surf, WOOD, (left + lw(2), y), (right - lw(2), y), 1, 150)
+
+    # A grown hut sits on stone. Drawn before the openings so the doorway cuts
+    # through it rather than standing on a plinth.
+    if g > 0.15:
+        fh = lw(4) + int(round(3.0 * g * s))
+        pygame.draw.rect(surf, _rgba(STONE_DARK),
+                         pygame.Rect(left, base - fh, max(2, right - left), fh))
+        step = max(4, int(round(9.0 * s)))
+        for bx in range(left, max(left + 1, right - 2), step):
+            _ellipse(surf, STONE, bx + step * 0.5, base - fh * 0.55, step * 0.34, fh * 0.34)
+        _rim_line(surf, (left, base - fh), (right, base - fh), 90)
 
     if stage == 2:
         # partially thatched roof: rafters showing through
-        _poly(surf, THATCH, [(left - 5, wall_top + 2), (cx, ridge), (cx + 2, ridge + 3),
-                             (int(w * 0.2), wall_top + 2)])
-        _line(surf, WOOD, (right + 4, wall_top + 2), (cx, ridge), 3)
-        _line(surf, WOOD, (int(w * 0.72), wall_top + 2), (cx, ridge + 5), 2)
-        _rim_line(surf, (left - 4, wall_top + 1), (cx, ridge - 1), 110)
+        _poly(surf, THATCH, [(left - eave, wall_top + lw(2)), (cx, ridge),
+                             (cx + lw(2), ridge + lw(3)), (fx(0.12), wall_top + lw(2))])
+        _line(surf, WOOD, (right + lw(4), wall_top + lw(2)), (cx, ridge), lw(3))
+        _line(surf, WOOD, (fx(0.80), wall_top + lw(2)), (cx, ridge + lw(5)), lw(2))
+        _rim_line(surf, (left - eave + lw(1), wall_top + 1), (cx, ridge - 1), 110)
     else:
         # finished: full thatch roof, ridge cap, doorway
-        _poly(surf, THATCH, [(left - 6, wall_top + 3), (cx, ridge),
-                             (right + 6, wall_top + 3)])
-        for i in range(5):
-            t = 0.18 + 0.16 * i
+        lspan = float(wall_top + lw(3) - ridge)
+        _poly(surf, THATCH, [(left - eave, wall_top + lw(3)), (cx, ridge),
+                             (right + eave, wall_top + lw(3))])
+        courses = 5 + int(round(3.0 * g))
+        for i in range(courses):
+            t = 0.18 + (0.80 / courses) * i
+            ly = wall_top + lw(3) - lspan * t
             _line(surf, THATCH_LIGHT,
-                  (left - 6 + (cx - left + 6) * t, wall_top + 3 - (wall_top + 3 - ridge) * t),
-                  (right + 6 - (right + 6 - cx) * t, wall_top + 3 - (wall_top + 3 - ridge) * t),
-                  1, 90)
-        _line(surf, WOOD_LIGHT, (cx - 4, ridge + 1), (cx + 4, ridge + 1), 2)
-        _rim_line(surf, (left - 6, wall_top + 2), (cx, ridge - 1), 130)
-        _rim_line(surf, (cx, ridge - 1), (right + 6, wall_top + 2), 60)
-        door = pygame.Rect(cx - 7, base - 20, 14, 19)
-        pygame.draw.rect(surf, _rgba((16, 12, 10), 235), door)
-        _rim_line(surf, (cx - 8, base - 21), (cx - 8, base - 2), 90)
-        _rim_line(surf, (cx - 8, base - 21), (cx + 7, base - 21), 70)
+                  (left - eave + (cx - left + eave) * t, ly),
+                  (right + eave - (right + eave - cx) * t, ly), lw(1), 90)
+        _line(surf, WOOD_LIGHT, (cx - lw(4), ridge + 1), (cx + lw(4), ridge + 1), lw(2))
+        _rim_line(surf, (left - eave, wall_top + lw(2)), (cx, ridge - 1), 130)
+        _rim_line(surf, (cx, ridge - 1), (right + eave, wall_top + lw(2)), 60)
 
-    _ellipse(surf, EARTH, cx, base, w * 0.44, 3.0)
+        if g > 0.55:
+            # a hearth big enough to need venting
+            hx = cx + int(wall_span * 0.18)
+            hy = wall_top + lw(3) - lspan * 0.42
+            _poly(surf, (18, 14, 12), [(hx - lw(4), hy), (hx + lw(4), hy - lw(2)),
+                                       (hx + lw(4), hy + lw(4)), (hx - lw(4), hy + lw(5))], 220)
+            _line(surf, THATCH_LIGHT, (hx - lw(5), hy - lw(3)),
+                  (hx + lw(5), hy - lw(5)), lw(2), 200)
+            _rim_line(surf, (hx - lw(5), hy - lw(3)), (hx + lw(5), hy - lw(5)), 100)
+
+        # Wall furniture. The main doorway stays centred at every size: the
+        # renderer puts its occupancy glow at rect.centerx.
+        win_y = wall_top + wall_h * 0.34
+        win_w, win_h = wall_span * 0.17, wall_h * 0.30
+        if g > 0.30:
+            _hut_window(surf, fx(0.20), win_y, win_w, win_h, s, g > 0.70)
+        if 0.55 < g <= 0.78:
+            _hut_window(surf, fx(0.80), win_y, win_w, win_h, s, g > 0.70)
+
+        dw = max(6, int(round(wall_span * 0.24)))
+        dh = max(8, int(round(wall_h * 0.58)))
+        door = pygame.Rect(cx - dw // 2, base - dh - lw(1), dw, dh)
+        pygame.draw.rect(surf, _rgba((16, 12, 10), 235), door)
+        _rim_line(surf, (door.left - 1, door.top - 1), (door.left - 1, base - lw(2)), 90)
+        _rim_line(surf, (door.left - 1, door.top - 1), (door.right - 1, door.top - 1), 70)
+
+        if g > 0.78:
+            # top of the range: a second doorway, plus a gable window above the
+            # main one - the hut has become a longhouse for two families
+            d2w = max(5, int(round(wall_span * 0.17)))
+            d2h = max(7, int(round(wall_h * 0.50)))
+            d2 = pygame.Rect(fx(0.80) - d2w // 2, base - d2h - lw(1), d2w, d2h)
+            pygame.draw.rect(surf, _rgba((16, 12, 10), 235), d2)
+            _line(surf, WOOD, (d2.left - lw(1), d2.top - lw(1)),
+                  (d2.right + lw(1), d2.top - lw(1)), lw(2))
+            _rim_line(surf, (d2.left - 1, d2.top - 1), (d2.left - 1, base - lw(2)), 85)
+            _rim_line(surf, (d2.left - 1, d2.top - 1), (d2.right - 1, d2.top - 1), 65)
+            _hut_window(surf, cx, wall_top + wall_h * 0.20, wall_span * 0.13,
+                        wall_h * 0.16, s)
+
+    _ellipse(surf, EARTH, cx, base, w * 0.44, 3.0 * s)
     return surf
 
 
@@ -752,8 +974,12 @@ class Atlas:
             return art - 1 if sim_stages == 1 and art > 1 else 0
         return int(round(st / (sim_stages - 1) * (art - 1)))
 
-    def _bake_one(self, kind: str, variant: int, stage: int) -> pygame.Surface:
+    def _bake_one(self, kind: str, variant: int, stage: int,
+                  scale: float = 1.0) -> pygame.Surface:
         rng = self._rng(kind, variant, stage)
+        if kind == "hut":
+            # the only kind whose art is a function of scale, not a resample
+            return _bake_hut(self._art_stage("hut", stage), rng, scale)
         baker = _STRUCTURE_BAKERS.get(kind)
         if baker is not None:
             return baker(self._art_stage(kind, stage), rng)
@@ -793,8 +1019,28 @@ class Atlas:
                         self._cache[key] = self._bake_one(kind, variant, stage)
                     except Exception:
                         self._cache[key] = self._missing
+        self._prebake_hut_growth()
         self.bake_ms = (time.perf_counter() - t0) * 1000.0
         return self.bake_ms
+
+    def _prebake_hut_growth(self) -> int:
+        """Bake the grown forms of a *finished* hut. Returns how many.
+
+        Only the finished stage: growth is earned by standing, so nothing ever
+        asks for a big hut still in scaffolding, and baking every stage would
+        multiply startup cost for sprites no frame requests. Done at startup so
+        the first hut to cross a bucket does not bake mid-frame.
+        """
+        n = 0
+        st = self.stages("hut") - 1
+        for v in range(self.variants("hut")):
+            for idx in range(1, HUT_GROWTH_BUCKETS):
+                try:
+                    self._hut_sprite(v, st, hut_bucket_scale(idx))
+                    n += 1
+                except Exception:
+                    continue
+        return n
 
     # ------------------------------------------------------------ queries --
 
@@ -821,7 +1067,13 @@ class Atlas:
         return kind in _STRUCTURE_BAKERS
 
     def size(self, kind: str, scale: float = 1.0) -> tuple[int, int]:
-        """Sprite size in pixels at *scale*."""
+        """Sprite size in pixels at *scale*.
+
+        Reports what :meth:`get` will actually hand back, bucket quantisation and
+        the hut's extra height gain included - not the naive ``base * scale``.
+        """
+        if kind == "hut" and float(scale) > float(HUT_SCALE_MIN) - 1e-6:
+            return hut_dims(hut_bucket_scale(hut_growth_bucket(scale)))
         w, h = KIND_SIZE.get(kind, (2, 2))
         s = max(0.05, float(scale))
         return (max(1, int(round(w * s))), max(1, int(round(h * s))))
@@ -864,6 +1116,11 @@ class Atlas:
         *state* accepts a ``sim.props.Prop.state`` dict (used to choose between
         visual forms of one kind, e.g. a bush with or without berries) or a bare
         int, which is treated as a stage index.
+
+        A hut at ``scale >= HUT_SCALE_MIN`` is served from the growth ladder: a
+        purpose-drawn bigger building, quantised into
+        :data:`HUT_GROWTH_BUCKETS` buckets. Below that it falls through to the
+        generic resample, so shrunken previews still work.
         """
         try:
             if isinstance(state, (int, float)) and not isinstance(state, bool):
@@ -873,6 +1130,8 @@ class Atlas:
             ns = self.stages(kind)
             v = int(variant) % nv
             st = max(0, min(int(stage), ns - 1))
+            if kind == "hut" and float(scale) > float(HUT_SCALE_MIN) - 1e-6:
+                return self._hut_sprite(v, st, float(scale))
             bucket = int(round(float(scale) * SCALE_BUCKET))
             bucket = max(2, min(bucket, 160))
             key = (kind, v, st, bucket)
@@ -904,6 +1163,38 @@ class Atlas:
         except Exception:
             return self._missing
 
+    def _hut_sprite(self, variant: int, stage: int, scale: float) -> pygame.Surface:
+        """Grown hut for *scale*, baked once per growth bucket.
+
+        A hut's scale drifts by a fraction of a percent per tick, so the whole
+        point is that the bucket - not the raw scale - is the cache key.
+        """
+        idx = hut_growth_bucket(scale)
+        if idx == 0 and abs(float(HUT_SCALE_MIN) - 1.0) < 1e-6:
+            # bucket 0 *is* the base bake; don't hold a second copy of it
+            key = ("hut", variant, stage, int(SCALE_BUCKET))
+        else:
+            key = ("hut", variant, stage, HUT_BUCKET_KEY + idx)
+        hit = self._cache.get(key)
+        if hit is not None:
+            return hit
+        try:
+            spr = self._bake_one("hut", variant, stage, hut_bucket_scale(idx))
+        except Exception:
+            spr = self._missing
+        self._cache[key] = spr
+        return spr
+
+    def hut_bucket(self, scale: float) -> tuple[int, float, tuple[int, int]]:
+        """``(bucket index, drawn scale, drawn size)`` for a hut *scale*.
+
+        Exposed for the diagnostics overlay and for tests that need to prove the
+        cache is actually bucketing rather than re-baking.
+        """
+        idx = hut_growth_bucket(scale)
+        drawn = hut_bucket_scale(idx)
+        return (idx, drawn, hut_dims(drawn))
+
     def blit(self, surf: pygame.Surface, kind: str, x: float, ground_y: float,
              variant: int = 0, stage: int = 0, scale: float = 1.0,
              flip: bool = False, state: Any = None) -> None:
@@ -919,14 +1210,24 @@ class Atlas:
             return
 
     def _trim(self) -> None:
-        """Drop scaled variants, keeping the base bake."""
+        """Drop resampled variants, keeping the base bake and the hut ladder.
+
+        The hut ladder is bounded (8 buckets x variants x stages) and is hit
+        every frame; the generic resample cache is the one that grows without
+        limit. Evicting the huts first would guarantee a re-bake next frame.
+        """
         base = int(SCALE_BUCKET)
-        for key in [k for k in self._cache if k[3] != base]:
+        for key in [k for k in self._cache if k[3] != base and k[3] < HUT_BUCKET_KEY]:
             self._cache.pop(key, None)
+        if len(self._cache) > 2000:                      # pathological; give it all back
+            for key in [k for k in self._cache if k[3] >= HUT_BUCKET_KEY]:
+                self._cache.pop(key, None)
 
     def cache_stats(self) -> dict[str, Any]:
         """Sprite count and bake time, for the diagnostics overlay."""
-        return {"sprites": len(self._cache), "bake_ms": round(self.bake_ms, 2)}
+        grown = sum(1 for k in self._cache if k[3] >= HUT_BUCKET_KEY)
+        return {"sprites": len(self._cache), "bake_ms": round(self.bake_ms, 2),
+                "hut_grown": grown}
 
 
 # --------------------------------------------------------------------------
@@ -984,6 +1285,44 @@ if __name__ == "__main__":  # pragma: no cover - smoke test
     except Exception as exc:
         print("capture skipped:", exc)
 
+    # hut growth ladder: every bucket, on one strip, with the ground line drawn
+    # so it is obvious the sprite grows upward from it
+    st_final = STRUCTURE_STAGES.get("hut", 5) - 1
+    dims = [atlas.hut_bucket(hut_bucket_scale(i)) for i in range(HUT_GROWTH_BUCKETS)]
+    strip_w = sum(d[2][0] + 16 for d in dims) + 16
+    strip_h = max(d[2][1] for d in dims) + 40
+    strip = pygame.Surface((strip_w, strip_h))
+    strip.fill((18, 20, 26))
+    gy = strip_h - 16
+    pygame.draw.line(strip, (44, 48, 54), (0, gy), (strip_w, gy), 1)
+    px = 16
+    for idx, drawn, (sw, sh) in dims:
+        atlas.blit(strip, "hut", px + sw // 2, gy, 0, st_final, drawn)
+        px += sw + 16
+    try:
+        pygame.image.save(strip, str(CAPTURE_DIR / "hut_growth.png"))
+        print("wrote hut_growth.png to", CAPTURE_DIR)
+    except Exception as exc:
+        print("hut strip capture skipped:", exc)
+
+    print(f"hut ladder ({HUT_GROWTH_BUCKETS} buckets, step {hut_bucket_step():.4f}):")
+    for idx, drawn, (sw, sh) in dims:
+        spr = atlas.get("hut", 0, st_final, drawn)
+        print(f"  bucket {idx}  scale {drawn:.3f}  growth {hut_growth(drawn):.2f}  "
+              f"dims {sw}x{sh}  actual {spr.get_size()}")
+
+    # the whole point of bucketing: a drifting scale must not add sprites
+    before = len(atlas._cache)
+    t0 = time.perf_counter()
+    n = 0
+    for i in range(4000):
+        sc = HUT_SCALE_MIN + (HUT_SCALE_MAX - HUT_SCALE_MIN) * (i / 3999.0)
+        atlas.get("hut", i % 4, st_final, sc)
+        n += 1
+    dt = (time.perf_counter() - t0) / n * 1e6
+    print(f"drifting-scale get(): {dt:.2f} us/call, cache {before} -> {len(atlas._cache)}")
+    assert len(atlas._cache) == before, "drifting hut scale is not hitting the bucket cache"
+
     t0 = time.perf_counter()
     for _ in range(2000):
         atlas.get("tree", 1, 0)
@@ -991,5 +1330,10 @@ if __name__ == "__main__":  # pragma: no cover - smoke test
     print(f"warm get(): {(time.perf_counter() - t0) / 4000 * 1e6:.2f} us/call")
     print("scaled:", atlas.get("tree", 0, 0, 0.5).get_size(),
           "| unknown kind:", atlas.get("nope").get_size(),
-          "| stage clamp:", atlas.get("hut", 0, 99).get_size())
+          "| stage clamp:", atlas.get("hut", 0, 99).get_size(),
+          "| shrunk hut:", atlas.get("hut", 0, st_final, 0.5).get_size(),
+          "| over-max hut:", atlas.get("hut", 0, st_final, 2.6).get_size())
+    print("size() agrees with get():",
+          all(atlas.size("hut", d[1]) == atlas.get("hut", 0, st_final, d[1]).get_size()
+              for d in dims))
     print(atlas.cache_stats())

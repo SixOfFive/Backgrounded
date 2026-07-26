@@ -16,6 +16,7 @@ log = logging.getLogger(__name__)
 class Config:
     show_window: bool = True          # preview visible by default, per spec
     show_stats: bool = True           # top-right colony/roster panel
+    show_names: bool = True           # name plates above each stickman
     wallpaper_enabled: bool = True
     scene: str = SCENE_NIGHT_STORM    # opening scene, per spec
     wallpaper_fps: int = WALLPAPER_FPS
