@@ -192,7 +192,34 @@ class World:
             # in another, so balance changes could not be compared.
             agent.apply_physics(dt, self.terrain, rng=self.pyrng)
 
+        self._free_orphaned_sleepers()
         self._reap_dead(dt)
+
+    def _free_orphaned_sleepers(self) -> None:
+        """Nobody stays inside a building that no longer exists.
+
+        render/ skips anyone with .inside set, so an agent still flagged as
+        inside a hut that burned down or was destroyed would be invisible for
+        the rest of the run.
+        """
+        for agent in self.population.alive_agents():
+            sid = getattr(agent, "inside", None)
+            if sid is None:
+                continue
+            st = None
+            try:
+                for cand in self.structures.all():
+                    if cand.id == sid:
+                        st = cand
+                        break
+            except Exception:
+                st = None
+            if st is None or getattr(st, "is_ruined", False):
+                agent.inside = None
+                try:
+                    agent.y = self.terrain.ground_y(agent.x)
+                except Exception:
+                    pass
 
     def _reap_dead(self, dt: float) -> None:
         """Turn fresh corpses into graves and bring in a replacement."""

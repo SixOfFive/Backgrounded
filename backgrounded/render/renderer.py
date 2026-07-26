@@ -183,6 +183,11 @@ class Renderer:
             r = spr.get_rect()
             r.midbottom = (int(st.x), int(st.y) + 2)
             s.blit(spr, r)
+            # occupied buildings glow: someone is asleep in there
+            occ = self._occupants(world, st)
+            if occ:
+                self._draw_occupancy(s, st, r, occ, world)
+
             # in-progress structures get a faint scaffold hint
             if not st.built and st.progress > 0:
                 w = int(28 * st.progress)
@@ -190,11 +195,60 @@ class Renderer:
                                  (r.centerx - 14, r.top - 6),
                                  (r.centerx - 14 + w, r.top - 6), 2)
 
+    @staticmethod
+    def _occupants(world, st) -> list:
+        try:
+            return [a for a in world.population.alive_agents()
+                    if getattr(a, "inside", None) == st.id]
+        except Exception:
+            return []
+
+    def _draw_occupancy(self, s: pygame.Surface, st, rect: pygame.Rect,
+                        occ: list, world) -> None:
+        """A warm doorway and a sleep mark, so an occupied hut reads as lived in.
+
+        This is the whole point of putting sleepers inside: you should still be
+        able to tell the difference between an empty hut and one with someone in
+        it, without seeing a body draped over the threshold.
+        """
+        try:
+            # Warm light spilling from the doorway. Brighter at night.
+            night = bool(getattr(world, "is_night", False))
+            glow = 150 if night else 70
+            dw, dh = max(4, rect.width // 5), max(5, rect.height // 3)
+            door = pygame.Rect(0, 0, dw, dh)
+            door.midbottom = (rect.centerx, rect.bottom - 1)
+            light = pygame.Surface(door.size, pygame.SRCALPHA)
+            light.fill((255, 186, 96, glow))
+            s.blit(light, door)
+
+            # A small "z" drifting up, one per sleeper, phase-offset by id.
+            t = float(getattr(world, "world_time", 0.0))
+            for i, a in enumerate(occ[:3]):
+                ph = (t * 0.6 + i * 0.37 + (a.id % 7) * 0.11) % 1.0
+                zy = rect.top - 4 - int(ph * 12)
+                zx = rect.centerx + 6 + i * 5 + int(3 * math.sin(ph * 6.28))
+                alpha = int(200 * (1.0 - ph))
+                if alpha <= 0:
+                    continue
+                col = (*tuple(a.color), alpha)
+                mark = pygame.Surface((5, 5), pygame.SRCALPHA)
+                pygame.draw.line(mark, col, (0, 0), (4, 0))
+                pygame.draw.line(mark, col, (4, 0), (0, 4))
+                pygame.draw.line(mark, col, (0, 4), (4, 4))
+                s.blit(mark, (zx, zy))
+        except Exception:
+            pass
+
     # ------------------------------------------------------------- agents --
     def _draw_agents(self, s: pygame.Surface, world) -> None:
         lighting = world.lighting
         for a in world.population.agents:
             if not a.alive and a.dead_t > 2.0:
+                continue
+            # Inside a building: they are genuinely in there, not lying across
+            # the doorstep. _draw_occupancy marks the hut instead.
+            if getattr(a, "inside", None) is not None and a.alive:
                 continue
             try:
                 lit = lighting.light_at(a.x, a.y)

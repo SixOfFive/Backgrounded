@@ -1506,15 +1506,26 @@ def _h_sleep(a: Action, ag: Any, w: Any, dt: float) -> None:
                 return
             a.data["in"] = 1
             a.phase = "sleep"
+            # Actually go inside. render/ hides anyone with .inside set and
+            # lights the hut instead, so they are no longer sprawled across
+            # the doorstep in full view.
+            try:
+                ag.inside = int(hut.id)
+            except Exception:
+                pass
         elif a.t > 75.0:
             a.failed = True
         return
 
     a.pose = "sleep"
     _halt(ag)
+    # Park them at the hut's centre. They are not drawn while inside, but the
+    # position still matters: it is where they reappear on waking, and it keeps
+    # any light they carry (a candle) shining from the right building.
     try:
-        ag.x = float(ag.x) + (float(hut.x) - float(ag.x)) * min(1.0, dt * 4.0)
+        ag.x = float(hut.x)
         ag.y = float(hut.y) - 2.0
+        ag.inside = int(hut.id)
     except Exception:
         pass
     _adjust(ag, "fatigue", -0.055 * dt)
@@ -1536,6 +1547,12 @@ def _c_sleep(a: Action, ag: Any, w: Any) -> None:
             ag.y = ground_y(w, ag.x)
         except Exception:
             pass
+    # Always clear this, even if the hut is gone: an agent left flagged as
+    # inside a building that no longer exists would be invisible forever.
+    try:
+        ag.inside = None
+    except Exception:
+        pass
     a.data["in"] = 0
 
 
@@ -2002,6 +2019,12 @@ def _c_lookout(a: Action, ag: Any, w: Any) -> None:
             ag.y = ground_y(w, ag.x)
         except Exception:
             pass
+    # Always clear this, even if the hut is gone: an agent left flagged as
+    # inside a building that no longer exists would be invisible forever.
+    try:
+        ag.inside = None
+    except Exception:
+        pass
     a.data["in"] = 0
 
 

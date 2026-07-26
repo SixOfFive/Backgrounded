@@ -313,6 +313,12 @@ class Stickman:
     # stop them walking. It was an undeclared attribute, so it silently
     # vanished across a save/load and any gate on it saw nothing.
     beamed: bool = False
+
+    #: Structure id this agent is currently inside, or None. Sleepers go *in*
+    #: the hut rather than lying across its doorstep, so render/ skips them and
+    #: the building shows an occupied light instead. Persisted, because a save
+    #: taken at night is mostly a save of people asleep.
+    inside: int | None = None
     alive: bool = True
     anim_t: float = 0.0                   # animation phase accumulator
 
@@ -920,6 +926,7 @@ class Stickman:
             "taken": bool(self.taken),
             "lift_t": float(self.lift_t),
             "beamed": bool(self.beamed),
+            "inside": self.inside,
             "alive": bool(self.alive),
             "anim_t": float(self.anim_t),
             "target_x": None if self.target_x is None else float(self.target_x),
@@ -974,6 +981,8 @@ class Stickman:
         s.taken = _b(d.get("taken"), False)
         s.lift_t = _f(d.get("lift_t"), 0.0)
         s.beamed = _b(d.get("beamed"), False)
+        _ins = d.get("inside")
+        s.inside = int(_ins) if isinstance(_ins, (int, float)) else None
         s.alive = _b(d.get("alive"), True)
         s.anim_t = _f(d.get("anim_t"), 0.0)
 
