@@ -30,6 +30,31 @@ from .sim.world import World
 log = logging.getLogger(__name__)
 
 
+def _acquire_single_instance() -> bool:
+    """Take a named mutex so only one copy ever runs.
+
+    Two instances both write the wallpaper A/B pair and both call
+    SystemParametersInfoW, so they overwrite each other's files mid-write and
+    the desktop flickers between two different worlds. Worse, closing the
+    preview window only *hides* it (the app lives in the tray), so it is easy
+    to leave orphans running without noticing. The handle is deliberately
+    leaked: it lives as long as the process and Windows frees it on exit.
+    """
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        handle = k32.CreateMutexW(None, False, "Local\\BackgroundedSingleInstance")
+        if not handle:
+            return True                      # cannot tell; allow startup
+        ERROR_ALREADY_EXISTS = 183
+        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+            return False
+        globals()["_INSTANCE_MUTEX"] = handle
+        return True
+    except Exception:
+        return True
+
+
 def _screen_size() -> tuple[int, int]:
     try:
         u = ctypes.windll.user32
@@ -283,6 +308,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--exit-after", type=float, default=0.0,
                    help="exit after N sim seconds (testing)")
     p.add_argument("--log-level", default="INFO")
+    p.add_argument("--allow-multi", action="store_true",
+                   help="permit a second instance (they will fight over the "
+                        "wallpaper; for debugging only)")
     return p
 
 
@@ -295,4 +323,8 @@ def main(argv: list[str] | None = None) -> int:
         handlers=[logging.FileHandler(paths.LOG_PATH, encoding="utf-8"),
                   logging.StreamHandler(sys.stdout)],
     )
+    if not args.allow_multi and not _acquire_single_instance():
+        log.error("Backgrounded is already running - look for the tray icon. "
+                  "Use --allow-multi to override.")
+        return 2
     return App(args).run()

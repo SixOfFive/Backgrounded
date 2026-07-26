@@ -22,8 +22,15 @@ CHRONICLE_PATH: Path = APP_DIR / "chronicle.txt"
 # Two alternating wallpaper targets. Windows caches the wallpaper by path, so
 # writing the *same* path repeatedly can be ignored or can collide with
 # Explorer/Defender holding the active file open. Alternating sidesteps both.
-WALLPAPER_A: Path = APP_DIR / "wallpaper_a.bmp"
-WALLPAPER_B: Path = APP_DIR / "wallpaper_b.bmp"
+#
+# JPEG, not BMP. A 2560x1600 24-bit BMP is ~12 MB, and Windows silently
+# declined to transcode ours: SPI_GETDESKWALLPAPER and the registry both
+# reported the file while %APPDATA%\Microsoft\Windows\Themes\TranscodedWallpaper
+# stayed 80 minutes stale, so the desktop fell back to the background colour
+# (black). JPEG is what the shell itself uses - Windows Spotlight writes .jpg -
+# and at ~400 KB it also writes roughly 30x faster.
+WALLPAPER_A: Path = APP_DIR / "wallpaper_a.jpg"
+WALLPAPER_B: Path = APP_DIR / "wallpaper_b.jpg"
 
 # Frame captures written by --capture, used for visual verification.
 CAPTURE_DIR: Path = APP_DIR / "captures"

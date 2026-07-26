@@ -265,7 +265,13 @@ class WallpaperWriter:
                     return
             try:
                 with open(tmp, "wb") as fh:
-                    img.save(fh, format="BMP")
+                    # quality 88 is visually indistinguishable at desktop
+                    # scale; subsampling off keeps the thin stickman limbs and
+                    # lightning filaments from smearing into mush.
+                    img.save(fh, format="JPEG", quality=88, subsampling=0,
+                             optimize=False)
+                    fh.flush()
+                    os.fsync(fh.fileno())     # Explorer must not read a partial file
                 os.replace(tmp, target)
                 break
             except Exception as exc:
@@ -281,7 +287,14 @@ class WallpaperWriter:
                         pass
                     return
 
-        if not _set_wallpaper(str(target), SPIF_SENDCHANGE):
+        # SPIF_UPDATEINIFILE is required, not optional. With SPIF_SENDCHANGE
+        # alone the change is never committed to HKCU\Control Panel\Desktop, so
+        # the desktop often does not repaint at all - and on a machine using
+        # Windows Spotlight the Iris service re-asserts its own image over ours
+        # within seconds. Measured: SPI_GETDESKWALLPAPER reported our BMP while
+        # the registry still held the Spotlight JPG and the desktop never
+        # changed. The extra registry write is cheap next to the ~200 ms call.
+        if not _set_wallpaper(str(target), SPIF_UPDATEINIFILE | SPIF_SENDCHANGE):
             self.failures += 1
             self.last_error = "SPI_SETDESKWALLPAPER returned 0"
             log.warning("SPI_SETDESKWALLPAPER failed for %s", target)
