@@ -309,6 +309,10 @@ class Stickman:
     # back. lift_t drives the beam animation in render/.
     taken: bool = False
     lift_t: float = 0.0
+    # Written by ufo.py while the beam holds someone, and read by behaviour to
+    # stop them walking. It was an undeclared attribute, so it silently
+    # vanished across a save/load and any gate on it saw nothing.
+    beamed: bool = False
     alive: bool = True
     anim_t: float = 0.0                   # animation phase accumulator
 
@@ -915,6 +919,7 @@ class Stickman:
             "target_animal": self.target_animal,
             "taken": bool(self.taken),
             "lift_t": float(self.lift_t),
+            "beamed": bool(self.beamed),
             "alive": bool(self.alive),
             "anim_t": float(self.anim_t),
             "target_x": None if self.target_x is None else float(self.target_x),
@@ -968,6 +973,7 @@ class Stickman:
         s.target_animal = int(ta) if isinstance(ta, (int, float)) else None
         s.taken = _b(d.get("taken"), False)
         s.lift_t = _f(d.get("lift_t"), 0.0)
+        s.beamed = _b(d.get("beamed"), False)
         s.alive = _b(d.get("alive"), True)
         s.anim_t = _f(d.get("anim_t"), 0.0)
 

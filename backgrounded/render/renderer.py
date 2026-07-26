@@ -17,7 +17,7 @@ from ..constants import (
     MATERIAL_COLORS, MAT_GRASS, RENDER_H, RENDER_SIZE, RENDER_W,
     SCENE_BLIZZARD, SCENE_FLOOD, SCENE_WILDFIRE,
 )
-from . import fx, hud, sky
+from . import creatures, fx, hud, sky
 from .atlas import Atlas
 from .particles import ParticleSystem
 from .stickfigure import draw_stickman
@@ -70,8 +70,12 @@ class Renderer:
         self._draw_props(s, world)
         self._draw_structures(s, world)
 
-        # 7. agents
+        # 7. agents, then the wildlife among them
         self._draw_agents(s, world)
+        try:
+            creatures.draw_animals(s, world, world.world_time)
+        except Exception:
+            log.exception("animal draw failed")
 
         # 8-9. near weather and particles
         self.particles.draw(s, layer="front")
@@ -82,6 +86,13 @@ class Renderer:
 
         # 10. the light composite
         self._composite_light(s, world)
+
+        # The saucer sits above the light pass: its beam is its own light and
+        # should not be multiplied down into the night.
+        try:
+            creatures.draw_ufo(s, world, world.world_time)
+        except Exception:
+            log.exception("ufo draw failed")
 
         # 11. lightning geometry, then vignette
         self._draw_lightning(s, world)

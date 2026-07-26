@@ -22,6 +22,8 @@ from ..constants import (
     RES_FOOD, RES_STONE, RES_WOOD, SCENE_NIGHT_STORM, SAVE_VERSION,
 )
 from . import behavior, names
+from .animals import AnimalRegistry
+from .ufo import Ufo
 from .entities import GRAVE_DELAY, Population, Stickman
 from .events import EventSystem
 from .lighting import Lighting, LightSource
@@ -59,6 +61,8 @@ class World:
         self.population: Population = Population()
         self.lighting: Lighting = Lighting()
         self.events: EventSystem = EventSystem(scene=scene)
+        self.animals: AnimalRegistry = AnimalRegistry()
+        self.ufo: Ufo = Ufo()
 
         # Colony-level state
         self.stockpile: dict[str, int] = {r: 0 for r in ALL_RESOURCES}
@@ -118,6 +122,8 @@ class World:
         self._guarded("props", lambda: self._tick_props(dt))
         self._guarded("structures", lambda: self.structures.update(dt, self))
         self._guarded("agents", lambda: self._tick_agents(dt))
+        self._guarded("animals", lambda: self.animals.tick(self, dt))
+        self._guarded("ufo", lambda: self.ufo.tick(self, dt))
         self._guarded("lights", self._rebuild_lights)
         self._guarded("lighting", lambda: self.lighting.tick(dt))
         self._guarded("colony", lambda: self._tick_colony(dt))
@@ -175,7 +181,16 @@ class World:
                                   agent.action.kind, agent.name)
                     agent.action.failed = True
 
-            agent.apply_physics(dt, self.terrain)
+            # heal() had no caller in production: an agent hurt to 40hp still
+            # read exactly 40hp after 600s. In a program that runs for hours
+            # that makes every wound permanent and cumulative, so the whole
+            # colony ratchets monotonically toward death.
+            agent.heal(dt)
+            # Pass the world RNG explicitly. apply_physics falls back to an
+            # unseeded module-global otherwise, which made the sim
+            # irreproducible: the same seed gave 8 deaths in one process and 1
+            # in another, so balance changes could not be compared.
+            agent.apply_physics(dt, self.terrain, rng=self.pyrng)
 
         self._reap_dead(dt)
 
@@ -337,6 +352,12 @@ class World:
             ls = st.light_source()
             if ls:
                 srcs.append(LightSource(**ls))
+        try:
+            beam = self.ufo.light_source()
+            if beam:
+                srcs.append(LightSource(**beam))
+        except Exception:
+            pass
         for prop in self.props.burning():
             srcs.append(LightSource(
                 x=prop.x, y=prop.y - 18.0, radius=150.0,
@@ -409,6 +430,8 @@ class World:
             "population": self.population.to_dict(),
             "lighting": self.lighting.to_dict(),
             "events": self.events.to_dict(),
+            "animals": self.animals.to_dict(),
+            "ufo": self.ufo.to_dict(),
             "stockpile": dict(self.stockpile),
             "build_queue": list(self.build_queue),
             "chronicle": list(self.chronicle),
@@ -442,6 +465,8 @@ class World:
         w.population = _sub("population", Population.from_dict, Population)
         w.lighting = _sub("lighting", Lighting.from_dict, Lighting)
         w.events = _sub("events", EventSystem.from_dict, EventSystem)
+        w.animals = _sub("animals", AnimalRegistry.from_dict, AnimalRegistry)
+        w.ufo = _sub("ufo", Ufo.from_dict, Ufo)
 
         w.stockpile = {r: 0 for r in ALL_RESOURCES}
         w.stockpile.update({k: int(v) for k, v in

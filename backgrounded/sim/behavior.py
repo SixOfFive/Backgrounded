@@ -370,6 +370,14 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
         for k in list(s):
             if k not in ("FleeFrom", "Panic"):
                 s[k] = min(s[k], 0.35)
+    # Wildlife scoring lives in combat_actions so the fight/flee/craft logic
+    # sits with the actions it drives. Merged last so a wolf at the door can
+    # outrank anything the colony was calmly getting on with.
+    try:
+        from .combat_actions import score_combat
+        s.update(score_combat(agent, world))
+    except Exception:
+        log.debug("combat scoring unavailable", exc_info=True)
     return s
 
 
@@ -743,7 +751,19 @@ def choose_action(agent: Any, world: Any) -> Action:
                 return cur          # keep the in-flight machine, do not restart it
             maker = _MAKERS.get(kind)
             if maker is None:
-                continue
+                try:
+                    from .combat_actions import make_combat_action
+                    act = make_combat_action(kind, agent, world)
+                except Exception:
+                    act = None
+                if act is None:
+                    continue
+                if cur is not None and cur is not act:
+                    try:
+                        cur.abandon(agent, world)
+                    except Exception:
+                        pass
+                return act
             try:
                 act = maker(agent, world)
             except Exception:

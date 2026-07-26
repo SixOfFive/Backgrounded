@@ -105,6 +105,25 @@ recent headstones stay standing; older ones weather away, so a world left
 running overnight doesn't turn into a cemetery. The running history is kept in
 `chronicle.txt` next to the save file.
 
+## Wildlife and other visitors
+
+Wolves, bears and boars wander in from the edge of the world every few minutes.
+An unarmed stickman runs. An armed one turns and fights.
+
+That's the loop: the first pack is genuinely dangerous, because nobody has a
+spear yet and nobody has leather — and leather is made from hides, which you
+only get by killing something. So the colony arms itself out of whatever tried
+to eat it. A spear costs wood and stone; armour costs hides and fibre and
+absorbs about half of everything after that.
+
+Wounded animals break off and run, but bleeding slows them down, so a hunter
+can run one down instead of watching it escape at full speed.
+
+And occasionally, usually at night, something else turns up. A saucer drifts
+in, hangs over somebody, and takes them up in a beam of light. That isn't a
+death: there's no body and no gravestone. Sometimes, much later, it brings them
+back — same name, same colour, thoroughly rattled.
+
 ## Where it keeps things
 
 `%LOCALAPPDATA%\Backgrounded\`
