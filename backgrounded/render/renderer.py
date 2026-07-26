@@ -17,7 +17,7 @@ from ..constants import (
     MATERIAL_COLORS, MAT_GRASS, RENDER_H, RENDER_SIZE, RENDER_W,
     SCENE_BLIZZARD, SCENE_FLOOD, SCENE_WILDFIRE,
 )
-from . import fx, sky
+from . import fx, hud, sky
 from .atlas import Atlas
 from .particles import ParticleSystem
 from .stickfigure import draw_stickman
@@ -38,6 +38,8 @@ class Renderer:
         self.atlas = Atlas()
         self.particles = ParticleSystem()
 
+        self.show_stats: bool = True
+        self.show_roster: bool = True
         self._terrain_cache: pygame.Surface | None = None
         self._terrain_fingerprint: tuple | None = None
         self._frame = 0
@@ -84,6 +86,11 @@ class Renderer:
         # 11. lightning geometry, then vignette
         self._draw_lightning(s, world)
         fx.draw_vignette(s)
+
+        # 12. stats panel. Deliberately after the light composite: it is UI,
+        # not part of the world, so it must stay readable in a black scene.
+        if self.show_stats:
+            hud.draw_stats(s, world, show_roster=self.show_roster)
 
         # screen shake: blit the composed scene at an offset
         dx, dy = ev.shake_offset() if hasattr(ev, "shake_offset") else (0, 0)

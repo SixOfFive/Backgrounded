@@ -109,6 +109,7 @@ class App:
         self.preview = Preview(RENDER_SIZE, scale=self.cfg.window_scale)
         self.preview.ensure_window(self.cfg.show_window)
         self.renderer = Renderer()
+        self.renderer.show_stats = getattr(self.cfg, "show_stats", True)
 
         # --- threads -----------------------------------------------------
         self.wallpaper = WallpaperWriter(_screen_size())
@@ -133,6 +134,7 @@ class App:
             "scene": self.world.events.scene if self.world else self.cfg.scene,
             "sim_speed": self.cfg.sim_speed,
             "wallpaper_enabled": self.cfg.wallpaper_enabled,
+            "show_stats": getattr(self.cfg, "show_stats", True),
         }
 
     def _drain_commands(self) -> None:
@@ -186,6 +188,10 @@ class App:
             cfg.scene = payload
             self.world.events.request_scene(payload)
             self._save_config("scene")
+        elif kind == "toggle_stats":
+            self.renderer.show_stats = not self.renderer.show_stats
+            cfg.show_stats = self.renderer.show_stats
+            self._save_config("show_stats")
         elif kind == "save":
             persist.save_world(self.world)
         elif kind == "reset":

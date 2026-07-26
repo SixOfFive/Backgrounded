@@ -1,0 +1,418 @@
+"""Vignette content, band D - mood and contemplation.
+
+The quiet interior beats: staring at the moon, watching a storm come in,
+head in hands, pacing while thinking, sulking, sighing, flinching at thunder,
+warming hands, hugging itself against the cold, mourning, daydreaming. Nothing
+here gathers, builds, consumes or changes the world - a vignette only touches
+the acting agent's ``pose``/``facing``/``speech``/``anim_t`` and drifts a few
+px, and the engine in :mod:`.vignettes` enforces that for us.
+
+Band D is the one that makes a colony read as *inhabited* rather than staffed.
+Where the other bands give a stickman something to do with its hands, these
+give it something to be thinking about while it does nothing at all.
+
+Content notes
+-------------
+* Every key is prefixed ``d_`` so it cannot collide with bands A/B/C/E.
+* Labels are third-person present phrases with no name: the chronicle renders
+  them as "<Name> stares at the moon."
+* Roughly a third are gated on context (weather, night, mood, company) and the
+  rest are always eligible, so :func:`vignettes.pick` never runs dry.
+* Odd, once-in-a-blue-moon beats carry a weight well under 1.0 so that seeing
+  one stays an event.
+
+Pure python. No pygame, no world access, no imports beyond the engine.
+"""
+from __future__ import annotations
+
+from .vignettes import Vignette
+
+__all__ = ["VIGNETTES"]
+
+
+VIGNETTES: list[Vignette] = [
+    # ------------------------------------------------------ sky and weather --
+    Vignette(
+        key="d_moon_stare",
+        label="stares at the moon",
+        pose="idle",
+        dur=(4.0, 7.5),
+        weight=1.1,
+        tags=("night",),
+        speech="*",
+        motion="still",
+    ),
+    Vignette(
+        key="d_count_stars",
+        label="counts the stars",
+        pose="sleep",
+        dur=(4.0, 8.0),
+        weight=0.7,
+        tags=("night", "alone"),
+        speech="*",
+        motion="lie",
+    ),
+    Vignette(
+        key="d_watch_storm",
+        label="watches the storm roll in",
+        pose="idle",
+        dur=(3.0, 6.0),
+        weight=1.0,
+        tags=("storm",),
+        motion="still",
+    ),
+    Vignette(
+        key="d_flinch_thunder",
+        label="flinches at the thunder",
+        pose="panic",
+        dur=(1.5, 2.5),
+        weight=1.2,
+        tags=("storm",),
+        speech="!",
+        motion="still",
+    ),
+    Vignette(
+        key="d_watch_rain",
+        label="watches the rain come down",
+        pose="idle",
+        dur=(2.4, 4.2),
+        weight=1.1,
+        tags=("raining",),
+        motion="still",
+    ),
+    Vignette(
+        key="d_catch_snowflake",
+        label="catches a snowflake",
+        pose="idle",
+        dur=(2.0, 3.2),
+        weight=0.9,
+        tags=("snowing",),
+        speech="*",
+        motion="still",
+    ),
+    Vignette(
+        key="d_listen_wind",
+        label="listens to the wind",
+        pose="idle",
+        dur=(2.0, 3.6),
+        weight=1.0,
+        tags=("windy",),
+        motion="still",
+    ),
+    Vignette(
+        key="d_gaze_horizon",
+        label="gazes at the horizon",
+        pose="idle",
+        dur=(3.0, 6.0),
+        weight=1.0,
+        tags=("high_up",),
+        motion="still",
+    ),
+    Vignette(
+        key="d_turn_slowly_taking_it_in",
+        label="turns slowly, taking it all in",
+        pose="idle",
+        dur=(3.0, 5.5),
+        weight=0.55,
+        tags=("high_up",),
+        motion="spin",
+    ),
+    Vignette(
+        key="d_wave_at_the_moon",
+        label="waves at the moon",
+        pose="idle",
+        dur=(2.0, 3.2),
+        weight=0.15,
+        tags=("night", "alone"),
+        speech="!",
+        motion="still",
+    ),
+
+    # ---------------------------------------------------------- fire and cold --
+    Vignette(
+        key="d_warm_hands",
+        label="warms its hands",
+        pose="warm",
+        dur=(3.0, 5.5),
+        weight=1.3,
+        tags=("near_fire",),
+        motion="crouch",
+    ),
+    Vignette(
+        key="d_stare_into_fire",
+        label="stares into the fire",
+        pose="warm",
+        dur=(4.0, 7.0),
+        weight=1.1,
+        tags=("near_fire",),
+        motion="sit",
+    ),
+    Vignette(
+        key="d_hug_self_cold",
+        label="hugs itself against the cold",
+        pose="idle",
+        dur=(2.0, 3.6),
+        weight=1.3,
+        tags=("cold",),
+        motion="still",
+    ),
+    # ------------------------------------------------------------- low moods --
+    Vignette(
+        key="d_head_in_hands",
+        label="puts its head in its hands",
+        pose="mourn",
+        dur=(2.5, 5.0),
+        weight=0.9,
+        tags=("sad",),
+        motion="sit",
+    ),
+    Vignette(
+        key="d_sulk",
+        label="sulks",
+        pose="mourn",
+        dur=(3.0, 6.0),
+        weight=0.8,
+        tags=("sad",),
+        motion="sit",
+    ),
+    Vignette(
+        key="d_wring_hands",
+        label="wrings its hands",
+        pose="walk",
+        dur=(1.8, 3.0),
+        weight=0.85,
+        tags=("sad",),
+        motion="pace",
+        drift=16.0,
+    ),
+    Vignette(
+        key="d_kneel_a_while",
+        label="kneels for a while",
+        pose="mourn",
+        dur=(4.0, 7.0),
+        weight=0.5,
+        tags=("sad",),
+        motion="crouch",
+    ),
+    Vignette(
+        key="d_mourn_quietly",
+        label="mourns quietly",
+        pose="mourn",
+        dur=(4.0, 8.0),
+        weight=0.45,
+        tags=("alone",),
+        motion="still",
+    ),
+    Vignette(
+        key="d_thousand_yard_stare",
+        label="stares at nothing",
+        pose="idle",
+        dur=(2.4, 4.4),
+        weight=0.9,
+        tags=("tired",),
+        motion="still",
+    ),
+    Vignette(
+        key="d_bows_to_nobody",
+        label="bows to nobody at all",
+        pose="mourn",
+        dur=(1.6, 2.6),
+        weight=0.15,
+        tags=("alone", "odd"),
+        motion="still",
+    ),
+
+    # ------------------------------------------------------------ high moods --
+    Vignette(
+        key="d_jump_for_joy",
+        label="jumps for joy",
+        pose="dance",
+        dur=(1.8, 3.0),
+        weight=1.0,
+        tags=("happy",),
+        speech="!",
+        motion="hop",
+    ),
+    Vignette(
+        key="d_celebrates_privately",
+        label="celebrates something privately",
+        pose="dance",
+        dur=(1.8, 3.0),
+        weight=0.6,
+        tags=("happy", "alone"),
+        motion="hop",
+    ),
+    Vignette(
+        key="d_stands_a_little_taller",
+        label="stands a little taller",
+        pose="idle",
+        dur=(1.8, 3.0),
+        weight=0.8,
+        tags=("happy",),
+        motion="still",
+    ),
+    Vignette(
+        key="d_quiet_relief",
+        label="lets out a long breath",
+        pose="idle",
+        dur=(1.5, 2.5),
+        weight=1.0,
+        tags=(),
+        motion="still",
+    ),
+    Vignette(
+        key="d_admires_the_building",
+        label="admires a finished building",
+        pose="idle",
+        dur=(2.5, 4.5),
+        weight=1.0,
+        tags=(),
+        motion="still",
+    ),
+
+    # ------------------------------------------------------ thought and doubt --
+    Vignette(
+        key="d_paces_thinking",
+        label="paces, thinking",
+        pose="walk",
+        dur=(3.5, 7.0),
+        weight=1.2,
+        tags=(),
+        motion="pace",
+        drift=34.0,
+    ),
+    Vignette(
+        key="d_looks_at_own_hands",
+        label="looks at its own hands",
+        pose="idle",
+        dur=(2.0, 3.2),
+        weight=0.9,
+        tags=(),
+        motion="still",
+    ),
+    Vignette(
+        key="d_daydreams",
+        label="daydreams",
+        pose="idle",
+        dur=(3.0, 6.0),
+        weight=1.1,
+        tags=("day",),
+        speech="~",
+        motion="still",
+    ),
+    Vignette(
+        key="d_sighs",
+        label="sighs",
+        pose="mourn",
+        dur=(1.6, 2.6),
+        weight=1.3,
+        tags=(),
+        speech="~",
+        motion="still",
+    ),
+    Vignette(
+        key="d_sits_down_to_think",
+        label="sits down to think",
+        pose="sleep",
+        dur=(4.0, 8.0),
+        weight=0.85,
+        tags=(),
+        motion="sit",
+    ),
+    Vignette(
+        key="d_mutters_to_itself",
+        label="mutters to itself",
+        pose="talk",
+        dur=(2.2, 4.0),
+        weight=0.7,
+        tags=("alone",),
+        speech="~",
+        motion="pace",
+        drift=18.0,
+    ),
+    Vignette(
+        key="d_remembers_something",
+        label="stops as if remembering something",
+        pose="idle",
+        dur=(1.6, 2.8),
+        weight=0.9,
+        tags=(),
+        speech="?",
+        motion="still",
+    ),
+    Vignette(
+        key="d_traces_a_shape",
+        label="traces a shape in the dirt",
+        pose="build",
+        dur=(2.5, 4.5),
+        weight=0.85,
+        tags=(),
+        motion="crouch",
+    ),
+    Vignette(
+        key="d_studies_its_shadow",
+        label="studies its own shadow",
+        pose="build",
+        dur=(2.0, 3.2),
+        weight=0.35,
+        tags=("day", "odd"),
+        motion="crouch",
+    ),
+    Vignette(
+        key="d_lies_back_and_looks_up",
+        label="lies back and looks upward",
+        pose="sleep",
+        dur=(5.0, 8.5),
+        weight=0.4,
+        tags=("alone",),
+        motion="lie",
+    ),
+
+    # --------------------------------------------------------- startle beats --
+    Vignette(
+        key="d_freezes_at_a_noise",
+        label="freezes at a noise",
+        pose="idle",
+        dur=(1.5, 2.4),
+        weight=1.1,
+        tags=(),
+        speech="!",
+        motion="still",
+    ),
+    Vignette(
+        key="d_glances_over_shoulder",
+        label="glances over its shoulder",
+        pose="idle",
+        dur=(1.5, 2.4),
+        weight=1.2,
+        tags=(),
+        motion="spin",
+    ),
+    Vignette(
+        key="d_looks_back_the_way_it_came",
+        label="looks back the way it came",
+        pose="idle",
+        dur=(2.0, 3.2),
+        weight=0.9,
+        tags=("alone",),
+        motion="spin",
+    ),
+    Vignette(
+        key="d_holds_its_breath",
+        label="holds its breath",
+        pose="idle",
+        dur=(1.5, 2.2),
+        weight=0.3,
+        tags=("odd",),
+        motion="still",
+    ),
+    Vignette(
+        key="d_shrugs_at_nothing",
+        label="shrugs at nothing in particular",
+        pose="idle",
+        dur=(1.5, 2.6),
+        weight=1.0,
+        tags=(),
+        motion="still",
+    ),
+]
