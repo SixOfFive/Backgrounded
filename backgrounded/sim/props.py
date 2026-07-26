@@ -155,7 +155,24 @@ WATER_MAX_DEPTH = 24.0
 REGROW_CHECK_SEC = 12.0        # how often the check even runs
 REGROW_TREE_SEC = 90.0         # mean gap between new saplings when short
 REGROW_BUSH_SEC = 60.0         # mean gap between new bushes when short
+REGROW_ROCK_SEC = 150.0        # stone weathers back slowest of the three
 REGROW_TRIES = 24              # candidate columns examined per attempt
+
+#: The renewable resources and how fast each tops back up. Rock was missing
+#: from this list entirely, so once a colony mined its last rock it could never
+#: make stone again - walls, watchtowers, firepits and spears all need it, so
+#: the settlement simply stopped, which is the "no stone halting their progress"
+#: a real run hit. Everything here also honours a hard floor (see _regrow):
+#: the map is never allowed to hold zero of any of them.
+REGROW_KINDS: tuple[tuple[str, float], ...] = (
+    (KIND_TREE, REGROW_TREE_SEC),
+    (KIND_BUSH, REGROW_BUSH_SEC),
+    (KIND_ROCK, REGROW_ROCK_SEC),
+)
+#: Never fewer than this many usable sources of each renewable kind. One is
+#: enough to break a deadlock; the probabilistic top-up carries it the rest of
+#: the way back to the scatter target.
+RESOURCE_FLOOR = 1
 
 #: Hard ceiling on the recovery multiplier, whatever a caller hands us.  Keeps
 #: a bad ``regrowth_factor`` (or a future constant change) from turning the map
@@ -658,6 +675,7 @@ class PropRegistry:
             reg.targets = {
                 KIND_TREE: counts.get(KIND_TREE, 0) + counts.get(KIND_SAPLING, 0),
                 KIND_BUSH: counts.get(KIND_BUSH, 0),
+                KIND_ROCK: counts.get(KIND_ROCK, 0),
             }
             reg.targets = {k: v for k, v in reg.targets.items() if v > 0}
         return reg
@@ -1074,9 +1092,12 @@ def _ensure_targets(reg: PropRegistry) -> None:
         counts = reg.counts()
         trees = counts.get(KIND_TREE, 0) + counts.get(KIND_SAPLING, 0)
         bushes = counts.get(KIND_BUSH, 0)
-        if trees <= 0 and bushes <= 0:
+        rocks = counts.get(KIND_ROCK, 0)
+        if trees <= 0 and bushes <= 0 and rocks <= 0:
             return
-        reg.targets = {k: v for k, v in ((KIND_TREE, trees), (KIND_BUSH, bushes)) if v > 0}
+        reg.targets = {k: v for k, v in
+                       ((KIND_TREE, trees), (KIND_BUSH, bushes), (KIND_ROCK, rocks))
+                       if v > 0}
     except Exception:  # pragma: no cover - never worth a frame
         pass
 
@@ -1110,33 +1131,89 @@ def _regrow(
     if factor <= 0.0:
         return
 
-    for kind, gap in ((KIND_TREE, REGROW_TREE_SEC), (KIND_BUSH, REGROW_BUSH_SEC)):
+    for kind, gap in REGROW_KINDS:
         target = _i(targets.get(kind), 0)
         if target <= 0:
             continue
-        # Saplings already count against the tree target - they are on their way.
-        have = len(reg.all_of(kind))
-        if kind == KIND_TREE:
-            have += len(reg.all_of(KIND_SAPLING))
+        have = _usable_count(reg, kind)
         if have >= target:
             continue
-        if float(rng.random()) > min(1.0, elapsed * factor / max(gap, 1e-3)):
-            continue
+
+        # Hard floor: if the map holds none of this resource, reseed at once and
+        # skip the probabilistic timer. Otherwise a colony that mined its last
+        # rock (or burned its last tree) would wait out a random gap it can no
+        # longer afford - or, for rock, never recover at all.
+        forced = have < RESOURCE_FLOOR
+        if not forced:
+            if float(rng.random()) > min(1.0, elapsed * factor / max(gap, 1e-3)):
+                continue
+
         x = _regrow_site(reg, terrain, rng, kind)
+        if x is None and forced:
+            x = _guaranteed_site(reg, terrain, rng)   # the floor must not fail
         if x is None:
             continue
-        if kind == KIND_TREE:
-            p = reg.spawn(
-                KIND_SAPLING, x, terrain.ground_y(x), scale=0.30, hp=SAPLING_HP,
-                variant=int(rng.integers(0, 1 << 30)), state={"growth": 0.0},
-            )
-        else:
-            p = reg.spawn(
-                KIND_BUSH, x, terrain.ground_y(x),
-                scale=0.55 + 0.35 * float(rng.random()), hp=BUSH_HP,
-                variant=int(rng.integers(0, 1 << 30)), state={"berries_left": 0},
-            )
-        events.append(_ev("prop_regrown", p, target=kind))
+        p = _reseed(reg, terrain, rng, kind, x, mature=forced)
+        if p is not None:
+            events.append(_ev("prop_regrown", p, target=kind))
+
+
+def _usable_count(reg: PropRegistry, kind: str) -> int:
+    """Sources of `kind` a colonist could actually harvest right now.
+
+    A fallen tree, a mined-out rock or a dead bush does not count - and a
+    sapling counts toward trees because it is one on its way up.
+    """
+    if kind == KIND_TREE:
+        trees = sum(1 for p in reg.all_of(KIND_TREE)
+                    if p.alive and not p.state.get("fallen"))
+        return trees + len(reg.all_of(KIND_SAPLING))
+    return sum(1 for p in reg.all_of(kind) if p.alive)
+
+
+def _reseed(reg: PropRegistry, terrain: "Terrain", rng: np.random.Generator,
+            kind: str, x: float, mature: bool) -> "Prop | None":
+    """Place one fresh source. Trees arrive as a sapling during ordinary
+    top-up, but as a full-grown tree when reseeded to break a floor deadlock,
+    so the colony is not left waiting minutes for the sapling to mature."""
+    y = terrain.ground_y(x)
+    var = int(rng.integers(0, 1 << 30))
+    if kind == KIND_TREE:
+        if mature:
+            return reg.spawn(KIND_TREE, x, y, scale=0.85 + 0.3 * float(rng.random()),
+                             hp=TREE_HP, variant=var, state=_default_state(KIND_TREE))
+        return reg.spawn(KIND_SAPLING, x, y, scale=0.30, hp=SAPLING_HP,
+                         variant=var, state={"growth": 0.0})
+    if kind == KIND_ROCK:
+        return reg.spawn(KIND_ROCK, x, y, scale=0.7 + 0.4 * float(rng.random()),
+                         hp=ROCK_HP, variant=var, state=_default_state(KIND_ROCK))
+    return reg.spawn(KIND_BUSH, x, y, scale=0.55 + 0.35 * float(rng.random()),
+                     hp=BUSH_HP, variant=var,
+                     state={"berries_left": BUSH_MAX_BERRIES if mature else 0,
+                            "regrow_t": 0.0, "burning": False, "burn_t": 0.0})
+
+
+def _guaranteed_site(reg: PropRegistry, terrain: "Terrain",
+                     rng: np.random.Generator) -> float | None:
+    """A placement that relaxes spacing so the resource floor can never fail.
+
+    _regrow_site respects spacing and can legitimately find nowhere; but the
+    floor exists precisely to rescue a bare map, so when it triggers we fall
+    back to any non-cliff, non-submerged column, spacing be damned.
+    """
+    try:
+        w = int(terrain.W)
+    except Exception:
+        return None
+    for _ in range(64):
+        xi = int(rng.integers(8, max(9, w - 8)))
+        try:
+            if terrain.is_cliff(xi):
+                continue
+        except Exception:
+            pass
+        return float(xi)
+    return float(w // 2)
 
 
 def _regrow_site(
@@ -1220,7 +1297,8 @@ def scatter(
     # Remember the requested vegetation density so the land can grow back to
     # it after fires and felling - see _regrow().
     reg.targets = {
-        k: want.get(k, 0) for k in (KIND_TREE, KIND_BUSH) if want.get(k, 0) > 0
+        k: want.get(k, 0)
+        for k in (KIND_TREE, KIND_BUSH, KIND_ROCK) if want.get(k, 0) > 0
     }
 
     try:
