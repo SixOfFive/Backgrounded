@@ -55,8 +55,127 @@ _PATH_CHARS = 600
 _BACKOFF: tuple[float, ...] = (0.05, 0.15, 0.4)
 
 
+class _GUID(ctypes.Structure):
+    _fields_ = [("d1", wintypes.DWORD), ("d2", wintypes.WORD),
+                ("d3", wintypes.WORD), ("d4", ctypes.c_byte * 8)]
+
+
+class _DesktopWallpaperCOM:
+    """Thin ctypes binding for the shell's IDesktopWallpaper.
+
+    Preferred over SystemParametersInfo for one decisive reason: SPI returns
+    *success* for a path the shell will not actually load, updates the registry,
+    and leaves the desktop showing its background colour. IDesktopWallpaper
+    returns a real HRESULT (0x80070002 for a rejected location), which is the
+    only way to find out something is wrong without screenshotting the desktop.
+    It also addresses each monitor explicitly, which matters on multi-head
+    setups.
+    """
+
+    CLSID = "{C2CF3110-460E-4fc1-B9D0-8A1C0C9CC4BD}"
+    IID = "{B92B56A9-8B55-4E14-9A89-0199BBB6F93B}"
+    DWPOS_FILL = 4
+
+    def __init__(self) -> None:
+        self._p: ctypes.c_void_p | None = None
+        self._set = None
+        self._get = None
+        self._setpos = None
+        try:
+            ole = ctypes.WinDLL("ole32")
+            ole.CoInitialize(None)
+
+            def guid(s: str) -> _GUID:
+                g = _GUID()
+                ole.CLSIDFromString(ctypes.c_wchar_p(s), ctypes.byref(g))
+                return g
+
+            p = ctypes.c_void_p()
+            CLSCTX_ALL = 23        # INPROC_SERVER is not enough for this class
+            hr = ole.CoCreateInstance(ctypes.byref(guid(self.CLSID)), None,
+                                      CLSCTX_ALL, ctypes.byref(guid(self.IID)),
+                                      ctypes.byref(p))
+            if hr != 0 or not p:
+                log.info("IDesktopWallpaper unavailable (hr=0x%08X); "
+                         "falling back to SystemParametersInfo", hr & 0xFFFFFFFF)
+                return
+            vt = ctypes.cast(
+                p, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+            F = ctypes.WINFUNCTYPE
+            #  3 SetWallpaper  4 GetWallpaper  10 SetPosition
+            self._set = F(ctypes.c_long, ctypes.c_void_p,
+                          ctypes.c_wchar_p, ctypes.c_wchar_p)(vt[3])
+            self._get = F(ctypes.c_long, ctypes.c_void_p, ctypes.c_wchar_p,
+                          ctypes.POINTER(ctypes.c_wchar_p))(vt[4])
+            self._setpos = F(ctypes.c_long, ctypes.c_void_p, ctypes.c_int)(vt[10])
+            self._p = p
+            try:
+                self._setpos(self._p, self.DWPOS_FILL)
+            except Exception:
+                pass
+        except Exception as exc:
+            log.info("IDesktopWallpaper init failed (%s); using SPI", exc)
+
+    @property
+    def available(self) -> bool:
+        return self._p is not None and self._set is not None
+
+    def set(self, path: str) -> int:
+        """Set on every monitor. Returns an HRESULT (0 == success)."""
+        if not self.available:
+            return -1
+        try:
+            return int(self._set(self._p, None, ctypes.c_wchar_p(path)))
+        except Exception as exc:
+            log.warning("IDesktopWallpaper.SetWallpaper threw: %s", exc)
+            return -1
+
+    def get(self) -> str | None:
+        if not self.available or self._get is None:
+            return None
+        try:
+            buf = ctypes.c_wchar_p()
+            if self._get(self._p, None, ctypes.byref(buf)) != 0:
+                return None
+            return buf.value or None
+        except Exception:
+            return None
+
+
+_com_tls = threading.local()
+
+
+def _com_for_thread() -> _DesktopWallpaperCOM:
+    """One COM object per thread.
+
+    IDesktopWallpaper is apartment-threaded: an interface pointer created on
+    one thread cannot be called from another. Creating it at import time on the
+    main thread and calling it from the wallpaper worker returns
+    RPC_E_WRONG_THREAD (0x8001010E) on every single frame.
+    """
+    com = getattr(_com_tls, "com", None)
+    if com is None:
+        com = _DesktopWallpaperCOM()
+        _com_tls.com = com
+    return com
+
+
 def _set_wallpaper(path: str, flags: int) -> bool:
-    """Call SPI_SETDESKWALLPAPER. Returns success; never raises."""
+    """Apply a wallpaper. Prefers the COM interface, falls back to SPI."""
+    com = _com_for_thread()
+    if com.available:
+        hr = com.set(path)
+        if hr == 0:
+            return True
+        if (hr & 0xFFFFFFFF) == 0x80070002:
+            # The shell will not load wallpapers from every directory - notably
+            # anywhere under %LOCALAPPDATA%. See paths.WALLPAPER_DIR.
+            log.error("the shell refused %s (FILE_NOT_FOUND although the file "
+                      "exists) - this location is not usable for wallpapers",
+                      path)
+            return False
+        log.warning("IDesktopWallpaper.SetWallpaper hr=0x%08X; trying SPI",
+                    hr & 0xFFFFFFFF)
     try:
         ok = user32.SystemParametersInfoW(
             SPI_SETDESKWALLPAPER, 0, ctypes.c_wchar_p(path), flags)

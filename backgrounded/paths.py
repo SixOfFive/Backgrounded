@@ -19,18 +19,29 @@ CONFIG_PATH: Path = APP_DIR / "config.json"
 LOG_PATH: Path = APP_DIR / "backgrounded.log"
 CHRONICLE_PATH: Path = APP_DIR / "chronicle.txt"
 
-# Two alternating wallpaper targets. Windows caches the wallpaper by path, so
-# writing the *same* path repeatedly can be ignored or can collide with
-# Explorer/Defender holding the active file open. Alternating sidesteps both.
+# Wallpaper frames do NOT live in APP_DIR.
 #
-# JPEG, not BMP. A 2560x1600 24-bit BMP is ~12 MB, and Windows silently
-# declined to transcode ours: SPI_GETDESKWALLPAPER and the registry both
-# reported the file while %APPDATA%\Microsoft\Windows\Themes\TranscodedWallpaper
-# stayed 80 minutes stale, so the desktop fell back to the background colour
-# (black). JPEG is what the shell itself uses - Windows Spotlight writes .jpg -
-# and at ~400 KB it also writes roughly 30x faster.
-WALLPAPER_A: Path = APP_DIR / "wallpaper_a.jpg"
-WALLPAPER_B: Path = APP_DIR / "wallpaper_b.jpg"
+# Windows refuses to load a desktop wallpaper out of %LOCALAPPDATA%. Measured
+# with IDesktopWallpaper::SetWallpaper against one identical JPEG copied to
+# several places:
+#
+#   C:\Users\<u>\Pictures\...              hr=0x00000000  OK
+#   C:\Users\<u>\AppData\Local\Temp\...    hr=0x00000000  OK
+#   C:\Users\<u>\AppData\Local\...         hr=0x80070002  FILE_NOT_FOUND
+#   C:\Users\<u>\AppData\Local\App\sub\... hr=0x80070002  FILE_NOT_FOUND
+#
+# The file demonstrably exists in every case, so this is a shell restriction on
+# the location, not a problem with the file, its format or its permissions. It
+# also fails silently through the legacy SystemParametersInfo path - that call
+# returns success and updates the registry, and the desktop just stays on the
+# background colour, which is why this looked like a rendering bug for so long.
+#
+# Pictures rather than Temp: if the process dies without restoring, the desktop
+# keeps showing the last frame instead of going black when a cleanup tool
+# reclaims Temp.
+WALLPAPER_DIR: Path = Path(os.path.expanduser("~")) / "Pictures" / APP_NAME
+WALLPAPER_A: Path = WALLPAPER_DIR / "wallpaper_a.jpg"
+WALLPAPER_B: Path = WALLPAPER_DIR / "wallpaper_b.jpg"
 
 # Frame captures written by --capture, used for visual verification.
 CAPTURE_DIR: Path = APP_DIR / "captures"
@@ -43,3 +54,4 @@ def ensure_dirs() -> None:
     """Create every directory the app writes into. Safe to call repeatedly."""
     APP_DIR.mkdir(parents=True, exist_ok=True)
     CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+    WALLPAPER_DIR.mkdir(parents=True, exist_ok=True)
