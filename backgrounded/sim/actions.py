@@ -1629,7 +1629,7 @@ def _h_celebrate(a: Action, ag: Any, w: Any, dt: float) -> None:
         a.pose = "walk"
         rem = step_toward(ag, w, float(a.data["tx"]), dt, speed=WALK_SPEED * 1.15,
                           arrive=FIRE_REACH)
-        if rem <= FIRE_REACH or a.t > 25.0:
+        if rem <= FIRE_REACH or a.t > 9.0:   # was 25s: a long failed walk reads as pacing
             a.phase = "dance"
             a.data["dt"] = 0.0
         return

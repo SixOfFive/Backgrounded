@@ -70,6 +70,7 @@ __all__ = [
     "next_build_kind",
     "find_chasm",
     "HYSTERESIS_BONUS",
+    "emergency_override",
     "ROLE_AFFINITY",
     "ROLES",
 ]
@@ -666,6 +667,47 @@ _MAKERS: dict[str, Callable[[Any, Any], Action | None]] = {
     "ClimbTo": _mk_climb,
     "FollowParent": _mk_follow,
 }
+
+
+def emergency_override(agent: Any, world: Any) -> bool:
+    """True only when something is urgent enough to abandon a job mid-way.
+
+    The scheduler leaves in-flight actions alone, so this is the sole way an
+    agent drops what it is doing. Keep the bar high: anything that returns True
+    too readily reintroduces the walk-there-change-mind-walk-back shuffle this
+    exists to prevent.
+    """
+    try:
+        cur = getattr(agent, "action", None)
+        kind = getattr(cur, "kind", "") if cur is not None else ""
+
+        # Already responding to the emergency.
+        if kind in ("FleeFrom", "Panic", "Eat", "Sleep"):
+            return False
+
+        if float(getattr(agent, "panic", 0.0) or 0.0) > 0.0:
+            return True
+        if float(getattr(agent, "hunger", 0.0)) > 0.92:
+            return True
+        if float(getattr(agent, "fatigue", 0.0)) > 0.95:
+            return True
+        if float(getattr(agent, "warmth", 0.0)) > 0.93:
+            return True
+
+        # Standing in something that is actively going to kill us.
+        try:
+            ev = getattr(world, "events", None)
+            level = getattr(ev, "water_level", None)
+            if level and float(getattr(agent, "y", 0.0)) > float(level):
+                return True
+            for prop in world.props.burning():
+                if abs(float(prop.x) - float(agent.x)) < 90.0:
+                    return True
+        except Exception:
+            pass
+        return False
+    except Exception:
+        return False
 
 
 def choose_action(agent: Any, world: Any) -> Action:

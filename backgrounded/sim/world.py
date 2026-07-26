@@ -137,7 +137,19 @@ class World:
         for agent in self.population.alive_agents():
             agent.update_needs(dt, self)
 
-            if ai_due or agent.action is None or agent.action.done or agent.action.failed:
+            act = agent.action
+            need_new = act is None or act.done or act.failed
+            if not need_new and ai_due:
+                # An action in flight is left alone. Re-scoring on a timer made
+                # agents abandon half-finished jobs: most tasks take 13-20s to
+                # complete, so re-deciding every few seconds meant walking
+                # toward a tree, changing its mind, walking back, and never
+                # arriving. Only a real emergency interrupts now.
+                try:
+                    need_new = behavior.emergency_override(agent, self)
+                except Exception:
+                    need_new = False
+            if need_new:
                 try:
                     agent.action = behavior.choose_action(agent, self)
                 except Exception:
