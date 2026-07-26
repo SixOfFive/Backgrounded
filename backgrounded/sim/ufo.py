@@ -50,6 +50,7 @@ import random
 from typing import Any
 
 from ..constants import (
+    MAX_POP as _MAX_POP,
     MAX_HEALTH,
     RENDER_H,
     RENDER_W,
@@ -564,6 +565,16 @@ class Ufo:
         pop = _population(world)
         if pop is None:
             return False
+        # Respect the population ceiling. This path adds directly via pop.add,
+        # bypassing World._spawn_replacement, so without this check a return at
+        # a full colony pushes it to MAX_POP + 1. Keep the record and try again
+        # on a later cycle, once somebody has left.
+        try:
+            alive = len(pop.alive_agents())
+            if alive >= _MAX_POP:
+                return False
+        except Exception:
+            pass
 
         agent: Any = None
         state = rec.get("state")

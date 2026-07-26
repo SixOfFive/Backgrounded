@@ -183,7 +183,9 @@ def _build(world, show_roster: bool) -> pygame.Surface:
     agents.sort(key=lambda a: a.id)
 
     rows = len(agents) if show_roster else 0
-    height = (PAD * 2 + LINE * 3 + 6 + (rows * (LINE + 9)) + LINE * 2 + 8
+    # Footer now wraps to two lines, so reserve LINE * 3 for it (divider +
+    # two text lines) instead of LINE * 2.
+    height = (PAD * 2 + LINE * 3 + 6 + (rows * (LINE + 9)) + LINE * 3 + 8
               + (LINE - 2 if show_roster else 0))
     panel = pygame.Surface((PANEL_W, height), pygame.SRCALPHA)
     panel.fill((*BG, BG_ALPHA))
@@ -263,7 +265,30 @@ def _build(world, show_roster: bool) -> pygame.Surface:
     last = world.chronicle[-1] if world.chronicle else ""
     if "] " in last:
         last = last.split("] ", 1)[1]
-    ls = _text(last[:44], DIM, 10)
-    panel.blit(ls, (PAD, y))
+    # Wrap onto up to two lines rather than clipping mid-word. The height
+    # calc below reserves two footer lines, so this never overruns the panel.
+    for line in _wrap(str(last), PANEL_W - PAD * 2, 10)[:2]:
+        panel.blit(_text(line, DIM, 10), (PAD, y))
+        y += LINE - 3
 
     return panel
+
+
+def _wrap(text: str, max_w: int, size: int) -> list[str]:
+    """Greedy word-wrap to a pixel width, using the cached font metrics."""
+    words = text.split()
+    if not words:
+        return [""]
+    font = _font(size)
+    lines: list[str] = []
+    cur = ""
+    for w in words:
+        trial = w if not cur else cur + " " + w
+        if font.size(trial)[0] <= max_w or not cur:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines

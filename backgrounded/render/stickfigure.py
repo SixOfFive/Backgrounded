@@ -101,6 +101,9 @@ _WALK_HZ = 1.55      # stride cycles per unit of anim_t
 _FLAME_CORE = (255, 240, 186)
 _FLAME_OUTER = (255, 162, 58)
 _CANDLE_WAX = (232, 224, 200)
+_TORCH_SHAFT = (120, 82, 44)      # a longer wooden haft than the candle's stub
+_TORCH_HEAD = (60, 44, 30)        # the pitch-soaked wrap at the top
+_TORCH_FLAME = (255, 138, 40)
 
 _BUBBLE_BG = (233, 236, 244)
 _BUBBLE_EDGE = (44, 48, 58)
@@ -592,6 +595,8 @@ def _draw(surf: pygame.Surface, s: Stickman, t: float,
         _draw_carried(surf, s, sk, base, silhouette)
     if getattr(s, "holds_candle", False) and getattr(s, "alive", True):
         _draw_candle(surf, s, sk, t, base)
+    elif getattr(s, "holds_torch", False) and getattr(s, "alive", True):
+        _draw_torch(surf, s, sk, t, base)
     speech = getattr(s, "speech", None)
     if isinstance(speech, str) and speech and getattr(s, "alive", True):
         _draw_bubble(surf, sk, speech, silhouette)
@@ -649,6 +654,31 @@ def _draw_candle(surf: pygame.Surface, s: Stickman, sk: Skeleton,
     fc = (tip[0] + lean, tip[1] - r * 0.75)
     _disc(surf, _FLAME_OUTER, fc, r)
     _disc(surf, _FLAME_CORE, (fc[0] + lean * 0.3, fc[1] + r * 0.18), r * 0.5)
+
+
+def _draw_torch(surf: pygame.Surface, s: Stickman, sk: Skeleton,
+                t: float, base: Sequence[int]) -> None:
+    """A torch: a longer haft with a wrapped, pitch-soaked head and a broad
+    flame. Bigger and rowdier than the elder's candle, so a whole colony of
+    them reads as a scatter of firelight rather than a single steady point."""
+    hx, hy = sk.front_hand
+    shaft = max(3.0, sk.height * 0.34)
+    tip = (hx + sk.facing * shaft * 0.22, hy - shaft)
+    w = 2 if sk.height >= 17 else 1
+    _line(surf, _TORCH_SHAFT, (hx, hy), tip, w)
+    # the soaked head sits just below the flame
+    head = (tip[0], tip[1] + max(1.0, sk.height * 0.05))
+    _disc(surf, _TORCH_HEAD, head, max(1.0, sk.height * 0.06))
+
+    idp = float(getattr(s, "id", 0)) * 1.71
+    flick = (0.55 * math.sin(t * 15.1 + idp)
+             + 0.30 * math.sin(t * 26.3 + idp * 2.3)
+             + 0.15 * math.sin(t * 39.7 + idp * 0.5))
+    r = max(1.1, sk.height * 0.11 * (1.0 + 0.32 * flick))
+    lean = sk.facing * 0.4 * flick
+    fc = (tip[0] + lean, tip[1] - r * 0.7)
+    _disc(surf, _TORCH_FLAME, fc, r)
+    _disc(surf, _FLAME_CORE, (fc[0] + lean * 0.3, fc[1] + r * 0.2), r * 0.45)
 
 
 # --------------------------------------------------------- speech bubble --

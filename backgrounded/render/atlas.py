@@ -195,8 +195,11 @@ def hut_growth_bucket(scale: float) -> int:
     if step <= 0.0:
         return 0
     try:
-        idx = int(round((float(scale) - float(HUT_SCALE_MIN)) / step))
-    except (TypeError, ValueError):
+        s = float(scale)
+        if not math.isfinite(s):
+            return 0
+        idx = int(round((s - float(HUT_SCALE_MIN)) / step))
+    except (TypeError, ValueError, OverflowError):
         return 0
     return max(0, min(idx, HUT_BUCKET_MAX))
 
@@ -216,8 +219,11 @@ def hut_growth(scale: float) -> float:
     if span <= 0.0:
         return 0.0
     try:
-        return max(0.0, min(1.0, (float(scale) - float(HUT_SCALE_MIN)) / span))
-    except (TypeError, ValueError):
+        s = float(scale)
+        if not math.isfinite(s):
+            return 0.0
+        return max(0.0, min(1.0, (s - float(HUT_SCALE_MIN)) / span))
+    except (TypeError, ValueError, OverflowError):
         return 0.0
 
 
@@ -253,7 +259,11 @@ def hut_dims(scale: float) -> tuple[int, int]:
     margin for the longer eaves, so a big roof is never clipped by its own
     canvas. At ``scale == 1.0`` this is exactly ``KIND_SIZE["hut"]``.
     """
-    s = max(0.05, float(scale))
+    s = float(scale)
+    s = max(0.05, s if math.isfinite(s) else 1.0)
+    # Capped at the top of the bucket ladder: get() can never serve anything
+    # bigger, so neither should the size helper the renderer lays out against.
+    s = min(s, hut_bucket_scale(HUT_BUCKET_MAX))
     g = hut_growth(s)
     bw, bh = KIND_SIZE.get("hut", (78, 64))
     w = max(4, int(round(bw * s)) + int(round(4.0 * g * s)))
@@ -545,10 +555,11 @@ def _bake_hut(stage: int, rng: random.Random, scale: float = 1.0) -> pygame.Surf
     - two dwellings under one roof.
 
     The caller seeds *rng* per ``(kind, variant, stage)``, so a hut keeps its own
-    jitter as it grows; details must not pop when it crosses a bucket. All
-    geometry is expressed in fractions of ``(w, h)`` and the ground contact stays
-    at the canvas bottom, because the renderer anchors ``midbottom`` - a taller
-    hut has to grow upward, not straddle the ground line.
+    jitter as it grows; details must not pop when it crosses a bucket. Vertical
+    geometry is a fraction of the canvas, horizontal geometry a fraction of the
+    wall span (see ``fx``), and the ground contact stays at the canvas bottom,
+    because the renderer anchors ``midbottom`` - a taller hut has to grow upward,
+    not straddle the ground line.
     """
     s = max(0.05, float(scale))
     g = hut_growth(s)

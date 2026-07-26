@@ -293,6 +293,7 @@ class Stickman:
     # --- behaviour --------------------------------------------------------
     action: "Action | None" = None
     holds_candle: bool = False
+    holds_torch: bool = True     # everyone carries one; the elder has a candle
 
     # --- combat & gear ---------------------------------------------------
     # health exists because animals are the first threat you can *survive*.
@@ -918,6 +919,7 @@ class Stickman:
             "generation": int(self.generation),
             "action": action_state,
             "holds_candle": bool(self.holds_candle),
+            "holds_torch": bool(self.holds_torch),
             "health": float(self.health),
             "weapon": str(self.weapon),
             "armour": float(self.armour),
@@ -972,6 +974,7 @@ class Stickman:
         s.role = role if is_role(role) else ROLE_GATHERER
         s.generation = max(0, _i(d.get("generation"), 0))
         s.holds_candle = _b(d.get("holds_candle"), False)
+        s.holds_torch = _b(d.get("holds_torch"), True)
         s.health = _f(d.get("health"), MAX_HEALTH)
         s.weapon = _s(d.get("weapon"), WEAPON_NONE) if "_s" in globals() else str(d.get("weapon") or WEAPON_NONE)
         s.armour = _f(d.get("armour"), ARMOUR_NONE)

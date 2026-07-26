@@ -87,6 +87,15 @@ SPEAR_REACH = 26.0
 SPEAR_COOLDOWN = 1.1
 SPEAR_COST = {RES_WOOD: 2, RES_STONE: 1}
 
+#: Every stickman carries a torch, so a colony at night is a scatter of moving
+#: light rather than one candle in the black. Kept a touch smaller and oranger
+#: than the elder's candle so a cluster reads as many pools, not one floodlight,
+#: and the lightning reveal still has darkness to cut through between them.
+TORCH_RADIUS = 96.0
+TORCH_COLOR = (255, 146, 54)
+TORCH_INTENSITY = 0.70
+TORCH_FLICKER = 0.38
+
 ARMOUR_NONE = 0.0
 ARMOUR_LEATHER = 0.45              # fraction of incoming damage absorbed
 ARMOUR_COST = {RES_HIDE: 2, RES_FIBRE: 1}

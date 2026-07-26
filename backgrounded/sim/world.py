@@ -22,6 +22,7 @@ from ..constants import (
     MAX_POP, MIN_POP, MORALE_TO_GROW, POP_BIRTH_COOLDOWN, POP_PER_HUT,
     REGROW_MAX, REGROW_PER_HEAD, RENDER_H, RENDER_W,
     RES_COOKED, RES_FOOD, RES_STONE, RES_WOOD, SCENE_NIGHT_STORM, SAVE_VERSION,
+    TORCH_COLOR, TORCH_FLICKER, TORCH_INTENSITY, TORCH_RADIUS,
 )
 from . import behavior, names
 from .animals import AnimalRegistry
@@ -62,8 +63,13 @@ class World:
         self.structures: StructureRegistry = StructureRegistry()
         self.population: Population = Population()
         self.lighting: Lighting = Lighting()
-        self.events: EventSystem = EventSystem(scene=scene)
-        self.animals: AnimalRegistry = AnimalRegistry()
+        # Seed both, or they fall back to unseeded module RNGs and the whole
+        # sim stops being reproducible from a seed - two runs of the same world
+        # in one process gave 1 vs 0 deaths and different terrain wear, so no
+        # balance number could be trusted. Offset the seeds so the two streams
+        # do not march in lockstep.
+        self.events: EventSystem = EventSystem(scene=scene, seed=self.seed ^ 0x513)
+        self.animals: AnimalRegistry = AnimalRegistry(seed=self.seed ^ 0xA17)
         self.ufo: Ufo = Ufo()
 
         # Colony-level state
@@ -389,11 +395,19 @@ class World:
         """Lights are derived state - rebuilt from scratch every tick."""
         srcs: list[LightSource] = []
         for agent in self.population.alive_agents():
+            if getattr(agent, "inside", None) is not None:
+                continue          # indoors: their light does not spill outside
             if agent.holds_candle and agent.__dict__.get("candle_lit", True):
                 srcs.append(LightSource(
                     x=agent.x, y=agent.y - 14.0, radius=118.0,
                     color=(255, 186, 92), intensity=0.85, flicker=0.30,
                     kind="candle", owner_id=agent.id,
+                ))
+            elif getattr(agent, "holds_torch", True):
+                srcs.append(LightSource(
+                    x=agent.x, y=agent.y - 16.0, radius=TORCH_RADIUS,
+                    color=TORCH_COLOR, intensity=TORCH_INTENSITY,
+                    flicker=TORCH_FLICKER, kind="torch", owner_id=agent.id,
                 ))
         for st in self.structures.all():
             ls = st.light_source()
