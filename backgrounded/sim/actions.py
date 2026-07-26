@@ -820,6 +820,25 @@ def _drop_all(agent: Any, action: "Action", world: Any) -> int:
     return moved
 
 
+
+def _load_is_useful(ag: Any, a: "Action", need: dict) -> bool:
+    """True if anything the agent is carrying is something the site still wants.
+
+    Guards the build state machine against walking a useless load to the site
+    forever. Checks both the hand and any stashed load the action tracks.
+    """
+    if not need:
+        return False
+    carrying = getattr(ag, "carrying", None)
+    if carrying in need and int(getattr(ag, "carry_qty", 0) or 0) > 0:
+        return True
+    stash = a.data.get("stash") or {}
+    try:
+        return any(need.get(res, 0) > 0 and int(qty) > 0
+                   for res, qty in stash.items())
+    except Exception:
+        return False
+
 def _has_load(agent: Any, action: "Action") -> bool:
     if int(getattr(agent, "carry_qty", 0) or 0) > 0 and getattr(agent, "carrying", None):
         return True
@@ -1123,9 +1142,15 @@ def _h_build(a: Action, ag: Any, w: Any, dt: float) -> None:
         a.phase = "work"
     elif carrying in need and carry_qty > 0:
         a.phase = "approach"
-    elif _has_load(ag, a):
-        a.phase = "approach"      # deliver what we can, stash the rest
+    elif _has_load(ag, a) and _load_is_useful(ag, a, need):
+        a.phase = "approach"      # we are carrying something the site wants
     else:
+        # Carrying a surplus the site has no use for. Routing to "approach"
+        # here (as this did unconditionally) deadlocks: the builder walks to
+        # the site, cannot deliver, and the haul action wins the next re-score,
+        # so the pair alternate every tick and the agent paces on the spot.
+        # Go and fetch what is actually needed instead; the surplus gets
+        # dropped off on the way.
         a.phase = "fetch"
 
     if a.phase == "fetch":

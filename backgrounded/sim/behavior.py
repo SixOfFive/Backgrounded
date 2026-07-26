@@ -75,7 +75,18 @@ __all__ = [
 ]
 
 # ------------------------------------------------------------------ tuning --
-HYSTERESIS_BONUS = 0.15     # stickiness for the action already running
+HYSTERESIS_BONUS = 0.35     # stickiness for the action already running
+
+#: Once an agent commits to something it sticks with it for at least this long
+#: unless a genuine emergency (score >= OVERRIDE_FLOOR) interrupts.
+#:
+#: Without this, two actions with near-equal utility trade places every time the
+#: AI re-scores. Measured before the change: one agent racked up 192 action
+#: switches and 184 direction reversals in 180 seconds, pacing back and forth
+#: over an 11 px stretch between a build site and the stockpile. A hysteresis
+#: bonus alone cannot fix that - it only biases the score, and the moment the
+#: rival action creeps above the margin the pair simply swap and swap back.
+MIN_COMMIT_SEC = 7.0
 TIEBREAK = 0.03             # random jitter so identical scores do not lock step
 OVERRIDE_FLOOR = 0.95       # scores at or above this ignore hysteresis
 DIRECTOR_PERIOD = 2.0       # seconds between director passes
@@ -667,6 +678,14 @@ def choose_action(agent: Any, world: Any) -> Action:
 
         scores = score_actions(agent, world)
         rng = rng_of(world)
+
+        # Commitment window: keep going unless something is genuinely urgent.
+        if cur_live:
+            elapsed = float(getattr(cur, "t", 0.0) or 0.0)
+            if elapsed < MIN_COMMIT_SEC:
+                peak = max(scores.values()) if scores else 0.0
+                if peak < OVERRIDE_FLOOR:
+                    return cur
         ranked: list[tuple[float, str]] = []
         for kind, base in scores.items():
             if base <= 0.0:

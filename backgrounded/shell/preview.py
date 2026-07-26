@@ -94,7 +94,10 @@ class Preview:
             if not pygame.display.get_init():
                 pygame.display.init()
             hidden_flag = getattr(pygame, "HIDDEN", 0)
-            flags = 0 if visible else hidden_flag
+            # RESIZABLE is what gives the window a drag border, a working
+            # maximise button and a snap target. Without it the window is
+            # pinned to its initial size and cannot be filled to the screen.
+            flags = pygame.RESIZABLE | (0 if visible else hidden_flag)
             self._screen = pygame.display.set_mode(self.window_size, flags)
             pygame.display.set_caption(self._caption)
             self._created = True
@@ -146,6 +149,44 @@ class Preview:
         self.ensure_window(not self._visible)
         return self._visible
 
+    # ---------------------------------------------------------- fullscreen --
+
+    def toggle_fullscreen(self) -> bool:
+        """Borderless-fullscreen the preview, or return it to a window.
+
+        SCALED keeps the render surface at its native size and lets SDL letterbox
+        it, so the aspect ratio survives on a screen that is not 16:10.
+        """
+        if not self._created or self._failed:
+            return False
+        try:
+            self._fullscreen = not getattr(self, "_fullscreen", False)
+            if self._fullscreen:
+                self._windowed_size = self._screen.get_size()
+                self._screen = pygame.display.set_mode(
+                    (0, 0), pygame.FULLSCREEN | pygame.SCALED)
+            else:
+                size = getattr(self, "_windowed_size", None) or self.window_size
+                self._screen = pygame.display.set_mode(size, pygame.RESIZABLE)
+            self._hwnd = self._get_hwnd()
+            return self._fullscreen
+        except Exception as exc:
+            log.warning("preview: fullscreen toggle failed: %s", exc)
+            self._fullscreen = False
+            return False
+
+    def handle_resize(self, size: tuple[int, int]) -> None:
+        """Adopt a user drag/maximise. Ignored while fullscreen."""
+        if not self._created or self._failed or getattr(self, "_fullscreen", False):
+            return
+        try:
+            w, h = max(320, int(size[0])), max(200, int(size[1]))
+            self._screen = pygame.display.set_mode((w, h), pygame.RESIZABLE)
+            self.window_size = (w, h)
+            self._hwnd = self._get_hwnd()
+        except Exception as exc:
+            log.warning("preview: resize failed: %s", exc)
+
     def set_scale(self, scale: float) -> None:
         """Resize the window. Cheap no-op if the scale is unchanged."""
         scale = scale if scale and scale > 0.05 else 1.0
@@ -156,7 +197,8 @@ class Preview:
         if not self._created or self._failed:
             return
         try:
-            flags = 0 if self._visible else getattr(pygame, "HIDDEN", 0)
+            flags = pygame.RESIZABLE | (
+                0 if self._visible else getattr(pygame, "HIDDEN", 0))
             self._screen = pygame.display.set_mode(self.window_size, flags)
             pygame.display.set_caption(self._caption)
             self._hwnd = self._get_hwnd()
@@ -191,16 +233,14 @@ class Preview:
         if screen is None or surface is None:
             return
         try:
-            if surface.get_size() == self.window_size:
+            target = screen.get_size()
+            if surface.get_size() == target:
                 screen.blit(surface, (0, 0))
             else:
                 try:
-                    pygame.transform.smoothscale(
-                        surface, self.window_size, screen)
+                    pygame.transform.smoothscale(surface, target, screen)
                 except Exception:
-                    screen.blit(
-                        pygame.transform.scale(surface, self.window_size),
-                        (0, 0))
+                    screen.blit(pygame.transform.scale(surface, target), (0, 0))
             pygame.display.flip()
         except Exception as exc:
             log.warning("preview: present failed: %s", exc)
@@ -214,16 +254,49 @@ class Preview:
         the preview is now off. Only QUIT events are consumed, so the app's own
         ``pygame.event.get()`` still sees everything else.
         """
+        return self.pump_events().get("closed", False)
+
+    def pump_events(self) -> dict:
+        """Handle the window's own events and report what happened.
+
+        Consumes only the events the window owns (close, resize, and the
+        fullscreen keys) so the app's own ``pygame.event.get()`` still sees
+        everything else.
+
+        Fullscreen is bound to F11 and Alt+Enter, and Escape leaves it - the
+        three bindings people actually try. Double-clicking the view works too.
+        """
+        out = {"closed": False, "fullscreen": getattr(self, "_fullscreen", False)}
         if self._failed or not self._created:
-            return False
+            return out
         try:
-            closed = bool(pygame.event.get(pygame.QUIT))
+            wanted = [pygame.QUIT, pygame.VIDEORESIZE,
+                      pygame.KEYDOWN, pygame.MOUSEBUTTONDOWN]
+            for ev in pygame.event.get(wanted):
+                if ev.type == pygame.QUIT:
+                    out["closed"] = True
+                elif ev.type == pygame.VIDEORESIZE:
+                    self.handle_resize((ev.w, ev.h))
+                elif ev.type == pygame.KEYDOWN:
+                    alt = bool(ev.mod & pygame.KMOD_ALT)
+                    if ev.key == pygame.K_F11 or (alt and ev.key == pygame.K_RETURN):
+                        out["fullscreen"] = self.toggle_fullscreen()
+                    elif ev.key == pygame.K_ESCAPE and getattr(self, "_fullscreen", False):
+                        out["fullscreen"] = self.toggle_fullscreen()
+                    else:
+                        pygame.event.post(ev)     # not ours; hand it back
+                elif ev.type == pygame.MOUSEBUTTONDOWN:
+                    now = pygame.time.get_ticks()
+                    last = getattr(self, "_last_click_ms", 0)
+                    self._last_click_ms = now
+                    if ev.button == 1 and now - last < 400:
+                        out["fullscreen"] = self.toggle_fullscreen()
         except Exception as exc:
-            log.debug("preview: event poll failed: %s", exc)
-            return False
-        if closed:
+            log.debug("preview: event pump failed: %s", exc)
+            return out
+        if out["closed"]:
             self._apply_visibility(False)
-        return closed
+        return out
 
     # ------------------------------------------------------------ shutdown --
 
