@@ -44,10 +44,26 @@ class App:
         paths.ensure_dirs()
         self.args = args
         self.cfg = Config.load()
+
+        # Command-line flags are *session* overrides, not preferences. Without
+        # this split a single `--hide --no-wallpaper` test run would write both
+        # into config.json and permanently disable the window and the wallpaper
+        # for every later run. _cli_keys records what the CLI touched so
+        # _save_config can put the stored value back; _user_keys records what
+        # the user changed via the tray during the session, which does win.
+        self._pristine = {k: getattr(self.cfg, k) for k in vars(self.cfg)}
+        self._cli_keys: set[str] = set()
+        self._user_keys: set[str] = set()
+
         if args.scene:
             self.cfg.scene = args.scene
+            self._cli_keys.add("scene")
         if args.hide:
             self.cfg.show_window = False
+            self._cli_keys.add("show_window")
+        if args.no_wallpaper:
+            self.cfg.wallpaper_enabled = False
+            self._cli_keys.add("wallpaper_enabled")
 
         self.running = True
         self.cmd_q: queue.Queue = queue.Queue()
@@ -105,6 +121,20 @@ class App:
             except Exception:
                 log.exception("command %r failed", kind)
 
+    def _save_config(self, *changed: str) -> None:
+        """Persist preferences, without letting this session's CLI flags leak
+        into the stored config."""
+        self._user_keys.update(changed)
+        revert = {k: getattr(self.cfg, k)
+                  for k in self._cli_keys - self._user_keys}
+        for k in revert:
+            setattr(self.cfg, k, self._pristine[k])
+        try:
+            self.cfg.save()
+        finally:
+            for k, v in revert.items():       # restore the live session value
+                setattr(self.cfg, k, v)
+
     def _handle(self, kind: str, payload) -> None:
         cfg = self.cfg
         if kind == "quit":
@@ -112,7 +142,7 @@ class App:
         elif kind == "toggle_window":
             cfg.show_window = not cfg.show_window
             self.preview.ensure_window(cfg.show_window)
-            cfg.save()
+            self._save_config("show_window")
         elif kind == "toggle_wallpaper":
             cfg.wallpaper_enabled = not cfg.wallpaper_enabled
             if cfg.wallpaper_enabled:
@@ -120,17 +150,17 @@ class App:
             else:
                 self.wallpaper.stop()
                 self.wallpaper.restore()
-            cfg.save()
+            self._save_config("wallpaper_enabled")
         elif kind == "toggle_pause":
             cfg.paused = not cfg.paused
-            cfg.save()
+            self._save_config("paused")
         elif kind == "speed":
             cfg.sim_speed = float(payload)
-            cfg.save()
+            self._save_config("sim_speed")
         elif kind == "scene" and payload in SCENES:
             cfg.scene = payload
             self.world.events.request_scene(payload)
-            cfg.save()
+            self._save_config("scene")
         elif kind == "save":
             persist.save_world(self.world)
         elif kind == "reset":
@@ -161,7 +191,7 @@ class App:
         if self.preview.handle_close():
             self.cfg.show_window = False
             self.preview.ensure_window(False)
-            self.cfg.save()
+            self._save_config("show_window")
 
         # fixed-timestep sim, scaled by the speed setting
         if not self.cfg.paused:
@@ -236,7 +266,7 @@ class App:
             pygame.quit()
         except Exception:
             pass
-        self.cfg.save()
+        self._save_config()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -265,8 +295,4 @@ def main(argv: list[str] | None = None) -> int:
         handlers=[logging.FileHandler(paths.LOG_PATH, encoding="utf-8"),
                   logging.StreamHandler(sys.stdout)],
     )
-    app = App(args)
-    if args.no_wallpaper:
-        app.cfg.wallpaper_enabled = False
-        app.wallpaper.stop()
-    return app.run()
+    return App(args).run()

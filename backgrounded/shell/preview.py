@@ -1,0 +1,268 @@
+"""The optional on-screen preview window.
+
+The app's real output is the desktop wallpaper; this window is a live view of
+the same render surface, handy while the world is being watched or tuned.
+
+Two rules make this module fiddlier than it looks:
+
+* Hiding the window must **not** tear down the pygame video context. Calling
+  ``pygame.display.quit()`` invalidates every Surface the renderer is holding,
+  which turns into a crash the next frame. So we keep the SDL window alive and
+  toggle it with ``ShowWindow`` on its raw HWND instead.
+* Clicking the window's X must hide it, not quit. The app lives in the tray;
+  the window is a peripheral.
+"""
+from __future__ import annotations
+
+import ctypes
+import logging
+import os
+from ctypes import wintypes
+from typing import Any
+
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+
+import pygame
+
+log = logging.getLogger(__name__)
+
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+user32.ShowWindow.restype = wintypes.BOOL
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+
+SW_HIDE = 0
+SW_SHOW = 5
+
+CAPTION = "Backgrounded - Live View"
+
+
+class Preview:
+    """Wraps the pygame display window: create once, show/hide, present."""
+
+    def __init__(self, size: tuple[int, int], scale: float = 1.0) -> None:
+        self.size: tuple[int, int] = (max(1, int(size[0])), max(1, int(size[1])))
+        self.scale: float = scale if scale and scale > 0.05 else 1.0
+        self.window_size: tuple[int, int] = self._scaled()
+
+        self._screen: pygame.Surface | None = None
+        self._hwnd: int = 0
+        self._visible: bool = False
+        self._created: bool = False
+        self._caption: str = CAPTION
+        self._failed: bool = False
+
+    # ---------------------------------------------------------------- misc --
+
+    def _scaled(self) -> tuple[int, int]:
+        return (max(1, int(self.size[0] * self.scale)),
+                max(1, int(self.size[1] * self.scale)))
+
+    @property
+    def visible(self) -> bool:
+        return self._visible
+
+    @property
+    def created(self) -> bool:
+        return self._created
+
+    @property
+    def surface(self) -> "pygame.Surface | None":
+        """The display surface, if the window exists. Read-only use please."""
+        return self._screen
+
+    # -------------------------------------------------------------- window --
+
+    def ensure_window(self, visible: bool) -> None:
+        """Create the window if needed, then match `visible`.
+
+        The display is created on the first call regardless of `visible` (as a
+        hidden SDL window when it should not be seen), because the renderer
+        needs a live video context for ``Surface.convert()``. Hiding and
+        showing afterwards is a pure ``ShowWindow`` toggle - the pygame
+        context, and every Surface derived from it, survives untouched.
+        """
+        if self._failed:
+            return
+        if not self._created:
+            if not self._create(visible):
+                return
+        if visible != self._visible:
+            self._apply_visibility(visible)
+
+    def _create(self, visible: bool) -> bool:
+        try:
+            if not pygame.display.get_init():
+                pygame.display.init()
+            hidden_flag = getattr(pygame, "HIDDEN", 0)
+            flags = 0 if visible else hidden_flag
+            self._screen = pygame.display.set_mode(self.window_size, flags)
+            pygame.display.set_caption(self._caption)
+            self._created = True
+            # With the HIDDEN flag SDL never maps the window, so it never
+            # flashes on screen; without it we hide immediately below.
+            self._visible = bool(visible) or not hidden_flag
+            self._hwnd = self._get_hwnd()
+            if not visible:
+                self._apply_visibility(False)
+            return True
+        except Exception as exc:
+            self._failed = True
+            log.error("preview window could not be created: %s", exc)
+            return False
+
+    def _get_hwnd(self) -> int:
+        try:
+            info = pygame.display.get_wm_info()
+            return int(info.get("window") or 0)
+        except Exception as exc:
+            log.warning("preview: no window handle available: %s", exc)
+            return 0
+
+    def _apply_visibility(self, visible: bool) -> None:
+        if not self._hwnd:
+            self._hwnd = self._get_hwnd()
+        if not self._hwnd:
+            # Without an HWND there is nothing to toggle; record intent so
+            # present() still behaves sensibly.
+            self._visible = visible
+            return
+        try:
+            user32.ShowWindow(self._hwnd, SW_SHOW if visible else SW_HIDE)
+            self._visible = visible
+        except Exception as exc:
+            log.warning("preview: ShowWindow failed: %s", exc)
+
+    def show(self) -> None:
+        self.ensure_window(True)
+
+    def hide(self) -> None:
+        if self._created:
+            self._apply_visibility(False)
+        else:
+            self._visible = False
+
+    def toggle(self) -> bool:
+        """Flip visibility and return the new state."""
+        self.ensure_window(not self._visible)
+        return self._visible
+
+    def set_scale(self, scale: float) -> None:
+        """Resize the window. Cheap no-op if the scale is unchanged."""
+        scale = scale if scale and scale > 0.05 else 1.0
+        if abs(scale - self.scale) < 1e-6:
+            return
+        self.scale = scale
+        self.window_size = self._scaled()
+        if not self._created or self._failed:
+            return
+        try:
+            flags = 0 if self._visible else getattr(pygame, "HIDDEN", 0)
+            self._screen = pygame.display.set_mode(self.window_size, flags)
+            pygame.display.set_caption(self._caption)
+            self._hwnd = self._get_hwnd()
+            self._apply_visibility(self._visible)
+        except Exception as exc:
+            log.warning("preview: could not resize to %s: %s",
+                        self.window_size, exc)
+
+    # ------------------------------------------------------------- drawing --
+
+    def set_caption(self, text: str) -> None:
+        """Live HUD in the title bar. Skips the syscall when unchanged."""
+        if not text or text == self._caption:
+            return
+        self._caption = text
+        if not self._created or self._failed:
+            return
+        try:
+            pygame.display.set_caption(text)
+        except Exception as exc:
+            log.debug("preview: set_caption failed: %s", exc)
+
+    def present(self, surface: "pygame.Surface") -> None:
+        """Scale the render surface onto the window and flip.
+
+        Does nothing at all when hidden - a hidden preview must cost the frame
+        loop nothing beyond this branch.
+        """
+        if self._failed or not self._created or not self._visible:
+            return
+        screen = self._screen
+        if screen is None or surface is None:
+            return
+        try:
+            if surface.get_size() == self.window_size:
+                screen.blit(surface, (0, 0))
+            else:
+                try:
+                    pygame.transform.smoothscale(
+                        surface, self.window_size, screen)
+                except Exception:
+                    screen.blit(
+                        pygame.transform.scale(surface, self.window_size),
+                        (0, 0))
+            pygame.display.flip()
+        except Exception as exc:
+            log.warning("preview: present failed: %s", exc)
+
+    # -------------------------------------------------------------- events --
+
+    def handle_close(self) -> bool:
+        """True if the user just closed the window (X / Alt+F4).
+
+        The window is hidden here as a side effect; the app should record that
+        the preview is now off. Only QUIT events are consumed, so the app's own
+        ``pygame.event.get()`` still sees everything else.
+        """
+        if self._failed or not self._created:
+            return False
+        try:
+            closed = bool(pygame.event.get(pygame.QUIT))
+        except Exception as exc:
+            log.debug("preview: event poll failed: %s", exc)
+            return False
+        if closed:
+            self._apply_visibility(False)
+        return closed
+
+    # ------------------------------------------------------------ shutdown --
+
+    def close(self) -> None:
+        """Tear the window down. Shutdown only - this invalidates surfaces."""
+        if not self._created:
+            return
+        self._created = False
+        self._visible = False
+        self._screen = None
+        self._hwnd = 0
+        try:
+            pygame.display.quit()
+        except Exception as exc:
+            log.debug("preview: display.quit failed: %s", exc)
+
+
+if __name__ == "__main__":                                    # pragma: no cover
+    import math
+    import time
+
+    logging.basicConfig(level=logging.INFO)
+    pygame.init()
+    preview = Preview((1280, 800), scale=0.5)
+    preview.ensure_window(True)
+    scene = pygame.Surface((1280, 800))
+    clock = pygame.time.Clock()
+    t0 = time.time()
+    while time.time() - t0 < 6.0:
+        t = time.time() - t0
+        scene.fill((10, 14, 30))
+        x = 640 + int(400 * math.sin(t))
+        pygame.draw.circle(scene, (255, 190, 90), (x, 400), 40)
+        preview.set_caption(f"Backgrounded - Live View  t={t:4.1f}s")
+        preview.present(scene)
+        if preview.handle_close():
+            print("closed -> hidden; re-showing in 1s")
+            time.sleep(1.0)
+            preview.show()
+        clock.tick(60)
+    preview.close()
+    pygame.quit()

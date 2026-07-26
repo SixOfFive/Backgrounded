@@ -8,6 +8,7 @@ to near-black, then add light back from candles, fires and lightning.
 from __future__ import annotations
 
 import logging
+import math
 
 import numpy as np
 import pygame
@@ -202,9 +203,16 @@ class Renderer:
 
         for src in getattr(lighting, "sources", ()):
             try:
-                spr = fx.radial_light_surface(src.radius, src.color,
-                                              src.intensity, src.flicker,
-                                              world.world_time)
+                # Flicker is folded into intensity here rather than passed
+                # through, so fx keeps a small cache key and the sprite cache
+                # still hits. Quantised to 12 steps for the same reason.
+                flick = 1.0
+                if src.flicker:
+                    phase = world.world_time * 9.7 + (src.owner_id or 0) * 1.7
+                    wob = (math.sin(phase) * 0.6 + math.sin(phase * 2.3) * 0.4)
+                    flick = 1.0 + src.flicker * wob * 0.5
+                inten = round(max(0.05, min(1.6, src.intensity * flick)), 2)
+                spr = fx.radial_light_surface(src.radius, src.color, inten)
             except Exception:
                 continue
             if spr is None:

@@ -109,19 +109,25 @@ class World:
         self.world_time += dt
         self.tick_count += 1
 
-        self._guarded("events", self.events.tick, self, dt)
-        self._guarded("props", self.props.tick, self, dt)
-        self._guarded("structures", self.structures.tick, self, dt)
-        self._guarded("agents", self._tick_agents, dt)
+        self._guarded("events", lambda: self.events.tick(self, dt))
+        self._guarded("props", lambda: self._tick_props(dt))
+        self._guarded("structures", lambda: self.structures.update(dt, self))
+        self._guarded("agents", lambda: self._tick_agents(dt))
         self._guarded("lights", self._rebuild_lights)
-        self._guarded("lighting", self.lighting.tick, dt)
-        self._guarded("colony", self._tick_colony, dt)
+        self._guarded("lighting", lambda: self.lighting.tick(dt))
+        self._guarded("colony", lambda: self._tick_colony(dt))
 
-    def _guarded(self, name: str, fn, *args) -> None:
+    def _guarded(self, name: str, fn) -> None:
+        """Run a subsystem step, disabling it if it ever raises.
+
+        `fn` is a zero-arg callable rather than (method, *args) deliberately:
+        resolving `self.foo.bar` at the call site would happen *outside* this
+        try block, so a missing attribute would escape the guard entirely.
+        """
         if name in self._disabled:
             return
         try:
-            fn(*args)
+            fn()
         except Exception:
             log.exception("subsystem %r failed; disabling for this session", name)
             self._disabled.add(name)
@@ -203,9 +209,20 @@ class World:
             ))
         self.lighting.sources = srcs
 
+    def _tick_props(self, dt: float) -> None:
+        """props.tick reports what happened; route it into the chronicle and
+        stats rather than discarding it."""
+        events = self.props.tick(self, dt) or ()
+        for ev in events:
+            kind = ev.get("kind") if isinstance(ev, dict) else None
+            if kind == "tree_felled":
+                self.stats["trees_felled"] += 1
+            elif kind == "prop_burned":
+                self.log_event(names.describe_event("burned", **ev))
+
     def _tick_colony(self, dt: float) -> None:
-        self.build_queue = behavior.plan_build_queue(self)
-        behavior.assign_roles(self)
+        behavior.update_director(self, dt)
+        behavior.assign_roles(self, dt)
 
     # ------------------------------------------------------------ helpers --
     def log_event(self, text: str) -> None:
