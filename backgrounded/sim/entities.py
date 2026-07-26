@@ -13,6 +13,16 @@ edges *are* the edge of the world. It never raises: a per-frame path that can
 throw is a per-frame path that will eventually kill an app running unattended
 overnight.
 
+Attrition
+---------
+:meth:`Stickman.update_needs` is also where a colony can lose someone to
+neglect. Hunger and cold both cap at 1.0, and sitting *at* the cap is what
+kills: ``starve_t`` and ``exposure_t`` count the sustained seconds at the cap
+and reset the instant the need drops. Both are deliberately slow
+(``STARVE_LETHAL_SEC``/``EXPOSURE_LETHAL_SEC``, 90 s) so they are a last
+resort for a colony that has already run out of food or fire, never a clock
+that ticks down on a working one.
+
 Death hand-off
 --------------
 :meth:`Stickman.die` sets ``alive=False`` and ``dead_t=0.0``, then notifies
@@ -89,6 +99,33 @@ ARRIVE_EPS = 1.5            # px, close enough to the target
 SLIP_CHANCE_PER_SEC = 0.42  # base slip probability while climbing, per second
 SPEECH_DEFAULT_SEC = 3.0
 GRAVE_DELAY = 7.0           # s a corpse lies there before it becomes a grave
+
+#: Going down a face is steadier than hauling yourself up one, so a descent
+#: runs the same slip roll at a fraction of the risk. Measured over 10 seeds x
+#: 300 s: 0.55 gives 0.9 fall deaths per colony-run, 0.30 gives 0.6, and
+#: neither changes how much gets built - so this is purely how often a climb
+#: turns into a funeral.
+#:
+#: 0.30 was still too generous on the chasm and cliff maps, where a descent is
+#: 150 px and takes nearly two seconds of slip rolls: a single seed contributed
+#: six fall deaths to an otherwise clear, hazard-free day, which is the whole
+#: 300 s death budget spent on gravity. 0.12 leaves the clear-weather colony at
+#: 0.1 fall deaths per run without changing what gets built.
+DESCENT_SLIP_SCALE = 0.12
+#: Ceiling on how fast a *deliberate* descent loses height, px/s. Horizontal
+#: speed alone does not bound it: on a face that drops 40 px per px of travel,
+#: CLIMB_SPEED sideways is 600 px/s downward, which is a fall with extra steps.
+DESCENT_DROP_RATE = 90.0
+
+# Attrition. A need pinned at its cap for this long is fatal. Sized well above
+# the time it takes an agent to notice the need and act on it (behaviour
+# re-scores every AI tick and a meal is a ~20 s round trip), so these only
+# ever fire for a colony that genuinely cannot feed or warm itself.
+NEED_FATAL_LEVEL = 0.999    # "at the cap", allowing for float drift
+STARVE_LETHAL_SEC = 90.0
+EXPOSURE_LETHAL_SEC = 90.0
+CAUSE_STARVED = "hunger"    # -> names.DEATH_KINDS -> "died_hunger"
+CAUSE_EXPOSURE = "cold"     # -> names.DEATH_KINDS -> "died_cold"
 
 # Need drift rates, per simulated second. Sized against DAY_LENGTH_SEC (1200s)
 # so an agent gets hungry two or three times a day rather than constantly.
@@ -266,6 +303,9 @@ class Stickman:
     dead_t: float = 0.0                   # s since death, drives the grave
     speech: str | None = None             # symbol key for the speech bubble
     speech_t: float = 0.0                 # s of bubble left
+    starve_t: float = 0.0                 # s hunger has been pinned at the cap
+    exposure_t: float = 0.0               # s warmth has been pinned at the cap
+    _blocked_t: float = 0.0               # s stuck against terrain, see actions
 
     # --- lineage ----------------------------------------------------------
     birth_time: float = 0.0               # world_time at birth
@@ -389,6 +429,37 @@ class Stickman:
         self.morale = _clamp(
             self.morale + (target - self.morale) * MORALE_LERP_PER_SEC * dt,
             0.0, 1.0)
+
+        self._tick_attrition(dt)
+
+    def _tick_attrition(self, dt: float) -> None:
+        """Age the starvation/exposure clocks and kill when one runs out.
+
+        Nothing used to *consume* a maxed-out need, so hunger pinned at 1.0
+        for four minutes killed nobody and the needs were decoration. The
+        clocks are sustained-time, not accumulated-damage: they zero the moment
+        the need comes off its cap, so one meal or one turn at the fire buys a
+        full reprieve and a fed colony never approaches the threshold.
+
+        Runs inside update_needs (a per-frame path) so it never raises: an
+        agent who cannot be killed is a far smaller bug than a sim that stops.
+        """
+        try:
+            if self.hunger >= NEED_FATAL_LEVEL:
+                self.starve_t += dt
+            else:
+                self.starve_t = 0.0
+            if self.warmth >= NEED_FATAL_LEVEL:
+                self.exposure_t += dt
+            else:
+                self.exposure_t = 0.0
+
+            if self.starve_t >= STARVE_LETHAL_SEC:
+                self.die(CAUSE_STARVED)
+            elif self.exposure_t >= EXPOSURE_LETHAL_SEC:
+                self.die(CAUSE_EXPOSURE)
+        except Exception:
+            log.exception("attrition failed for agent %s (%s)", self.id, self.name)
 
     def needs(self) -> dict[str, float]:
         """Current need *pressures*, 0 = fine, 1 = urgent.
@@ -598,13 +669,7 @@ class Stickman:
             self.climbing = True
             self.climb_t += dt
             speed = CLIMB_SPEED * _clamp(self.gait, 0.6, 1.4)
-            risk = (
-                SLIP_CHANCE_PER_SEC
-                * dt
-                * (0.55 + 0.85 * self.fatigue + 0.25 * self.hunger)
-                * _clamp(steep / max(1e-3, MAX_SLOPE_CLIMB), 0.2, 1.0)
-            )
-            if _rand_of(rng) < risk:
+            if _rand_of(rng) < self.slip_risk(dt, steep):
                 self._slip(d)
                 return
         elif rise <= 0.0:
@@ -635,6 +700,96 @@ class Stickman:
         else:
             self.y = ngy
             self.vy = 0.0
+
+    def slip_risk(self, dt: float, steep: float, scale: float = 1.0) -> float:
+        """Chance of losing grip this tick on a face of steepness *steep*.
+
+        One formula for both directions of travel: tired and hungry agents come
+        off a face sooner, and steeper is worse. ``scale`` lets a descent buy
+        itself better odds than a climb without forking the maths.
+        """
+        return (
+            SLIP_CHANCE_PER_SEC
+            * max(0.0, _f(dt, 0.0))
+            * max(0.0, _f(scale, 1.0))
+            * (0.55 + 0.85 * self.fatigue + 0.25 * self.hunger)
+            * _clamp(abs(_f(steep, 0.0)) / max(1e-3, MAX_SLOPE_CLIMB), 0.2, 1.0)
+        )
+
+    def descend_step(
+        self,
+        dt: float,
+        terrain: "Terrain | None" = None,
+        *,
+        direction: float = 1.0,
+        rng: Any = None,
+        speed: float = CLIMB_SPEED,
+    ) -> float:
+        """Climb *down* the ledge ahead, staying attached to the surface.
+
+        The mirror image of the climb branch in :meth:`_ground_step`: the agent
+        moves at ``speed`` horizontally, the step is further shortened so the
+        face is never descended faster than ``DESCENT_DROP_RATE``, and y is
+        pinned to the ground the whole way, so no fall velocity ever
+        accumulates and no landing check can fire. The one way down badly is
+        the shared slip roll, which pitches you forward off the face.
+
+        Returns the horizontal distance actually covered. ``0.0`` means the
+        descent did not happen: there was no drop to descend, or the agent
+        slipped and is now airborne (check ``on_ground`` to tell them apart).
+        Never raises - callers are on the per-frame path.
+        """
+        try:
+            dt = _clamp(_f(dt, 0.0), 0.0, _MAX_DT)
+            if dt <= 0.0 or not self.alive:
+                return 0.0
+            d = 1.0 if _f(direction, 1.0) >= 0.0 else -1.0
+
+            gy = _ground_y(terrain, self.x)
+            step = max(0.0, _f(speed, CLIMB_SPEED)) * dt
+            nx = _clamp(self.x + d * step, _EDGE_MIN, _EDGE_MAX)
+            step = abs(nx - self.x)
+            if step <= 0.0:
+                return 0.0                       # against the world edge
+            drop = _ground_y(terrain, nx) - gy
+            if drop <= 0.0:
+                return 0.0                       # nothing to descend
+
+            # Rate-limit the *fall* of the step, not just its length. Terrain is
+            # piecewise linear, so scaling the step by the overshoot lands on
+            # the wanted drop in one pass.
+            budget = DESCENT_DROP_RATE * dt
+            if drop > budget:
+                short_x = _clamp(self.x + d * step * (budget / drop),
+                                 _EDGE_MIN, _EDGE_MAX)
+                short_step = abs(short_x - self.x)
+                short_drop = _ground_y(terrain, short_x) - gy
+                if short_step > 0.0 and short_drop > 0.0:
+                    nx, step, drop = short_x, short_step, short_drop
+                # Otherwise the surface is a step function here, not a slope:
+                # shortening walks back onto the lip and the descent never
+                # starts. Take the whole drop instead - still attached to the
+                # ground, still not a fall.
+
+            self.facing = 1 if d > 0.0 else -1
+            self.climbing = True
+            self.climb_t += dt
+            steep = drop / max(1e-3, step)
+            if _rand_of(rng) < self.slip_risk(dt, steep, DESCENT_SLIP_SCALE):
+                self._slip(-d)          # pitched forward, over the lip
+                return 0.0
+
+            self.x = nx
+            self.vx = d * (step / dt)
+            self.y = gy + drop
+            self.vy = 0.0
+            self.on_ground = True
+            self.fall_t = 0.0
+            self._clamp_edges()
+            return step
+        except Exception:
+            log.exception("descend failed for agent %s (%s)", self.id, self.name)
+            return 0.0
 
     def _slip(self, d: float) -> None:
         """Lose grip mid-climb: detach from the face and start falling."""
@@ -723,6 +878,9 @@ class Stickman:
             "dead_t": float(self.dead_t),
             "speech": self.speech,
             "speech_t": float(self.speech_t),
+            "starve_t": float(self.starve_t),
+            "exposure_t": float(self.exposure_t),
+            "blocked_t": float(self._blocked_t),
             "birth_time": float(self.birth_time),
             "parent_ids": [int(p) for p in self.parent_ids],
             "on_ground": bool(self.on_ground),
@@ -769,6 +927,11 @@ class Stickman:
         s.speech_t = max(0.0, _f(d.get("speech_t"), 0.0))
         if s.speech is None:
             s.speech_t = 0.0
+        # Attrition clocks survive a restart: reloading must not hand a
+        # starving agent a fresh 90 seconds.
+        s.starve_t = max(0.0, _f(d.get("starve_t"), 0.0))
+        s.exposure_t = max(0.0, _f(d.get("exposure_t"), 0.0))
+        s._blocked_t = max(0.0, _f(d.get("blocked_t"), 0.0))
         s.birth_time = _f(d.get("birth_time"), 0.0)
 
         parents = d.get("parent_ids")
@@ -1129,4 +1292,30 @@ if __name__ == "__main__":   # pragma: no cover - headless smoke test
     assert pop.deaths == 1 and len(pop) == 3, (pop.deaths, len(pop))
     print("grave:", graves[0]["name"], "at", round(graves[0]["x"], 1))
     assert Population.from_dict(pop.to_dict()).deaths == 1
+
+    # The same 200px ledge, taken deliberately instead of walked off.
+    solo = Population()
+    climber = solo.spawn(599.9, 400.0, rng=rng)   # toes on the lip
+    for _ in range(int(30 * 20)):
+        climber.descend_step(1.0 / 30.0, terrain, direction=1.0, rng=rng)
+        climber.apply_physics(1.0 / 30.0, terrain, rng)
+        if climber.y >= 599.5:
+            break
+    print("descended to", round(climber.y, 1), "alive:", climber.alive)
+    assert climber.alive and climber.y >= 599.5, (climber.alive, climber.y)
+
+    # Attrition: only *sustained* time at the cap counts, and it is slow.
+    victim = solo.spawn(200.0, 400.0, rng=rng)
+    victim.hunger = 1.0
+    for _ in range(int(30 * (STARVE_LETHAL_SEC - 5.0))):
+        victim.update_needs(1.0 / 30.0)
+    assert victim.alive, "starved early"
+    victim.hunger = 0.2                        # one meal buys a full reprieve
+    victim.update_needs(1.0 / 30.0)
+    assert victim.starve_t == 0.0, victim.starve_t
+    victim.hunger = 1.0
+    for _ in range(int(30 * (STARVE_LETHAL_SEC + 2.0))):
+        victim.update_needs(1.0 / 30.0)
+    assert not victim.alive and victim.death_cause == CAUSE_STARVED, victim.summary()
+    print("attrition:", victim.summary())
     clear_death_listeners()

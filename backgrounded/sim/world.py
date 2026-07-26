@@ -22,7 +22,7 @@ from ..constants import (
     RES_FOOD, RES_STONE, RES_WOOD, SCENE_NIGHT_STORM, SAVE_VERSION,
 )
 from . import behavior, names
-from .entities import Population, Stickman
+from .entities import GRAVE_DELAY, Population, Stickman
 from .events import EventSystem
 from .lighting import Lighting, LightSource
 from .props import PropRegistry, scatter
@@ -136,6 +136,12 @@ class World:
         ai_due = (self.tick_count % AI_TICKS) == 0
         for agent in self.population.alive_agents():
             agent.update_needs(dt, self)
+            if not agent.alive:
+                # Starved or froze this tick. The roster snapshot still lists
+                # them, and running the rest of the loop would hand a corpse a
+                # fresh action (die() clears agent.action, which reads as
+                # "needs a new one") and then walk it around.
+                continue
 
             act = agent.action
             need_new = act is None or act.done or act.failed
@@ -173,14 +179,47 @@ class World:
         for agent in list(self.population.agents):
             if agent.alive:
                 continue
+            # This is the ONLY place a corpse's clock advances. _tick_agents
+            # iterates alive_agents(), so the dead never reach apply_physics
+            # and Stickman._physics never runs for them. Dropping this (it
+            # looked like a double-count against entities.py) stopped dead_t
+            # ever reaching the burial threshold: no graves, no replacements,
+            # and the colony went extinct with stats["died"] still reading 0.
             agent.dead_t += dt
             if agent.dead_t < 2.0 or agent.__dict__.get("_buried"):
                 continue
             agent.__dict__["_buried"] = True
             self.props.add_grave(agent.x, self.terrain.ground_y(agent.x), agent.name)
             self.stats["died"] += 1
-            self.log_event(names.describe_event("death", name=agent.name))
+            # One chronicle line per death, here, because every cause funnels
+            # through this reaper. "death" is not a template kind - it fell
+            # through to the generic "did something worth noting", so a colony
+            # could lose half its people without the log ever saying so.
+            # death_event_kind() maps the cause onto died_fall / died_hunger /
+            # died_lightning / ... so the line names who died and of what.
+            self.log_event(names.describe_event(
+                agent.death_event_kind(),
+                name=agent.name,
+                cause=agent.death_cause or "the dark",
+                x=agent.x,
+            ))
             self._spawn_replacement()
+
+        # Retire buried corpses off the roster. Leaving them on it meant
+        # Population.agents only ever grew - measured 11 -> 41 entries over
+        # 1800s while the living count stayed at 4 - and every tick's
+        # alive_agents(), every hazard's agent scan and every save walked the
+        # whole thing. This program is meant to run unattended for hours, so an
+        # unbounded roster is a real leak, not a tidiness issue. The grave prop
+        # is what remembers them now.
+        stale = [a for a in self.population.agents
+                 if not a.alive and a.__dict__.get("_buried")
+                 and a.dead_t > GRAVE_DELAY]
+        for a in stale:
+            try:
+                self.population.agents.remove(a)
+            except ValueError:
+                pass
 
     def _spawn_replacement(self) -> None:
         used = {a.name for a in self.population.agents}
@@ -197,7 +236,11 @@ class World:
         # Keep exactly one candle in the world.
         if not any(a.holds_candle for a in self.population.alive_agents()):
             s.holds_candle = True
-        self.log_event(names.describe_event("arrival", name=s.name, generation=gen))
+        # "arrived", not "arrival" - the latter is not a template key and fell
+        # through to the generic line, so every replacement was announced as
+        # "Something happened." rather than by name.
+        self.log_event(names.describe_event("arrived", name=s.name,
+                                            generation=gen))
 
     def _rebuild_lights(self) -> None:
         """Lights are derived state - rebuilt from scratch every tick."""
@@ -226,13 +269,29 @@ class World:
         stats rather than discarding it."""
         events = self.props.tick(self, dt) or ()
         for ev in events:
-            kind = ev.get("kind") if isinstance(ev, dict) else None
-            if kind == "tree_felled":
+            if not isinstance(ev, dict):
+                continue
+            # The event NAME lives under "type"; "kind" is the prop's kind
+            # ("tree", "bush"). Reading "kind" here matched nothing, so
+            # trees_felled sat at 0 while trees fell all around it.
+            #
+            # Do not splat ev into describe_event either: it carries its own
+            # "kind" key, which collides with describe_event's first parameter
+            # and raises TypeError. That raise happens inside _guarded("props"),
+            # which would disable the entire props subsystem for the session -
+            # a logging nicety silently stopping trees from growing.
+            etype = ev.get("type")
+            if etype == "tree_felled":
                 self.stats["trees_felled"] += 1
-            elif kind == "prop_burned":
-                self.log_event(names.describe_event("burned", **ev))
+            elif etype == "prop_burned_out" and ev.get("kind") == "tree":
+                self.log_event(f"A tree burned to nothing.")
 
     def _tick_colony(self, dt: float) -> None:
+        # stats["built"] was declared but never written by anything, so it read
+        # 0 while 157 structures completed across a test sweep. Count the
+        # finished ones directly rather than trusting an increment somewhere.
+        self.stats["built"] = sum(1 for st in self.structures.all()
+                                  if getattr(st, "built", False))
         behavior.update_director(self, dt)
         behavior.assign_roles(self, dt)
 

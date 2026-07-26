@@ -17,9 +17,11 @@ World coupling is deliberately duck-typed so the modules other agents own can
 evolve. What is actually used, all optional:
 
     world.terrain      .height (np.float32[W])  .material (np.uint8[W])
-                       .ground_y(x) .deform(x0,x1,dy) .crater(x,y,r) .paint(x0,x1,m)
+                       .ground_y(x) .deform(x0,x1,dy) .paint(x0,x1,m)
+                       .crater(cx, radius, depth)   <- column based, takes no y
     world.lighting     .add_flash(i, decay, color) ; .wind_gust attribute
     world.agents       iterable of Stickman (.x .y .alive .warmth .morale .id)
+                       - the real World calls this ``world.population``
     world.props        iterable of Prop (.x .y .kind .burning .ignite())
     world.structures   iterable, same shape as props
     world.cfg/.config  Config (auto_scene_change, scene_min_sec)
@@ -30,7 +32,11 @@ Sign convention used for terrain: ``height[x]`` is the *y* of the surface, so
 **+dy lowers the ground (digs) and -dy raises it**.
 
 Panic protocol (honoured by behavior.py if it wants to): events set
-``agent.panic`` (seconds), ``agent.panic_target_x`` and ``agent.panic_reason``.
+``agent.panic`` (seconds), ``agent.panic_target_x`` and ``agent.panic_reason``,
+and count the timer back down again in ``_expire_panic`` - nothing else does,
+and a stuck flag makes an agent reckless near drops for the rest of its life.
+Evacuation proper goes through :meth:`EventSystem.hazards`, which behavior.py
+reads (via ``actions.hazards_of``) to score FleeFrom.
 """
 from __future__ import annotations
 
@@ -67,31 +73,118 @@ __all__ = ["EventSystem"]
 # ------------------------------------------------------------------ tuning --
 STRIKE_TTL = 0.5                 # seconds a bolt stays drawable
 STRIKE_MIN, STRIKE_MAX = 4.0, 12.0
-DIRECT_HIT_CHANCE = 0.08
-DIRECT_KILL_RADIUS = 25.0
+#: Share of bolts that aim at somebody. A storm throws ~37 bolts per 300 s, and
+#: an aimed one lands inside its own kill radius by construction, so this is
+#: very nearly the number of funerals per storm: at 0.08 a four-person colony
+#: was losing 4.3 people per 300 s to lightning alone. 0.02 gives ~0.9 aimed
+#: bolts per storm. Measured over 20 seeds x 300 s: 0.08 -> 4.3 lightning
+#: deaths per storm, 0.02 -> 1.25, 0.016 -> 0.85. The night-storm budget is the
+#: tightest in the spec (0-2 deaths *including* falls), so this sits low: a
+#: stickman is struck roughly every second storm, which is what "rare" means.
+DIRECT_HIT_CHANCE = 0.016
+#: A bolt kills everything in this column, and stickmen cluster round the fire,
+#: so a wide radius quietly turns one strike into a double funeral (measured:
+#: 2.1 deaths per aimed bolt at 20 px, 1.15 at 13 px). Keep the jitter under it
+#: or "direct" strikes go wide and feature 29 stops firing at all.
+DIRECT_KILL_RADIUS = 13.0
+DIRECT_AIM_JITTER = 7.0
 SCORCH_HALF_WIDTH = 14.0
+#: px either side of a bolt that can catch. props.py runs its own fire spread,
+#: so one ignition is not one burnt tree - it is a fire front. Every ignition
+#: here is therefore paid for in wood the colony will not get to build with.
+STRIKE_IGNITE_REACH = 45.0
 
 METEOR_MIN, METEOR_MAX = 1.6, 5.0
-METEOR_IMPACT_CHANCE = 0.32
+#: At 0.20 roughly 18 rocks per 300 s actually landed. That is a crater every
+#: 17 s and an ignition with each one, which stripped the map from 24 trees to
+#: 2 and halved what got built - all for 0.7 deaths, because most of them
+#: landed nowhere near anybody. Fewer, bigger, more dangerous impacts instead.
+METEOR_IMPACT_CHANCE = 0.09
 METEOR_TTL = 0.45                # afterglow once the streak lands
+METEOR_BLAST = 1.5               # share of the crater radius that actually kills
+METEOR_WARN_R = 130.0            # how far out an inbound rock reads as a hazard
+METEOR_PANIC = 1.2               # panic seconds for the near-miss ring
+#: multiples of the crater radius a rock can set alight. At 2.5 nearly every
+#: impact started a fire and props.py's own spread did the rest - the map went
+#: from 24 trees to 2 in a single meteor scene.
+METEOR_IGNITE_REACH = 1.0
 
-MUDSLIDE_WARN = 4.0
+MUDSLIDE_WARN = 2.8
 MUDSLIDE_SLIDE = 3.0
 MUDSLIDE_SETTLE = 2.5
+MUDSLIDE_REST = 38.0             # quiet spell before the slope fails again
+#: Panic seconds granted per tick in the span. Re-applied every tick while the
+#: ground is moving, so this is not "how long the fright lasts" - it is how
+#: long an agent stays reckless *after* getting clear, which is the part that
+#: kills. Short.
+MUDSLIDE_PANIC = 0.15
+#: Share of slides that come down where people are. Fewer slides (see REST)
+#: means each one has to matter, or the scene rumbles all evening and buries
+#: nobody: at 0.5 only 13% of slides caught anyone at all.
+MUDSLIDE_AIM_CHANCE = 0.85
+#: px the upper slope is scoured over one slide. Nine slides fit in a 300 s
+#: scene and the scour is cumulative, so this is really "how much fresh cliff
+#: the scene manufactures per run". At 26 px the map grew drops that killed
+#: more people by falling than the mud ever buried (42 falls vs 24 burials).
+MUDSLIDE_DROP = 9.0
+MUDSLIDE_BURY_SEC = 1.1          # seconds inside the moving span before it kills
+#: px of hillside that goes at once. Width is mostly a *panic* dial rather than
+#: a burial one: the aimed slides centre on somebody either way, but a wide
+#: span also panics the bystanders, and a panicking stickman walks off ledges a
+#: calm one refuses. Wide spans made the mudslide scene kill more people by
+#: falling than by burial.
+MUDSLIDE_SPAN_MIN, MUDSLIDE_SPAN_MAX = 90.0, 170.0
+#: px past the edge of the span a panicking stickman runs for. Measured to be
+#: inert as a safety dial (60 and 170 give identical death counts) - what makes
+#: a mudslide flight dangerous is the panic flag itself, not how far it aims.
+MUDSLIDE_FLEE_X = 170.0
 
-FLOOD_RISE = 40.0
-FLOOD_HOLD = 22.0
-FLOOD_FALL = 34.0
-DROWN_SEC = 7.0
+#: The surge envelope, and the most important build-rate dial in the file.
+#: behavior.py makes anyone whose ground is under the waterline flee uphill, so
+#: while the water is up most of the colony is running rather than working:
+#: the old 96 s wet / 24 s dry cycle spent 36% of all agent-time on FleeFrom
+#: and finished 2.3 structures per 300 s. 64 s wet / 95 s dry finishes 3.25 and
+#: still drowns people, because a surge that is *shorter* is not gentler.
+FLOOD_RISE = 28.0
+FLOOD_HOLD = 12.0
+FLOOD_FALL = 24.0
+FLOOD_DRY = 95.0                 # dry spell before the next surge
+FLOOD_DEPTH_FRAC = 0.45          # share of the terrain's relief the water covers
+DROWN_SEC = 5.5
+DROWN_DEPTH = 8.0                # px below the line before you are actually under
+FLOOD_PANIC = 2.0                # panic seconds while under the water
 
 SNOW_MAX_DEPTH = 3.2             # px the ground rises under a full snow layer
 SNOW_RATE = 0.055                # px/s
 ASH_MAX_DEPTH = 2.4
 ASH_RATE = 0.030
 
-BURN_DEATH_SEC = 3.0
-BURN_TOUCH_DIST = 13.0
-FLEE_DIST = 92.0
+#: Fire is tuned as "rare but nasty" rather than "constant and survivable".
+#: props.py spreads fire on its own and a burnt tree is wood the colony never
+#: gets, so the number of fires has to stay low (FIRE_RELIGHT_*) - which means
+#: each one has to earn its 1-3 deaths. Measured over 10 seeds x 300 s of
+#: wildfire: rare + gentle (6.0 s / 15 px) gives 0.9 deaths, rare + nasty
+#: (3.5 s / 22 px) gives 2.6, and both leave 3.2 structures standing where the
+#: old constant fire left 1.7.
+BURN_DEATH_SEC = 3.5             # seconds of unbroken contact before it kills
+BURN_TOUCH_DIST = 22.0           # horizontal reach of the flames
+BURN_TOUCH_HEIGHT = 45.0         # ...but not onto a ledge far above/below
+BURN_COOL_RATE = 1.2             # burn timer bleeds off this much faster once clear
+#: How near a fire you have to be to bolt. This is the single most lethal
+#: number in the file, because a panicking agent is allowed over ledges a calm
+#: one refuses (see actions.step_toward): at 92 px a wildfire kept most of the
+#: colony permanently panicking and killed 27 people per 10 runs by fall
+#: against 13 by fire. At 30 px only the people genuinely in danger run.
+FLEE_DIST = 30.0
+BURN_PANIC = 1.5                 # panic seconds granted per tick near flames
+FIRE_SPREAD_RATE = 0.15          # jumps/s from a lit prop to its neighbour
+FIRE_SPREAD_REACH = 80.0         # px the fire can reach for its next victim
+#: quiet spell before the hillside catches again once the last fire is out.
+#: Too short and the map is stripped bare inside a scene: every tree gone is
+#: wood the colony cannot build with (24 trees -> 1, and the build rate halved).
+FIRE_RELIGHT_MIN, FIRE_RELIGHT_MAX = 70.0, 140.0
+STRIKE_PANIC = 1.5               # panic seconds for everyone near a bolt
+STRIKE_PANIC_R = 130.0           # ...and how near that is
 
 SHAKE_DECAY = 3.4                # exponential decay rate of screen shake
 
@@ -168,7 +261,11 @@ def _iter(obj: Any, names: tuple[str, ...]) -> list[Any]:
 
 
 def _agents(world: Any) -> list[Any]:
-    return [a for a in _iter(world, ("agents", "stickmen", "people"))
+    # World keeps its roster in ``world.population`` (a Population, which is
+    # iterable) - it has no ``.agents`` attribute. Leaving that name out of the
+    # lookup made this return [] against the real World, which is why every
+    # hazard that iterates agents killed nobody: the loop body never ran.
+    return [a for a in _iter(world, ("agents", "population", "stickmen", "people"))
             if getattr(a, "alive", True)]
 
 
@@ -516,7 +613,9 @@ class EventSystem:
         self.slide_t: float = 0.0
         self.flood_y0: float | None = None
         self.flood_y1: float | None = None
+        self.flood_t: float = 0.0              # surge clock, resets per surge
         self._submerged: dict[int, float] = {}
+        self._buried: dict[int, float] = {}    # agent id -> s inside the slide
         self._burning: dict[int, float] = {}
         self._want_advance: bool = False
         self._cov_order: np.ndarray | None = None
@@ -540,6 +639,7 @@ class EventSystem:
             self._safe(handler, world, step)
         self._safe(self._tick_pending, world, step)
         self._safe(self._tick_quake, world, step)
+        self._safe(self._tick_panic, world, step)
         self._safe(self._publish, world, step)
 
         cfg = getattr(world, "cfg", None) or getattr(world, "config", None)
@@ -572,6 +672,28 @@ class EventSystem:
                 self.shake_amp = 0.0
         self.rumble = max(0.0, self.rumble - dt * 0.8)
         self.fireflies = False
+
+    def _tick_panic(self, world: Any, dt: float) -> None:
+        """Run the panic clock down.
+
+        The module docstring calls ``agent.panic`` a countdown in seconds and
+        events.py is its only writer - but nothing anywhere was decrementing
+        it. One hazard call therefore pinned an agent above zero forever, so
+        ``behavior.emergency_override`` kept returning True, the agent
+        re-decided every AI tick and stayed at flee speed for the rest of the
+        session. On cliff terrain that is a death sentence: measured over
+        5x300s of wildfire, fall deaths went 5 (no panic at all) -> 67 (panic,
+        no countdown) -> 32 (panic with this countdown), with burn deaths
+        unchanged at 7-8. Fleeing should be a spike, not a personality.
+        """
+        for ag in _agents(world):
+            left = _fnum(getattr(ag, "panic", 0.0), 0.0)
+            if left <= 0.0:
+                continue
+            try:
+                ag.panic = max(0.0, left - dt)
+            except Exception:
+                break
 
     def _publish(self, world: Any, dt: float) -> None:
         """Push the few values other subsystems read off us."""
@@ -706,6 +828,13 @@ class EventSystem:
         if self.next_strike <= 0.0:
             self.next_strike = self._rng.uniform(STRIKE_MIN, STRIKE_MAX)
             self._lightning_strike(world)
+        # A bolt can set a tree alight mid-storm (see _strike_damage), so the
+        # burn path has to run here too - it used to live only in the wildfire
+        # handler, which meant a storm fire was pure decoration. Rain still
+        # douses it below, so storm fires are short and usually survivable.
+        storm_fires = self._burning_props(world)
+        if storm_fires:
+            self._fire_harms_agents(world, dt, storm_fires)
         self._rain_douses(world, dt)
 
     def _lightning_strike(self, world: Any) -> None:
@@ -714,16 +843,23 @@ class EventSystem:
 
         # A "direct" strike has to actually aim. Rolling a uniform x across
         # 1280px and then killing only within 25px meant a direct hit landed on
-        # somebody with probability ~4%, so across a whole storm nobody was
-        # ever struck and feature 29 never once fired in testing. When the roll
-        # says direct, pick a victim and strike near them - slightly off, so it
-        # is still luck whether it lands.
+        # somebody with probability ~4%, so across a whole storm nobody was ever
+        # struck and feature 29 never once fired. So: pick a victim and strike
+        # near them - but the jitter has to stay inside DIRECT_KILL_RADIUS or
+        # the aim is a lie. At the old +/-34px against a 25px radius roughly one
+        # aimed bolt in three still landed too wide to hurt anyone. The final
+        # re-clamp keeps a bolt aimed at somebody hugging the screen edge from
+        # being shoved back out of its own kill radius.
         if direct:
             crowd = [a for a in _agents(world) if getattr(a, "alive", False)]
             if crowd:
                 victim = crowd[self._rng.randrange(len(crowd))]
-                x = _fnum(getattr(victim, "x", x), x) + self._rng.uniform(-34.0, 34.0)
+                vx = _fnum(getattr(victim, "x", x), x)
+                x = vx + self._rng.uniform(-DIRECT_AIM_JITTER, DIRECT_AIM_JITTER)
                 x = max(24.0, min(RENDER_W - 24.0, x))
+                if abs(x - vx) > DIRECT_KILL_RADIUS:
+                    x = vx + math.copysign(DIRECT_KILL_RADIUS * 0.5, x - vx)
+                    x = max(0.0, min(float(RENDER_W - 1), x))
         gy = _ground_y(world, x)
         self.strikes.append({
             "x": float(x), "t": 0.0,
@@ -732,6 +868,7 @@ class EventSystem:
         })
         if len(self.strikes) > 6:
             del self.strikes[0]
+        self._bump_strike_stat(world)
         if direct:
             _flash(world, 1.0, 0.45, LIGHTNING_COLOR)
             self.add_shake(7.5)
@@ -740,23 +877,44 @@ class EventSystem:
             _flash(world, self._rng.uniform(0.5, 0.85),
                    self._rng.uniform(0.22, 0.38), LIGHTNING_COLOR)
 
+    @staticmethod
+    def _bump_strike_stat(world: Any) -> None:
+        """World keeps a ``lightning_strikes`` counter that nothing was ever
+        incrementing. Best-effort; a world without stats is fine."""
+        try:
+            stats = getattr(world, "stats", None)
+            if isinstance(stats, dict):
+                stats["lightning_strikes"] = int(stats.get("lightning_strikes", 0)) + 1
+        except Exception:
+            pass
+
     def _strike_damage(self, world: Any, x: float, gy: float) -> None:
+        # A bolt is a vertical column, so the hit test is a *column* test.
+        # The old `hypot(ax - x, ay - gy)` compared the agent's own y against
+        # the ground under the bolt: on any slope that vertical term alone blew
+        # past the 25px radius, so even a bolt landing 8px away killed nobody.
+        # Guard the vertical only against being a whole terrace away.
         for ag in _agents(world):
             ax = _fnum(getattr(ag, "x", 1e9), 1e9)
             ay = _fnum(getattr(ag, "y", 1e9), 1e9)
-            if math.hypot(ax - x, ay - gy) <= DIRECT_KILL_RADIUS:
-                if _kill(world, ag, "was struck by lightning"):
-                    _chronicle(world, f"{getattr(ag, 'name', 'A stickman')} "
-                                      f"was struck by lightning.")
+            if abs(ax - x) > DIRECT_KILL_RADIUS:
+                continue
+            if abs(ay - _ground_y(world, ax)) > 120.0:
+                continue                       # airborne / on a tower, spared
+            if abs(ay - gy) > 120.0:
+                continue                       # different terrace entirely
+            if _kill(world, ag, "lightning"):
+                _chronicle(world, f"{getattr(ag, 'name', 'A stickman')} "
+                                  f"was struck by lightning.")
         _paint(world, x - SCORCH_HALF_WIDTH, x + SCORCH_HALF_WIDTH, MAT_ASH)
-        p = _nearest_flammable(world, x, 70.0)
+        p = _nearest_flammable(world, x, STRIKE_IGNITE_REACH)
         if p is not None:
             _ignite(world, p)
         for ag in _agents(world):
             ax = _fnum(getattr(ag, "x", 1e9), 1e9)
-            if abs(ax - x) < 180.0:
-                away = -180.0 if ax < x else 180.0
-                _panic(world, ag, ax + away, 3.0, "lightning")
+            if abs(ax - x) < STRIKE_PANIC_R:
+                away = -STRIKE_PANIC_R if ax < x else STRIKE_PANIC_R
+                _panic(world, ag, ax + away, STRIKE_PANIC, "lightning")
 
     def _rain_douses(self, world: Any, dt: float) -> None:
         if self.rain < 0.55:
@@ -764,7 +922,7 @@ class EventSystem:
         if self._rng.random() > dt * 0.25 * self.rain:
             return
         for p in _props(world):
-            if getattr(p, "burning", False):
+            if self._is_alight(p):        # structures included - they burn too
                 _extinguish(p)
                 break
 
@@ -785,54 +943,92 @@ class EventSystem:
         self._set_wind(dt, 0.55, 0.7, slow=0.33, fast=1.31)
         self.tint = (255, 176, 118)
         self.ember_rate = 0.55 + 0.45 * self.intensity
-        burning = [p for p in _props(world) if getattr(p, "burning", False)]
+        burning = self._burning_props(world)
         self.next_ignite -= dt
         if not burning and self.next_ignite <= 0.0:
-            self.next_ignite = self._rng.uniform(8.0, 20.0)
+            self.next_ignite = self._rng.uniform(FIRE_RELIGHT_MIN, FIRE_RELIGHT_MAX)
             x = self._rng.uniform(40.0, RENDER_W - 40.0)
             p = _nearest_flammable(world, x, RENDER_W)
             if p is not None and _ignite(world, p):
                 _chronicle(world, "A wildfire catches in the dry brush.")
         if burning:
             self._fire_harms_agents(world, dt, burning)
-            if self._rng.random() < dt * 0.35 * (0.3 + 0.7 * abs(self.wind)):
+            if self._rng.random() < dt * FIRE_SPREAD_RATE * (0.3 + 0.7 * abs(self.wind)):
                 lead = burning[self._rng.randrange(len(burning))]
                 fx = _fnum(getattr(lead, "x", 0.0))
-                nxt = _nearest_flammable(world, fx + 40.0 * (1 if self.wind >= 0 else -1), 120.0)
+                nxt = _nearest_flammable(world, fx + 40.0 * (1 if self.wind >= 0 else -1),
+                                         FIRE_SPREAD_REACH)
                 if nxt is not None:
                     _ignite(world, nxt)
 
+    @staticmethod
+    def _is_alight(obj: Any) -> bool:
+        """Props spell it ``burning``; Structure spells it ``is_burning``.
+
+        Only checking ``burning`` meant a hut fully ablaze was not fire as far
+        as this module was concerned - it neither burned anyone standing in it
+        nor spread. A ruined structure has stopped burning, so skip those.
+        """
+        if getattr(obj, "burning", False):
+            return True
+        return bool(getattr(obj, "is_burning", False)) and not getattr(obj, "is_ruined", False)
+
+    def _burning_props(self, world: Any) -> list[Any]:
+        """Everything currently alight, prop or structure, in any scene."""
+        return [p for p in _props(world) if self._is_alight(p)]
+
     def _fire_harms_agents(self, world: Any, dt: float, burning: list[Any]) -> None:
+        """Burn anyone standing in the flames; scare anyone merely near them.
+
+        Contact is measured as a *horizontal* reach with a loose vertical sanity
+        check. The old 2D ``hypot`` against the prop's anchor y meant that on a
+        slope - which is most of this map - an agent sharing a tree's column was
+        already 20-30px "away" and never accumulated a single burn tick, so
+        ``BURN_DEATH_SEC`` was unreachable and feature 30 never fired.
+        """
         fires = [(_fnum(getattr(p, "x", 1e9), 1e9), _fnum(getattr(p, "y", 1e9), 1e9))
                  for p in burning]
+        if not fires:
+            return
         for ag in _agents(world):
             aid = _aid(ag)
             ax = _fnum(getattr(ag, "x", 1e9), 1e9)
             ay = _fnum(getattr(ag, "y", 1e9), 1e9)
-            near = min((math.hypot(ax - fx, ay - fy) for fx, fy in fires),
-                       default=1e9)
-            if near < FLEE_DIST:
-                fx = min(fires, key=lambda f: math.hypot(ax - f[0], ay - f[1]))[0]
+            fx, fy = min(fires, key=lambda f: abs(ax - f[0]))
+            gap = abs(ax - fx)
+            if gap < FLEE_DIST:
                 away = ax + (140.0 if ax >= fx else -140.0)
-                _panic(world, ag, away, 2.5, "fire")
+                _panic(world, ag, away, BURN_PANIC, "fire")
             if aid is None:
                 continue
-            if near < BURN_TOUCH_DIST:
+            in_flames = gap <= BURN_TOUCH_DIST and abs(ay - fy) <= BURN_TOUCH_HEIGHT
+            if in_flames:
                 burnt = self._burning.get(aid, 0.0) + dt
                 self._burning[aid] = burnt
                 try:
                     ag.warmth = _clamp(_fnum(getattr(ag, "warmth", 0.5), 0.5) - dt * 0.4)
                 except Exception:
                     pass
+                try:
+                    ag.morale = _clamp(_fnum(getattr(ag, "morale", 0.5), 0.5) - dt * 0.25)
+                except Exception:
+                    pass
                 if burnt >= BURN_DEATH_SEC:
                     self._burning.pop(aid, None)
-                    if _kill(world, ag, "burned in the wildfire"):
+                    if _kill(world, ag, "fire"):
                         _chronicle(world, f"{getattr(ag, 'name', 'A stickman')} "
                                           f"burned in the wildfire.")
             elif aid in self._burning:
-                self._burning[aid] = max(0.0, self._burning[aid] - dt * 2.0)
+                # Getting clear is survivable: the timer bleeds off faster than
+                # it filled, so anyone who runs within a second or two lives.
+                self._burning[aid] = max(0.0, self._burning[aid] - dt * BURN_COOL_RATE)
                 if self._burning[aid] <= 0.0:
                     self._burning.pop(aid, None)
+        if len(self._burning) > 64:
+            # Someone who was mid-burn died of something else; drop the orphans
+            # rather than let the dict grow over an all-night run.
+            live = {i for i in (_aid(a) for a in _agents(world)) if i is not None}
+            self._burning = {k: v for k, v in self._burning.items() if k in live}
 
     # ===================================================== scene: mudslide ==
     def _scene_mudslide(self, world: Any, dt: float) -> None:
@@ -840,15 +1036,18 @@ class EventSystem:
         self._set_wind(dt, 0.4, 0.5)
         self.tint = (226, 214, 198)
         self.ember_rate = 0.0
+        self._expire_panic(world, dt)
         if self.slide_phase == "idle":
             self._pick_slide_span(world)
             self.slide_phase = "warn"
             self.slide_t = 0.0
+            self._buried.clear()
             _chronicle(world, "The hillside groans; loose earth begins to shift.")
         elif self.slide_phase == "warn":
             self.slide_t += dt
             self.rumble = _clamp(self.slide_t / MUDSLIDE_WARN)
             self.add_shake(1.4 * self.rumble)
+            self._warn_slide(world)
             if self.slide_t >= MUDSLIDE_WARN:
                 self.slide_phase = "slide"
                 self.slide_t = 0.0
@@ -861,6 +1060,7 @@ class EventSystem:
             if self.slide_t >= MUDSLIDE_SLIDE:
                 self.slide_phase = "settle"
                 self.slide_t = 0.0
+                self._buried.clear()
                 _paint(world, self.slide_x0, self.slide_x1, MAT_MUD)
                 _chronicle(world, "A mudslide reshapes the slope.")
         elif self.slide_phase == "settle":
@@ -868,12 +1068,35 @@ class EventSystem:
             self.rumble = max(0.0, 1.0 - self.slide_t / MUDSLIDE_SETTLE)
             if self.slide_t >= MUDSLIDE_SETTLE:
                 self.slide_phase = "done"
+                self.slide_t = 0.0
                 self._want_advance = True
+        else:
+            # "done" doubles as the cooldown. It used to be terminal: one slide
+            # and then an inert hillside for as long as the scene ran, because
+            # auto_scene_change is off by default so nothing ever reset the
+            # phase. Re-arm on a new span so the slope keeps failing.
+            self.slide_t += dt
+            if self.slide_t >= MUDSLIDE_REST:
+                self.slide_phase = "idle"
+                self.slide_t = 0.0
 
     def _pick_slide_span(self, world: Any) -> None:
-        width = self._rng.uniform(140.0, 260.0)
+        width = self._rng.uniform(MUDSLIDE_SPAN_MIN, MUDSLIDE_SPAN_MAX)
         h = _height(world)
         x0 = self._rng.uniform(0.0, max(1.0, RENDER_W - width))
+        crowd = _agents(world)
+        if crowd and self._rng.random() < MUDSLIDE_AIM_CHANCE:
+            # Always sliding the steepest face means mostly sliding empty
+            # hillside: whole scenes went by burying nobody. Half the time the
+            # slope that goes is one somebody is standing on. They still get
+            # the full MUDSLIDE_WARN of rumble to walk off it.
+            who = crowd[self._rng.randrange(len(crowd))]
+            cx = _fnum(getattr(who, "x", RENDER_W * 0.5), RENDER_W * 0.5)
+            cx += self._rng.uniform(-width * 0.25, width * 0.25)
+            self.slide_x0 = float(_clamp(cx - width * 0.5, 0.0,
+                                         max(0.0, RENDER_W - width)))
+            self.slide_x1 = float(min(RENDER_W, self.slide_x0 + width))
+            return
         if h is not None and h.size > 16:
             grad = np.gradient(h.astype(np.float32))
             win = max(8, int(width) // 8)
@@ -882,31 +1105,82 @@ class EventSystem:
             lo = int(width * 0.5)
             hi = max(lo + 1, int(h.size - width * 0.5))
             centre = int(np.argmax(smooth[lo:hi])) + lo
+            # Pure argmax picks the same face every cycle, so a long scene slid
+            # the one slope over and over. Wander off it a little.
+            centre += int(self._rng.uniform(-width, width))
             x0 = _clamp(centre - width * 0.5, 0.0, max(0.0, RENDER_W - width))
         self.slide_x0 = float(x0)
         self.slide_x1 = float(min(RENDER_W, x0 + width))
+
+    def _warn_slide(self, world: Any) -> None:
+        """Rumble phase: get anyone standing *on* the span moving.
+
+        Only agents actually on the doomed ground are panicked. The flag is
+        expensive - actions.py lets a panicking agent step off a drop it would
+        normally refuse - so scaring the whole neighbourhood traded a few
+        burials for a lot of broken necks. Everyone else is served by
+        ``hazards()``, which makes them flee without making them reckless.
+        """
+        x0, x1 = self.slide_x0, self.slide_x1
+        if x1 - x0 < 8.0:
+            return
+        if self.slide_t < MUDSLIDE_WARN * 0.45:
+            return                      # the ground only starts to go late on
+        mid = (x0 + x1) * 0.5
+        for ag in _agents(world):
+            ax = _fnum(getattr(ag, "x", 1e9), 1e9)
+            if x0 - 20.0 <= ax <= x1 + 20.0:
+                away = (x0 - MUDSLIDE_FLEE_X) if ax < mid else (x1 + MUDSLIDE_FLEE_X)
+                _panic(world, ag, away, MUDSLIDE_PANIC, "mudslide")
 
     def _slide_step(self, world: Any, dt: float) -> None:
         x0, x1 = self.slide_x0, self.slide_x1
         if x1 - x0 < 8.0:
             return
-        mid = (x0 + x1) * 0.5
-        amount = 26.0 * dt / max(0.1, MUDSLIDE_SLIDE)
-        _deform(world, x0, mid, amount)          # scour the upper slope
-        _deform(world, mid, x1, -amount * 0.85)  # pile it at the toe
+        # Terrain.deform(x0:int, x1:int, dy:float): +dy digs, -dy heaps, and the
+        # default 'smooth' blend tapers both ends, so scour and toe meet without
+        # a knife-edge step (a hard step here just made agents fall to death).
+        mid = x0 + (x1 - x0) * 0.5
+        amount = MUDSLIDE_DROP * dt / max(0.1, MUDSLIDE_SLIDE)
+        # Earth moves *downhill*. Splitting the span down the middle and always
+        # scouring the left half dug a pit beside a mound whenever the slope ran
+        # the other way: local relief grew every cycle and the map sprouted
+        # fresh cliffs to fall off. Scour whichever half is higher (smaller y).
+        h = _height(world)
+        high_first = True
+        if h is not None:
+            a, b, c = int(max(0.0, x0)), int(mid), int(min(float(h.size), x1))
+            if b > a and c > b:
+                high_first = float(h[a:b].mean()) <= float(h[b:c].mean())
+        if high_first:
+            _deform(world, x0, mid, amount)          # scour the upper slope
+            _deform(world, mid, x1, -amount * 0.75)  # pile it at the toe
+        else:
+            _deform(world, mid, x1, amount)
+            _deform(world, x0, mid, -amount * 0.75)
         _paint(world, x0, x1, MAT_MUD)
         for ag in _agents(world):
             ax = _fnum(getattr(ag, "x", 1e9), 1e9)
-            if x0 - 10.0 <= ax <= x1 + 10.0:
-                ay = _fnum(getattr(ag, "y", 0.0))
-                if ay >= _ground_y(world, ax) - 26.0:
-                    if _kill(world, ag, "was buried by the mudslide"):
+            aid = _aid(ag)
+            if x0 <= ax <= x1 and _fnum(getattr(ag, "y", 0.0)) >= _ground_y(world, ax) - 30.0:
+                # Inside the moving span and on the ground (not up a tower).
+                # A short grace period, so the 4s of rumble is a real warning:
+                # anyone still standing here when the earth arrives goes under.
+                if aid is None:
+                    continue
+                under = self._buried.get(aid, 0.0) + dt
+                self._buried[aid] = under
+                _panic(world, ag,
+                       (x0 - MUDSLIDE_FLEE_X) if ax < mid else (x1 + MUDSLIDE_FLEE_X),
+                       MUDSLIDE_PANIC, "mudslide")
+                if under >= MUDSLIDE_BURY_SEC:
+                    self._buried.pop(aid, None)
+                    if _kill(world, ag, "mudslide"):
                         _chronicle(world, f"{getattr(ag, 'name', 'A stickman')} "
                                           f"was buried by the mudslide.")
                 continue
-            edge = x0 if ax < x0 else x1
-            if abs(ax - edge) < 130.0:
-                _panic(world, ag, ax + (-140.0 if ax < x0 else 140.0), 3.0, "mudslide")
+            if aid is not None and aid in self._buried:
+                self._buried.pop(aid, None)      # got clear in time
 
     # ===================================================== scene: blizzard ==
     def _scene_blizzard(self, world: Any, dt: float) -> None:
@@ -942,34 +1216,51 @@ class EventSystem:
         self._set_wind(dt, 0.35, 0.4)
         self.tint = (206, 224, 246)
         self.ember_rate = 0.0
+        self._expire_panic(world, dt)
+        # The envelope runs off its own clock, not scene_t. scene_t only ever
+        # grows, so once the single surge had drained (96s in) the scene sat at
+        # u=0 with water_level None for the rest of its life - which is what
+        # "200s in SCENE_FLOOD and water_level is still None" was measuring.
+        self.flood_t += dt
         if self.flood_y0 is None or self.flood_y1 is None:
-            h = _height(world)
-            if h is not None:
-                low = float(np.max(h))
-                high = float(np.min(h))
-            else:
-                low, high = RENDER_H * 0.8, RENDER_H * 0.4
-            depth = _clamp(0.45 * (low - high), 40.0, 180.0)
-            self.flood_y0 = low + 4.0
-            self.flood_y1 = low - depth
-            _chronicle(world, "Water begins to pool in the low ground.")
-        t = self.scene_t
+            self._arm_flood(world)
+        t = self.flood_t
+        cycle = FLOOD_RISE + FLOOD_HOLD + FLOOD_FALL
         if t < FLOOD_RISE:
-            u = _smooth(t / FLOOD_RISE)
+            u = _smooth(t / FLOOD_RISE)              # ~40s to full height
         elif t < FLOOD_RISE + FLOOD_HOLD:
             u = 1.0
-        elif t < FLOOD_RISE + FLOOD_HOLD + FLOOD_FALL:
+        elif t < cycle:
             u = 1.0 - _smooth((t - FLOOD_RISE - FLOOD_HOLD) / FLOOD_FALL)
         else:
             u = 0.0
-            if not self._want_advance:
-                self._want_advance = True
+            if self.water_level is not None:
                 _chronicle(world, "The floodwater drains away.")
-        self.water_level = self.flood_y0 + (self.flood_y1 - self.flood_y0) * u
+            self._want_advance = True
+            if t >= cycle + FLOOD_DRY:              # nobody moved us on: again
+                self.flood_t = 0.0
+                self.flood_y0 = None
+                self.flood_y1 = None
         if u <= 0.0:
             self.water_level = None
+            self._submerged.clear()
             return
+        self.water_level = self.flood_y0 + (self.flood_y1 - self.flood_y0) * u
         self._flood_effects(world, dt, float(self.water_level))
+
+    def _arm_flood(self, world: Any) -> None:
+        """Fix the still-water line for one surge: y0 dry, y1 at full height."""
+        h = _height(world)
+        if h is not None:
+            low = float(np.max(h))                  # y grows downward: lowest ground
+            high = float(np.min(h))
+        else:
+            low, high = RENDER_H * 0.8, RENDER_H * 0.4
+        depth = _clamp(FLOOD_DEPTH_FRAC * (low - high), 40.0, 170.0)
+        self.flood_y0 = low + 4.0
+        self.flood_y1 = low - depth
+        self._submerged.clear()
+        _chronicle(world, "Water begins to pool in the low ground.")
 
     def _flood_effects(self, world: Any, dt: float, level: float) -> None:
         for p in _props(world):
@@ -985,26 +1276,42 @@ class EventSystem:
             ax = _fnum(getattr(ag, "x", 0.0))
             ay = _fnum(getattr(ag, "y", 0.0))
             aid = _aid(ag)
-            if ay <= level:
+            if ay <= level + DROWN_DEPTH:
+                # Dry, or no worse than ankle deep. The clock unwinds faster
+                # than it filled: reaching the shore is meant to save you.
                 if aid is not None and aid in self._submerged:
-                    self._submerged[aid] = max(0.0, self._submerged[aid] - dt)
+                    self._submerged[aid] = max(0.0, self._submerged[aid] - dt * 1.5)
+                    if self._submerged[aid] <= 0.0:
+                        self._submerged.pop(aid, None)
                 continue
-            target = ax
-            if dry is not None:
-                j = int(np.argmin(np.abs(dry - int(ax))))
-                target = float(dry[j])
-            else:
-                target = 20.0 if ax > RENDER_W * 0.5 else RENDER_W - 20.0
-            _panic(world, ag, target, 4.0, "flood")
+            # Under the line. Run for the nearest ground above the water; the
+            # drowning timer only pays out for whoever does not make it. The
+            # panic flag is what interrupts a job mid-swing - hazards() handles
+            # the ones who are merely near the water, without the recklessness.
+            _panic(world, ag, self._high_ground(world, ax, dry), FLOOD_PANIC, "flood")
             if aid is None:
                 continue
             sub = self._submerged.get(aid, 0.0) + dt
             self._submerged[aid] = sub
+            try:
+                ag.morale = _clamp(_fnum(getattr(ag, "morale", 0.5), 0.5) - dt * 0.08)
+            except Exception:
+                pass
             if sub >= DROWN_SEC:
                 self._submerged.pop(aid, None)
-                if _kill(world, ag, "drowned in the flood"):
+                if _kill(world, ag, "drown"):
                     _chronicle(world, f"{getattr(ag, 'name', 'A stickman')} "
-                                      f"drowned in the flood.")
+                                      f"drowned in the floodwater.")
+
+    def _high_ground(self, world: Any, ax: float, dry: np.ndarray | None) -> float:
+        """Nearest column standing clear of the water; failing that, the peak."""
+        if dry is not None and dry.size:
+            j = int(np.argmin(np.abs(dry - int(ax))))
+            return float(dry[j])
+        h = _height(world)
+        if h is not None:
+            return float(int(np.argmin(h)))
+        return 20.0 if ax > RENDER_W * 0.5 else RENDER_W - 20.0
 
     # ======================================================= scene: meteor ==
     def _scene_meteor(self, world: Any, dt: float) -> None:
@@ -1012,6 +1319,7 @@ class EventSystem:
         self._set_wind(dt, 0.3, 0.35)
         self.tint = (226, 226, 255)
         self.ember_rate = 0.25
+        self._expire_panic(world, dt)
         wt = _fnum(getattr(world, "world_time", self.t), self.t)
         self.fireflies = is_night(wt) and daylight_factor(wt) < 0.1
         self.next_meteor -= dt * (0.5 + 0.5 * self.intensity)
@@ -1052,26 +1360,79 @@ class EventSystem:
         self.meteors = keep
 
     def _meteor_impact(self, world: Any, x: float, y: float) -> None:
-        r = self._rng.uniform(18.0, 40.0)
+        r = self._rng.uniform(16.0, 34.0)
+        # Terrain.crater is (cx:int, radius:int, depth:float) - column based,
+        # no y at all. _crater() adapts to that; the y here is only used to
+        # decide who was standing close enough to be under it.
         _crater(world, x, y, r)
         _paint(world, x - r * 0.9, x + r * 0.9, MAT_ASH)
         _flash(world, 0.85, 0.35, METEOR_COLOR)
         self.add_shake(9.0)
         self.trigger_quake(world, 1.2, 4.0)
-        p = _nearest_flammable(world, x, r * 2.5)
+        p = _nearest_flammable(world, x, r * METEOR_IGNITE_REACH)
         if p is not None:
             _ignite(world, p)
+        blast = max(9.0, r * METEOR_BLAST)
+        killed = 0
         for ag in _agents(world):
             ax = _fnum(getattr(ag, "x", 1e9), 1e9)
             ay = _fnum(getattr(ag, "y", 1e9), 1e9)
             d = math.hypot(ax - x, ay - y)
-            if d <= r:
-                if _kill(world, ag, "was crushed by a meteor"):
+            if d <= blast:
+                if _kill(world, ag, "meteor"):
+                    killed += 1
                     _chronicle(world, f"{getattr(ag, 'name', 'A stickman')} "
                                       f"was crushed by a falling star.")
-            elif d < r * 5.0:
-                _panic(world, ag, ax + (150.0 if ax >= x else -150.0), 3.0, "meteor")
-        _chronicle(world, "A meteor slams into the hillside.")
+            elif d < r * 3.0:
+                _panic(world, ag, ax + (150.0 if ax >= x else -150.0), METEOR_PANIC, "meteor")
+        if killed == 0 and self._rng.random() < 0.3:
+            # One line per rock would drown the chronicle - impacts are common,
+            # a stickman dying under one is not.
+            _chronicle(world, "A meteor slams into the hillside.")
+
+    # ================================================== hazards / panic aid ==
+    def hazards(self) -> list[dict[str, Any]]:
+        """Live danger zones, read by ``actions.hazards_of`` (behavior.py).
+
+        Nothing used to publish these, so ``_danger_for`` always came back
+        empty: FleeFrom scored 0 and no stickman ever ran from a flood, a slope
+        about to go, or an incoming rock. ``water_y`` is the shape behavior.py
+        expects for a waterline (it makes the flee uphill).
+        """
+        out: list[dict[str, Any]] = []
+        level = self.water_level
+        if level is not None:
+            out.append({"kind": "flood", "x": RENDER_W * 0.5, "y": float(level),
+                        "water_y": float(level), "radius": float(RENDER_W)})
+        if self.scene == SCENE_MUDSLIDE and self.slide_phase in ("warn", "slide"):
+            x0, x1 = self.slide_x0, self.slide_x1
+            if x1 - x0 >= 8.0:
+                out.append({"kind": "mudslide", "x": (x0 + x1) * 0.5,
+                            "y": RENDER_H * 0.6, "radius": (x1 - x0) * 0.5 + 70.0})
+        for m in self.meteors:
+            if not isinstance(m, dict) or not m.get("impact") or m.get("done"):
+                continue
+            out.append({"kind": "meteor", "x": _fnum(m.get("x1"), RENDER_W * 0.5),
+                        "y": _fnum(m.get("y1"), RENDER_H * 0.7),
+                        "radius": METEOR_WARN_R})
+        return out
+
+    def _expire_panic(self, world: Any, dt: float) -> None:
+        """Count the panic timer down for everyone.
+
+        ``_panic`` sets ``agent.panic`` in seconds but nothing in the sim ever
+        decremented it, so a single scare left an agent permanently "in an
+        emergency": behavior.emergency_override kept returning True and every
+        in-flight job was re-decided for the rest of the session. The scenes
+        that raise the flag lower it again.
+        """
+        for ag in _agents(world):
+            try:
+                p = _fnum(getattr(ag, "panic", 0.0), 0.0)
+                if p > 0.0:
+                    ag.panic = max(0.0, p - dt)
+            except Exception:
+                return
 
     # ====================================================== scene: ashfall ==
     def _scene_ashfall(self, world: Any, dt: float) -> None:
@@ -1139,11 +1500,13 @@ class EventSystem:
         self.water_level = None
         self.flood_y0 = None
         self.flood_y1 = None
+        self.flood_t = 0.0
         self.slide_phase = "idle"
         self.slide_t = 0.0
         self.rumble = 0.0
         self.ember_rate = 0.0
         self._submerged.clear()
+        self._buried.clear()
         self._burning.clear()
         self.next_strike = self._rng.uniform(2.0, 6.0)
         self.next_meteor = self._rng.uniform(1.0, 3.0)
@@ -1213,6 +1576,8 @@ class EventSystem:
             "slide_t": float(self.slide_t),
             "flood_y0": None if self.flood_y0 is None else float(self.flood_y0),
             "flood_y1": None if self.flood_y1 is None else float(self.flood_y1),
+            "flood_t": float(self.flood_t),
+            "buried": {str(k): float(v) for k, v in self._buried.items()},
             "next_strike": float(self.next_strike),
             "next_meteor": float(self.next_meteor),
             "next_ignite": float(self.next_ignite),
@@ -1272,6 +1637,8 @@ class EventSystem:
         f0, f1 = d.get("flood_y0"), d.get("flood_y1")
         ev.flood_y0 = None if f0 is None else _fnum(f0, 0.0)
         ev.flood_y1 = None if f1 is None else _fnum(f1, 0.0)
+        ev.flood_t = max(0.0, _fnum(d.get("flood_t"), 0.0))
+        ev._buried = _intmap(d.get("buried"))
         ev.next_strike = max(0.0, _fnum(d.get("next_strike"), 5.0))
         ev.next_meteor = max(0.0, _fnum(d.get("next_meteor"), 2.0))
         ev.next_ignite = max(0.0, _fnum(d.get("next_ignite"), 0.5))

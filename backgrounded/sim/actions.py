@@ -33,16 +33,22 @@ from ..constants import (
     RES_WOOD,
     WALK_SPEED,
 )
-from .entities import GROUND_SNAP
+from .entities import GROUND_SNAP, STEP_DROP_MAX
 
 #: Ground drop, in px, that counts as a ledge rather than a slope. Roughly a
-#: body height: below this a stickman steps down, above it they would have to
-#: jump, and only a panicking one does.
+#: body height: below this a stickman steps down, above it they have to climb
+#: down (or, panicking, jump).
 CLIFF_DROP = 46.0
 
 #: How far ahead to probe the ground for a ledge, in px. Must be several
 #: times the per-tick step or a cliff edge is invisible until you are over it.
 CLIFF_LOOKAHEAD = 14.0
+
+#: Seconds an agent may stand blocked by terrain before it gives the goal up.
+#: The action timeouts below are 75-120 s; waiting that long to notice a wall
+#: burns a third of a run standing still, which is how "safe" pathing cost the
+#: colony two thirds of its buildings.
+BLOCKED_GIVE_UP = 2.0
 from .structures import Structure, StructureRegistry
 
 log = logging.getLogger(__name__)
@@ -732,6 +738,92 @@ def _plant(agent: Any, gy: float) -> None:
     agent.fall_t = 0.0
 
 
+def _clear_blocked(agent: Any) -> None:
+    try:
+        agent._blocked_t = 0.0
+    except Exception:
+        pass
+
+
+def _note_blocked(agent: Any, dt: float) -> None:
+    """Count time spent stuck against terrain; give the goal up past the limit.
+
+    Refusing a ledge without this is how the cliff guard walled the map off:
+    the agent stood at the lip until its action timed out 90 s later, having
+    done nothing. There is no second path to try - the ground is a function of
+    x, so "re-route" means picking a different goal - and failing the action is
+    what makes world._tick_agents re-score on the next tick.
+    """
+    try:
+        t = float(getattr(agent, "_blocked_t", 0.0) or 0.0) + max(0.0, float(dt))
+        agent._blocked_t = t
+        if t < BLOCKED_GIVE_UP:
+            return
+        agent._blocked_t = 0.0
+        act = getattr(agent, "action", None)
+        if act is not None and not getattr(act, "finished", True):
+            act.failed = True
+    except Exception:
+        log.debug("_note_blocked failed", exc_info=True)
+
+
+def _descend(agent: Any, world: Any, d: float, dt: float) -> float:
+    """Ask the agent to climb down the face ahead. Returns px covered.
+
+    entities owns the climb: it has the slip roll, the surface attachment and
+    the descent rate limit already. Duplicating any of that here would give
+    two subtly different cliffs depending on which module moved the agent.
+    """
+    fn = getattr(agent, "descend_step", None)
+    if not callable(fn):
+        return 0.0                      # a stub agent: fall back to refusing
+    try:
+        return float(fn(dt, getattr(world, "terrain", None),
+                        direction=d, rng=rng_of(world)) or 0.0)
+    except Exception:
+        log.debug("descend_step failed", exc_info=True)
+        return 0.0
+
+
+def _ledge_step(
+    agent: Any, world: Any, tx: float, d: float, dt: float, gy_now: float,
+) -> float:
+    """One tick of crossing a ledge: creep to the lip, then climb down it."""
+    if not getattr(agent, "on_ground", True):
+        return abs(tx - float(agent.x))      # already airborne; entities owns it
+
+    # Judge the step we are about to take, not the walking one we gave up on.
+    # A 1.1px walk step can reach over a lip that the 0.5px climb step does
+    # not, and asking for a descent there finds no drop to descend, reports
+    # failure, and parks the agent 0.7px short of the edge forever.
+    nx = _clamp_x(float(agent.x) + d * CLIMB_SPEED * max(0.0, dt))
+    gy_next = ground_y(world, nx)
+    if nx != float(agent.x) and gy_next - gy_now <= STEP_DROP_MAX:
+        # Still on the flat above the lip. Close the gap at climb speed so we
+        # arrive at the edge under control rather than at a walking sprint.
+        _clear_blocked(agent)
+        agent.x = nx
+        agent.vx = d * CLIMB_SPEED
+        _plant(agent, gy_next)
+        return abs(tx - float(agent.x))
+
+    if _descend(agent, world, d, dt) > 0.0:
+        _clear_blocked(agent)
+        act = getattr(agent, "action", None)
+        if act is not None:
+            act.pose = "climb"
+        return abs(tx - float(agent.x))
+
+    # No descent happened. Either the agent slipped - in which case it is
+    # airborne and entities owns it now - or the face is impassable and we
+    # stand, then give up.
+    if getattr(agent, "on_ground", True):
+        agent.vx = 0.0
+        _plant(agent, gy_now)
+        _note_blocked(agent, dt)
+    return abs(tx - float(agent.x))
+
+
 def step_toward(
     agent: Any,
     world: Any,
@@ -748,6 +840,7 @@ def step_toward(
         dist = abs(dx)
         if dist <= arrive:
             agent.vx = 0.0
+            _clear_blocked(agent)
             return dist
         d = 1.0 if dx > 0.0 else -1.0
         _face(agent, d)
@@ -776,14 +869,23 @@ def step_toward(
         # test never fires: agents walked straight off a 146px drop measuring
         # it 8px at a time. LOOKAHEAD is what makes the edge visible.
         gy_ahead = ground_y(world, _clamp_x(float(agent.x) + d * CLIFF_LOOKAHEAD))
-        drop = max(gy_next - gy_now, gy_ahead - gy_now)
+        drop_now = gy_next - gy_now
         panicking = float(getattr(agent, "panic", 0.0) or 0.0) > 0.0
-        if drop > CLIFF_DROP and not panicking:
-            agent.vx = 0.0
-            _plant(agent, gy_now)
-            agent._blocked_t = getattr(agent, "_blocked_t", 0.0) + dt
-            return abs(tx - float(agent.x))
-        agent._blocked_t = 0.0
+        # Two ways to be at a ledge: one is coming up within a body width, or
+        # this very step drops further than a walk can absorb. The second test
+        # matters once agents are allowed *onto* faces - halfway down a cliff
+        # the remaining drop is often under CLIFF_DROP, so only the lookahead
+        # test would let go of the surface and hand the rest to gravity. That
+        # was 17 of 24 fall deaths in a three-seed trace.
+        if not panicking and (max(drop_now, gy_ahead - gy_now) > CLIFF_DROP
+                              or drop_now > STEP_DROP_MAX):
+            # Refusing a ledge outright kept everyone alive and cut the colony
+            # from 3 completed structures per 300s to 1, because whole regions
+            # - and the wood and stone in them - stopped being reachable.
+            # Climb down instead: attached to the face, so it costs time and a
+            # slip chance rather than a life.
+            return _ledge_step(agent, world, tx, d, dt, gy_now)
+        _clear_blocked(agent)
 
         agent.x = nx
         agent.vx = d * spd
@@ -2083,3 +2185,41 @@ if __name__ == "__main__":  # pragma: no cover - headless smoke test
         assert rt.kind == act.kind
         print(f"  {kind:16s} -> {act.phase:9s} done={act.done} failed={act.failed}")
     print("junk action:", Action.from_dict({"kind": "Nope"}))
+
+    # ---- ledges: crossable by climbing down, and never a silent standstill --
+    from .entities import Stickman
+
+    class _Cliff:
+        """Flat, a 150px face over 6px of run, then flat again."""
+
+        def ground_y(self, x: float) -> float:
+            x = float(x)
+            if x <= 600.0:
+                return 500.0
+            if x >= 606.0:
+                return 650.0
+            return 500.0 + 150.0 * (x - 600.0) / 6.0
+
+        def slope(self, x: float) -> float:
+            return 25.0 if 600.0 < float(x) < 606.0 else 0.0
+
+    cw = _World()
+    cw.terrain = _Cliff()
+    walker = Stickman(id=9, name="Ledge", x=560.0, y=500.0)
+    for _ in range(int(30 * 40)):
+        step_toward(walker, cw, 900.0, 1 / 30)
+        walker.apply_physics(1 / 30, cw.terrain)
+        if walker.x > 640.0:
+            break
+    print(f"ledge: x={walker.x:.1f} y={walker.y:.1f} alive={walker.alive}")
+    assert walker.alive, "climbing down a 150px ledge should not kill anyone"
+    assert walker.x > 640.0, f"never got across the ledge (x={walker.x:.1f})"
+
+    # An agent that cannot get onto the face at all must abandon the goal
+    # rather than stand at the lip until the action's 90s timeout.
+    stuck = _Agent(2, 600.5)          # on the face; a stub has no descend_step
+    stuck.action = make_action("Wander")
+    for _ in range(int(30 * (BLOCKED_GIVE_UP + 0.5))):
+        _ledge_step(stuck, cw, 900.0, 1.0, 1 / 30, cw.terrain.ground_y(stuck.x))
+    assert stuck.action.failed, "a blocked agent never gave its goal up"
+    print(f"blocked: goal abandoned after {BLOCKED_GIVE_UP}s")
