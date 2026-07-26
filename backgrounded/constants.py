@@ -68,7 +68,55 @@ RES_STONE = "stone"
 RES_FOOD = "food"
 RES_COOKED = "cooked"
 RES_FIBRE = "fibre"
-ALL_RESOURCES = (RES_WOOD, RES_STONE, RES_FOOD, RES_COOKED, RES_FIBRE)
+RES_HIDE = "hide"                 # taken from a killed animal; makes armour
+ALL_RESOURCES = (RES_WOOD, RES_STONE, RES_FOOD, RES_COOKED, RES_FIBRE, RES_HIDE)
+
+# ------------------------------------------------------------------ combat --
+#: Stickmen have health only because something can now hurt them. Everything
+#: else that kills is instant (a fall, a strike, drowning); animals are the
+#: first threat you can survive, fight, and be wounded by.
+MAX_HEALTH = 100.0
+HEALTH_REGEN_PER_SEC = 1.0 / 6.0   # a scratch heals in a minute or so
+
+WEAPON_NONE = ""
+WEAPON_SPEAR = "spear"
+#: A spear is the difference between prey and a hunting party. Unarmed agents
+#: flee; armed ones will stand and fight.
+SPEAR_DAMAGE = 26.0
+SPEAR_REACH = 26.0
+SPEAR_COOLDOWN = 1.1
+SPEAR_COST = {RES_WOOD: 2, RES_STONE: 1}
+
+ARMOUR_NONE = 0.0
+ARMOUR_LEATHER = 0.45              # fraction of incoming damage absorbed
+ARMOUR_COST = {RES_HIDE: 2, RES_FIBRE: 1}
+
+# ----------------------------------------------------------------- animals --
+ANIMAL_WOLF = "wolf"
+ANIMAL_BEAR = "bear"
+ANIMAL_BOAR = "boar"
+ANIMAL_KINDS = (ANIMAL_WOLF, ANIMAL_BEAR, ANIMAL_BOAR)
+
+#: (max_health, damage/s, speed px/s, hides dropped, pack size)
+ANIMAL_STATS: dict[str, tuple[float, float, float, int, int]] = {
+    ANIMAL_WOLF: (58.0,  8.0, 46.0, 1, 3),
+    ANIMAL_BEAR: (140.0, 15.0, 30.0, 3, 1),
+    ANIMAL_BOAR: (78.0, 11.0, 54.0, 2, 1),
+}
+
+#: Seconds between attempted incursions. A pack that arrives every couple of
+#: minutes is a threat; one that arrives constantly is just a death clock.
+ANIMAL_SPAWN_MIN = 150.0
+ANIMAL_SPAWN_MAX = 420.0
+ANIMAL_MAX_ALIVE = 4
+ANIMAL_LEAVE_SEC = 90.0            # give up and wander off after this long
+
+# --------------------------------------------------------------------- ufo --
+#: Rare enough to be an event you tell someone about.
+UFO_INTERVAL_MIN = 420.0
+UFO_INTERVAL_MAX = 1500.0
+UFO_BEAM_SEC = 4.5                 # hover + beam before the lift completes
+UFO_RETURN_CHANCE = 0.25           # sometimes they get dropped back, dazed
 
 # ------------------------------------------------------------------ scenes --
 SCENE_NIGHT_STORM = "night_storm"

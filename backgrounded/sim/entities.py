@@ -52,8 +52,12 @@ from ..constants import (
     SCENE_BLIZZARD,
     SCENE_NIGHT_STORM,
     SCENE_WILDFIRE,
+    ARMOUR_NONE,
+    HEALTH_REGEN_PER_SEC,
+    MAX_HEALTH,
     STICK_PALETTE,
     WALK_SPEED,
+    WEAPON_NONE,
 )
 from .names import (
     ADULT_ROLES,
@@ -289,6 +293,22 @@ class Stickman:
     # --- behaviour --------------------------------------------------------
     action: "Action | None" = None
     holds_candle: bool = False
+
+    # --- combat & gear ---------------------------------------------------
+    # health exists because animals are the first threat you can *survive*.
+    # Everything else that kills is instantaneous, so until now an agent was
+    # simply alive or not.
+    health: float = MAX_HEALTH
+    weapon: str = WEAPON_NONE          # "" | "spear"
+    armour: float = ARMOUR_NONE        # 0..1 fraction of damage absorbed
+    attack_cd: float = 0.0             # seconds until the next swing lands
+    target_animal: int | None = None   # animal id this agent is fighting
+
+    # --- abduction -------------------------------------------------------
+    # Taken is not the same as dead: no corpse, no grave, and they may come
+    # back. lift_t drives the beam animation in render/.
+    taken: bool = False
+    lift_t: float = 0.0
     alive: bool = True
     anim_t: float = 0.0                   # animation phase accumulator
 
@@ -514,6 +534,25 @@ class Stickman:
         return " - ".join(bits)
 
     # -------------------------------------------------------------- death --
+    def hurt(self, amount: float, cause: str = "mauled") -> bool:
+        """Take damage through armour. Returns True if this killed them.
+
+        Armour is a flat fraction absorbed rather than a hit-point pool: a
+        stickman in leather takes roughly half as long to bring down, which is
+        the difference between a wolf pack being a funeral and being a fight.
+        """
+        if not self.alive or amount <= 0.0:
+            return False
+        taken = float(amount) * (1.0 - _clamp(self.armour, 0.0, 0.9))
+        self.health = max(0.0, self.health - taken)
+        if self.health <= 0.0:
+            return self.die(cause)
+        return False
+
+    def heal(self, dt: float) -> None:
+        if self.alive and self.health < MAX_HEALTH:
+            self.health = min(MAX_HEALTH, self.health + HEALTH_REGEN_PER_SEC * dt)
+
     def die(self, cause: str = "") -> bool:
         """Kill this agent. Idempotent; returns True only on the transition.
 
@@ -869,6 +908,13 @@ class Stickman:
             "generation": int(self.generation),
             "action": action_state,
             "holds_candle": bool(self.holds_candle),
+            "health": float(self.health),
+            "weapon": str(self.weapon),
+            "armour": float(self.armour),
+            "attack_cd": float(self.attack_cd),
+            "target_animal": self.target_animal,
+            "taken": bool(self.taken),
+            "lift_t": float(self.lift_t),
             "alive": bool(self.alive),
             "anim_t": float(self.anim_t),
             "target_x": None if self.target_x is None else float(self.target_x),
@@ -914,6 +960,14 @@ class Stickman:
         s.role = role if is_role(role) else ROLE_GATHERER
         s.generation = max(0, _i(d.get("generation"), 0))
         s.holds_candle = _b(d.get("holds_candle"), False)
+        s.health = _f(d.get("health"), MAX_HEALTH)
+        s.weapon = _s(d.get("weapon"), WEAPON_NONE) if "_s" in globals() else str(d.get("weapon") or WEAPON_NONE)
+        s.armour = _f(d.get("armour"), ARMOUR_NONE)
+        s.attack_cd = _f(d.get("attack_cd"), 0.0)
+        ta = d.get("target_animal")
+        s.target_animal = int(ta) if isinstance(ta, (int, float)) else None
+        s.taken = _b(d.get("taken"), False)
+        s.lift_t = _f(d.get("lift_t"), 0.0)
         s.alive = _b(d.get("alive"), True)
         s.anim_t = _f(d.get("anim_t"), 0.0)
 
