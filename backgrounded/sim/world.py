@@ -1,0 +1,289 @@
+"""World - the simulation aggregate root.
+
+Owns every piece of sim state and drives the fixed-timestep tick. Contains no
+pygame and no rendering: this module must stay importable and runnable headless
+so the simulation can be tested without a display.
+
+Fail-soft policy: each subsystem tick is individually guarded. A subsystem that
+raises is logged once and disabled for the rest of the session rather than
+taking the whole program down - this app runs unattended for hours.
+"""
+from __future__ import annotations
+
+import logging
+import random
+from collections import deque
+from typing import Any
+
+import numpy as np
+
+from ..constants import (
+    AI_TICKS, ALL_RESOURCES, DAY_LENGTH_SEC, RENDER_H, RENDER_W,
+    RES_FOOD, RES_STONE, RES_WOOD, SCENE_NIGHT_STORM, SAVE_VERSION,
+)
+from . import behavior, names
+from .entities import Population, Stickman
+from .events import EventSystem
+from .lighting import Lighting, LightSource
+from .props import PropRegistry, scatter
+from .structures import StructureRegistry
+from .terrain import Terrain
+
+log = logging.getLogger(__name__)
+
+CHRONICLE_MAX = 400
+
+
+class World:
+    """Everything that persists across a restart."""
+
+    def __init__(self, seed: int | None = None, scene: str = SCENE_NIGHT_STORM) -> None:
+        self.seed: int = int(seed if seed is not None else random.randrange(1 << 30))
+        self.rng: np.random.Generator = np.random.default_rng(self.seed)
+        self.pyrng: random.Random = random.Random(self.seed ^ 0x5EED)
+
+        self.world_time: float = 0.0      # seconds since world creation
+        self.tick_count: int = 0
+
+        self.terrain: Terrain = Terrain.generate(self.seed, style=self._pick_style())
+        self.props: PropRegistry = scatter(
+            self.terrain, self.rng,
+            {"tree": 14, "rock": 8, "bush": 10, "boulder": 3},
+        )
+        self.structures: StructureRegistry = StructureRegistry()
+        self.population: Population = Population()
+        self.lighting: Lighting = Lighting()
+        self.events: EventSystem = EventSystem(scene=scene)
+
+        # Colony-level state
+        self.stockpile: dict[str, int] = {r: 0 for r in ALL_RESOURCES}
+        self.build_queue: list[str] = []
+        self.chronicle: deque[str] = deque(maxlen=CHRONICLE_MAX)
+        self.stats: dict[str, int] = {
+            "born": 0, "died": 0, "built": 0, "trees_felled": 0,
+            "lightning_strikes": 0, "generations": 1,
+        }
+
+        # Subsystems that have failed and been disabled this session.
+        self._disabled: set[str] = set()
+
+        self._seed_population()
+
+    # ------------------------------------------------------------ startup --
+    def _pick_style(self) -> str:
+        return str(self.rng.choice(["hills", "cliffs", "plateau", "chasm", "valley"]))
+
+    def _seed_population(self, n: int = 4) -> None:
+        used: set[str] = set()
+        for i in range(n):
+            x = float(self.rng.uniform(RENDER_W * 0.2, RENDER_W * 0.8))
+            s = self.population.spawn(
+                x=x,
+                y=self.terrain.ground_y(x),
+                name=names.new_name(self.pyrng, used),
+                generation=1,
+                birth_time=0.0,
+            )
+            used.add(s.name)
+            s.role = "gatherer" if i % 2 else "builder"
+        # Exactly one candle-bearer, per the spec's night-storm scene.
+        alive = self.population.alive_agents()
+        if alive:
+            alive[0].holds_candle = True
+            alive[0].role = "elder"
+        self.log_event(f"A group of {n} arrives in a new land.")
+
+    # --------------------------------------------------------------- time --
+    @property
+    def day_fraction(self) -> float:
+        """0.0 = midnight, 0.5 = noon."""
+        return (self.world_time % DAY_LENGTH_SEC) / DAY_LENGTH_SEC
+
+    @property
+    def is_night(self) -> bool:
+        f = self.day_fraction
+        return f < 0.25 or f > 0.75
+
+    # --------------------------------------------------------------- tick --
+    def tick(self, dt: float) -> None:
+        self.world_time += dt
+        self.tick_count += 1
+
+        self._guarded("events", self.events.tick, self, dt)
+        self._guarded("props", self.props.tick, self, dt)
+        self._guarded("structures", self.structures.tick, self, dt)
+        self._guarded("agents", self._tick_agents, dt)
+        self._guarded("lights", self._rebuild_lights)
+        self._guarded("lighting", self.lighting.tick, dt)
+        self._guarded("colony", self._tick_colony, dt)
+
+    def _guarded(self, name: str, fn, *args) -> None:
+        if name in self._disabled:
+            return
+        try:
+            fn(*args)
+        except Exception:
+            log.exception("subsystem %r failed; disabling for this session", name)
+            self._disabled.add(name)
+
+    def _tick_agents(self, dt: float) -> None:
+        ai_due = (self.tick_count % AI_TICKS) == 0
+        for agent in self.population.alive_agents():
+            agent.update_needs(dt, self)
+
+            if ai_due or agent.action is None or agent.action.done or agent.action.failed:
+                try:
+                    agent.action = behavior.choose_action(agent, self)
+                except Exception:
+                    log.exception("choose_action failed for %s", agent.name)
+                    agent.action = None
+
+            if agent.action is not None:
+                try:
+                    agent.action.update(agent, self, dt)
+                except Exception:
+                    log.exception("action %r failed for %s",
+                                  agent.action.kind, agent.name)
+                    agent.action.failed = True
+
+            agent.apply_physics(dt, self.terrain)
+
+        self._reap_dead(dt)
+
+    def _reap_dead(self, dt: float) -> None:
+        """Turn fresh corpses into graves and bring in a replacement."""
+        for agent in list(self.population.agents):
+            if agent.alive:
+                continue
+            agent.dead_t += dt
+            if agent.dead_t < 2.0 or agent.__dict__.get("_buried"):
+                continue
+            agent.__dict__["_buried"] = True
+            self.props.add_grave(agent.x, self.terrain.ground_y(agent.x), agent.name)
+            self.stats["died"] += 1
+            self.log_event(names.describe_event("death", name=agent.name))
+            self._spawn_replacement()
+
+    def _spawn_replacement(self) -> None:
+        used = {a.name for a in self.population.agents}
+        gen = self.population.generation + 1
+        self.population.generation = gen
+        self.stats["generations"] = max(self.stats["generations"], gen)
+        x = float(self.rng.uniform(RENDER_W * 0.1, RENDER_W * 0.9))
+        s = self.population.spawn(
+            x=x, y=self.terrain.ground_y(x),
+            name=names.new_name(self.pyrng, used),
+            generation=gen, birth_time=self.world_time,
+        )
+        self.stats["born"] += 1
+        # Keep exactly one candle in the world.
+        if not any(a.holds_candle for a in self.population.alive_agents()):
+            s.holds_candle = True
+        self.log_event(names.describe_event("arrival", name=s.name, generation=gen))
+
+    def _rebuild_lights(self) -> None:
+        """Lights are derived state - rebuilt from scratch every tick."""
+        srcs: list[LightSource] = []
+        for agent in self.population.alive_agents():
+            if agent.holds_candle and agent.__dict__.get("candle_lit", True):
+                srcs.append(LightSource(
+                    x=agent.x, y=agent.y - 14.0, radius=118.0,
+                    color=(255, 186, 92), intensity=0.85, flicker=0.30,
+                    kind="candle", owner_id=agent.id,
+                ))
+        for st in self.structures.all():
+            ls = st.light_source()
+            if ls:
+                srcs.append(LightSource(**ls))
+        for prop in self.props.burning():
+            srcs.append(LightSource(
+                x=prop.x, y=prop.y - 18.0, radius=150.0,
+                color=(255, 130, 40), intensity=0.95, flicker=0.45,
+                kind="fire", owner_id=None,
+            ))
+        self.lighting.sources = srcs
+
+    def _tick_colony(self, dt: float) -> None:
+        self.build_queue = behavior.plan_build_queue(self)
+        behavior.assign_roles(self)
+
+    # ------------------------------------------------------------ helpers --
+    def log_event(self, text: str) -> None:
+        stamp = f"[day {int(self.world_time // DAY_LENGTH_SEC) + 1}]"
+        self.chronicle.append(f"{stamp} {text}")
+
+    def take(self, resource: str, qty: int) -> bool:
+        if self.stockpile.get(resource, 0) >= qty:
+            self.stockpile[resource] -= qty
+            return True
+        return False
+
+    def give(self, resource: str, qty: int) -> None:
+        self.stockpile[resource] = self.stockpile.get(resource, 0) + qty
+
+    def agent_by_id(self, aid: int) -> Stickman | None:
+        for a in self.population.agents:
+            if a.id == aid:
+                return a
+        return None
+
+    # -------------------------------------------------------- persistence --
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": SAVE_VERSION,
+            "seed": self.seed,
+            "world_time": self.world_time,
+            "tick_count": self.tick_count,
+            "terrain": self.terrain.to_dict(),
+            "props": self.props.to_dict(),
+            "structures": self.structures.to_dict(),
+            "population": self.population.to_dict(),
+            "lighting": self.lighting.to_dict(),
+            "events": self.events.to_dict(),
+            "stockpile": dict(self.stockpile),
+            "build_queue": list(self.build_queue),
+            "chronicle": list(self.chronicle),
+            "stats": dict(self.stats),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "World":
+        """Defensive load: any missing or malformed section falls back to a
+        freshly generated equivalent rather than raising."""
+        w = cls.__new__(cls)
+        w.seed = int(d.get("seed", random.randrange(1 << 30)))
+        w.rng = np.random.default_rng(w.seed)
+        w.pyrng = random.Random(w.seed ^ 0x5EED)
+        w.world_time = float(d.get("world_time", 0.0))
+        w.tick_count = int(d.get("tick_count", 0))
+        w._disabled = set()
+
+        def _sub(key, loader, fallback):
+            try:
+                return loader(d[key])
+            except Exception:
+                log.warning("save section %r unusable; regenerating", key)
+                return fallback()
+
+        w.terrain = _sub("terrain", Terrain.from_dict,
+                         lambda: Terrain.generate(w.seed))
+        w.props = _sub("props", PropRegistry.from_dict, PropRegistry)
+        w.structures = _sub("structures", StructureRegistry.from_dict,
+                            StructureRegistry)
+        w.population = _sub("population", Population.from_dict, Population)
+        w.lighting = _sub("lighting", Lighting.from_dict, Lighting)
+        w.events = _sub("events", EventSystem.from_dict, EventSystem)
+
+        w.stockpile = {r: 0 for r in ALL_RESOURCES}
+        w.stockpile.update({k: int(v) for k, v in
+                            (d.get("stockpile") or {}).items() if k in ALL_RESOURCES})
+        w.build_queue = list(d.get("build_queue") or [])
+        w.chronicle = deque(d.get("chronicle") or [], maxlen=CHRONICLE_MAX)
+        w.stats = {"born": 0, "died": 0, "built": 0, "trees_felled": 0,
+                   "lightning_strikes": 0, "generations": 1}
+        w.stats.update({k: int(v) for k, v in (d.get("stats") or {}).items()})
+
+        if not w.population.alive_agents():
+            log.info("loaded world had no survivors; seeding a new group")
+            w._seed_population()
+        return w
