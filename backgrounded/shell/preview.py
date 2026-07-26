@@ -50,6 +50,19 @@ class Preview:
         self._created: bool = False
         self._caption: str = CAPTION
         self._failed: bool = False
+        self._fullscreen: bool = False
+        self._last_click_ms: int = 0
+
+        # --- camera (preview only) ------------------------------------
+        # Zoom lives here rather than in the Renderer on purpose: the desktop
+        # wallpaper must always show the whole world, so zooming the render
+        # itself would crop what everyone else sees. This crops the finished
+        # frame at presentation time instead, which also costs nothing when
+        # zoom == 1.
+        self.zoom: float = 1.0
+        self.cam: list[float] = [self.size[0] / 2.0, self.size[1] / 2.0]
+        self._panning: bool = False
+        self._pan_from: tuple[int, int] | None = None
 
     # ---------------------------------------------------------------- misc --
 
@@ -149,6 +162,72 @@ class Preview:
         self.ensure_window(not self._visible)
         return self._visible
 
+    # -------------------------------------------------------------- camera --
+
+    ZOOM_MIN = 1.0
+    ZOOM_MAX = 8.0
+    ZOOM_STEP = 1.18
+
+    def _centre_px(self) -> tuple[int, int]:
+        if self._screen is None:
+            return (self.size[0] // 2, self.size[1] // 2)
+        w, h = self._screen.get_size()
+        return (w // 2, h // 2)
+
+    def _clamp_cam(self) -> None:
+        """Keep the visible rect inside the world, so you can never scroll off
+        into empty space."""
+        w = self.size[0] / self.zoom
+        h = self.size[1] / self.zoom
+        self.cam[0] = min(max(self.cam[0], w / 2.0), self.size[0] - w / 2.0)
+        self.cam[1] = min(max(self.cam[1], h / 2.0), self.size[1] - h / 2.0)
+
+    def zoom_at(self, wheel: int, mouse_px: tuple[int, int] | None = None) -> float:
+        """Zoom under the cursor, so the point beneath the pointer stays put."""
+        try:
+            old = self.zoom
+            factor = self.ZOOM_STEP ** wheel
+            self.zoom = min(self.ZOOM_MAX, max(self.ZOOM_MIN, self.zoom * factor))
+            if abs(self.zoom - old) < 1e-6:
+                return self.zoom
+            if mouse_px and self._screen is not None:
+                sw, sh = self._screen.get_size()
+                # where the cursor points, in world coords, before the zoom
+                fx = (mouse_px[0] / max(1, sw)) - 0.5
+                fy = (mouse_px[1] / max(1, sh)) - 0.5
+                wx = self.cam[0] + fx * (self.size[0] / old)
+                wy = self.cam[1] + fy * (self.size[1] / old)
+                # move the camera so that same world point lands under it again
+                self.cam[0] = wx - fx * (self.size[0] / self.zoom)
+                self.cam[1] = wy - fy * (self.size[1] / self.zoom)
+            if self.zoom <= self.ZOOM_MIN + 1e-6:
+                self.cam = [self.size[0] / 2.0, self.size[1] / 2.0]
+            self._clamp_cam()
+            return self.zoom
+        except Exception as exc:
+            log.debug("preview: zoom failed: %s", exc)
+            return self.zoom
+
+    def pan_by(self, dx_px: int, dy_px: int) -> None:
+        if self.zoom <= self.ZOOM_MIN + 1e-6 or self._screen is None:
+            return
+        try:
+            sw, sh = self._screen.get_size()
+            self.cam[0] -= dx_px * (self.size[0] / self.zoom) / max(1, sw)
+            self.cam[1] -= dy_px * (self.size[1] / self.zoom) / max(1, sh)
+            self._clamp_cam()
+        except Exception:
+            pass
+
+    def reset_view(self) -> None:
+        self.zoom = 1.0
+        self.cam = [self.size[0] / 2.0, self.size[1] / 2.0]
+
+    def _view_rect(self) -> pygame.Rect:
+        w = max(16, int(self.size[0] / self.zoom))
+        h = max(16, int(self.size[1] / self.zoom))
+        return pygame.Rect(int(self.cam[0] - w / 2), int(self.cam[1] - h / 2), w, h)
+
     # ---------------------------------------------------------- fullscreen --
 
     def toggle_fullscreen(self) -> bool:
@@ -234,6 +313,13 @@ class Preview:
             return
         try:
             target = screen.get_size()
+            if self.zoom > self.ZOOM_MIN + 1e-6:
+                try:
+                    view = self._view_rect().clip(surface.get_rect())
+                    if view.width > 0 and view.height > 0:
+                        surface = surface.subsurface(view)
+                except Exception:
+                    pass
             if surface.get_size() == target:
                 screen.blit(surface, (0, 0))
             else:
@@ -266,12 +352,14 @@ class Preview:
         Fullscreen is bound to F11 and Alt+Enter, and Escape leaves it - the
         three bindings people actually try. Double-clicking the view works too.
         """
-        out = {"closed": False, "fullscreen": getattr(self, "_fullscreen", False)}
+        out = {"closed": False, "fullscreen": getattr(self, "_fullscreen", False),
+               "zoom": self.zoom}
         if self._failed or not self._created:
             return out
         try:
-            wanted = [pygame.QUIT, pygame.VIDEORESIZE,
-                      pygame.KEYDOWN, pygame.MOUSEBUTTONDOWN]
+            wanted = [pygame.QUIT, pygame.VIDEORESIZE, pygame.KEYDOWN,
+                      pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP,
+                      pygame.MOUSEWHEEL, pygame.MOUSEMOTION]
             for ev in pygame.event.get(wanted):
                 if ev.type == pygame.QUIT:
                     out["closed"] = True
@@ -283,14 +371,35 @@ class Preview:
                         out["fullscreen"] = self.toggle_fullscreen()
                     elif ev.key == pygame.K_ESCAPE and getattr(self, "_fullscreen", False):
                         out["fullscreen"] = self.toggle_fullscreen()
+                    elif ev.key in (pygame.K_0, pygame.K_HOME):
+                        self.reset_view()
+                    elif ev.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
+                        self.zoom_at(1, self._centre_px())
+                    elif ev.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                        self.zoom_at(-1, self._centre_px())
                     else:
                         pygame.event.post(ev)     # not ours; hand it back
+                elif ev.type == pygame.MOUSEWHEEL:
+                    out["zoom"] = self.zoom_at(int(ev.y), pygame.mouse.get_pos())
+                elif ev.type == pygame.MOUSEMOTION:
+                    if self._panning and self._pan_from is not None:
+                        self.pan_by(ev.pos[0] - self._pan_from[0],
+                                    ev.pos[1] - self._pan_from[1])
+                        self._pan_from = ev.pos
+                elif ev.type == pygame.MOUSEBUTTONUP:
+                    if ev.button in (1, 2, 3):
+                        self._panning = False
+                        self._pan_from = None
                 elif ev.type == pygame.MOUSEBUTTONDOWN:
                     now = pygame.time.get_ticks()
                     last = getattr(self, "_last_click_ms", 0)
                     self._last_click_ms = now
                     if ev.button == 1 and now - last < 400:
                         out["fullscreen"] = self.toggle_fullscreen()
+                    elif ev.button in (1, 2, 3):
+                        # drag to pan once zoomed in
+                        self._panning = True
+                        self._pan_from = ev.pos
         except Exception as exc:
             log.debug("preview: event pump failed: %s", exc)
             return out

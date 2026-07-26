@@ -257,10 +257,13 @@ class App:
     def _hud(self) -> str:
         w = self.world
         pop = len(w.population.alive_agents())
+        z = getattr(self.preview, "zoom", 1.0)
+        zoom = f" - {z:.1f}x" if z > 1.01 else ""
         return (f"Backgrounded - {w.events.scene} - pop {pop} "
                 f"gen {w.population.generation} - "
                 f"wood {w.stockpile.get('wood',0)} stone {w.stockpile.get('stone',0)} "
-                f"food {w.stockpile.get('food',0)} - {self.clock.get_fps():.0f} fps")
+                f"food {w.stockpile.get('food',0)}{zoom} - "
+                f"{self.clock.get_fps():.0f} fps  [wheel=zoom drag=pan 0=reset F11=full]")
 
     def _save_capture(self, frame: pygame.Surface) -> None:
         self._captures += 1
