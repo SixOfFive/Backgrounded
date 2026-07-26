@@ -33,6 +33,16 @@ from ..constants import (
     RES_WOOD,
     WALK_SPEED,
 )
+from .entities import GROUND_SNAP
+
+#: Ground drop, in px, that counts as a ledge rather than a slope. Roughly a
+#: body height: below this a stickman steps down, above it they would have to
+#: jump, and only a panicking one does.
+CLIFF_DROP = 46.0
+
+#: How far ahead to probe the ground for a ledge, in px. Must be several
+#: times the per-tick step or a cliff edge is invisible until you are over it.
+CLIFF_LOOKAHEAD = 14.0
 from .structures import Structure, StructureRegistry
 
 log = logging.getLogger(__name__)
@@ -705,6 +715,23 @@ def _face(agent: Any, d: float) -> None:
         agent.facing = -1
 
 
+
+def _plant(agent: Any, gy: float) -> None:
+    """Put the agent on the ground and make the rest of its state agree.
+
+    Writing y alone is not enough. entities.apply_physics decides an agent is
+    airborne from on_ground/vy, so pinning y here while leaving vy alone let
+    gravity accumulate against a body that never moved: measured vy reaching
+    780 px/s over 0.87s of "falling" that covered 0.3px. The landing check then
+    read that as a fatal impact, which is why every agent died of a fall while
+    standing still on flat ground. Position and state must be asserted together.
+    """
+    agent.y = float(gy)
+    agent.vy = 0.0
+    agent.on_ground = True
+    agent.fall_t = 0.0
+
+
 def step_toward(
     agent: Any,
     world: Any,
@@ -734,10 +761,39 @@ def step_toward(
         step = spd * max(0.0, dt)
         if step > dist:
             step = dist
-        agent.x = _clamp_x(float(agent.x) + d * step)
+        nx = _clamp_x(float(agent.x) + d * step)
+
+        # Look before stepping. Walking is terrain-following: if the ground
+        # ahead drops by more than a body height this is a ledge, not a slope,
+        # and a calm stickman does not stroll off it. Letting gravity work
+        # without this check turned every cliff into a meat grinder - 30 to 42
+        # deaths per 260s, every single one a fall, even in clear weather.
+        # Panicking agents DO go over, which is what makes a stampede lethal.
+        gy_now = ground_y(world, agent.x)
+        gy_next = ground_y(world, nx)
+        # Probe a body-width ahead, not one footstep. A step is ~1px, and even
+        # a sheer cliff only drops 4-11px across 1px of travel, so a per-step
+        # test never fires: agents walked straight off a 146px drop measuring
+        # it 8px at a time. LOOKAHEAD is what makes the edge visible.
+        gy_ahead = ground_y(world, _clamp_x(float(agent.x) + d * CLIFF_LOOKAHEAD))
+        drop = max(gy_next - gy_now, gy_ahead - gy_now)
+        panicking = float(getattr(agent, "panic", 0.0) or 0.0) > 0.0
+        if drop > CLIFF_DROP and not panicking:
+            agent.vx = 0.0
+            _plant(agent, gy_now)
+            agent._blocked_t = getattr(agent, "_blocked_t", 0.0) + dt
+            return abs(tx - float(agent.x))
+        agent._blocked_t = 0.0
+
+        agent.x = nx
         agent.vx = d * spd
-        if abs(float(getattr(agent, "vy", 0.0))) < 1e-3:
-            agent.y = ground_y(world, agent.x)
+        # Stick to the surface ONLY when actually on it. Snapping y whenever
+        # vy happened to be ~0 teleported falling agents straight to the
+        # ground before entities.apply_physics could see them airborne, so
+        # gravity never accumulated and nobody could ever fall to their death.
+        # Actions own x; entities owns y whenever the agent is off the ground.
+        if float(agent.y) >= gy_next - GROUND_SNAP:
+            _plant(agent, gy_next)
         return abs(tx - float(agent.x))
     except Exception:
         log.debug("step_toward failed", exc_info=True)

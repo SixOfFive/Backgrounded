@@ -709,9 +709,22 @@ class EventSystem:
         self._rain_douses(world, dt)
 
     def _lightning_strike(self, world: Any) -> None:
-        x = self._rng.uniform(24.0, RENDER_W - 24.0)
-        gy = _ground_y(world, x)
         direct = self._rng.random() < DIRECT_HIT_CHANCE
+        x = self._rng.uniform(24.0, RENDER_W - 24.0)
+
+        # A "direct" strike has to actually aim. Rolling a uniform x across
+        # 1280px and then killing only within 25px meant a direct hit landed on
+        # somebody with probability ~4%, so across a whole storm nobody was
+        # ever struck and feature 29 never once fired in testing. When the roll
+        # says direct, pick a victim and strike near them - slightly off, so it
+        # is still luck whether it lands.
+        if direct:
+            crowd = [a for a in _agents(world) if getattr(a, "alive", False)]
+            if crowd:
+                victim = crowd[self._rng.randrange(len(crowd))]
+                x = _fnum(getattr(victim, "x", x), x) + self._rng.uniform(-34.0, 34.0)
+                x = max(24.0, min(RENDER_W - 24.0, x))
+        gy = _ground_y(world, x)
         self.strikes.append({
             "x": float(x), "t": 0.0,
             "seed": int(self._rng.randrange(1 << 20)),
