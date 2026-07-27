@@ -23,6 +23,7 @@ from .constants import (
 )
 from .render.renderer import Renderer
 from .shell.preview import Preview
+from .shell.tools import ToolController
 from .shell.tray import Tray
 from .shell.wallpaper import WallpaperWriter
 from .sim.world import World
@@ -111,6 +112,7 @@ class App:
         self.renderer = Renderer()
         self.renderer.show_stats = getattr(self.cfg, "show_stats", True)
         self.renderer.show_names = getattr(self.cfg, "show_names", True)
+        self.tools = ToolController()
 
         # --- threads -----------------------------------------------------
         self.wallpaper = WallpaperWriter(_screen_size())
@@ -231,7 +233,9 @@ class App:
         dt = min(dt, 0.1)                     # never let a stall bomb the sim
 
         self._drain_commands()
-        if self.preview.handle_close():
+        pointer = self.preview.pump_events()
+        self.tools.handle(pointer.get("pointer"), self.world, self.world.world_time)
+        if pointer.get("closed"):
             self.cfg.show_window = False
             self.preview.ensure_window(False)
             self._save_config("show_window")
@@ -248,7 +252,7 @@ class App:
         frame = self.renderer.draw(self.world, dt)
 
         if self.cfg.show_window:
-            self.preview.present(frame)
+            self.preview.present(frame, overlay=self.tools.draw_overlay)
             self.preview.set_caption(self._hud())
 
         now = time.monotonic()
@@ -304,6 +308,10 @@ class App:
                 self.wallpaper.restore()
         except Exception:
             log.exception("wallpaper shutdown failed")
+        try:
+            self.tools.release_all(self.world)
+        except Exception:
+            pass
         try:
             self.tray.stop()
         except Exception:

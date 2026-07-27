@@ -172,6 +172,32 @@ class Preview:
     ZOOM_MAX = 8.0
     ZOOM_STEP = 1.18
 
+    def _pointer(self, kind: str, button: int, pos) -> dict:
+        """One pointer event carrying both window pixels and world coords.
+
+        The toolbar is hit-tested in window pixels (it is a fixed overlay); the
+        world action needs world coords, which are None when the click landed on
+        a letterbox bar rather than the scene.
+        """
+        wx, wy = self.window_to_world(pos)
+        return {"type": kind, "button": button,
+                "sx": int(pos[0]), "sy": int(pos[1]), "wx": wx, "wy": wy}
+
+    def window_to_world(self, pos) -> tuple:
+        """Map a window pixel to a world coordinate, honouring letterbox + zoom
+        + pan. Returns (x, y), or (None, None) if the pixel is off the scene."""
+        ox, oy, dw, dh = self._image_rect()
+        if dw <= 0 or dh <= 0:
+            return (None, None)
+        fx = (pos[0] - ox) / dw - 0.5
+        fy = (pos[1] - oy) / dh - 0.5
+        if not (-0.5 <= fx <= 0.5 and -0.5 <= fy <= 0.5):
+            return (None, None)
+        z = self.zoom if self.zoom else 1.0
+        wx = self.cam[0] + fx * (self.size[0] / z)
+        wy = self.cam[1] + fy * (self.size[1] / z)
+        return (float(wx), float(wy))
+
     def _image_rect(self) -> tuple[int, int, int, int]:
         """Where the scene actually sits inside the window, letterbox aside."""
         lb = getattr(self, "_letterbox", None)
@@ -314,11 +340,14 @@ class Preview:
         except Exception as exc:
             log.debug("preview: set_caption failed: %s", exc)
 
-    def present(self, surface: "pygame.Surface") -> None:
+    def present(self, surface: "pygame.Surface", overlay=None) -> None:
         """Scale the render surface onto the window and flip.
 
         Does nothing at all when hidden - a hidden preview must cost the frame
-        loop nothing beyond this branch.
+        loop nothing beyond this branch. ``overlay`` is an optional callable
+        ``fn(window_surface)`` run after the world is scaled in but before the
+        flip - the tool palette draws there, in window pixels, so it stays a
+        fixed size and never appears on the wallpaper.
         """
         if self._failed or not self._created or not self._visible:
             return
@@ -356,6 +385,11 @@ class Preview:
                     scaled = pygame.transform.scale(surface, (dw, dh))
                 screen.blit(scaled, (ox, oy))
             self._letterbox = (ox, oy, dw, dh)
+            if overlay is not None:
+                try:
+                    overlay(screen)
+                except Exception:
+                    log.debug("preview overlay failed", exc_info=True)
             pygame.display.flip()
         except Exception as exc:
             log.warning("preview: present failed: %s", exc)
@@ -382,7 +416,7 @@ class Preview:
         three bindings people actually try. Double-clicking the view works too.
         """
         out = {"closed": False, "fullscreen": getattr(self, "_fullscreen", False),
-               "zoom": self.zoom}
+               "zoom": self.zoom, "pointer": []}
         if self._failed or not self._created:
             return out
         try:
@@ -411,24 +445,32 @@ class Preview:
                 elif ev.type == pygame.MOUSEWHEEL:
                     out["zoom"] = self.zoom_at(int(ev.y), pygame.mouse.get_pos())
                 elif ev.type == pygame.MOUSEMOTION:
+                    # Right/middle drag pans; left never does - left belongs to
+                    # the tool palette now.
                     if self._panning and self._pan_from is not None:
                         self.pan_by(ev.pos[0] - self._pan_from[0],
                                     ev.pos[1] - self._pan_from[1])
                         self._pan_from = ev.pos
+                    out["pointer"].append(self._pointer("move", 0, ev.pos))
                 elif ev.type == pygame.MOUSEBUTTONUP:
-                    if ev.button in (1, 2, 3):
+                    if ev.button in (2, 3):
                         self._panning = False
                         self._pan_from = None
+                    if ev.button == 1:
+                        out["pointer"].append(self._pointer("up", 1, ev.pos))
                 elif ev.type == pygame.MOUSEBUTTONDOWN:
                     now = pygame.time.get_ticks()
-                    last = getattr(self, "_last_click_ms", 0)
-                    self._last_click_ms = now
-                    if ev.button == 1 and now - last < 400:
-                        out["fullscreen"] = self.toggle_fullscreen()
-                    elif ev.button in (1, 2, 3):
-                        # drag to pan once zoomed in
-                        self._panning = True
-                        self._pan_from = ev.pos
+                    if ev.button in (2, 3):
+                        # Right/middle: pan, and double-right toggles fullscreen.
+                        last = getattr(self, "_last_rclick_ms", 0)
+                        self._last_rclick_ms = now
+                        if ev.button == 3 and now - last < 400:
+                            out["fullscreen"] = self.toggle_fullscreen()
+                        else:
+                            self._panning = True
+                            self._pan_from = ev.pos
+                    elif ev.button == 1:
+                        out["pointer"].append(self._pointer("down", 1, ev.pos))
         except Exception as exc:
             log.debug("preview: event pump failed: %s", exc)
             return out

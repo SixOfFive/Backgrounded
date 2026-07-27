@@ -837,6 +837,35 @@ class EventSystem:
             self._fire_harms_agents(world, dt, storm_fires)
         self._rain_douses(world, dt)
 
+    def strike_at(self, world: Any, x: float, direct: bool = True) -> None:
+        """A lightning bolt at a chosen x. The player's Lightning tool calls
+        this; it is the aimed sibling of the scene's random _lightning_strike."""
+        try:
+            x = max(24.0, min(float(RENDER_W - 24.0), float(x)))
+            gy = _ground_y(world, x)
+            self.strikes.append({
+                "x": float(x), "t": 0.0,
+                "seed": int(self._rng.randrange(1 << 20)),
+                "ground_y": float(gy), "direct": bool(direct),
+            })
+            if len(self.strikes) > 6:
+                del self.strikes[0]
+            self._bump_strike_stat(world)
+            _flash(world, 1.0 if direct else 0.7, 0.45, LIGHTNING_COLOR)
+            self.add_shake(7.5 if direct else 3.0)
+            if direct:
+                self._strike_damage(world, x, gy)
+        except Exception:
+            log.debug("strike_at failed", exc_info=True)
+
+    def meteor_at(self, world: Any, x: float) -> None:
+        """A meteor impact at a chosen x. The player's Meteor tool calls this."""
+        try:
+            x = max(8.0, min(float(RENDER_W - 8.0), float(x)))
+            self._meteor_impact(world, x, _ground_y(world, x))
+        except Exception:
+            log.debug("meteor_at failed", exc_info=True)
+
     def _lightning_strike(self, world: Any) -> None:
         direct = self._rng.random() < DIRECT_HIT_CHANCE
         x = self._rng.uniform(24.0, RENDER_W - 24.0)

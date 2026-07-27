@@ -84,6 +84,12 @@ class World:
         # Subsystems that have failed and been disabled this session.
         self._disabled: set[str] = set()
 
+        # Things the player's Hand tool is currently carrying, by id. Transient
+        # by design: never serialised, so a save mid-drag reloads with nothing
+        # held and no one can end up frozen in the air across a restart.
+        self.held_agent_ids: set[int] = set()
+        self.held_prop_ids: set[int] = set()
+
         self._seed_population()
 
     # ------------------------------------------------------------ startup --
@@ -160,6 +166,8 @@ class World:
     def _tick_agents(self, dt: float) -> None:
         ai_due = (self.tick_count % AI_TICKS) == 0
         for agent in self.population.alive_agents():
+            if agent.id in self.held_agent_ids:
+                continue          # held by the Hand tool: frozen until released
             agent.update_needs(dt, self)
             if not agent.alive:
                 # Starved or froze this tick. The roster snapshot still lists
@@ -391,6 +399,24 @@ class World:
         self.log_event(names.describe_event("born" if born else "arrived",
                                             name=s.name, generation=gen))
 
+    def spawn_visitor(self, x: float) -> str | None:
+        """Player's Spawn tool: a newcomer appears at x, if there is room."""
+        from ..constants import MAX_POP
+        if len(self.population.alive_agents()) >= MAX_POP:
+            return "The land is already full."
+        used = {a.name for a in self.population.agents}
+        gx = float(max(RENDER_W * 0.03, min(RENDER_W * 0.97, x)))
+        s = self.population.spawn(
+            x=gx, y=self.terrain.ground_y(gx),
+            name=names.new_name(self.pyrng, used),
+            generation=self.population.generation,
+            birth_time=self.world_time,
+        )
+        self.stats["born"] += 1
+        self.log_event(names.describe_event("arrived", name=s.name,
+                                            generation=s.generation))
+        return None
+
     def _rebuild_lights(self) -> None:
         """Lights are derived state - rebuilt from scratch every tick."""
         srcs: list[LightSource] = []
@@ -554,6 +580,8 @@ class World:
         w.world_time = float(d.get("world_time", 0.0))
         w.tick_count = int(d.get("tick_count", 0))
         w._disabled = set()
+        w.held_agent_ids = set()
+        w.held_prop_ids = set()
 
         def _sub(key, loader, fallback):
             try:

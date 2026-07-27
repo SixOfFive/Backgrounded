@@ -161,6 +161,32 @@ REGROW_BASE = 1.0               # multiplier at MIN_POP
 REGROW_PER_HEAD = 0.22          # added per colonist above MIN_POP
 REGROW_MAX = 3.0
 
+# --------------------------------------------------------- player tools ----
+#: The left-mouse tool palette, shown top-left in the preview. The player picks
+#: one, then left-clicks the world to use it. Right-mouse always pans; left is
+#: never pan. Order here is the on-screen order.
+TOOL_NONE = "none"          # just watch; clicks do nothing
+TOOL_HAND = "hand"          # grab a prop or stickman, drag, then place or toss
+TOOL_LIGHTNING = "lightning"  # smite the clicked spot
+TOOL_METEOR = "meteor"      # crater the clicked spot
+TOOL_PLANT = "plant"        # grow a tree where clicked
+TOOL_ROCK = "rock"          # drop a boulder/rock where clicked
+TOOL_FEED = "feed"          # bless the colony with food at the spot
+TOOL_SPAWN = "spawn"        # a newcomer arrives where clicked
+TOOLS = (TOOL_HAND, TOOL_LIGHTNING, TOOL_METEOR, TOOL_PLANT, TOOL_ROCK,
+         TOOL_FEED, TOOL_SPAWN)
+TOOL_LABELS = {
+    TOOL_HAND: "Hand - grab and toss", TOOL_LIGHTNING: "Lightning",
+    TOOL_METEOR: "Meteor", TOOL_PLANT: "Plant a tree", TOOL_ROCK: "Drop a rock",
+    TOOL_FEED: "Feed the colony", TOOL_SPAWN: "New arrival",
+}
+#: How close to the click a grab looks for something to pick up, in px.
+GRAB_RADIUS = 46.0
+#: A release faster than this (px/s) is a throw, not a placement. A hard throw
+#: can hurt: a stickman flung off a cliff still takes fall damage on landing.
+TOSS_SPEED = 240.0
+FEED_AMOUNT = 8             # food added per Feed click
+
 # ------------------------------------------------------------------ scenes --
 SCENE_NIGHT_STORM = "night_storm"
 SCENE_CLEAR = "clear"
