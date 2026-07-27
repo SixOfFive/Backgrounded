@@ -5,8 +5,8 @@ Nothing in here may import pygame - `sim/` must stay headless-importable.
 from __future__ import annotations
 
 # ---------------------------------------------------------------- geometry --
-RENDER_W = 1280
-RENDER_H = 800
+RENDER_W = 1600
+RENDER_H = 1000
 RENDER_SIZE = (RENDER_W, RENDER_H)
 
 # ------------------------------------------------------------------ timing --
@@ -191,12 +191,22 @@ FEED_AMOUNT = 8             # food added per Feed click
 #: Farming grows food (distinct from foraging wild berries); mining digs stone
 #: from boulders and stone ground (distinct from the quick GatherStone off loose
 #: rocks). Both are sustained, visible jobs meant to read as work.
-FARM_FIELD_SIZE = 6         # crops a colony tends toward
-FARM_HARVEST_FOOD = 3       # food per ripe crop
+FARM_FIELD_SIZE = 8         # crops a colony tends toward
+FARM_HARVEST_FOOD = 4       # food per ripe crop
 FARM_TILL_SEC = 6.0         # planting a new crop
 MINE_YIELD_STONE = 2        # stone per mining yield tick
 MINE_YIELD_SEC = 4.0        # seconds of digging per yield
 MINE_SESSION_SEC = 24.0     # how long a miner works one spot before moving on
+
+# ------------------------------------------------------------- defense -----
+#: Spiked barricades the colony raises near the world's edges - where animals
+#: come in from - so invaders are hurt (and often killed) before they reach the
+#: settlement. Passive: they damage any wild animal that lingers in range, never
+#: a stickman.
+BARRICADE_DAMAGE = 12.0     # hp/s dealt to an animal within range
+BARRICADE_RANGE = 34.0      # px
+BARRICADE_EDGE_FRAC = 0.16  # a barricade sits within this fraction of an edge
+BARRICADE_MIN_POP = 4       # colony builds them once it is this many strong
 
 # ------------------------------------------------------------------ scenes --
 SCENE_NIGHT_STORM = "night_storm"

@@ -108,7 +108,7 @@ KINDS: tuple[str, ...] = (
 #: A crop grows over this long, then reads ripe until a farmer harvests it, at
 #: which point it drops back to a seedling and grows again - a field is
 #: perennial, unlike a felled tree.
-CROP_GROW_SEC = 150.0
+CROP_GROW_SEC = 115.0
 CROP_HP = 3.0
 
 FLAMMABLE: frozenset[str] = frozenset({KIND_TREE, KIND_SAPLING, KIND_BUSH, KIND_CROP})
