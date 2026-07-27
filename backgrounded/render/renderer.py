@@ -41,6 +41,7 @@ class Renderer:
         self.show_stats: bool = True
         self.show_roster: bool = True
         self.show_names: bool = True
+        self.show_log: bool = True
         self._terrain_cache: pygame.Surface | None = None
         self._terrain_fingerprint: tuple | None = None
         self._frame = 0
@@ -107,6 +108,8 @@ class Renderer:
         # not part of the world, so it must stay readable in a black scene.
         if self.show_stats:
             hud.draw_stats(s, world, show_roster=self.show_roster)
+        if self.show_log:
+            hud.draw_log(s, world)
 
         # screen shake: blit the composed scene at an offset
         dx, dy = ev.shake_offset() if hasattr(ev, "shake_offset") else (0, 0)

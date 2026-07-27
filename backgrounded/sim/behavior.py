@@ -26,11 +26,14 @@ from typing import Any, Callable
 import numpy as np
 
 from ..constants import (
+    BARRICADE_EDGE_FRAC,
+    BARRICADE_MIN_POP,
     FARM_FIELD_SIZE,
     MAT_DIRT,
     MAT_GRASS,
     MAT_LAVA,
     MAT_STONE,
+    MAX_SLOPE_CLIMB,
     MAX_SLOPE_WALK,
     RENDER_W,
     RES_COOKED,
@@ -136,6 +139,7 @@ KIND_PRIORITY: dict[str, float] = {
     "hut": 0.85,
     "grave": 0.80,
     "bridge": 0.62,
+    "barricade": 0.60,
     "wall": 0.58,
     "watchtower": 0.54,
     "totem": 0.40,
@@ -1029,6 +1033,14 @@ def next_build_kind(world: Any, reg: StructureRegistry | None = None) -> str | N
     want_huts = min(MAX_HUTS, max(1, (pop + 1) // 2))
     if built("hut") < want_huts:
         return "hut"
+    # Edge defence. Once the basics stand and the colony is big enough to spare
+    # the hands, raise spiked barricades where the animals come in - one near
+    # each edge, so two in all. Slotted around wall priority: it is the first
+    # thing built once shelter is up, because the whole point is to hurt an
+    # incursion before it reaches the huts. Placement (which edge) is decided in
+    # pick_site; here we only ask for another until both edges are covered.
+    if pop >= BARRICADE_MIN_POP and built("barricade") < 2:
+        return "barricade"
     if pop >= 4 and built("wall") < 1:
         return "wall"
     if pop >= 5 and built("watchtower") < 1:
@@ -1083,6 +1095,12 @@ def pick_site(
         cx = 0.5 * (x0 + x1)
         rim = min(ground_y(world, x0 - 4.0), ground_y(world, x1 + 4.0))
         return cx, rim, {"w": (x1 - x0) + 18.0, "span": [float(x0), float(x1)]}
+
+    # A barricade does not belong near the colony centre like everything else -
+    # it belongs out at the edge the animals arrive from. Only the x-choice
+    # differs; the caller still creates it as a normal unbuilt Structure.
+    if kind == "barricade":
+        return _barricade_site(world, reg)
 
     lo = max(24.0, center - SITE_RANGE)
     hi = min(float(RENDER_W - 24), center + SITE_RANGE)
@@ -1143,6 +1161,80 @@ def pick_site(
         return None
     bx = float(xs[best])
     return bx, float(ground_y(world, bx)), {}
+
+
+def _is_cliff(world: Any, x: float) -> bool:
+    """True where a barricade cannot stand: a fall-risk cliff face.
+
+    Prefers the terrain's own ``is_cliff`` (slope beyond MAX_SLOPE_CLIMB) and
+    falls back to the shared ``slope_at`` helper so a stub terrain without the
+    method still gets a sane answer instead of raising."""
+    terr = getattr(world, "terrain", None)
+    fn = getattr(terr, "is_cliff", None)
+    if callable(fn):
+        try:
+            return bool(fn(float(x)))
+        except Exception:
+            pass
+    return abs(slope_at(world, float(x))) > MAX_SLOPE_CLIMB
+
+
+def _barricade_site(
+    world: Any, reg: StructureRegistry
+) -> tuple[float, float, dict[str, Any]] | None:
+    """A site for a barricade, hard against whichever edge has none yet.
+
+    The animals cross in at ``x = 0`` and ``x = RENDER_W``; a barricade wants to
+    sit in the band within ``BARRICADE_EDGE_FRAC * RENDER_W`` of one of them, on
+    non-cliff ground, as close to the edge as the terrain allows so it bites an
+    incursion the moment it lands. Left edge is filled first, then the right.
+    Returns ``(x, y, {})`` in the same shape as :func:`pick_site`, or None if
+    both edges are covered or the band is nothing but cliff.
+    """
+    band = max(24.0, BARRICADE_EDGE_FRAC * float(RENDER_W))
+    mid = RENDER_W * 0.5
+
+    # Which edges already hold a barricade (built or still going up)?
+    left_has = right_has = False
+    try:
+        for s in reg.of_kind("barricade"):
+            if float(s.x) <= mid:
+                left_has = True
+            else:
+                right_has = True
+    except Exception:
+        pass
+
+    if not left_has:
+        lo, hi, edge = 6.0, band, 0.0
+    elif not right_has:
+        lo, hi, edge = float(RENDER_W) - band, float(RENDER_W) - 6.0, float(RENDER_W)
+    else:
+        return None                      # both edges covered - nothing to do
+
+    lo = max(4.0, lo)
+    hi = min(float(RENDER_W - 4), hi)
+    if hi <= lo:
+        return None
+
+    # Walk the band; keep the non-cliff column that is closest to the edge and,
+    # among near-equals, flattest. Closeness dominates so the spikes really do
+    # straddle the entry point rather than drifting toward the settlement.
+    best_x: float | None = None
+    best_score = float("-inf")
+    x = lo
+    while x <= hi:
+        cx = float(x)
+        if not _is_cliff(world, cx):
+            score = -abs(cx - edge) / band - abs(slope_at(world, cx)) * 0.6
+            if score > best_score:
+                best_score = score
+                best_x = cx
+        x += 6.0
+
+    if best_x is None:
+        return None
+    return best_x, float(ground_y(world, best_x)), {}
 
 
 def find_chasm(world: Any) -> tuple[float, float] | None:

@@ -93,6 +93,7 @@ KIND_VARIANTS: dict[str, int] = {
     "totem": 3,
     "stockpile": 2,
     "crop": 4,              # four field looks; growth lives on the stage axis
+    "barricade": 4,         # spiked palisades raised near the world edges
 }
 
 #: A crop is a prop, not a buildable, but its growth reads on the same *stage*
@@ -114,6 +115,7 @@ ART_STAGES: dict[str, int] = {
     "totem": 3,
     "stockpile": 3,
     "grave": 2,
+    "barricade": 3,
 }
 
 # kind -> number of build stages the simulation uses (stage 0 is stakes /
@@ -128,6 +130,7 @@ STRUCTURE_STAGES: dict[str, int] = {
     "stockpile": 2,
     "grave": 2,
     "crop": CROP_ART_STAGES,   # crop growth is baked as staged art
+    "barricade": 3,            # stakes -> framed -> full spiked palisade
 }
 
 
@@ -178,6 +181,7 @@ KIND_SIZE: dict[str, tuple[int, int]] = {
     "watchtower": (58, 116),
     "totem": (30, 90),
     "stockpile": (52, 38),
+    "barricade": (60, 58),
 }
 
 SCALE_BUCKET = 20.0              # scales quantise to 1/20 = 0.05 steps
@@ -1043,6 +1047,121 @@ def _bake_stockpile(stage: int, rng: random.Random) -> pygame.Surface:
     return surf
 
 
+def _stake(surf: pygame.Surface, x: float, base: float, top_y: float,
+           half: float, lean: float = 0.0, point: float = 0.26) -> tuple[float, float]:
+    """One driven stake, drawn as a filled post with a sharpened tip.
+
+    ``point`` is the fraction of the stake's height taken up by the sharpened
+    head: ~0.26 is a wicked spike, ~0.10 a stake only starting to be worked to a
+    point, and <=0.02 a blunt, freshly-sawn top. ``lean`` tilts the head sideways
+    so a row of these can fan outward. The lit upper-left edge and the near face
+    of the point carry the cool rim highlight the whole atlas leans on to stay
+    legible under a single torch. Returns the tip point.
+    """
+    tx = x + lean
+    span = max(1.0, base - top_y)
+    pf = max(0.0, min(0.5, point))
+    shoulder_y = top_y + span * pf
+    band = max(1, int(round(half * 0.7)))
+    if pf <= 0.02:                                  # blunt: a plain driven post
+        _poly(surf, WOOD_DARK, [(x - half, base), (x - half, top_y),
+                                (x + half, top_y), (x + half, base)])
+        _line(surf, WOOD, (x - half * 0.15, base - 1), (x - half * 0.15, top_y), band, 150)
+        _rim_line(surf, (x - half, base - 2), (x - half, top_y + 1), 90)
+        _ellipse(surf, WOOD, x, top_y, max(1.2, half * 0.9), 1.4)
+        return (x, top_y)
+    _poly(surf, WOOD_DARK, [
+        (x - half, base), (x - half * 0.72, shoulder_y), (tx, top_y),
+        (x + half * 0.72, shoulder_y), (x + half, base),
+    ])
+    _line(surf, WOOD, (x - half * 0.15, base - 1),
+          (tx - half * 0.15, shoulder_y), band, 150)
+    _rim_line(surf, (x - half, base - 2), (x - half * 0.72, shoulder_y), 90)
+    _rim_line(surf, (x - half * 0.72, shoulder_y), (tx, top_y), 120)
+    return (tx, top_y)
+
+
+def _bake_barricade(stage: int, rng: random.Random) -> pygame.Surface:
+    """A spiked defensive palisade the colony raises near a world edge.
+
+    Stage 0 is a scraped trench with a couple of short driven stakes; the middle
+    stage frames a row of posts and lashes a crossbar across them, their tips
+    only starting to be worked to a point; the finished stage is a dense row of
+    sharpened posts lashed with crossbars, sharp points at the top and the
+    flanking stakes splayed *outward* on both sides so the barricade reads as a
+    spiked barrier from whichever edge it guards - the renderer draws it without
+    flipping, so "angled outward" has to hold for the left edge and the right
+    edge at once.
+
+    Same flat, rim-lit idiom as the other structures so it holds its silhouette
+    when a passing torch is the only light on it, and it grows upward from the
+    canvas bottom, because the renderer anchors ``midbottom`` on the ground line.
+    """
+    surf = _canvas("barricade")
+    w, h = surf.get_size()
+    cx = w // 2
+    base = h - 2
+    st = max(0, min(int(stage), 2))
+    inner_l = int(w * 0.18)
+    inner_r = int(w * 0.82)
+
+    # turned earth heaped at the foot, common to every stage
+    _ellipse(surf, EARTH, cx, base, w * 0.48, 3.0)
+
+    if st == 0:
+        # foundation: a scraped trench line and a few short, blunt driven stakes
+        _line(surf, SOIL_DARK, (inner_l, base - 1), (inner_r, base - 1), 2, 170)
+        for t in (0.28, 0.5, 0.74):
+            sx = int(inner_l + (inner_r - inner_l) * t) + int(rng.uniform(-1, 1))
+            ph = base - int(h * (0.20 + 0.12 * rng.random()))
+            _stake(surf, sx, base, ph, 2.4, lean=rng.uniform(-1.0, 1.0), point=0.0)
+        # a spare stake laid ready beside the works, plus a mallet chip
+        _line(surf, WOOD, (int(w * 0.30), base - 1), (int(w * 0.56), base - 2), 2, 170)
+        _ellipse(surf, WOOD_LIGHT, int(w * 0.62), base - 1, 1.8, 1.2)
+        return surf
+
+    full = st >= 2
+    top_full = int(h * (0.14 if full else 0.42))
+    n = (6 if full else 4) + (1 if rng.random() < 0.5 else 0)
+    n = max(3, n)
+    half = 2.5 if full else 2.2
+    point = 0.28 if full else 0.11
+    fan = 6.5 if full else 2.4
+
+    posts: list[tuple[int, float]] = []
+    for i in range(n):
+        t = i / (n - 1)
+        px = int(inner_l + (inner_r - inner_l) * t)
+        spread = (t - 0.5) * 2.0                     # -1 at left, +1 at right
+        lean = spread * (fan + 2.2 * rng.random())   # outer stakes splay outward
+        top_y = top_full + rng.uniform(0.0, h * 0.05)
+        _stake(surf, px, base, top_y, half, lean=lean, point=point)
+        posts.append((px, top_y))
+
+    # lashed crossbar(s): a horizontal timber with a rope wrap at each post
+    bars = 2 if (full and rng.random() < 0.6) else 1
+    for k in range(bars):
+        yy = base - int(h * (0.30 + 0.26 * k))
+        _line(surf, WOOD, (inner_l - 3, yy + 1), (inner_r + 3, yy), 2)
+        _rim_line(surf, (inner_l - 3, yy), (inner_r + 3, yy - 1), 70)
+        for px, _ in posts:
+            _line(surf, ROPE, (px - 2, yy - 2), (px + 2, yy + 2), 1, 190)
+            _line(surf, ROPE, (px - 2, yy + 2), (px + 2, yy - 2), 1, 190)
+
+    # the finished palisade earns a pair of low stakes jammed outward at the
+    # foot - points fanning left and right, menacing from either edge
+    if full and rng.random() < 0.7:
+        for sx, sdir in ((int(w * 0.32), -1), (int(w * 0.68), 1)):
+            tipx = sx + sdir * int(w * 0.15)
+            tipy = base - int(h * 0.30)
+            _line(surf, WOOD_DARK, (sx, base), (tipx, tipy), 3)
+            _poly(surf, WOOD, [(tipx - sdir * 2, tipy + 3),
+                               (tipx + sdir * 3, tipy - 2),
+                               (tipx - sdir, tipy + 5)])
+            _rim_line(surf, (sx, base - 2), (tipx, tipy), 90)
+    return surf
+
+
 _STRUCTURE_BAKERS = {
     "firepit": _bake_firepit,
     "hut": _bake_hut,
@@ -1052,6 +1171,7 @@ _STRUCTURE_BAKERS = {
     "totem": _bake_totem,
     "stockpile": _bake_stockpile,
     "grave": _bake_grave_structure,
+    "barricade": _bake_barricade,
 }
 
 _sync_with_sim()

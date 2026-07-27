@@ -292,3 +292,65 @@ def _wrap(text: str, max_w: int, size: int) -> list[str]:
     if cur:
         lines.append(cur)
     return lines
+
+
+# ============================================================ chronicle log ==
+# The last N chronicle lines, lower-left. Where the top-right footer shows only
+# the newest event, this is the running story: births, deaths, buildings, the
+# spikes taking a wolf. Drawn on the render surface like the stats panel, so it
+# reads on the wallpaper too. Newest sits at the bottom; older lines fade up.
+
+LOG_W = 360
+LOG_LINES = 10
+
+_log_cache: pygame.Surface | None = None
+_log_key: tuple | None = None
+
+
+def draw_log(surf: pygame.Surface, world, n: int = LOG_LINES) -> None:
+    """Draw the last `n` chronicle entries, lower-left. Never raises."""
+    global _log_cache, _log_key
+    try:
+        chron = list(getattr(world, "chronicle", ()) or ())
+        tail = chron[-n:]
+        key = (tuple(tail),)
+        if _log_cache is None or key != _log_key:
+            _log_cache = _build_log(tail)
+            _log_key = key
+        if _log_cache is not None:
+            from ..constants import RENDER_H
+            surf.blit(_log_cache, (12, RENDER_H - _log_cache.get_height() - 12))
+    except Exception:
+        log.exception("chronicle log draw failed")
+
+
+def _build_log(tail: list) -> "pygame.Surface | None":
+    # Strip the "[day N] " stamp the chronicle prepends - the log is tight on
+    # width and the day is already implied by order.
+    lines: list[str] = []
+    for entry in tail:
+        text = str(entry)
+        if "] " in text:
+            text = text.split("] ", 1)[1]
+        wrapped = _wrap(text, LOG_W - PAD * 2, 11)
+        lines.extend(wrapped[:2])          # a single event never eats the log
+
+    lines = lines[-(LOG_LINES + 4):]       # cap total rows after wrapping
+    if not lines:
+        return None
+
+    row = LINE - 2
+    height = PAD * 2 + row * len(lines)
+    panel = pygame.Surface((LOG_W, height), pygame.SRCALPHA)
+    panel.fill((*BG, 150))
+    pygame.draw.rect(panel, EDGE, panel.get_rect(), 1)
+
+    y = PAD
+    total = len(lines)
+    for i, ln in enumerate(lines):
+        # Oldest at the top, dimmest; newest at the bottom, brightest.
+        f = 0.45 + 0.55 * (i + 1) / total
+        col = (int(DIM[0] * f), int(DIM[1] * f), int(DIM[2] * f))
+        panel.blit(_text(ln, col, 11), (PAD, y))
+        y += row
+    return panel

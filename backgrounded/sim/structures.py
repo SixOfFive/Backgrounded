@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 from ..constants import (
+    BARRICADE_DAMAGE,
+    BARRICADE_RANGE,
     HUT_AGE_WEIGHT,
     HUT_GROWTH_AGE_SEC,
     HUT_GROWTH_STORE_REF,
@@ -109,6 +111,17 @@ STRUCTURE_SPECS: dict[str, StructureSpec] = {
         "wall", 2, 170.0, {RES_STONE: 14, RES_WOOD: 4},
         width=30.0, height=30.0, capacity=0, flammable=False,
         build_time=7.0, spacing=28.0, variants=3,
+    ),
+    # A spiked wooden palisade the colony raises near a screen edge - where the
+    # wild animals come in from. Two stages, moderately sturdy, no occupants.
+    # `flammable=False` keeps it out of the wildfire spread loop (it is meant to
+    # be the thing still standing when everything else has burned). The wide
+    # spacing lets one sit at each edge without the director treating the pair
+    # as neighbours; behaviour.py picks the edge, this only describes the thing.
+    "barricade": StructureSpec(
+        "barricade", 2, 150.0, {RES_STONE: 8, RES_WOOD: 6},
+        width=40.0, height=34.0, capacity=0, flammable=False,
+        build_time=8.0, spacing=120.0, variants=2,
     ),
     "bridge": StructureSpec(
         "bridge", 3, 120.0, {RES_WOOD: 20, RES_FIBRE: 4},
@@ -710,17 +723,69 @@ class Structure:
                 self.state["fuel"] = fuel
         if self.kind == "totem" and self.built:
             self.state["glow"] = _clamp01(float(self.state.get("glow", 1.0)))
+        if self.kind == "barricade" and self.built:
+            self._tick_barricade(dt, world)
+
+    def _tick_barricade(self, dt: float, world: Any | None) -> None:
+        """A built barricade wounds wild animals lingering within its spikes.
+
+        Passive defence: it damages any *animal* within ``BARRICADE_RANGE`` and
+        never a stickman - stickmen are simply not in ``world.animals``. On the
+        edge that kills an animal it names the beast in the chronicle.
+
+        Runs on the per-frame path, so it must never raise: ``world.animals``
+        may be absent (a bare test world) or malformed, and an individual
+        animal's ``.x``/``.hurt`` might misbehave. Every one of those degrades
+        to "no damage this tick" rather than disabling the structures subsystem.
+        """
+        if world is None or dt <= 0.0:
+            return
+        dmg = BARRICADE_DAMAGE * float(dt)
+        if dmg <= 0.0:
+            return
+        reg = getattr(world, "animals", None)
+        alive = getattr(reg, "alive", None)
+        if not callable(alive):
+            return
+        try:
+            animals = list(alive())
+        except Exception:
+            return
+        for a in animals:
+            try:
+                if abs(float(a.x) - self.x) > BARRICADE_RANGE:
+                    continue
+                if a.hurt(dmg):
+                    kind = str(getattr(a, "kind", "") or "beast").strip().lower()
+                    self._chronicle(world, f"The spikes take a {kind or 'beast'}.")
+            except Exception:
+                continue
 
     @staticmethod
     def _chronicle(world: Any | None, text: str) -> None:
-        if world is None:
+        """Route a line into the world's chronicle, whatever shape it takes.
+
+        World exposes ``chronicle`` as a bounded ``deque`` and the stamping
+        ``log_event`` method; the module smoke tests pass a stub with a callable
+        ``chronicle``. Try a callable ``chronicle`` first (the stubs), then the
+        canonical ``log_event`` (the real World, so the line gets its day
+        stamp), then fall back to appending to a deque/list-like chronicle.
+        """
+        if world is None or not text:
             return
         try:
             fn = getattr(world, "chronicle", None)
             if callable(fn):
                 fn(text)
-            elif fn is not None and hasattr(fn, "add"):
-                fn.add(text)
+                return
+            log_fn = getattr(world, "log_event", None)
+            if callable(log_fn):
+                log_fn(text)
+                return
+            if fn is not None:
+                add = getattr(fn, "append", None) or getattr(fn, "add", None)
+                if callable(add):
+                    add(text)
         except Exception:
             pass
 
@@ -1085,6 +1150,54 @@ if __name__ == "__main__":  # pragma: no cover - smoke test
     again = StructureRegistry.from_dict(blob)
     print("round trip:", len(again), "count huts", again.count("hut"))
     print("junk load:", len(StructureRegistry.from_dict({"items": [{"kind": "???"}, 5]})))
+
+    # ------------------------------------------------ barricade vs animals --
+    class _StubAnimal:
+        def __init__(self, x: float, hp: float, kind: str = "wolf") -> None:
+            self.x, self.health, self.kind = x, hp, kind
+
+        def hurt(self, amount: float) -> bool:
+            self.health -= amount
+            return self.health <= 0.0
+
+    class _StubStick:
+        def __init__(self, x: float) -> None:
+            self.x, self.health = x, 100.0
+
+    class _StubAnimals:
+        def __init__(self, items: list[_StubAnimal]) -> None:
+            self.items = items
+
+        def alive(self) -> list[_StubAnimal]:
+            return [a for a in self.items if a.health > 0.0]
+
+    class _BarWorld:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+            wolf = _StubAnimal(210.0, 58.0, "wolf")       # in range of barricade
+            far = _StubAnimal(900.0, 58.0, "boar")        # out of range
+            self.animals = _StubAnimals([wolf, far])
+            self.stick = _StubStick(206.0)                # standing in the spikes
+
+        def log_event(self, text: str) -> None:
+            self.lines.append(text)
+
+    bw = _BarWorld()
+    bar = StructureRegistry().create("barricade", 200.0, 600.0, built=True)
+    ticks = 0
+    while bw.animals.items[0].health > 0.0 and ticks < 1000:
+        ticks += 1
+        bar.update(1.0 / 30.0, bw)
+    print("barricade: wolf killed in", ticks, "ticks;"
+          f" near-wolf hp {bw.animals.items[0].health:.1f}"
+          f" far-boar hp {bw.animals.items[1].health:.1f}"
+          f" stickman hp {bw.stick.health:.1f}")
+    print("  kill line:", [ln for ln in bw.lines if "spikes" in ln][:1])
+    # An unfinished barricade must not bite.
+    unbuilt_bar = StructureRegistry().create("barricade", 200.0, 600.0)
+    before = bw.animals.items[1].health
+    unbuilt_bar.update(1.0 / 30.0, bw)
+    print("  unbuilt barricade harmless:", bw.animals.items[1].health == before)
 
     # ---------------------------------------------- hut growth, real World --
     from .world import World  # noqa: PLC0415 - smoke test only

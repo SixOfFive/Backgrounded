@@ -112,6 +112,7 @@ class App:
         self.renderer = Renderer()
         self.renderer.show_stats = getattr(self.cfg, "show_stats", True)
         self.renderer.show_names = getattr(self.cfg, "show_names", True)
+        self.renderer.show_log = getattr(self.cfg, "show_log", True)
         self.tools = ToolController()
 
         # --- threads -----------------------------------------------------
@@ -139,6 +140,7 @@ class App:
             "wallpaper_enabled": self.cfg.wallpaper_enabled,
             "show_stats": getattr(self.cfg, "show_stats", True),
             "show_names": getattr(self.cfg, "show_names", True),
+            "show_log": getattr(self.cfg, "show_log", True),
         }
 
     def _drain_commands(self) -> None:
@@ -200,6 +202,10 @@ class App:
             self.renderer.show_names = not self.renderer.show_names
             cfg.show_names = self.renderer.show_names
             self._save_config("show_names")
+        elif kind == "toggle_log":
+            self.renderer.show_log = not self.renderer.show_log
+            cfg.show_log = self.renderer.show_log
+            self._save_config("show_log")
         elif kind == "new_terrain":
             self.world.randomise_terrain()
             persist.save_world(self.world)
