@@ -187,6 +187,17 @@ GRAB_RADIUS = 46.0
 TOSS_SPEED = 240.0
 FEED_AMOUNT = 8             # food added per Feed click
 
+# ------------------------------------------------------- farming & mining --
+#: Farming grows food (distinct from foraging wild berries); mining digs stone
+#: from boulders and stone ground (distinct from the quick GatherStone off loose
+#: rocks). Both are sustained, visible jobs meant to read as work.
+FARM_FIELD_SIZE = 6         # crops a colony tends toward
+FARM_HARVEST_FOOD = 3       # food per ripe crop
+FARM_TILL_SEC = 6.0         # planting a new crop
+MINE_YIELD_STONE = 2        # stone per mining yield tick
+MINE_YIELD_SEC = 4.0        # seconds of digging per yield
+MINE_SESSION_SEC = 24.0     # how long a miner works one spot before moving on
+
 # ------------------------------------------------------------------ scenes --
 SCENE_NIGHT_STORM = "night_storm"
 SCENE_CLEAR = "clear"

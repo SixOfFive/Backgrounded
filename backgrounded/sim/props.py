@@ -98,13 +98,20 @@ KIND_BOULDER = "boulder"
 KIND_WATER = "water"
 KIND_GRAVE = "grave"
 KIND_SCORCH = "scorch"
+KIND_CROP = "crop"        # a farmed food plant; grows, is harvested, regrows
 
 KINDS: tuple[str, ...] = (
     KIND_TREE, KIND_SAPLING, KIND_ROCK, KIND_BUSH,
-    KIND_BOULDER, KIND_WATER, KIND_GRAVE, KIND_SCORCH,
+    KIND_BOULDER, KIND_WATER, KIND_GRAVE, KIND_SCORCH, KIND_CROP,
 )
 
-FLAMMABLE: frozenset[str] = frozenset({KIND_TREE, KIND_SAPLING, KIND_BUSH})
+#: A crop grows over this long, then reads ripe until a farmer harvests it, at
+#: which point it drops back to a seedling and grows again - a field is
+#: perennial, unlike a felled tree.
+CROP_GROW_SEC = 150.0
+CROP_HP = 3.0
+
+FLAMMABLE: frozenset[str] = frozenset({KIND_TREE, KIND_SAPLING, KIND_BUSH, KIND_CROP})
 
 # -------------------------------------------------------------------- tuning --
 
@@ -288,6 +295,8 @@ def _default_state(kind: str) -> dict:
         return {"name": "", "generation": 0, "age": 0.0}
     if kind == KIND_SCORCH:
         return {"radius": float(SCORCH_RADIUS), "age": 0.0, "fade": 1.0}
+    if kind == KIND_CROP:
+        return {"growth": 0.0, "ripe": False, "burning": False, "burn_t": 0.0}
     return {}
 
 
@@ -297,6 +306,7 @@ def _default_hp(kind: str) -> float:
         KIND_SAPLING: SAPLING_HP,
         KIND_ROCK: ROCK_HP,
         KIND_BUSH: BUSH_HP,
+        KIND_CROP: CROP_HP,
         KIND_BOULDER: BOULDER_HP,
     }.get(kind, 1.0)
 
@@ -887,6 +897,8 @@ def tick_props(
                     events.append(_ev("rock_depleted", p))
             elif p.kind == KIND_BOULDER:
                 _tick_boulder(p, terrain, reg, step, events)
+            elif p.kind == KIND_CROP:
+                _tick_crop(p, step, grow)
             elif p.kind == KIND_SCORCH:
                 _tick_scorch(p, step, events, doomed)
             elif p.kind == KIND_GRAVE:
@@ -1263,6 +1275,17 @@ def _regrow_site(
         if not near:
             return float(xi)
     return None
+
+
+def _tick_crop(p: Prop, dt: float, grow: float = 1.0) -> None:
+    """Ripen toward harvest. `grow` (the colony regrowth factor) speeds it, so a
+    bigger settlement's fields come in faster - the same logic as vegetation."""
+    if p.state.get("ripe"):
+        return
+    g = _f(p.state.get("growth"), 0.0) + dt * max(0.2, grow) / max(1.0, CROP_GROW_SEC)
+    p.state["growth"] = min(1.0, g)
+    if g >= 1.0:
+        p.state["ripe"] = True
 
 
 def _tick_scorch(p: Prop, dt: float, events: list[dict], doomed: list[Prop]) -> None:
