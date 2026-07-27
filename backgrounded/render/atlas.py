@@ -57,6 +57,17 @@ EARTH: Color = (60, 46, 32)
 RIM: Color = (178, 190, 208)
 RIM_A = 110                      # rim highlight alpha
 
+# Crops: a tilled bed, green shoots that grow taller, then heavy golden ears.
+# Kept in the same muted register as the leaf/wood palette so a field reads as a
+# shape under a single torch rather than glowing on its own.
+SOIL: Color = (74, 56, 38)
+SOIL_DARK: Color = (46, 34, 24)
+STALK: Color = (78, 112, 54)
+STALK_DARK: Color = (46, 70, 34)
+GRAIN_DARK: Color = (150, 116, 44)
+GRAIN: Color = (198, 158, 66)
+GRAIN_LIGHT: Color = (230, 200, 112)
+
 # ------------------------------------------------------------------ registry --
 
 # kind -> number of visual variants. Prop kinds match ``sim.props.KIND_*``;
@@ -81,7 +92,14 @@ KIND_VARIANTS: dict[str, int] = {
     "watchtower": 2,
     "totem": 3,
     "stockpile": 2,
+    "crop": 4,              # four field looks; growth lives on the stage axis
 }
+
+#: A crop is a prop, not a buildable, but its growth reads on the same *stage*
+#: axis the atlas already caches by: stage 0 is a freshly tilled seedling bed,
+#: the stages between are green shoots getting taller, and the last is heavy
+#: golden ears. :meth:`Atlas.crop_stage` maps a prop's ``state`` dict onto this.
+CROP_ART_STAGES = 5
 
 # How many distinct *drawings* exist per structure kind. This is independent of
 # how many build stages the sim declares: ``get`` maps the sim's stage index
@@ -109,6 +127,7 @@ STRUCTURE_STAGES: dict[str, int] = {
     "totem": 3,
     "stockpile": 2,
     "grave": 2,
+    "crop": CROP_ART_STAGES,   # crop growth is baked as staged art
 }
 
 
@@ -146,6 +165,7 @@ KIND_SIZE: dict[str, tuple[int, int]] = {
     "boulder": (50, 34),
     "bush": (36, 26),
     "bush_berry": (36, 26),
+    "crop": (26, 30),
     "grave": (24, 32),
     "grave_cross": (22, 32),
     "grave_stone": (24, 30),
@@ -448,6 +468,101 @@ def _bake_bush(variant: int, rng: random.Random, berries: bool) -> pygame.Surfac
             by = rng.uniform(h * 0.36, h * 0.80)
             pygame.draw.circle(surf, _rgba(BERRY), (int(bx), int(by)), 2)
             surf.fill(_rgba((240, 150, 150), 160), pygame.Rect(int(bx) - 1, int(by) - 1, 1, 1))
+    return surf
+
+
+def _crop_shoot(surf: pygame.Surface, root: tuple[float, float], sh: float,
+                lean: float, grow: float, rng: random.Random) -> None:
+    """One young plant: a green stem with paired blades and a bright tip.
+
+    More blades and a longer stem as *grow* rises, so a field visibly fills in
+    on its way to ripe."""
+    top = (root[0] + lean, root[1] - sh)
+    _line(surf, STALK_DARK, root, top, 2 if sh > 11 else 1)
+    _line(surf, STALK, (root[0] - 0.6, root[1]), (top[0] - 0.6, top[1]), 1, 200)
+    blades = 1 + int(round(grow * 3))
+    for j in range(blades):
+        u = 0.30 + 0.55 * (j / max(1, blades))
+        lx = root[0] + (top[0] - root[0]) * u
+        ly = root[1] + (top[1] - root[1]) * u
+        side = -1.0 if j % 2 == 0 else 1.0
+        blen = 2.6 + 2.2 * grow
+        col = LEAF if j % 2 else LEAF_DARK
+        _ellipse(surf, col, lx + side * blen * 0.55, ly, blen * 0.55, 1.4)
+    _ellipse(surf, LEAF_LIGHT, top[0], top[1], 1.7, 2.3)
+    _rim_line(surf, root, top, 70)
+
+
+def _crop_ear(surf: pygame.Surface, root: tuple[float, float], sh: float,
+              lean: float, rng: random.Random) -> None:
+    """One ripe plant: a dry stem carrying a heavy, drooping golden ear."""
+    shoulder = (root[0] + lean * 0.5, root[1] - sh * 0.60)
+    _line(surf, GRAIN_DARK, root, shoulder, 2 if sh > 12 else 1)
+    _line(surf, GRAIN, (root[0] - 0.6, root[1]), (shoulder[0] - 0.6, shoulder[1]), 1, 180)
+    ear_len = sh * 0.44
+    droop = rng.uniform(-2.4, 2.4)
+    tip = (shoulder[0] + droop, shoulder[1] - ear_len)
+    grains = 4 + int(ear_len // 3)
+    for k in range(grains):
+        u = k / max(1, grains - 1)
+        gx = shoulder[0] + (tip[0] - shoulder[0]) * u
+        gy = shoulder[1] + (tip[1] - shoulder[1]) * u
+        col = GRAIN if k % 2 else GRAIN_DARK
+        _ellipse(surf, col, gx, gy, 2.0, 1.5)
+        if k > grains // 2:                 # awns flicking off the upper grains
+            _line(surf, GRAIN_LIGHT, (gx, gy), (gx + 1.6, gy - 2.2), 1, 120)
+    _ellipse(surf, GRAIN_LIGHT, tip[0], tip[1], 1.5, 1.9)
+    _rim_line(surf, shoulder, tip, 90)
+
+
+def _bake_crop(variant: int, stage: int, rng: random.Random) -> pygame.Surface:
+    """A farmed food plant, keyed by growth stage so a field visibly ripens.
+
+    Stage 0 is a freshly tilled mound with seedling nubs; the middle stages are
+    green shoots growing taller; the final stage is heavy golden ears. Four
+    variants plus per-stalk jitter keep a planted row from looking stamped, and
+    it uses the same flat, rim-lit idiom as the other props so a crop still
+    reads when the only light on it is a passing torch.
+    """
+    surf = _canvas("crop")
+    w, h = surf.get_size()
+    cx = w // 2
+    base = h - 1
+    ns = max(1, CROP_ART_STAGES)
+    st = max(0, min(int(stage), ns - 1))
+    ripe = st >= ns - 1
+    # 0..1 how grown the greenery is; the ripe stage is as tall as the last
+    # green one but spends its extra height on the ear rather than the stalk.
+    grow = 1.0 if ns <= 2 else (st / float(ns - 2) if not ripe else 1.0)
+    grow = max(0.0, min(1.0, grow))
+
+    # -- tilled mound -----------------------------------------------------
+    mound_h = 4.0
+    _ellipse(surf, SOIL_DARK, cx, base, w * 0.46, mound_h + 1.0)
+    _ellipse(surf, SOIL, cx, base - 1.0, w * 0.40, mound_h)
+    for i in range(3):                       # a couple of furrow ticks
+        fxp = w * (0.28 + 0.22 * i)
+        _line(surf, SOIL_DARK, (fxp, base - 1), (fxp + 2, base - 3), 1, 150)
+    _rim_arc(surf, cx, base - 1.0, w * 0.40, mound_h, 3.3, 6.1, 80)
+
+    # -- the stand of plants ---------------------------------------------
+    bed = base - mound_h + 1.0
+    max_stalk = (h - 5) * (0.30 + 0.66 * grow)
+    n = 3 + (int(variant) % 3)               # 3..5 stalks, per field
+    seedling = (not ripe) and st <= 0
+    for i in range(n):
+        t = (i + 0.5) / n
+        sx = w * 0.20 + (w * 0.60) * t + rng.uniform(-1.4, 1.4)
+        lean = rng.uniform(-2.0, 2.0)
+        sh = max(2.0, max_stalk * rng.uniform(0.82, 1.08))
+        root = (sx, bed)
+        if seedling:                          # just-planted nubs
+            _ellipse(surf, LEAF_DARK, sx, bed - 1.6, 1.6, 1.8)
+            _ellipse(surf, LEAF, sx + rng.uniform(-1.0, 1.0), bed - 2.6, 1.2, 1.4)
+        elif ripe:
+            _crop_ear(surf, root, sh, lean, rng)
+        else:
+            _crop_shoot(surf, root, sh, lean, grow, rng)
     return surf
 
 
@@ -1014,6 +1129,8 @@ class Atlas:
             return _bake_grave_stone(variant, rng)
         if kind == "scorch":
             return _bake_scorch(variant, rng)
+        if kind == "crop":
+            return _bake_crop(variant, stage, rng)
         return self._missing
 
     def bake_all(self) -> float:
@@ -1116,6 +1233,31 @@ class Atlas:
                 return kind
         return kind
 
+    @staticmethod
+    def crop_stage(state: Any) -> int:
+        """Growth-stage index for a crop from its ``sim.props`` state dict.
+
+        ``state['growth']`` runs 0..1 as the crop ripens and ``state['ripe']``
+        latches True once it is harvest-ready; the top art stage is the golden
+        ear, the ones below it are green shoots getting taller. A field that
+        regrows after harvest (``ripe`` back to False, ``growth`` to 0) walks
+        back down these stages on its own. Fails soft to the seedling stage.
+        """
+        ns = max(1, CROP_ART_STAGES)
+        if not isinstance(state, dict):
+            return 0
+        try:
+            if bool(state.get("ripe", False)):
+                return ns - 1
+            g = float(state.get("growth", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0
+        if not math.isfinite(g):
+            return 0
+        g = 0.0 if g < 0.0 else (1.0 if g > 1.0 else g)
+        green = max(1, ns - 1)          # stages 0 .. ns-2 are the green ones
+        return max(0, min(int(g * green), green - 1))
+
     def get(self, kind: str, variant: int = 0, stage: int = 0,
             scale: float = 1.0, state: Any = None) -> pygame.Surface:
         """Return the baked sprite for ``(kind, variant, stage)`` at *scale*.
@@ -1137,6 +1279,8 @@ class Atlas:
             if isinstance(state, (int, float)) and not isinstance(state, bool):
                 stage = max(stage, int(state))
             kind = self.resolve(kind, state)
+            if kind == "crop" and isinstance(state, dict):
+                stage = self.crop_stage(state)
             nv = self.variants(kind)
             ns = self.stages(kind)
             v = int(variant) % nv

@@ -23,7 +23,17 @@ from typing import Any, Callable, Iterable
 from ..constants import (
     CLIMB_SPEED,
     DAY_LENGTH_SEC,
+    FARM_FIELD_SIZE,
+    FARM_HARVEST_FOOD,
+    FARM_TILL_SEC,
+    MAT_DIRT,
+    MAT_GRASS,
+    MAT_STONE,
+    MAX_SLOPE_CLIMB,
     MAX_SLOPE_WALK,
+    MINE_SESSION_SEC,
+    MINE_YIELD_SEC,
+    MINE_YIELD_STONE,
     RENDER_H,
     RENDER_W,
     RES_COOKED,
@@ -82,6 +92,19 @@ CLIMB_TIME = 2.5
 CHOP_YIELD = 6
 STONE_YIELD = 5
 BERRY_YIELD = 4
+
+#: How far from the colony centre a tended field may spread. Crops beyond this
+#: are somebody else's plot, not this colony's, for the purpose of "is the field
+#: full" and "where do I till the next one".
+FARM_FIELD_RADIUS = 260.0
+#: A ripe crop this much further out than the field is still worth walking to.
+FARM_REACH = FARM_FIELD_RADIUS * 1.8
+HARVEST_TIME = 1.6          # seconds bent over a ripe crop before it is in hand
+#: A quarry divot stays cosmetic: dug at most this deep, a little per yield, and
+#: spread wide enough that it is a scoop in the ground, never a fall-risk cliff.
+MINE_DIVOT_MAX = 8.0
+MINE_DIVOT_PER = 1.3
+MINE_DIVOT_HALF = 12        # px each side of the dig point the divot spans
 SPEECH_SYMBOLS = ("?", "!", "~", "*", "+", "o", "^", "#")
 
 POSES: tuple[str, ...] = (
@@ -93,8 +116,8 @@ POSES: tuple[str, ...] = (
 ACTION_KINDS: tuple[str, ...] = (
     "Wander", "GatherWood", "GatherStone", "ForageBerries", "HaulToStockpile",
     "BuildStructure", "RepairStructure", "Eat", "Sleep", "WarmAtFire",
-    "CookFood", "PlantSapling", "Converse", "Celebrate", "Mourn", "FleeFrom",
-    "ClimbTo", "Lookout", "FollowParent", "Panic",
+    "CookFood", "PlantSapling", "Farm", "Mine", "Converse", "Celebrate",
+    "Mourn", "FleeFrom", "ClimbTo", "Lookout", "FollowParent", "Panic",
 )
 
 _TREE_KINDS = ("tree", "pine", "oak", "deadtree")
@@ -2109,6 +2132,317 @@ def _h_panic(a: Action, ag: Any, w: Any, dt: float) -> None:
         a.done = True
 
 
+# ===========================================================================
+#  Farming - grows FOOD (complements ForageBerries, which strips wild bushes)
+# ===========================================================================
+def _material_at(world: Any, x: float) -> int:
+    """Terrain material id under `x`, or -1 if the terrain cannot say."""
+    terr = getattr(world, "terrain", None)
+    fn = getattr(terr, "material_at", None)
+    if callable(fn):
+        try:
+            return int(fn(_clamp_x(x)))
+        except Exception:
+            return -1
+    return -1
+
+
+def _crop_state(prop: Any) -> dict:
+    st = getattr(prop, "state", None)
+    return st if isinstance(st, dict) else {}
+
+
+def _count_crops_near(world: Any, center: float,
+                      radius: float = FARM_FIELD_RADIUS) -> int:
+    """Living crops that count as *this* colony's field."""
+    n = 0
+    for p in props_of(world):
+        if not prop_alive(p) or _prop_kind(p) != "crop":
+            continue
+        try:
+            if abs(float(getattr(p, "x", 0.0)) - float(center)) <= radius:
+                n += 1
+        except (TypeError, ValueError):
+            continue
+    return n
+
+
+def _nearest_ripe_crop(world: Any, x: float,
+                       max_dist: float = FARM_REACH) -> Any | None:
+    best, best_d = None, float("inf")
+    for p in props_of(world):
+        if not prop_alive(p) or _prop_kind(p) != "crop":
+            continue
+        if not _crop_state(p).get("ripe"):
+            continue
+        try:
+            d = abs(float(getattr(p, "x", 0.0)) - float(x))
+        except (TypeError, ValueError):
+            continue
+        if d < best_d:
+            best_d, best = d, p
+    return best if best is not None and best_d <= max_dist else None
+
+
+def _till_site(world: Any, center: float) -> float | None:
+    """A gentle grass/dirt column near the colony to break new ground on.
+
+    Never a cliff, never water, not stacked on an existing crop or a building.
+    Returns None if the ground around the colony is all rock, slope or water -
+    the caller then falls back to harvesting instead of standing idle.
+    """
+    rng = rng_of(world)
+    for _ in range(16):
+        cand = _clamp_x(float(center) + rng.uniform(-FARM_FIELD_RADIUS, FARM_FIELD_RADIUS))
+        if abs(slope_at(world, cand)) > MAX_SLOPE_WALK * 0.7:
+            continue
+        if _material_at(world, cand) not in (MAT_GRASS, MAT_DIRT):
+            continue
+        if find_prop(world, ("crop",), cand, max_dist=22.0) is not None:
+            continue
+        st = nearest_structure(world, None, cand, built_only=False)
+        if st is not None and abs(float(getattr(st, "x", 1e9)) - cand) < 26.0:
+            continue
+        return float(cand)
+    return None
+
+
+def _plant_crop(world: Any, x: float) -> bool:
+    """Break ground: spawn a fresh (unripe) crop on the surface at `x`."""
+    src = getattr(world, "props", None)
+    spawn = getattr(src, "spawn", None)
+    if not callable(spawn):
+        return False
+    try:
+        spawn("crop", float(x), float(ground_y(world, x)),
+              state={"growth": 0.0, "ripe": False})
+        return True
+    except Exception:
+        log.debug("_plant_crop failed", exc_info=True)
+        return False
+
+
+def _h_farm(a: Action, ag: Any, w: Any, dt: float) -> None:
+    if a.phase == "start":
+        center = colony_center(w)
+        tx = None
+        if _count_crops_near(w, center) < FARM_FIELD_SIZE:
+            tx = _till_site(w, center)
+        if tx is not None:
+            a.data["mode"] = "plant"
+            a.data["tx"] = float(tx)
+            a.phase = "approach"
+        else:
+            crop = _nearest_ripe_crop(w, float(ag.x))
+            if crop is None:
+                a.failed = True         # field full and nothing ripe: do else
+                return
+            a.data["mode"] = "harvest"
+            a.target = getattr(crop, "id", None)
+            a.data["px"] = float(getattr(crop, "x", ag.x))
+            a.phase = "approach"
+
+    if a.phase == "approach":
+        if a.data.get("mode") == "plant":
+            a.pose = "walk"
+            rem = step_toward(ag, w, float(a.data.get("tx", ag.x)), dt)
+            if rem <= REACH:
+                a.phase = "till"
+                a.data["kt"] = 0.0
+            elif a.t > 75.0:
+                a.failed = True
+            return
+        # harvest: re-resolve the crop each tick - a wildfire may have taken it
+        p = prop_by_id(w, a.target) if a.target is not None else None
+        if p is None:
+            p = find_prop(w, ("crop",), float(a.data.get("px", ag.x)), max_dist=40.0)
+        if p is None or not prop_alive(p):
+            a.failed = True
+            return
+        a.data["px"] = float(getattr(p, "x", a.data.get("px", ag.x)))
+        a.pose = "walk"
+        rem = step_toward(ag, w, float(a.data["px"]), dt)
+        if rem <= REACH:
+            a.phase = "harvest"
+            a.data["ht"] = 0.0
+        elif a.t > 75.0:
+            a.failed = True
+        return
+
+    if a.phase == "till":
+        a.pose = "build"
+        _halt(ag)
+        _face(ag, float(a.data.get("tx", ag.x)) - float(ag.x))
+        a.data["kt"] = float(a.data.get("kt", 0.0)) + dt
+        _adjust(ag, "fatigue", 0.010 * dt)
+        if a.data["kt"] >= FARM_TILL_SEC / max(0.3, _work_rate(ag)):
+            if _plant_crop(w, float(a.data.get("tx", ag.x))):
+                if rng_of(w).random() < 0.30:
+                    chronicle(w, f"{getattr(ag, 'name', 'Someone')} broke new ground.")
+                _adjust(ag, "morale", 0.04)
+                a.done = True
+            else:
+                a.failed = True
+        return
+
+    if a.phase == "harvest":
+        a.pose = "forage"
+        _halt(ag)
+        p = prop_by_id(w, a.target) if a.target is not None else None
+        if p is None:
+            p = find_prop(w, ("crop",), float(a.data.get("px", ag.x)), max_dist=30.0)
+        # Crop gone (burned) or picked already: bail out softly, delivering
+        # anything we happen to be holding.
+        if p is None or not prop_alive(p) or not _crop_state(p).get("ripe"):
+            if _has_load(ag, a):
+                a.phase = "deliver"
+            else:
+                a.failed = True
+            return
+        _face(ag, float(getattr(p, "x", ag.x)) - float(ag.x))
+        a.data["ht"] = float(a.data.get("ht", 0.0)) + dt
+        if a.data["ht"] < HARVEST_TIME:
+            return
+        try:
+            p.state["ripe"] = False
+            p.state["growth"] = 0.0          # perennial: it will grow back
+        except Exception:
+            pass
+        _carry_add(ag, a, RES_FOOD, FARM_HARVEST_FOOD)
+        _adjust(ag, "fatigue", 0.02)
+        if rng_of(w).random() < 0.35:
+            chronicle(w, f"{getattr(ag, 'name', 'Someone')} brought in the harvest.")
+        a.phase = "deliver"
+        return
+
+    if a.phase == "deliver":
+        if _deposit_step(a, ag, w, dt):
+            a.done = True
+        return
+
+    a.phase = "start"
+
+
+# ===========================================================================
+#  Mining - a sustained dig (distinct from GatherStone's quick rock-grab)
+# ===========================================================================
+def _nearest_stone_column(world: Any, x: float,
+                          max_dist: float = 460.0) -> float | None:
+    """Nearest MAT_STONE column an agent could stand at and hew, or None.
+
+    Scans outward from `x` in both directions. Rejects fall-risk cliffs so the
+    miner does not commit to a spot it can only reach by falling off it.
+    """
+    terr = getattr(world, "terrain", None)
+    if not callable(getattr(terr, "material_at", None)):
+        return None
+    step = 5.0
+    d = 0.0
+    while d <= max_dist:
+        cands = (x,) if d == 0.0 else (x + d, x - d)
+        for c in cands:
+            cx = _clamp_x(c)
+            if _material_at(world, cx) != MAT_STONE:
+                continue
+            if abs(slope_at(world, cx)) > MAX_SLOPE_CLIMB:
+                continue
+            return float(cx)
+        d += step
+    return None
+
+
+def _dig_divot(world: Any, a: "Action", x: float) -> None:
+    """Scoop the quarry a touch deeper - subtle, capped, never a cliff."""
+    cur = float(a.data.get("divot", 0.0))
+    if cur >= MINE_DIVOT_MAX:
+        return
+    terr = getattr(world, "terrain", None)
+    fn = getattr(terr, "deform", None)
+    if not callable(fn):
+        return
+    dyy = min(MINE_DIVOT_PER, MINE_DIVOT_MAX - cur)
+    try:
+        # positive dy digs the ground DOWN; a wide bowl keeps the walls gentle.
+        fn(int(x - MINE_DIVOT_HALF), int(x + MINE_DIVOT_HALF), float(dyy), "bowl")
+        a.data["divot"] = cur + dyy
+    except Exception:
+        log.debug("_dig_divot failed", exc_info=True)
+
+
+def _h_mine(a: Action, ag: Any, w: Any, dt: float) -> None:
+    if a.phase == "start":
+        b = find_prop(w, ("boulder",), float(ag.x), max_dist=520.0)
+        if b is not None:
+            a.target = getattr(b, "id", None)
+            a.data["mx"] = float(getattr(b, "x", ag.x))
+            a.data["src"] = "boulder"
+        else:
+            sx = _nearest_stone_column(w, float(ag.x))
+            if sx is None:
+                a.failed = True
+                return
+            a.target = None
+            a.data["mx"] = float(sx)
+            a.data["src"] = "ground"
+        a.data["dig_t"] = 0.0
+        a.data["yt"] = 0.0
+        a.data["divot"] = 0.0
+        a.phase = "approach"
+
+    if a.phase == "approach":
+        try:
+            ag.mining = False
+        except Exception:
+            pass
+        a.pose = "walk"
+        rem = step_toward(ag, w, float(a.data.get("mx", ag.x)), dt, arrive=REACH)
+        if rem <= REACH:
+            a.phase = "dig"
+            a.data["dig_t"] = 0.0
+            a.data["yt"] = 0.0
+        elif a.t > 75.0:
+            a.failed = True
+        return
+
+    if a.phase == "dig":
+        mx = float(a.data.get("mx", ag.x))
+        _halt(ag)
+        _face(ag, mx - float(ag.x))
+        a.data["dig_t"] = float(a.data.get("dig_t", 0.0)) + dt
+        # Alternate the swing so the figure reads as working, not frozen.
+        a.pose = "chop" if int(a.data["dig_t"] * 2.0) % 2 == 0 else "build"
+        # Transient flag for the renderer's dust; runtime-only, never persisted.
+        try:
+            ag.mining = True
+        except Exception:
+            pass
+        _adjust(ag, "fatigue", 0.012 * dt)
+        a.data["yt"] = float(a.data.get("yt", 0.0)) + dt
+        if a.data["yt"] >= MINE_YIELD_SEC / max(0.3, _work_rate(ag)):
+            a.data["yt"] = 0.0
+            stock_add(w, RES_STONE, MINE_YIELD_STONE)
+            _dig_divot(w, a, mx)
+            if rng_of(w).random() < 0.22:
+                chronicle(w, f"{getattr(ag, 'name', 'Someone')} hewed stone from the earth.")
+        if a.data["dig_t"] >= MINE_SESSION_SEC:
+            try:
+                ag.mining = False
+            except Exception:
+                pass
+            a.done = True
+        return
+
+    a.phase = "start"
+
+
+def _c_mine(a: Action, ag: Any, w: Any) -> None:
+    """Drop the transient dust flag whenever a dig is cut short."""
+    try:
+        ag.mining = False
+    except Exception:
+        pass
+
+
 _HANDLERS: dict[str, Callable[[Action, Any, Any, float], None]] = {
     "Wander": _h_wander,
     "GatherWood": _h_gather,
@@ -2122,6 +2456,8 @@ _HANDLERS: dict[str, Callable[[Action, Any, Any, float], None]] = {
     "WarmAtFire": _h_warm,
     "CookFood": _h_cook,
     "PlantSapling": _h_plant,
+    "Farm": _h_farm,
+    "Mine": _h_mine,
     "Converse": _h_converse,
     "Celebrate": _h_celebrate,
     "Mourn": _h_mourn,
@@ -2135,6 +2471,7 @@ _HANDLERS: dict[str, Callable[[Action, Any, Any, float], None]] = {
 _CLEANUP: dict[str, Callable[[Action, Any, Any], None]] = {
     "Sleep": _c_sleep,
     "Lookout": _c_lookout,
+    "Mine": _c_mine,
 }
 
 # Sanity: every advertised kind must have a real handler.

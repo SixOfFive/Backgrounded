@@ -71,7 +71,7 @@ from . import fx
 log = logging.getLogger(__name__)
 
 __all__ = [
-    "draw_animals", "draw_ufo", "draw_gear",
+    "draw_animals", "draw_ufo", "draw_gear", "draw_mining_dust",
     "animal_kind_of", "clear_caches", "cache_stats",
 ]
 
@@ -1188,6 +1188,106 @@ def _draw_spear(surf: pygame.Surface, sk: Any, flat: Color | None, fade: float) 
 
 
 # --------------------------------------------------------------------------
+# mining dust
+# --------------------------------------------------------------------------
+
+_DUST: Color = (152, 148, 140)
+_DUST_DARK: Color = (110, 106, 100)
+_CHIP: Color = (182, 184, 190)
+
+
+def _iter_mining_agents(world: Any) -> list[Any]:
+    """Alive agents with the sim's soft ``mining`` flag set. Fails soft to []."""
+    pop = getattr(world, "population", None)
+    agents = getattr(pop, "agents", None) if pop is not None else None
+    if agents is None:
+        agents = getattr(world, "agents", None)
+    if agents is None:
+        return []
+    out: list[Any] = []
+    try:
+        for a in agents:
+            if a is None:
+                continue
+            if not bool(getattr(a, "alive", True)):
+                continue
+            if not bool(getattr(a, "mining", False)):
+                continue
+            out.append(a)
+    except TypeError:
+        return []
+    return out
+
+
+def draw_mining_dust(surf: pygame.Surface, world: Any, t: float) -> None:
+    """Kick up grey dust and stone chips at the feet of every mining agent.
+
+    Reads the sim's soft ``agent.mining`` flag and never writes it. Meant to be
+    called from ``renderer.draw`` right after the agents layer and *before* the
+    light composite, so the motes obey the same rule the figures do: a miner
+    working under a torch throws lit dust, one in the dark throws dust the
+    composite swallows to near-black. Cheap - a handful of AA discs per miner,
+    no per-pixel work - and fails soft, per miner and overall.
+    """
+    try:
+        miners = _iter_mining_agents(world)
+    except Exception:
+        log.debug("could not read the miner list", exc_info=True)
+        return
+    if not miners:
+        return
+    try:
+        tt = float(t)
+    except (TypeError, ValueError):
+        return
+    if not math.isfinite(tt):
+        return
+    for a in miners:
+        try:
+            _draw_one_miner_dust(surf, a, tt)
+        except Exception:
+            log.debug("mining dust draw failed", exc_info=True)
+
+
+def _draw_one_miner_dust(surf: pygame.Surface, a: Any, t: float) -> None:
+    x = fx.attr_num(a, "x", default=math.nan)
+    y = fx.attr_num(a, "y", default=math.nan)
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return
+    if x < -40.0 or x > RENDER_W + 40.0:
+        return
+    face = fx.attr_num(a, "facing", "vx", default=1.0)
+    facing = -1.0 if face < 0.0 else 1.0
+    idp = (fx.attr_num(a, "id", default=0.0) * 1.37) % TAU
+
+    # The working point: a little in front of the feet, where the tool bites.
+    wx = x + facing * 5.0
+    wy = y - 1.0
+
+    # A short-lived puff of grey motes rising and drifting from the strike.
+    n = 5
+    for i in range(n):
+        life = (t * 1.7 + i * 0.41 + idp) % 1.0        # 0..1 loop per mote
+        rise = life * 9.0
+        drift = facing * (1.6 + i * 0.9) * (0.4 + life)
+        mx = wx + drift + math.sin(t * 2.3 + i + idp) * 1.1
+        my = wy - rise - (i % 2) * 1.4
+        fade = 1.0 - life
+        r = max(0.8, 2.2 - 1.3 * life)
+        col = _DUST if i % 2 else _DUST_DARK
+        _disc(surf, _dim(col, 0.30 + 0.55 * fade), (mx, my), r)
+
+    # Chip sparks flicked out low and forward on the swing's contact beat.
+    swing = 0.5 + 0.5 * math.sin(t * 6.4 + idp)        # ~one strike per cycle
+    if swing > 0.74:
+        for k in range(2):
+            u = 0.5 + 0.5 * k
+            cxp = wx + facing * (2.5 + 6.5 * u)
+            cyp = wy - 1.0 - math.sin(u * math.pi) * 3.2
+            _disc(surf, _CHIP, (cxp, cyp), 1.0)
+
+
+# --------------------------------------------------------------------------
 # cache management
 # --------------------------------------------------------------------------
 
@@ -1284,6 +1384,8 @@ if __name__ == "__main__":                             # pragma: no cover
             ag.weapon = _WS
         elif i == 2:
             ag.armour = ARMOUR_LEATHER
+        elif i == 3:
+            ag.mining = True            # exercise the mining-dust path
     if agents:
         victim = agents[-1]
         victim.x = 980.0
@@ -1308,6 +1410,7 @@ if __name__ == "__main__":                             # pragma: no cover
         draw_animals(scene, world, wt)
         for ag in world.population.agents:
             draw_gear(scene, ag, t=wt)
+        draw_mining_dust(scene, world, wt)
         draw_ufo(scene, world, wt)
         t_creatures += _time.perf_counter() - c0
     total = _time.perf_counter() - t0

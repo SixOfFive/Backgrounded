@@ -77,6 +77,10 @@ class Renderer:
             creatures.draw_animals(s, world, world.world_time)
         except Exception:
             log.exception("animal draw failed")
+        try:
+            creatures.draw_mining_dust(s, world, world.world_time)
+        except Exception:
+            log.exception("mining dust draw failed")
 
         # 8-9. near weather and particles
         self.particles.draw(s, layer="front")

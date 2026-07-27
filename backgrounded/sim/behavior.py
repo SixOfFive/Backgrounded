@@ -26,7 +26,11 @@ from typing import Any, Callable
 import numpy as np
 
 from ..constants import (
+    FARM_FIELD_SIZE,
+    MAT_DIRT,
+    MAT_GRASS,
     MAT_LAVA,
+    MAT_STONE,
     MAX_SLOPE_WALK,
     RENDER_W,
     RES_COOKED,
@@ -108,13 +112,21 @@ CELEBRATION_FRESH = 30.0
 
 ROLES: tuple[str, ...] = ("gatherer", "builder", "elder", "child", "lookout")
 
-# per-role appetite for each family of work
+# per-role appetite for each family of work. `farm` and `mine` are the two
+# sustained jobs: gatherers lean to the fields (reliable food), builders to the
+# quarry (they are the ones who burn stone), so a normal colony visibly does
+# both without either job being a dedicated role of its own.
 ROLE_AFFINITY: dict[str, dict[str, float]] = {
-    "gatherer": {"gather": 1.00, "build": 0.55, "social": 0.85, "watch": 0.35},
-    "builder":  {"gather": 0.60, "build": 1.00, "social": 0.70, "watch": 0.35},
-    "elder":    {"gather": 0.35, "build": 0.40, "social": 1.00, "watch": 0.55},
-    "lookout":  {"gather": 0.55, "build": 0.45, "social": 0.60, "watch": 1.00},
-    "child":    {"gather": 0.30, "build": 0.15, "social": 1.00, "watch": 0.10},
+    "gatherer": {"gather": 1.00, "build": 0.55, "social": 0.85, "watch": 0.35,
+                 "farm": 0.95, "mine": 0.55},
+    "builder":  {"gather": 0.60, "build": 1.00, "social": 0.70, "watch": 0.35,
+                 "farm": 0.50, "mine": 1.00},
+    "elder":    {"gather": 0.35, "build": 0.40, "social": 1.00, "watch": 0.55,
+                 "farm": 0.55, "mine": 0.30},
+    "lookout":  {"gather": 0.55, "build": 0.45, "social": 0.60, "watch": 1.00,
+                 "farm": 0.45, "mine": 0.55},
+    "child":    {"gather": 0.30, "build": 0.15, "social": 1.00, "watch": 0.10,
+                 "farm": 0.25, "mine": 0.10},
 }
 _DEFAULT_AFFINITY = ROLE_AFFINITY["gatherer"]
 
@@ -307,6 +319,38 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
     if _find_target_prop(world, ("bush", "berry", "berrybush", "shrub"), ax) is None:
         s["ForageBerries"] = 0.0
 
+    # ------------------------------------------------------------ farm ------
+    # Farming is the RELIABLE food source. A tended field beats stripping wild
+    # bushes, so once a field exists (or there is ground to break) Farm is
+    # weighted a touch above ForageBerries. Anyone will bring in a ripe crop;
+    # the standing work of tilling leans on the `farm` affinity.
+    crops_near, ripe_ready, tillable = _farm_feasible(world)
+    if ripe_ready or tillable:
+        field_bonus = 0.12 if crops_near > 0 else 0.0
+        ripe_bonus = 0.15 if ripe_ready else 0.0
+        s["Farm"] = _clamp01(
+            aff.get("farm", 0.5) * (0.18 + 0.82 * food_short + field_bonus)
+            + ripe_bonus + hunger * 0.12
+        )
+    else:
+        s["Farm"] = 0.0
+
+    # ------------------------------------------------------------ mine ------
+    # A sustained dig, complementing GatherStone. Rises as stored stone falls or
+    # a build is blocked on stone, and is preferred when loose rocks are scarce.
+    stored_stone = stock_qty(world, RES_STONE)
+    stone_target = float(max(6, pop * 3))
+    stone_low = _clamp01((stone_target - stored_stone) / stone_target)
+    if _mineable_near(world, ax):
+        loose_rock = _find_target_prop(world, ("rock",), ax) is not None
+        scarce_bonus = 0.0 if loose_rock else 0.20
+        s["Mine"] = _clamp01(
+            aff.get("mine", 0.5)
+            * (0.10 + 0.90 * max(stone_low, stone_urg) + scarce_bonus)
+        )
+    else:
+        s["Mine"] = 0.0
+
     # ------------------------------------------------------------ haul ------
     s["HaulToStockpile"] = (
         _clamp01(0.42 + 0.42 * min(1.0, carry_qty / float(CARRY_CAP)))
@@ -481,6 +525,94 @@ def _count_props(world: Any, kinds: tuple[str, ...]) -> int:
         if str(k).lower() in want:
             n += 1
     return n
+
+
+def _ripe_crop_exists(world: Any) -> bool:
+    for p in props_of(world):
+        if not prop_alive(p):
+            continue
+        k = getattr(p, "kind", None) or getattr(p, "type", None) or ""
+        if str(k).lower() != "crop":
+            continue
+        st = getattr(p, "state", None)
+        if isinstance(st, dict) and st.get("ripe"):
+            return True
+    return False
+
+
+def _tillable_near(world: Any, center: float, radius: float = 260.0) -> bool:
+    """True if there is gentle grass/dirt near the colony to break new ground."""
+    mat_at = getattr(getattr(world, "terrain", None), "material_at", None)
+    if not callable(mat_at):
+        return False
+    x = center - radius
+    while x <= center + radius:
+        cx = max(4.0, min(float(RENDER_W - 4), x))
+        try:
+            if int(mat_at(cx)) in (MAT_GRASS, MAT_DIRT) and \
+                    abs(slope_at(world, cx)) < MAX_SLOPE_WALK * 0.7:
+                return True
+        except Exception:
+            pass
+        x += 14.0
+    return False
+
+
+def _farm_feasible(world: Any) -> tuple[int, bool, bool]:
+    """(#crops near the colony, a ripe crop is ready, ground can be tilled).
+
+    Cached for a few seconds: it walks the prop list and samples the terrain,
+    and score_actions runs per agent every AI tick.
+    """
+    now = world_now(world)
+    try:
+        t = float(getattr(world, "_bhv_farm_t", -1e9))
+        if 0.0 <= now - t < 5.0:
+            cached = getattr(world, "_bhv_farm", None)
+            if isinstance(cached, tuple) and len(cached) == 3:
+                return cached  # type: ignore[return-value]
+    except Exception:
+        pass
+    center = colony_center(world)
+    crops = _count_props(world, ("crop",))
+    ripe = _ripe_crop_exists(world)
+    tillable = _tillable_near(world, center) if crops < FARM_FIELD_SIZE else False
+    val = (crops, ripe, tillable)
+    try:
+        setattr(world, "_bhv_farm", val)
+        setattr(world, "_bhv_farm_t", now)
+    except Exception:
+        pass
+    return val
+
+
+def _stone_terrain_exists(world: Any) -> bool:
+    """Any MAT_STONE column at all - cached, the check scans the whole map."""
+    now = world_now(world)
+    try:
+        t = float(getattr(world, "_bhv_mine_t", -1e9))
+        if 0.0 <= now - t < 6.0:
+            return bool(getattr(world, "_bhv_mine", False))
+    except Exception:
+        pass
+    mat = getattr(getattr(world, "terrain", None), "material", None)
+    try:
+        found = bool(np.any(np.asarray(mat) == MAT_STONE))
+    except Exception:
+        found = False
+    try:
+        setattr(world, "_bhv_mine", found)
+        setattr(world, "_bhv_mine_t", now)
+    except Exception:
+        pass
+    return found
+
+
+def _mineable_near(world: Any, x: float) -> bool:
+    """A boulder within reach, or failing that any stone terrain to dig."""
+    if _find_target_prop(world, ("boulder",), x) is not None:
+        return True
+    return _stone_terrain_exists(world)
 
 
 def _talk_partner(world: Any, agent: Any) -> Any | None:
@@ -661,6 +793,8 @@ _MAKERS: dict[str, Callable[[Any, Any], Action | None]] = {
     "HaulToStockpile": _mk_simple("HaulToStockpile"),
     "Eat": _mk_simple("Eat"),
     "PlantSapling": _mk_simple("PlantSapling"),
+    "Farm": _mk_simple("Farm"),
+    "Mine": _mk_simple("Mine"),
     "Panic": _mk_simple("Panic"),
     "FleeFrom": _mk_flee,
     "Sleep": _mk_sleep,
