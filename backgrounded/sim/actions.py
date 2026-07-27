@@ -2184,27 +2184,39 @@ def _nearest_ripe_crop(world: Any, x: float,
     return best if best is not None and best_d <= max_dist else None
 
 
-def _till_site(world: Any, center: float) -> float | None:
-    """A gentle grass/dirt column near the colony to break new ground on.
+def _till_col_ok(world: Any, cand: float) -> bool:
+    """The single tillability test. Used by both the site picker and the
+    behaviour feasibility check, so the two can never disagree - the bug where
+    Farm was chosen 1449 times and completed 47 was exactly that disagreement,
+    a random picker missing ground a grid scan swore was there."""
+    if abs(slope_at(world, cand)) > MAX_SLOPE_WALK * 0.7:
+        return False
+    if _material_at(world, cand) not in (MAT_GRASS, MAT_DIRT):
+        return False
+    if find_prop(world, ("crop",), cand, max_dist=22.0) is not None:
+        return False
+    st = nearest_structure(world, None, cand, built_only=False)
+    if st is not None and abs(float(getattr(st, "x", 1e9)) - cand) < 26.0:
+        return False
+    return True
 
-    Never a cliff, never water, not stacked on an existing crop or a building.
-    Returns None if the ground around the colony is all rock, slope or water -
-    the caller then falls back to harvesting instead of standing idle.
-    """
-    rng = rng_of(world)
-    for _ in range(16):
-        cand = _clamp_x(float(center) + rng.uniform(-FARM_FIELD_RADIUS, FARM_FIELD_RADIUS))
-        if abs(slope_at(world, cand)) > MAX_SLOPE_WALK * 0.7:
-            continue
-        if _material_at(world, cand) not in (MAT_GRASS, MAT_DIRT):
-            continue
-        if find_prop(world, ("crop",), cand, max_dist=22.0) is not None:
-            continue
-        st = nearest_structure(world, None, cand, built_only=False)
-        if st is not None and abs(float(getattr(st, "x", 1e9)) - cand) < 26.0:
-            continue
-        return float(cand)
+
+def find_till_site(world: Any, center: float) -> float | None:
+    """The nearest tillable column to `center`, or None if there is genuinely
+    nowhere. A deterministic outward grid scan rather than random darts, so if a
+    site exists it is found - which is what keeps feasibility and execution in
+    step. Public so behaviour can ask 'is there anywhere to farm?' with the very
+    same test the action will use."""
+    for off in range(0, int(FARM_FIELD_RADIUS) + 1, 12):
+        for cand in ((center + off, center - off) if off else (center,)):
+            cx = _clamp_x(float(cand))
+            if _till_col_ok(world, cx):
+                return cx
     return None
+
+
+# Back-compat alias for the old private name.
+_till_site = find_till_site
 
 
 def _plant_crop(world: Any, x: float) -> bool:

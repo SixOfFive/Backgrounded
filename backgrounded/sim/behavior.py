@@ -344,9 +344,12 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
     if _mineable_near(world, ax):
         loose_rock = _find_target_prop(world, ("rock",), ax) is not None
         scarce_bonus = 0.0 if loose_rock else 0.20
+        # A higher floor than most jobs on purpose: a colony keeps a quarry
+        # ticking over even when the stores are full, so mining is a visible
+        # ongoing activity rather than only a stone-emergency response.
         s["Mine"] = _clamp01(
             aff.get("mine", 0.5)
-            * (0.10 + 0.90 * max(stone_low, stone_urg) + scarce_bonus)
+            * (0.30 + 0.70 * max(stone_low, stone_urg) + scarce_bonus)
         )
     else:
         s["Mine"] = 0.0
