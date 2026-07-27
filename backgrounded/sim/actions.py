@@ -68,6 +68,7 @@ __all__ = [
     "ACTION_KINDS",
     "POSES",
     "make_action",
+    "action_from_dict",
     "CARRY_CAP",
     # accessor layer, reused by behavior.py
     "world_now", "is_night", "rng_of", "ground_y", "slope_at",
@@ -1188,6 +1189,25 @@ def make_action(kind: str, **kw: Any) -> Action:
         a.data.update(data)
     a.data.update(kw)
     return a
+
+
+def action_from_dict(d: Any) -> Any:
+    """Rehydrate a saved action, honouring the vignette engine's own kind.
+
+    ``Action.from_dict`` coerces any unknown ``kind`` to ``Wander``, which would
+    quietly turn a saved cosmetic vignette into a wander on every reload. The
+    vignette module owns a parallel state machine with the same interface, so
+    give it first refusal; fall back to a real :class:`Action` otherwise. The
+    import is local to keep ``vignettes`` off actions.py's import graph (it
+    imports *from* here)."""
+    try:
+        from .vignettes import vignette_action_from_dict
+        v = vignette_action_from_dict(d)
+        if v is not None:
+            return v
+    except Exception:
+        log.debug("vignette rehydrate unavailable", exc_info=True)
+    return Action.from_dict(d if isinstance(d, dict) else {})
 
 
 # ===========================================================================

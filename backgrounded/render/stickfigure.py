@@ -48,10 +48,14 @@ __all__ = [
 TAU = math.tau
 
 # ------------------------------------------------------------------- poses --
-#: Every pose the poser draws. ``'dead'`` is derived, not requested.
+#: Every pose the poser draws. ``'dead'`` is derived, not requested. The
+#: acrobatics band (``cartwheel``..``split``) exists for the idle vignettes -
+#: villagers showing off when nobody needs them - and leans on the skeleton's
+#: whole-body ``rot`` rather than limb flailing.
 POSES: tuple[str, ...] = (
     "idle", "walk", "carry", "chop", "build", "climb", "fall", "sleep",
     "dance", "mourn", "panic",
+    "cartwheel", "handstand", "flip", "backflip", "highkick", "split",
 )
 _KNOWN: frozenset[str] = frozenset(POSES) | {"dead"}
 
@@ -406,6 +410,86 @@ def _p_dance(s: Stickman, t: float, ph: float, idp: float) -> _Pose:
     )
 
 
+# ----------------------------------------------------------- acrobatics --
+# A small vocabulary of showing-off bodies for the idle vignettes. Where the
+# ordinary poses animate their limbs, these lean on the skeleton's whole-body
+# ``rot`` about the hip - at ~21px a stickman reads far more clearly tumbling
+# as a rigid star than as flailing lines. The spin is driven off the render
+# clock ``t`` so it is smooth whatever the sim rate, exactly like _p_dance.
+def _p_cartwheel(s: Stickman, t: float, ph: float, idp: float) -> _Pose:
+    spin = t * TAU * 0.85 + idp
+    return _Pose(
+        rot=spin,
+        thigh=(0.85, -0.85),                 # legs thrown wide: the star
+        knee=(0.06, 0.06),
+        shoulder=(2.35, -2.35),              # arms wide, opposite the legs
+        elbow=(0.05, 0.05),
+    )
+
+
+def _p_handstand(s: Stickman, t: float, ph: float, idp: float) -> _Pose:
+    wob = math.sin(t * 2.4 + idp)            # a held handstand still trembles
+    return _Pose(
+        rot=math.pi + 0.06 * wob,            # inverted, minus a little balance
+        thigh=(0.12 + 0.05 * wob, -0.12 - 0.05 * wob),   # legs up, slightly apart
+        knee=(0.05, 0.05),
+        shoulder=(2.98, 2.98),               # arms straight overhead -> planted
+        elbow=(0.04, 0.04),
+    )
+
+
+def _p_flip(s: Stickman, t: float, ph: float, idp: float) -> _Pose:
+    spin = t * TAU * 0.80 + idp              # forward somersault
+    return _Pose(
+        rot=spin,
+        head=0.34,
+        crouch=0.18,
+        thigh=(1.55, 1.42),                  # tucked into a ball
+        knee=(1.70, 1.62),
+        shoulder=(1.25, 1.12),               # arms hugging the shins
+        elbow=(1.30, 1.24),
+    )
+
+
+def _p_backflip(s: Stickman, t: float, ph: float, idp: float) -> _Pose:
+    spin = -(t * TAU * 0.80 + idp)           # the other way round
+    return _Pose(
+        rot=spin,
+        head=-0.30,
+        crouch=0.16,
+        thigh=(1.50, 1.38),
+        knee=(1.66, 1.58),
+        shoulder=(1.20, 1.08),
+        elbow=(1.26, 1.20),
+    )
+
+
+def _p_highkick(s: Stickman, t: float, ph: float, idp: float) -> _Pose:
+    k = 0.5 + 0.5 * math.sin(t * 2.7 + idp)  # the lead leg swings up and down
+    return _Pose(
+        lean=-0.26 * k,
+        head=-0.05,
+        bob=-0.22 * k,
+        thigh=(1.90 * k, 0.18),              # lead leg swings up past the hip
+        knee=(0.14, 0.12),
+        shoulder=(0.95, -0.55),              # arms out for balance
+        elbow=(0.28, 0.50),
+    )
+
+
+def _p_split(s: Stickman, t: float, ph: float, idp: float) -> _Pose:
+    br = math.sin(t * 1.1 + idp)
+    return _Pose(
+        crouch=0.85,                         # hips right down to the ground
+        lean=0.04,
+        head=-0.04,
+        thigh=(1.50, -1.50),                 # legs straight out, both ways
+        knee=(0.03, 0.03),
+        shoulder=(0.70 + 0.12 * br, -0.70 - 0.12 * br),
+        elbow=(0.20, 0.20),
+    )
+
+
 def _p_mourn(s: Stickman, t: float, ph: float, idp: float) -> _Pose:
     sway = math.sin(t * 0.7 + idp)
     return _Pose(
@@ -438,6 +522,8 @@ _POSE_FN: dict[str, Callable[[Stickman, float, float, float], _Pose]] = {
     "idle": _p_idle, "walk": _p_walk, "carry": _p_carry, "chop": _p_chop,
     "build": _p_build, "climb": _p_climb, "fall": _p_fall, "sleep": _p_sleep,
     "dance": _p_dance, "mourn": _p_mourn, "panic": _p_panic, "dead": _p_dead,
+    "cartwheel": _p_cartwheel, "handstand": _p_handstand, "flip": _p_flip,
+    "backflip": _p_backflip, "highkick": _p_highkick, "split": _p_split,
 }
 
 

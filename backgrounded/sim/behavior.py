@@ -85,6 +85,24 @@ __all__ = [
 # ------------------------------------------------------------------ tuning --
 HYSTERESIS_BONUS = 0.35     # stickiness for the action already running
 
+#: When an agent is idle and content, "Wander" wins the utility race - and that
+#: is exactly the moment it should sometimes do something *cosmetic* instead:
+#: a cartwheel, a handstand, a stretch. These are the odds of playing a vignette
+#: rather than plain wandering. A second, lower chance applies right after one
+#: finishes so acrobatics do not chain forever without a wander in between.
+VIGNETTE_CHANCE = 0.55
+VIGNETTE_CHANCE_AFTER = 0.20
+#: Of the idle beats that do play, this fraction is aimed at the acrobatics band
+#: (cartwheels, handstands, flips) rather than the general "various things".
+ACROBATIC_BIAS = 0.45
+#: Above any of these need levels an agent has better things to do than show off.
+VIGNETTE_NEED_CEIL = 0.72
+#: Top utility below this counts as "idle": the only things worth doing are
+#: low-value chores, so a villager may mess about instead. Set just above the
+#: resting floors of Mine/Farm/gather (~0.30-0.50) so a healthy colony has
+#: downtime, but any genuine shortfall (which lifts those scores) closes it.
+DOWNTIME_PEAK = 0.62
+
 #: Once an agent commits to something it sticks with it for at least this long
 #: unless a genuine emergency (score >= OVERRIDE_FLOOR) interrupts.
 #:
@@ -690,6 +708,60 @@ def _mk_simple(kind: str) -> Callable[[Any, Any], Action | None]:
     return build
 
 
+def _content_enough(agent: Any) -> bool:
+    """True when an agent has no pressing need and could plausibly mess about.
+
+    A hungry, exhausted, freezing or panicking villager does not do cartwheels;
+    it deals with the thing that is wrong. Danger never reaches here anyway - a
+    real threat makes FleeFrom win outright - but the needs are checked so an
+    agent that is merely *coping* still keeps its head down."""
+    try:
+        if float(getattr(agent, "panic", 0.0) or 0.0) > 0.0:
+            return False
+    except (TypeError, ValueError):
+        pass
+    return (_need(agent, "hunger") < VIGNETTE_NEED_CEIL
+            and _need(agent, "fatigue") < VIGNETTE_NEED_CEIL
+            and _need(agent, "warmth") < VIGNETTE_NEED_CEIL)
+
+
+def _maybe_vignette(
+    agent: Any, world: Any, scores: dict[str, float], rng: Any
+) -> Action | None:
+    """A cosmetic vignette for a villager between jobs, or None.
+
+    This is the single seam that turns the (previously dormant) vignette engine
+    on. Agents are almost never "idle" in the strict sense - Mine, Farm and the
+    gather chores all carry a positive floor, so "Wander" essentially never wins
+    the utility race. What *does* happen is stretches where the best thing worth
+    doing is low-value busywork (topping up a full stockpile). That is the real
+    idle moment, and it is defined here as "nothing scored above
+    :data:`DOWNTIME_PEAK`" - so when food or stone actually run short the peak
+    climbs, the gate closes, and everyone gets back to work on their own."""
+    try:
+        if not _content_enough(agent):
+            return None
+        peak = max(scores.values()) if scores else 0.0
+        if peak >= DOWNTIME_PEAK:
+            return None
+        prev = getattr(getattr(agent, "action", None), "kind", "") or ""
+        chance = VIGNETTE_CHANCE_AFTER if prev == "Vignette" else VIGNETTE_CHANCE
+        if rng.random() >= chance:
+            return None
+        from .vignettes import ACROBATIC_POSES, make_vignette_action
+        # The user asked for acrobatics specifically, so bias toward them - but
+        # they are only ~5% of the 520-vignette pool, so ask for one directly a
+        # good fraction of the time and let the rest be the "various things".
+        if rng.random() < ACROBATIC_BIAS:
+            acro = make_vignette_action(agent, world, rng, poses=ACROBATIC_POSES)
+            if acro is not None:
+                return acro
+        return make_vignette_action(agent, world, rng)
+    except Exception:
+        log.debug("idle vignette pick failed", exc_info=True)
+        return None
+
+
 def _mk_flee(agent: Any, world: Any) -> Action | None:
     d = _danger_for(agent, world)
     if d is None:
@@ -877,6 +949,22 @@ def choose_action(agent: Any, world: Any) -> Action:
                 peak = max(scores.values()) if scores else 0.0
                 if peak < OVERRIDE_FLOOR:
                     return cur
+
+        # Between jobs, with nothing pressing: sometimes mess about (a cartwheel,
+        # a handstand, a stretch) instead of picking up the next low-value chore.
+        # Only when the previous action ran to completion - never as an emergency
+        # interrupt (those arrive here with cur still live) - so a vignette never
+        # pre-empts real work, only fills the gaps between it.
+        if not cur_live:
+            vig = _maybe_vignette(agent, world, scores, rng)
+            if vig is not None:
+                if cur is not None and cur is not vig:
+                    try:
+                        cur.abandon(agent, world)
+                    except Exception:
+                        pass
+                return vig
+
         ranked: list[tuple[float, str]] = []
         for kind, base in scores.items():
             if base <= 0.0:

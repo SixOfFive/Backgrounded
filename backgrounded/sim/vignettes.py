@@ -608,18 +608,30 @@ def _remember(agent: Any, key: str) -> None:
         log.debug("could not record recent vignette", exc_info=True)
 
 
-def candidates(agent: Any, world: Any, ctx: set[str] | None = None) -> list[Vignette]:
-    """Every vignette that fits the context and is not one of the last two."""
+#: The bodies drawn by the acrobatics band. Kept here so a caller can ask the
+#: picker for "something acrobatic" without knowing which content keys carry it.
+ACROBATIC_POSES: frozenset[str] = frozenset(
+    {"cartwheel", "handstand", "flip", "backflip", "highkick", "split"})
+
+
+def candidates(agent: Any, world: Any, ctx: set[str] | None = None,
+               poses: frozenset[str] | None = None) -> list[Vignette]:
+    """Every vignette that fits the context and is not one of the last two.
+
+    *poses*, if given, restricts the pool to vignettes whose base pose is in the
+    set - used to ask specifically for an acrobatic beat."""
     if not REGISTRY:
         return []
     if ctx is None:
         ctx = context_tags(agent, world)
     barred = set(recent_of(agent))
     return [v for v in REGISTRY.values()
-            if v.weight > 0.0 and v.key not in barred and v.gates <= ctx]
+            if v.weight > 0.0 and v.key not in barred and v.gates <= ctx
+            and (poses is None or v.pose in poses)]
 
 
-def pick(agent: Any, world: Any, rng: Any = None) -> Vignette | None:
+def pick(agent: Any, world: Any, rng: Any = None,
+         poses: frozenset[str] | None = None) -> Vignette | None:
     """Weighted choice over the vignettes whose tags the context satisfies.
 
     Never returns either of the agent's previous two vignettes - the repeat is
@@ -628,7 +640,7 @@ def pick(agent: Any, world: Any, rng: Any = None) -> Vignette | None:
     would otherwise have done.
     """
     try:
-        pool = candidates(agent, world)
+        pool = candidates(agent, world, poses=poses)
         if not pool:
             return None
         r = _coerce_rng(rng, world)
@@ -918,13 +930,17 @@ def _set_pose(agent: Any, pose: str) -> None:
         pass
 
 
-def make_vignette_action(agent: Any, world: Any, rng: Any = None) -> VignetteAction | None:
+def make_vignette_action(agent: Any, world: Any, rng: Any = None,
+                         poses: frozenset[str] | None = None) -> VignetteAction | None:
     """Pick a vignette for *agent* and wrap it in an action. None if none fit.
 
-    This is what behavior.py calls when an agent is idle or between jobs.
+    This is what behavior.py calls when an agent is idle or between jobs. Pass
+    *poses* (e.g. :data:`ACROBATIC_POSES`) to ask specifically for that kind of
+    beat; it returns None if none currently fit, so the caller can fall back to
+    an unrestricted pick.
     """
     try:
-        v = pick(agent, world, rng)
+        v = pick(agent, world, rng, poses=poses)
     except Exception:
         log.debug("make_vignette_action failed", exc_info=True)
         return None
