@@ -1030,17 +1030,20 @@ def next_build_kind(world: Any, reg: StructureRegistry | None = None) -> str | N
         return "stockpile"
     if built("hut") < 1:
         return "hut"
+    # Edge defence is interleaved with expansion, not deferred behind it, so it
+    # goes up *as the colony progresses* rather than after five huts. First
+    # shelter, then the first spiked barricade on one edge, then keep growing,
+    # and the second edge once the settlement is a bit bigger. Placement (which
+    # edge) is decided in pick_site; here we only ask for the next one.
+    if pop >= BARRICADE_MIN_POP and built("barricade") < 1:
+        return "barricade"
+    if built("hut") < 3:
+        return "hut"
+    if pop >= BARRICADE_MIN_POP and built("barricade") < 2:
+        return "barricade"
     want_huts = min(MAX_HUTS, max(1, (pop + 1) // 2))
     if built("hut") < want_huts:
         return "hut"
-    # Edge defence. Once the basics stand and the colony is big enough to spare
-    # the hands, raise spiked barricades where the animals come in - one near
-    # each edge, so two in all. Slotted around wall priority: it is the first
-    # thing built once shelter is up, because the whole point is to hurt an
-    # incursion before it reaches the huts. Placement (which edge) is decided in
-    # pick_site; here we only ask for another until both edges are covered.
-    if pop >= BARRICADE_MIN_POP and built("barricade") < 2:
-        return "barricade"
     if pop >= 4 and built("wall") < 1:
         return "wall"
     if pop >= 5 and built("watchtower") < 1:
@@ -1205,36 +1208,41 @@ def _barricade_site(
     except Exception:
         pass
 
+    # Candidate edges, left first, that still need one. Trying both (rather than
+    # committing to the left) means an all-cliff left band falls through to the
+    # right instead of stalling the build order forever.
+    candidates: list[tuple[float, float, float]] = []
     if not left_has:
-        lo, hi, edge = 6.0, band, 0.0
-    elif not right_has:
-        lo, hi, edge = float(RENDER_W) - band, float(RENDER_W) - 6.0, float(RENDER_W)
-    else:
+        candidates.append((6.0, band, 0.0))
+    if not right_has:
+        candidates.append((float(RENDER_W) - band, float(RENDER_W) - 6.0,
+                           float(RENDER_W)))
+    if not candidates:
         return None                      # both edges covered - nothing to do
 
-    lo = max(4.0, lo)
-    hi = min(float(RENDER_W - 4), hi)
-    if hi <= lo:
-        return None
+    for lo, hi, edge in candidates:
+        lo = max(4.0, lo)
+        hi = min(float(RENDER_W - 4), hi)
+        if hi <= lo:
+            continue
+        # Walk the band; keep the non-cliff column closest to the edge and,
+        # among near-equals, flattest. Closeness dominates so the spikes really
+        # do straddle the entry point rather than drifting toward the camp.
+        best_x: float | None = None
+        best_score = float("-inf")
+        x = lo
+        while x <= hi:
+            cx = float(x)
+            if not _is_cliff(world, cx):
+                score = -abs(cx - edge) / band - abs(slope_at(world, cx)) * 0.6
+                if score > best_score:
+                    best_score = score
+                    best_x = cx
+            x += 6.0
+        if best_x is not None:
+            return best_x, float(ground_y(world, best_x)), {}
 
-    # Walk the band; keep the non-cliff column that is closest to the edge and,
-    # among near-equals, flattest. Closeness dominates so the spikes really do
-    # straddle the entry point rather than drifting toward the settlement.
-    best_x: float | None = None
-    best_score = float("-inf")
-    x = lo
-    while x <= hi:
-        cx = float(x)
-        if not _is_cliff(world, cx):
-            score = -abs(cx - edge) / band - abs(slope_at(world, cx)) * 0.6
-            if score > best_score:
-                best_score = score
-                best_x = cx
-        x += 6.0
-
-    if best_x is None:
-        return None
-    return best_x, float(ground_y(world, best_x)), {}
+    return None
 
 
 def find_chasm(world: Any) -> tuple[float, float] | None:

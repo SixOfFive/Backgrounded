@@ -203,8 +203,8 @@ MINE_SESSION_SEC = 24.0     # how long a miner works one spot before moving on
 #: come in from - so invaders are hurt (and often killed) before they reach the
 #: settlement. Passive: they damage any wild animal that lingers in range, never
 #: a stickman.
-BARRICADE_DAMAGE = 12.0     # hp/s dealt to an animal within range
-BARRICADE_RANGE = 34.0      # px
+BARRICADE_DAMAGE = 22.0     # hp/s dealt to an animal within range
+BARRICADE_RANGE = 48.0      # px
 BARRICADE_EDGE_FRAC = 0.16  # a barricade sits within this fraction of an edge
 BARRICADE_MIN_POP = 4       # colony builds them once it is this many strong
 
