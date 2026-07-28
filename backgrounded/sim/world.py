@@ -21,10 +21,12 @@ from ..constants import (
     AI_TICKS, ALL_RESOURCES, DAY_LENGTH_SEC, FOOD_PER_HEAD_TO_GROW,
     MAX_POP, MIN_POP, MORALE_TO_GROW, POP_BIRTH_COOLDOWN, POP_PER_HUT,
     REGROW_MAX, REGROW_PER_HEAD, RENDER_H, RENDER_W,
-    RES_COOKED, RES_FOOD, RES_STONE, RES_WOOD, SCENE_NIGHT_STORM, SAVE_VERSION,
+    RES_COOKED, RES_FOOD, RES_STONE, RES_WOOD, SAVE_VERSION,
+    SCENE_LABELS, SCENE_NIGHT_STORM, SCENE_ROTATE_SEC, SCENES,
     TORCH_COLOR, TORCH_FLICKER, TORCH_INTENSITY, TORCH_RADIUS,
 )
 from . import behavior, names
+from .actions import sweep_claims
 from .animals import AnimalRegistry
 from .ufo import Ufo
 from .entities import GRAVE_DELAY, Population, Stickman
@@ -73,6 +75,7 @@ class World:
         self.ufo: Ufo = Ufo()
 
         # Colony-level state
+        self.auto_scene_rotate: bool = True     # flip scene every SCENE_ROTATE_SEC
         self.stockpile: dict[str, int] = {r: 0 for r in ALL_RESOURCES}
         self.build_queue: list[str] = []
         self.chronicle: deque[str] = deque(maxlen=CHRONICLE_MAX)
@@ -103,6 +106,7 @@ class World:
             s = self.population.spawn(
                 x=x,
                 y=self.terrain.ground_y(x),
+                rng=self.pyrng,
                 name=names.new_name(self.pyrng, used),
                 generation=1,
                 birth_time=0.0,
@@ -138,6 +142,7 @@ class World:
         self.tick_count += 1
 
         self._guarded("events", lambda: self.events.tick(self, dt))
+        self._guarded("scene", lambda: self._tick_scene(dt))
         self._guarded("props", lambda: self._tick_props(dt))
         self._guarded("structures", lambda: self.structures.update(dt, self))
         self._guarded("agents", lambda: self._tick_agents(dt))
@@ -162,6 +167,21 @@ class World:
         except Exception:
             log.exception("subsystem %r failed; disabling for this session", name)
             self._disabled.add(name)
+
+    def _tick_scene(self, dt: float) -> None:
+        """Rotate to a fresh, random scene every SCENE_ROTATE_SEC, and sweep the
+        harvest-claim table while we are here (both are cheap, per-tick chores
+        that key off the world clock). Keying the flip off the event system's own
+        ``scene_t`` means a manual scene pick from the tray resets the countdown,
+        so a chosen scene holds for a full interval before the weather moves on."""
+        ev = self.events
+        if self.auto_scene_rotate and float(getattr(ev, "scene_t", 0.0)) >= SCENE_ROTATE_SEC:
+            choices = [s for s in SCENES if s != ev.scene]
+            if choices:
+                nxt = choices[self.pyrng.randrange(len(choices))]
+                if ev.request_scene(nxt):
+                    self.log_event(f"The weather turns to {SCENE_LABELS.get(nxt, nxt)}.")
+        sweep_claims(self)
 
     def _tick_agents(self, dt: float) -> None:
         ai_due = (self.tick_count % AI_TICKS) == 0
@@ -271,6 +291,7 @@ class World:
                 name=agent.name,
                 cause=agent.death_cause or "the dark",
                 x=agent.x,
+                rng=self.pyrng,
             ))
             # Deaths are NOT replaced one-for-one any more. A fixed headcount
             # made every disaster free: lose four to a wildfire and four walk
@@ -386,6 +407,7 @@ class World:
         x = float(self.rng.uniform(RENDER_W * 0.1, RENDER_W * 0.9))
         s = self.population.spawn(
             x=x, y=self.terrain.ground_y(x),
+            rng=self.pyrng,
             name=names.new_name(self.pyrng, used),
             generation=gen, birth_time=self.world_time,
         )
@@ -397,7 +419,8 @@ class World:
         # through to the generic line, so every replacement was announced as
         # "Something happened." rather than by name.
         self.log_event(names.describe_event("born" if born else "arrived",
-                                            name=s.name, generation=gen))
+                                            name=s.name, generation=gen,
+                                            rng=self.pyrng))
 
     def spawn_visitor(self, x: float) -> str | None:
         """Player's Spawn tool: a newcomer appears at x, if there is room."""
@@ -408,13 +431,15 @@ class World:
         gx = float(max(RENDER_W * 0.03, min(RENDER_W * 0.97, x)))
         s = self.population.spawn(
             x=gx, y=self.terrain.ground_y(gx),
+            rng=self.pyrng,
             name=names.new_name(self.pyrng, used),
             generation=self.population.generation,
             birth_time=self.world_time,
         )
         self.stats["born"] += 1
         self.log_event(names.describe_event("arrived", name=s.name,
-                                            generation=s.generation))
+                                            generation=s.generation,
+                                            rng=self.pyrng))
         return None
 
     def _rebuild_lights(self) -> None:

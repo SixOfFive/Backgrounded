@@ -469,6 +469,88 @@ def _prop_kind(prop: Any) -> str:
     return str(k).lower()
 
 
+# --------------------------------------------------------- resource claims --
+#: Seconds a harvest claim survives without renewal. An agent renews its claim
+#: every tick it is walking to or working a prop, so a live claim never lapses;
+#: this only governs how fast a claim frees after its owner stops renewing it
+#: (died, fled, switched jobs), and is deliberately short so a dropped resource
+#: is available again almost immediately.
+CLAIM_TTL = 4.0
+
+
+def _prop_claims(world: Any) -> dict[Any, tuple[int, float]]:
+    """The world's transient prop->(*agent_id*, *expires*) claim table.
+
+    Created on demand and never serialised - on load everyone re-claims what
+    they resume working, exactly like the Hand tool's held-item sets."""
+    c = getattr(world, "prop_claims", None)
+    if not isinstance(c, dict):
+        c = {}
+        try:
+            setattr(world, "prop_claims", c)
+        except Exception:
+            return {}
+    return c
+
+
+def claim_prop(world: Any, prop: Any, agent: Any, ttl: float = CLAIM_TTL) -> None:
+    """Reserve *prop* for *agent* so no one else picks it as a harvest target."""
+    if prop is None:
+        return
+    pid = getattr(prop, "id", None)
+    aid = getattr(agent, "id", None)
+    if pid is None or aid is None:
+        return
+    try:
+        _prop_claims(world)[pid] = (int(aid), world_now(world) + max(0.5, float(ttl)))
+    except Exception:
+        pass
+
+
+def release_claim(world: Any, pid: Any, agent: Any = None) -> None:
+    """Drop a claim by prop id. With *agent*, only if that agent still holds it
+    (so a later claimant's reservation is never yanked out by the first one)."""
+    if pid is None:
+        return
+    c = _prop_claims(world)
+    rec = c.get(pid)
+    if rec is None:
+        return
+    if agent is None or rec[0] == getattr(agent, "id", None):
+        c.pop(pid, None)
+
+
+def prop_claimed_by_other(
+    world: Any, prop: Any, claimant_id: Any, now: float | None = None
+) -> bool:
+    """True if a *different* agent holds an unexpired claim on *prop*."""
+    pid = getattr(prop, "id", None)
+    if pid is None:
+        return False
+    rec = _prop_claims(world).get(pid)
+    if rec is None:
+        return False
+    holder, expire = rec
+    if now is None:
+        now = world_now(world)
+    if expire <= now:
+        return False
+    return holder != claimant_id
+
+
+def sweep_claims(world: Any) -> None:
+    """Drop expired claims and claims on props that are gone. Cheap; the table
+    never holds more than a claim per agent, but stale keys would otherwise
+    accumulate for every prop ever harvested."""
+    c = getattr(world, "prop_claims", None)
+    if not isinstance(c, dict) or not c:
+        return
+    now = world_now(world)
+    live = {getattr(p, "id", None) for p in props_of(world) if prop_alive(p)}
+    for pid in [k for k, (_, exp) in c.items() if exp <= now or k not in live]:
+        c.pop(pid, None)
+
+
 def find_prop(
     world: Any,
     kinds: Iterable[str],
@@ -476,16 +558,26 @@ def find_prop(
     *,
     max_dist: float = 720.0,
     exclude: Iterable[Any] = (),
+    claimant: Any = None,
 ) -> Any | None:
-    """Nearest living prop whose kind is in `kinds`."""
+    """Nearest living prop whose kind is in `kinds`.
+
+    With *claimant* (an agent id), props another agent has an unexpired claim on
+    are skipped, so two villagers never converge on the same tree and one is
+    left miming a harvest. The same claim-aware call is used both to *score* a
+    gather (is any prop free?) and to *target* one, so the two never disagree.
+    """
     want = tuple(k.lower() for k in kinds)
     skip = {id(e) for e in exclude}
+    now = world_now(world) if claimant is not None else 0.0
     best = None
     best_d = float("inf")
     for p in props_of(world):
         if id(p) in skip or not prop_alive(p):
             continue
         if _prop_kind(p) not in want:
+            continue
+        if claimant is not None and prop_claimed_by_other(world, p, claimant, now):
             continue
         try:
             d = abs(float(getattr(p, "x", 0.0)) - float(x))
@@ -1259,8 +1351,10 @@ def _h_gather(a: Action, ag: Any, w: Any, dt: float) -> None:
         a.failed = True
         return
 
+    aid = getattr(ag, "id", None)
+
     if a.phase == "start":
-        p = find_prop(w, spec["kinds"], ag.x)
+        p = find_prop(w, spec["kinds"], ag.x, claimant=aid)
         if p is None:
             a.failed = True
             return
@@ -1268,6 +1362,7 @@ def _h_gather(a: Action, ag: Any, w: Any, dt: float) -> None:
         a.data["px"] = float(getattr(p, "x", ag.x))
         a.data["hits"] = 0
         a.data["hit_t"] = 0.0
+        claim_prop(w, p, ag)          # this prop is mine; no one else target it
         a.phase = "approach"
 
     if a.phase in ("approach", "work"):
@@ -1275,14 +1370,19 @@ def _h_gather(a: Action, ag: Any, w: Any, dt: float) -> None:
         if p is None:
             # id lookup can fail if props.py has no id field - fall back to
             # position, and give up gracefully if the prop is really gone.
-            p = find_prop(w, spec["kinds"], float(a.data.get("px", ag.x)), max_dist=40.0)
+            p = find_prop(w, spec["kinds"], float(a.data.get("px", ag.x)),
+                          max_dist=40.0, claimant=aid)
         if p is None or not prop_alive(p):
+            release_claim(w, a.target, ag)
             if _has_load(ag, a):
                 a.phase = "deliver"
             else:
                 a.failed = True
             return
         a.data["px"] = float(getattr(p, "x", a.data.get("px", ag.x)))
+        # Renew every tick we are actively pursuing it, so the claim only lapses
+        # once we walk away for good.
+        claim_prop(w, p, ag)
 
     if a.phase == "approach":
         a.pose = "walk"
@@ -1304,7 +1404,7 @@ def _h_gather(a: Action, ag: Any, w: Any, dt: float) -> None:
         a.data["hit_t"] = 0.0
         a.data["hits"] = int(a.data.get("hits", 0)) + 1
         p = prop_by_id(w, a.target) or find_prop(
-            w, spec["kinds"], float(a.data["px"]), max_dist=40.0)
+            w, spec["kinds"], float(a.data["px"]), max_dist=40.0, claimant=aid)
         got = hit_prop(w, p, float(spec["dmg"]), int(spec["yield"]))
         if a.data["hits"] > 24 and got <= 0:
             # Something odd about this prop - take the yield and move on.
@@ -1319,7 +1419,9 @@ def _h_gather(a: Action, ag: Any, w: Any, dt: float) -> None:
             _adjust(ag, "fatigue", 0.02)
             if not prop_alive(p):
                 chronicle(w, f"{getattr(ag, 'name', 'Someone')} {spec['verb']}.")
+                release_claim(w, a.target, ag)   # exhausted: free it for others
             if int(getattr(ag, "carry_qty", 0) or 0) >= CARRY_CAP or not prop_alive(p):
+                release_claim(w, a.target, ag)   # done here, hands full
                 a.phase = "deliver"
         return
 
@@ -1329,6 +1431,16 @@ def _h_gather(a: Action, ag: Any, w: Any, dt: float) -> None:
         return
 
     a.phase = "start"
+
+
+def _c_gather(a: Action, ag: Any, w: Any) -> None:
+    """Free the claimed prop whenever a gather is cut short (abandoned for an
+    emergency, superseded, or killed off). Without this a villager who bolts
+    from a wolf mid-chop would keep a tree reserved until the claim timed out."""
+    try:
+        release_claim(w, a.target, ag)
+    except Exception:
+        pass
 
 
 def _h_haul(a: Action, ag: Any, w: Any, dt: float) -> None:
@@ -2403,11 +2515,13 @@ def _dig_divot(world: Any, a: "Action", x: float) -> None:
 
 def _h_mine(a: Action, ag: Any, w: Any, dt: float) -> None:
     if a.phase == "start":
-        b = find_prop(w, ("boulder",), float(ag.x), max_dist=520.0)
+        b = find_prop(w, ("boulder",), float(ag.x), max_dist=520.0,
+                      claimant=getattr(ag, "id", None))
         if b is not None:
             a.target = getattr(b, "id", None)
             a.data["mx"] = float(getattr(b, "x", ag.x))
             a.data["src"] = "boulder"
+            claim_prop(w, b, ag)      # two miners never share one boulder
         else:
             sx = _nearest_stone_column(w, float(ag.x))
             if sx is None:
@@ -2438,6 +2552,8 @@ def _h_mine(a: Action, ag: Any, w: Any, dt: float) -> None:
 
     if a.phase == "dig":
         mx = float(a.data.get("mx", ag.x))
+        if a.data.get("src") == "boulder" and a.target is not None:
+            claim_prop(w, prop_by_id(w, a.target), ag)   # hold it while digging
         _halt(ag)
         _face(ag, mx - float(ag.x))
         a.data["dig_t"] = float(a.data.get("dig_t", 0.0)) + dt
@@ -2461,6 +2577,7 @@ def _h_mine(a: Action, ag: Any, w: Any, dt: float) -> None:
                 ag.mining = False
             except Exception:
                 pass
+            release_claim(w, a.target, ag)
             a.done = True
         return
 
@@ -2468,9 +2585,13 @@ def _h_mine(a: Action, ag: Any, w: Any, dt: float) -> None:
 
 
 def _c_mine(a: Action, ag: Any, w: Any) -> None:
-    """Drop the transient dust flag whenever a dig is cut short."""
+    """Drop the transient dust flag and free the boulder when a dig is cut short."""
     try:
         ag.mining = False
+    except Exception:
+        pass
+    try:
+        release_claim(w, a.target, ag)
     except Exception:
         pass
 
@@ -2504,6 +2625,9 @@ _CLEANUP: dict[str, Callable[[Action, Any, Any], None]] = {
     "Sleep": _c_sleep,
     "Lookout": _c_lookout,
     "Mine": _c_mine,
+    "GatherWood": _c_gather,
+    "GatherStone": _c_gather,
+    "ForageBerries": _c_gather,
 }
 
 # Sanity: every advertised kind must have a real handler.

@@ -223,6 +223,11 @@ SCENES = (
     SCENE_BLIZZARD, SCENE_FLOOD, SCENE_METEOR, SCENE_ASHFALL,
 )
 
+#: The world flips to a fresh, randomly chosen scene this often (world-seconds).
+#: A manual scene pick from the tray resets the countdown, so a deliberately
+#: chosen scene still gets a full interval before the weather moves on.
+SCENE_ROTATE_SEC = 600.0        # 10 minutes
+
 SCENE_LABELS = {
     SCENE_NIGHT_STORM: "Night Storm",
     SCENE_CLEAR:       "Clear Skies",

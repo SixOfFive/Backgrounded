@@ -103,6 +103,9 @@ class App:
             log.info("generated a new world (seed=%d)", self.world.seed)
         else:
             self.world.events.request_scene(self.cfg.scene)
+        # Honour the config's auto-scene switch (default on): the world flips to
+        # a random new scene every SCENE_ROTATE_SEC unless the user turned it off.
+        self.world.auto_scene_rotate = bool(getattr(self.cfg, "auto_scene_change", True))
 
         # --- pygame ------------------------------------------------------
         pygame.init()

@@ -334,11 +334,14 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
     s["GatherWood"] = _clamp01(aff["gather"] * (0.10 + 0.90 * wood_urg))
     s["GatherStone"] = _clamp01(aff["gather"] * (0.05 + 0.95 * stone_urg))
     s["ForageBerries"] = _clamp01(aff["gather"] * food_urg + hunger * 0.30)
-    if _find_target_prop(world, _TREE_KINDS, ax) is None:
+    # Claim-aware: a prop another villager has already reserved does not count as
+    # available here, so an agent will not pick GatherWood only to find every
+    # tree taken - it scores the job zero and does something else instead.
+    if _find_target_prop(world, _TREE_KINDS, ax, agent) is None:
         s["GatherWood"] = 0.0
-    if _find_target_prop(world, ("rock", "boulder", "stone", "outcrop"), ax) is None:
+    if _find_target_prop(world, ("rock", "boulder", "stone", "outcrop"), ax, agent) is None:
         s["GatherStone"] = 0.0
-    if _find_target_prop(world, ("bush", "berry", "berrybush", "shrub"), ax) is None:
+    if _find_target_prop(world, ("bush", "berry", "berrybush", "shrub"), ax, agent) is None:
         s["ForageBerries"] = 0.0
 
     # ------------------------------------------------------------ farm ------
@@ -363,8 +366,8 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
     stored_stone = stock_qty(world, RES_STONE)
     stone_target = float(max(6, pop * 3))
     stone_low = _clamp01((stone_target - stored_stone) / stone_target)
-    if _mineable_near(world, ax):
-        loose_rock = _find_target_prop(world, ("rock",), ax) is not None
+    if _mineable_near(world, ax, agent):
+        loose_rock = _find_target_prop(world, ("rock",), ax, agent) is not None
         scarce_bonus = 0.0 if loose_rock else 0.20
         # A higher floor than most jobs on purpose: a colony keeps a quarry
         # ticking over even when the stores are full, so mining is a visible
@@ -536,8 +539,10 @@ def _free_tower(world: Any, agent: Any) -> Structure | None:
     )
 
 
-def _find_target_prop(world: Any, kinds: tuple[str, ...], x: float) -> Any | None:
-    return find_prop(world, kinds, x)
+def _find_target_prop(world: Any, kinds: tuple[str, ...], x: float,
+                      agent: Any = None) -> Any | None:
+    claimant = getattr(agent, "id", None) if agent is not None else None
+    return find_prop(world, kinds, x, claimant=claimant)
 
 
 def _count_props(world: Any, kinds: tuple[str, ...]) -> int:
@@ -633,9 +638,11 @@ def _stone_terrain_exists(world: Any) -> bool:
     return found
 
 
-def _mineable_near(world: Any, x: float) -> bool:
-    """A boulder within reach, or failing that any stone terrain to dig."""
-    if _find_target_prop(world, ("boulder",), x) is not None:
+def _mineable_near(world: Any, x: float, agent: Any = None) -> bool:
+    """An unclaimed boulder within reach, or failing that any stone terrain to
+    dig. Ground stone is shared freely - two diggers at one seam barely read -
+    but a boulder another miner has claimed no longer counts as mineable here."""
+    if _find_target_prop(world, ("boulder",), x, agent) is not None:
         return True
     return _stone_terrain_exists(world)
 
