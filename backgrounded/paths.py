@@ -43,6 +43,20 @@ WALLPAPER_DIR: Path = Path(os.path.expanduser("~")) / "Pictures" / APP_NAME
 WALLPAPER_A: Path = WALLPAPER_DIR / "wallpaper_a.jpg"
 WALLPAPER_B: Path = WALLPAPER_DIR / "wallpaper_b.jpg"
 
+# The user's ORIGINAL desktop wallpaper - what to put back on exit.
+#
+# This is the guard against the failure that actually happened once: the app's
+# own frames overwrote Windows' wallpaper history until the real wallpaper was
+# unrecoverable. So we do not trust Windows to remember it. On every clean start
+# we (a) record the real wallpaper's path in ORIGINAL_RECORD, and (b) keep a
+# byte-for-byte COPY of it in ORIGINAL_BACKUP, which lives in the wallpaper dir
+# (a location the shell will actually load from) so it can be re-applied even if
+# the user later moves or deletes the real file. A program frame is NEVER
+# adopted as the original, so a crash that leaves one of our frames on screen
+# cannot poison the record - the next start keeps the real original instead.
+ORIGINAL_RECORD: Path = APP_DIR / "original_wallpaper.json"
+ORIGINAL_BACKUP: Path = WALLPAPER_DIR / "_original_backup"   # + real extension
+
 # Frame captures written by --capture, used for visual verification.
 CAPTURE_DIR: Path = APP_DIR / "captures"
 

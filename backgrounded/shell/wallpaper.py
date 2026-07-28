@@ -18,9 +18,11 @@ Nothing in here raises. A failed frame is counted and skipped.
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import os
 import queue
+import shutil
 import threading
 import time
 from ctypes import wintypes
@@ -29,6 +31,67 @@ from pathlib import Path
 from .. import paths
 
 log = logging.getLogger(__name__)
+
+
+# --------------------------------------------------- original-wallpaper record --
+def _is_program_managed(path: str) -> bool:
+    """True if *path* is one of our own files - a rendered frame or our backup
+    copy - because it sits in the wallpaper output directory.
+
+    Such a path must NEVER be adopted as "the original": it is exactly what a
+    crashed run leaves on the desktop, and recording it would overwrite the real
+    original with our own image (the failure this whole record exists to prevent).
+    """
+    if not path:
+        return False
+    try:
+        parent = os.path.normcase(os.path.normpath(os.path.dirname(path)))
+        home = os.path.normcase(os.path.normpath(str(paths.WALLPAPER_DIR)))
+        return parent == home
+    except Exception:
+        return False
+
+
+def _load_record() -> dict:
+    try:
+        data = json.loads(paths.ORIGINAL_RECORD.read_text("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_record(original: str, backup: str | None) -> None:
+    try:
+        paths.ensure_dirs()
+        rec: dict[str, str] = {"original": original}
+        if backup:
+            rec["backup"] = backup
+        tmp = paths.ORIGINAL_RECORD.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rec, indent=2), "utf-8")
+        os.replace(tmp, paths.ORIGINAL_RECORD)
+    except Exception as exc:
+        log.warning("could not persist original-wallpaper record: %s", exc)
+
+
+def _copy_backup(src: str) -> str | None:
+    """Keep a byte-for-byte copy of the real original inside the wallpaper dir
+    (a location the shell will load from), so it can be re-applied even after
+    the user moves or deletes the source. Returns the copy path or None."""
+    try:
+        paths.ensure_dirs()
+        ext = os.path.splitext(src)[1] or ".jpg"
+        dst = str(paths.ORIGINAL_BACKUP) + ext
+        try:
+            if os.path.exists(dst) and os.path.getsize(dst) == os.path.getsize(src):
+                return dst                       # already backed up, no churn
+        except Exception:
+            pass
+        shutil.copy2(src, dst)
+        log.info("backed up original wallpaper -> %s", dst)
+        return dst
+    except Exception as exc:
+        log.warning("could not back up original wallpaper %s: %s", src, exc)
+        return None
 
 try:
     from PIL import Image
@@ -210,6 +273,7 @@ class WallpaperWriter:
         self.screen_size: tuple[int, int] = (w, h)
 
         self.original_path: str | None = None
+        self._backup_path: str | None = None
         self.frames_written: int = 0
         self.failures: int = 0
         self.frames_dropped: int = 0
@@ -225,12 +289,8 @@ class WallpaperWriter:
 
     # ------------------------------------------------------------- capture --
 
-    def capture_original(self) -> str | None:
-        """Read and remember the wallpaper Windows is currently showing.
-
-        Returns the path, or None if the query failed or the desktop is set
-        to a solid colour (empty string).
-        """
+    def _read_current_wallpaper(self) -> str | None:
+        """The path Windows currently shows, or None (query failed / solid)."""
         try:
             buf = ctypes.create_unicode_buffer(_PATH_CHARS)
             ok = user32.SystemParametersInfoW(
@@ -239,24 +299,52 @@ class WallpaperWriter:
             log.warning("could not read current wallpaper: %s", exc)
             return None
         if not ok:
-            log.warning("SPI_GETDESKWALLPAPER failed; nothing to restore later")
+            log.warning("SPI_GETDESKWALLPAPER failed")
             return None
-        value = buf.value.strip()
-        if not value:
-            log.info("no original wallpaper file set (solid colour?)")
-            return None
-        # Never adopt one of our own frames as "the original" - that happens
-        # if a previous run was killed before it could restore.
-        try:
-            ours = {str(p).lower() for p in self._paths}
-            if value.lower() in ours:
-                log.info("current wallpaper is one of ours; not recording it")
-                return None
-        except Exception:
-            pass
-        self.original_path = value
-        log.info("original wallpaper recorded: %s", value)
-        return value
+        return buf.value.strip() or None
+
+    def capture_original(self) -> str | None:
+        """Remember what to put back on exit, durably and crash-safely.
+
+        The rule that makes the original un-loseable: a program frame is never
+        adopted as the original. So:
+
+        * If the desktop currently shows the user's real wallpaper (anything not
+          in our own wallpaper dir), record its path AND keep a byte copy, both
+          persisted to disk so they survive a crash or a machine reboot.
+        * If it shows one of our frames - which is exactly what a crashed run
+          leaves behind - we keep whatever we recorded on a previous clean start
+          instead, and never overwrite it.
+
+        Returns the original path (possibly loaded from the persisted record),
+        or None if none is known yet.
+        """
+        record = _load_record()
+        rec_original = record.get("original")
+        rec_backup = record.get("backup")
+
+        current = self._read_current_wallpaper()
+
+        if current and not _is_program_managed(current) and os.path.exists(current):
+            self.original_path = current
+            self._backup_path = _copy_backup(current)
+            _save_record(current, self._backup_path)
+            log.info("original wallpaper recorded: %s", current)
+            return current
+
+        # Crash leftover (one of our frames), solid colour, or a missing file:
+        # fall back to what we already knew, and leave the record untouched.
+        if current and _is_program_managed(current):
+            log.info("current wallpaper is one of ours (%s); keeping the stored "
+                     "original instead of adopting it", current)
+        self.original_path = rec_original or None
+        self._backup_path = rec_backup or None
+        if self.original_path:
+            log.info("using stored original wallpaper: %s", self.original_path)
+        else:
+            log.info("no original wallpaper known yet (none recorded, desktop not "
+                     "on a user image)")
+        return self.original_path
 
     # ----------------------------------------------------------- lifecycle --
 
@@ -427,27 +515,34 @@ class WallpaperWriter:
     # ------------------------------------------------------------- restore --
 
     def restore(self) -> None:
-        """Put the user's original wallpaper back. Idempotent, never raises."""
+        """Put the user's original wallpaper back. Idempotent, never raises.
+
+        Tries the real original in its real location first; if that file is gone
+        (the user moved or deleted it), falls back to our own byte copy, which is
+        what makes the restore survive anything short of losing both at once."""
         if self._restored:
             return
         self._restored = True
-        original = self.original_path
-        if not original:
-            log.info("no original wallpaper recorded; leaving desktop as-is")
-            return
-        try:
-            exists = os.path.exists(original)
-        except Exception:
-            exists = False
-        if not exists:
-            log.warning("original wallpaper %s no longer exists; "
-                        "leaving desktop as-is", original)
-            return
         flags = SPIF_UPDATEINIFILE | SPIF_SENDCHANGE
-        if _set_wallpaper(original, flags):
-            log.info("original wallpaper restored: %s", original)
-        else:
-            log.warning("could not restore original wallpaper: %s", original)
+
+        candidates: list[str] = []
+        if self.original_path and not _is_program_managed(self.original_path):
+            candidates.append(self.original_path)
+        backup = self._backup_path or _load_record().get("backup")
+        if backup:
+            candidates.append(backup)
+
+        for path in candidates:
+            try:
+                if not os.path.exists(path):
+                    continue
+            except Exception:
+                continue
+            if _set_wallpaper(path, flags):
+                log.info("original wallpaper restored: %s", path)
+                return
+
+        log.warning("no original wallpaper available to restore; leaving as-is")
 
     # --------------------------------------------------------------- stats --
 

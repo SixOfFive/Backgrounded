@@ -29,9 +29,11 @@ from ..constants import (
     RENDER_H,
     RENDER_W,
     SCENE_ASHFALL,
+    SCENE_AURORA,
     SCENE_BLIZZARD,
     SCENE_CLEAR,
     SCENE_FLOOD,
+    SCENE_FOG,
     SCENE_METEOR,
     SCENE_MUDSLIDE,
     SCENE_NIGHT_STORM,
@@ -73,6 +75,11 @@ _SCENE_SKY: dict[str, _SceneSky] = {
     SCENE_FLOOD:       ((44, 66, 82),    0.55, (0.60, 0.72, 0.80), 0.90, 0.18, False),
     SCENE_METEOR:      ((18, 14, 36),    0.58, (0.68, 0.64, 0.86), 0.28, 0.95, True),
     SCENE_ASHFALL:     ((84, 38, 28),    0.66, (0.86, 0.58, 0.46), 0.85, 0.12, False),
+    # Aurora: a deep blue-black night, almost no cloud, full stars, ribbons on.
+    SCENE_AURORA:      ((8, 16, 30),     0.68, (0.42, 0.52, 0.70), 0.14, 1.00, True),
+    # Fog: a pale flat grey. No stars, no aurora; the fog overlay in the renderer
+    # supplies the mood, so the sky just needs to be featureless.
+    SCENE_FOG:         ((176, 182, 188), 0.80, (0.82, 0.84, 0.86), 0.55, 0.05, False),
 }
 _DEFAULT_SKY = _SCENE_SKY[SCENE_CLEAR]
 
@@ -86,6 +93,8 @@ _SCENE_RIDGE: dict[str, Color] = {
     SCENE_FLOOD:       (34, 46, 54),
     SCENE_METEOR:      (22, 20, 38),
     SCENE_ASHFALL:     (44, 32, 30),
+    SCENE_AURORA:      (14, 22, 34),
+    SCENE_FOG:         (120, 126, 132),
 }
 
 # ------------------------------------------------------------------- caches --
@@ -651,6 +660,11 @@ def draw_sky(surf: pygame.Surface, scene: str, world_time: float,
     try:
         w, h = surf.get_size()
         phase = day_phase(world_time, lighting)
+        # A dedicated aurora night is always deep night: pin the phase to midnight
+        # so the gradient, the stars and the aurora gate all treat it as such,
+        # independent of the world clock. The ambient curve is pinned to match.
+        if scene == SCENE_AURORA:
+            phase = 0.0
         dl = daylight(phase)
         night = night_factor(phase)
         _tint, _st, _gain, _density, star_mul, aurora_ok = _scene_sky(scene)

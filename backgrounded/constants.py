@@ -217,10 +217,13 @@ SCENE_BLIZZARD = "blizzard"
 SCENE_FLOOD = "flood"
 SCENE_METEOR = "meteor"
 SCENE_ASHFALL = "ashfall"
+SCENE_AURORA = "aurora"          # calm deep-night sky lit by aurora ribbons
+SCENE_FOG = "fog"                # a still grey mist that swallows the distance
 
 SCENES = (
     SCENE_NIGHT_STORM, SCENE_CLEAR, SCENE_WILDFIRE, SCENE_MUDSLIDE,
     SCENE_BLIZZARD, SCENE_FLOOD, SCENE_METEOR, SCENE_ASHFALL,
+    SCENE_AURORA, SCENE_FOG,
 )
 
 #: The world flips to a fresh, randomly chosen scene this often (world-seconds).
@@ -237,6 +240,8 @@ SCENE_LABELS = {
     SCENE_FLOOD:       "Flood",
     SCENE_METEOR:      "Meteor Shower",
     SCENE_ASHFALL:     "Volcanic Ashfall",
+    SCENE_AURORA:      "Aurora Night",
+    SCENE_FOG:         "Fog",
 }
 
 # ------------------------------------------------------------------ saving --

@@ -32,9 +32,11 @@ import numpy as np
 from ..constants import (
     DAY_LENGTH_SEC,
     SCENE_ASHFALL,
+    SCENE_AURORA,
     SCENE_BLIZZARD,
     SCENE_CLEAR,
     SCENE_FLOOD,
+    SCENE_FOG,
     SCENE_METEOR,
     SCENE_MUDSLIDE,
     SCENE_NIGHT_STORM,
@@ -83,6 +85,12 @@ _SCENE_AMBIENT: dict[str, tuple[float, float]] = {
     SCENE_FLOOD:       (0.30, 0.68),
     SCENE_METEOR:      (0.30, 0.82),
     SCENE_ASHFALL:     (0.26, 0.48),
+    # Aurora night: dark and *constant* - the same low level day or night - so it
+    # always reads as a deep-night sky lit only by the ribbons and the torches.
+    SCENE_AURORA:      (0.15, 0.15),
+    # Fog: a flat grey day. Not dark - fog scatters light - but low-contrast, and
+    # the overlay does the rest of the work in the renderer.
+    SCENE_FOG:         (0.40, 0.66),
 }
 _DEFAULT_AMBIENT: tuple[float, float] = (0.22, 0.88)
 
@@ -104,6 +112,8 @@ _SCENE_RGB: dict[str, tuple[float, float, float]] = {
     SCENE_FLOOD:       (0.80, 0.90, 1.00),
     SCENE_METEOR:      (0.86, 0.86, 1.00),
     SCENE_ASHFALL:     (0.98, 0.62, 0.50),
+    SCENE_AURORA:      (0.72, 0.88, 1.00),   # cool blue-green night cast
+    SCENE_FOG:         (0.86, 0.88, 0.90),   # desaturated toward grey
 }
 
 _MAX_FLASHES = 8

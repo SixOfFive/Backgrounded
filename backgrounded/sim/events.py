@@ -55,9 +55,11 @@ from ..constants import (
     RENDER_H,
     RENDER_W,
     SCENE_ASHFALL,
+    SCENE_AURORA,
     SCENE_BLIZZARD,
     SCENE_CLEAR,
     SCENE_FLOOD,
+    SCENE_FOG,
     SCENE_METEOR,
     SCENE_MUDSLIDE,
     SCENE_NIGHT_STORM,
@@ -199,6 +201,8 @@ _HANDLERS: dict[str, str] = {
     SCENE_FLOOD: "_scene_flood",
     SCENE_METEOR: "_scene_meteor",
     SCENE_ASHFALL: "_scene_ashfall",
+    SCENE_AURORA: "_scene_aurora",
+    SCENE_FOG: "_scene_fog",
 }
 
 #: plausible successors, weighted. Storms clear, fires leave ash, etc.
@@ -582,6 +586,7 @@ class EventSystem:
         self.rain: float = 0.0                 # 0..1
         self.snow: float = 0.0                 # 0..1
         self.ash: float = 0.0                  # 0..1
+        self.fog: float = 0.0                  # 0..1 mist density (renderer wash)
         self.gust: float = 0.0                 # 0..1 candle guttering strength
         self.water_level: float | None = None  # y of the flood line, or None
         self.quake_t: float = 0.0              # seconds of quake left
@@ -964,6 +969,35 @@ class EventSystem:
         self.water_level = None
         wt = _fnum(getattr(world, "world_time", self.t), self.t)
         self.fireflies = is_night(wt)
+        self._melt_snow(world, dt)
+
+    # ======================================================= scene: aurora ==
+    def _scene_aurora(self, world: Any, dt: float) -> None:
+        """A calm, clear deep-night sky lit by aurora ribbons. No hazards - the
+        whole payoff is the light, and a scatter of torches under the ribbons.
+        The renderer pins this scene to midnight, so it always reads as night
+        whatever the world clock says, and the ambient curve is pinned to match."""
+        self._approach_env(dt, rate=0.30)          # let any lingering rain/snow clear
+        self._set_wind(dt, 0.20, 0.28, slow=0.15, fast=0.50)
+        self.tint = (150, 200, 220)                # a faint cool cast
+        self.ember_rate = 0.0
+        self.water_level = None
+        self.fireflies = True                      # a still night draws them out
+        self.fog = _approach(self.fog, 0.0, 0.40, dt)
+        self._melt_snow(world, dt)
+
+    # ========================================================== scene: fog ==
+    def _scene_fog(self, world: Any, dt: float) -> None:
+        """A thick, still grey mist. Nothing dangerous: it just swallows the
+        distance and damps the colour. Depth is published as ``fog`` (0..1) and
+        drawn as a full-frame wash by the renderer, densest low to the ground."""
+        self._approach_env(dt, rate=0.25)          # no rain, no snow
+        self._set_wind(dt, 0.10, 0.14, slow=0.08, fast=0.30)   # barely a breath
+        self.tint = (206, 210, 214)                # desaturated toward grey
+        self.ember_rate = 0.0
+        self.water_level = None
+        self.fireflies = False
+        self.fog = _approach(self.fog, 0.85 * self.intensity, 0.35, dt)
         self._melt_snow(world, dt)
 
     # ===================================================== scene: wildfire ==
@@ -1534,6 +1568,7 @@ class EventSystem:
         self.slide_t = 0.0
         self.rumble = 0.0
         self.ember_rate = 0.0
+        self.fog = 0.0
         self._submerged.clear()
         self._buried.clear()
         self._burning.clear()
@@ -1585,6 +1620,7 @@ class EventSystem:
             "rain": float(self.rain),
             "snow": float(self.snow),
             "ash": float(self.ash),
+            "fog": float(self.fog),
             "gust": float(self.gust),
             "water_level": None if self.water_level is None else float(self.water_level),
             "quake_t": float(self.quake_t),
@@ -1633,6 +1669,7 @@ class EventSystem:
         ev.rain = _clamp(_fnum(d.get("rain"), 0.0))
         ev.snow = _clamp(_fnum(d.get("snow"), 0.0))
         ev.ash = _clamp(_fnum(d.get("ash"), 0.0))
+        ev.fog = _clamp(_fnum(d.get("fog"), 0.0))
         ev.gust = _clamp(_fnum(d.get("gust"), 0.0))
         wl = d.get("water_level")
         ev.water_level = None if wl is None else _fnum(wl, 0.0)

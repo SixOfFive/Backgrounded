@@ -495,6 +495,51 @@ def draw_rain_overlay(surf: pygame.Surface, intensity: float, wind: float = 0.0,
 
 
 # --------------------------------------------------------------------------
+# fog overlay (a grey wash that swallows the distance)
+# --------------------------------------------------------------------------
+
+_FOG_CACHE: dict[tuple, pygame.Surface] = {}
+_FOG_GREY = (198, 202, 208)
+
+
+def _fog_layer(w: int, h: int, inten: float) -> pygame.Surface:
+    """A full-frame grey wash whose opacity rises toward the ground, built from
+    a tiny gradient strip and cached per intensity bucket (fog ramps smoothly,
+    so ~8 buckets are indistinguishable from continuous)."""
+    bucket = max(0, min(8, int(round(inten * 8))))
+    key = (w, h, bucket)
+    hit = _FOG_CACHE.get(key)
+    if hit is not None:
+        return hit
+    g = bucket / 8.0
+    strip = pygame.Surface((1, 256), pygame.SRCALPHA)
+    for y in range(256):
+        f = y / 255.0
+        a = int(255 * g * (0.30 + 0.55 * f))       # a haze everywhere, thick low down
+        strip.set_at((0, y), (_FOG_GREY[0], _FOG_GREY[1], _FOG_GREY[2],
+                              max(0, min(255, a))))
+    surf = pygame.transform.smoothscale(strip, (max(1, w), max(1, h)))
+    if len(_FOG_CACHE) > 16:
+        _FOG_CACHE.clear()
+    _FOG_CACHE[key] = surf
+    return surf
+
+
+def draw_fog_overlay(surf: pygame.Surface, intensity: float, t: float = 0.0) -> None:
+    """Wash the whole frame toward a flat grey - the look of standing in fog.
+
+    *intensity* 0..1. Drawn late (after the light composite) so it dims the lit
+    scene rather than being multiplied away by the ambient. Fails soft."""
+    try:
+        inten = clamp(float(intensity), 0.0, 1.0)
+        if inten <= 0.02:
+            return
+        surf.blit(_fog_layer(*surf.get_size(), inten), (0, 0))
+    except Exception:
+        return
+
+
+# --------------------------------------------------------------------------
 # heat shimmer
 # --------------------------------------------------------------------------
 

@@ -104,6 +104,12 @@ class Renderer:
         self._draw_lightning(s, world)
         fx.draw_vignette(s)
 
+        # fog wash sits above the whole lit world (so it dims it rather than
+        # being multiplied away), but below the HUD, which must stay readable.
+        fog = float(getattr(ev, "fog", 0.0) or 0.0)
+        if fog > 0.02:
+            fx.draw_fog_overlay(s, fog, world.world_time)
+
         # 12. stats panel. Deliberately after the light composite: it is UI,
         # not part of the world, so it must stay readable in a black scene.
         if self.show_stats:
