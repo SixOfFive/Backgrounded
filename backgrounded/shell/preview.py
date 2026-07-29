@@ -558,6 +558,13 @@ class Preview:
                         self.zoom_at(1, self._centre_px())
                     elif ev.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
                         self.zoom_at(-1, self._centre_px())
+                    elif ev.key in (pygame.K_LEFTBRACKET, pygame.K_RIGHTBRACKET):
+                        # HUD size, reported rather than applied: the panels
+                        # belong to render/, and the window has no business
+                        # reaching into them. The app owns the setting and is
+                        # the only thing that can persist it.
+                        out["hud_scale"] = (
+                            -1 if ev.key == pygame.K_LEFTBRACKET else 1)
                     else:
                         pygame.event.post(ev)     # not ours; hand it back
                 elif ev.type == pygame.MOUSEWHEEL:

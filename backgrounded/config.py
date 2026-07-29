@@ -19,6 +19,7 @@ class Config:
     show_names: bool = True           # name plates above each stickman
     show_activity: bool = True        # "chopping wood" plate above each stickman
     show_log: bool = True             # last-10 chronicle log, lower-left
+    hud_scale: float = 1.6            # size of the stats panel / chronicle log
     wallpaper_enabled: bool = True
     scene: str = SCENE_NIGHT_STORM    # opening scene, per spec
     wallpaper_fps: int = WALLPAPER_FPS

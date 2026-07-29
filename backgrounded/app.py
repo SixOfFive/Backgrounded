@@ -116,6 +116,15 @@ class App:
         self.renderer.show_stats = getattr(self.cfg, "show_stats", True)
         self.renderer.show_names = getattr(self.cfg, "show_names", True)
         self.renderer.show_log = getattr(self.cfg, "show_log", True)
+        # HUD size is a module-level dial rather than a Renderer flag because the
+        # wallpaper bake and the window overlay go through the same two draw
+        # functions and must agree; applying the stored value here is what makes
+        # the [ and ] adjustment survive a restart.
+        try:
+            from .render import hud as _hud
+            _hud.HUD_SCALE = float(getattr(self.cfg, "hud_scale", _hud.HUD_SCALE))
+        except Exception:
+            log.debug("could not apply stored hud scale", exc_info=True)
         self.tools = ToolController()
 
         # --- threads -----------------------------------------------------
@@ -160,6 +169,29 @@ class App:
                 self._handle(kind, payload)
             except Exception:
                 log.exception("command %r failed", kind)
+
+    def _nudge_hud_scale(self, step: int) -> None:
+        """Grow or shrink the stats panel and chronicle log, and remember it.
+
+        Screen-anchoring the HUD means it is drawn at its authored pixel size
+        rather than being magnified by the letterbox fit, so how big it *should*
+        be depends on the monitor it is being read on. That is a per-user
+        judgement, not something a constant can be right about, hence a live
+        control - and hence persisting it, since being asked to re-tune it on
+        every launch would be worse than the original hard-coded number.
+        """
+        try:
+            from .render import hud
+            lo, hi = 1.0, 3.5
+            new = round(min(hi, max(lo, hud.HUD_SCALE + 0.15 * step)), 2)
+            if abs(new - hud.HUD_SCALE) < 1e-6:
+                return
+            hud.HUD_SCALE = new
+            self.cfg.hud_scale = new
+            self._save_config("hud_scale")
+            log.info("hud scale %.2f", new)
+        except Exception:
+            log.debug("could not change hud scale", exc_info=True)
 
     def _save_config(self, *changed: str) -> None:
         """Persist preferences, without letting this session's CLI flags leak
@@ -253,6 +285,9 @@ class App:
         # un-zoomed preview does nothing here.
         self.preview.pan_keys(dt)
         self.tools.handle(pointer.get("pointer"), self.world, self.world.world_time)
+        step = pointer.get("hud_scale")
+        if step:
+            self._nudge_hud_scale(int(step))
         if pointer.get("closed"):
             self.cfg.show_window = False
             self.preview.ensure_window(False)
@@ -348,7 +383,7 @@ class App:
                 f"wood {w.stockpile.get('wood',0)} stone {w.stockpile.get('stone',0)} "
                 f"food {w.stockpile.get('food',0)}{zoom} - "
                 f"{self.clock.get_fps():.0f} fps  "
-                f"[wheel=zoom wasd/arrows=pan 0=reset F11=full]")
+                f"[wheel=zoom wasd/arrows=pan []=text 0=reset F11=full]")
 
     def _save_capture(self, frame: pygame.Surface) -> None:
         self._captures += 1
