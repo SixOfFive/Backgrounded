@@ -2,6 +2,13 @@
 
 Read-only with respect to sim state, like everything else under render/.
 
+Both panels anchor to the corners of whatever surface they are handed, never to
+``RENDER_W``/``RENDER_H``. That is deliberate and load-bearing: the wallpaper is
+a bare 1600x1000 image with no window to anchor to, so its copy is baked into
+the world surface, while the preview draws the *same* panels onto the real
+window surface after the world has been scaled and cropped in - which is what
+keeps them in the window's corner while the view zooms and pans underneath.
+
 Text rendering is the expensive part here - a roster of ten agents is ~40
 `font.render` calls, and at 60 fps that would dominate the frame. Every glyph
 run is therefore cached by (text, colour, size); the cache is bounded and the
@@ -18,7 +25,7 @@ import logging
 import pygame
 
 from ..constants import (
-    DAY_LENGTH_SEC, RENDER_W, RES_COOKED, RES_FIBRE, RES_FOOD, RES_STONE,
+    DAY_LENGTH_SEC, RES_COOKED, RES_FIBRE, RES_FOOD, RES_STONE,
     RES_WOOD, SCENE_LABELS,
 )
 
@@ -27,6 +34,9 @@ log = logging.getLogger(__name__)
 PANEL_W = 268
 PAD = 9
 LINE = 14
+
+#: Gap between a panel and the two edges of the target surface it hugs.
+MARGIN = 12
 
 BG = (10, 12, 18)
 BG_ALPHA = 178
@@ -385,8 +395,26 @@ def _content_key(world, show_roster: bool) -> tuple:
     )
 
 
-def draw_stats(surf: pygame.Surface, world, show_roster: bool = True) -> None:
-    """Draw the panel. Never raises - a broken HUD must not kill the frame."""
+def draw_stats(surf: pygame.Surface, world, show_roster: bool = True,
+               offset: tuple[int, int] = (0, 0)) -> None:
+    """Draw the panel in *surf*'s own top-right corner. Never raises.
+
+    The anchor is measured off the target surface rather than off ``RENDER_W``,
+    which is what lets one function serve both outputs: handed the 1600x1000
+    world surface it lands exactly where it always has (the wallpaper has no
+    window to anchor to, so its panel has to be baked into the image), and
+    handed a preview *window* surface of any size it lands in that window's
+    corner - which is the whole point, because a panel baked into the image
+    slides off screen the moment you zoom or pan.
+
+    Only the blit *position* depends on the target; the cached panel does not.
+    So a resized window costs nothing, needs no cache invalidation, and can
+    never draw at a stale position.
+
+    ``offset`` shifts the whole panel, and exists for one caller: the wallpaper
+    path re-applies the screen shake that :meth:`Renderer.draw` baked into the
+    frame, so the panel keeps riding the earthquake there exactly as before.
+    """
     global _panel_cache, _panel_key
     try:
         key = _content_key(world, show_roster)
@@ -394,7 +422,10 @@ def draw_stats(surf: pygame.Surface, world, show_roster: bool = True) -> None:
             _panel_cache = _build(world, show_roster)
             _panel_key = key
         if _panel_cache is not None:
-            surf.blit(_panel_cache, (RENDER_W - PANEL_W - 12, 12))
+            # max(0, ...) so a window narrower than the panel still shows its
+            # left edge rather than pushing it off screen entirely.
+            x = max(0, surf.get_width() - PANEL_W - MARGIN)
+            surf.blit(_panel_cache, (x + int(offset[0]), MARGIN + int(offset[1])))
     except Exception:
         log.exception("hud draw failed")
 
@@ -518,8 +549,9 @@ def _wrap(text: str, max_w: int, size: int) -> list[str]:
 # ============================================================ chronicle log ==
 # The last N chronicle lines, lower-left. Where the top-right footer shows only
 # the newest event, this is the running story: births, deaths, buildings, the
-# spikes taking a wolf. Drawn on the render surface like the stats panel, so it
-# reads on the wallpaper too. Newest sits at the bottom; older lines fade up.
+# spikes taking a wolf. Anchored to the target surface like the stats panel, so
+# it reads on the wallpaper and holds the preview window's corner alike.
+# Newest sits at the bottom; older lines fade up.
 
 LOG_W = 360
 LOG_LINES = 10
@@ -528,8 +560,13 @@ _log_cache: pygame.Surface | None = None
 _log_key: tuple | None = None
 
 
-def draw_log(surf: pygame.Surface, world, n: int = LOG_LINES) -> None:
-    """Draw the last `n` chronicle entries, lower-left. Never raises."""
+def draw_log(surf: pygame.Surface, world, n: int = LOG_LINES,
+             offset: tuple[int, int] = (0, 0)) -> None:
+    """Draw the last `n` chronicle entries in *surf*'s lower-left. Never raises.
+
+    Anchored to the target surface's own height for the same reason
+    :func:`draw_stats` is anchored to its width - see that docstring.
+    """
     global _log_cache, _log_key
     try:
         chron = list(getattr(world, "chronicle", ()) or ())
@@ -539,8 +576,8 @@ def draw_log(surf: pygame.Surface, world, n: int = LOG_LINES) -> None:
             _log_cache = _build_log(tail)
             _log_key = key
         if _log_cache is not None:
-            from ..constants import RENDER_H
-            surf.blit(_log_cache, (12, RENDER_H - _log_cache.get_height() - 12))
+            y = max(0, surf.get_height() - _log_cache.get_height() - MARGIN)
+            surf.blit(_log_cache, (MARGIN + int(offset[0]), y + int(offset[1])))
     except Exception:
         log.exception("chronicle log draw failed")
 

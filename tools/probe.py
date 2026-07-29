@@ -44,6 +44,21 @@ def warm(world: World, seconds: float, renderer: Renderer) -> None:
         world.tick(SIM_DT)
 
 
+def shot(r: Renderer, world: World) -> pygame.Surface:
+    """One frame, with the HUD baked in the way the wallpaper sees it.
+
+    Renderer.draw deliberately stopped blitting the HUD when the preview gained
+    a screen-anchored one: the window overlays it at window coordinates and the
+    wallpaper path bakes it at world coordinates. A contact sheet is a picture of
+    the *wallpaper*, so it has to bake it too - otherwise these shots silently
+    stop showing the stats panel and the chronicle log, which is exactly what
+    happened until this helper existed.
+    """
+    f = r.draw(world, SIM_DT)
+    r.draw_hud(f, world)
+    return f
+
+
 def label(surf: pygame.Surface, text: str) -> pygame.Surface:
     out = surf.copy()
     font = pygame.font.SysFont("consolas", 17)
@@ -79,7 +94,7 @@ def mode_storm(args) -> None:
     warm(world, args.warm, r)
 
     frames = []
-    f = r.draw(world, SIM_DT)
+    f = shot(r, world)
     print("ambient dark ", stats(f))
     frames.append(("1. night storm - ambient only", f.copy()))
 
@@ -93,19 +108,19 @@ def mode_storm(args) -> None:
         ev.strikes.append({"x": RENDER_W * 0.62, "t": 0.0, "seed": 7,
                            "ground_y": gy, "direct": False})
     world.lighting.tick(SIM_DT)
-    f = r.draw(world, SIM_DT)
+    f = shot(r, world)
     print("flash peak   ", stats(f))
     frames.append(("2. lightning strike - the reveal", f.copy()))
 
     for _ in range(6):
         world.tick(SIM_DT)
-    f = r.draw(world, SIM_DT)
+    f = shot(r, world)
     print("afterglow    ", stats(f))
     frames.append(("3. 0.2s later - fading", f.copy()))
 
     for _ in range(20):
         world.tick(SIM_DT)
-    f = r.draw(world, SIM_DT)
+    f = shot(r, world)
     print("back to dark ", stats(f))
     frames.append(("4. dark again - candle only", f.copy()))
 
@@ -119,7 +134,7 @@ def mode_scenes(args) -> None:
         r = Renderer()
         world.events.request_scene(sc)
         warm(world, args.warm, r)
-        f = r.draw(world, SIM_DT)
+        f = shot(r, world)
         print(f"{sc:14} {stats(f)}")
         frames.append((sc, f.copy()))
     sheet(frames, OUT / "scenes.png", cols=2, scale=0.42)
@@ -135,7 +150,7 @@ def mode_ambient(args) -> None:
         warm(world, args.warm, r)
         world.lighting.night_floor = amb          # honoured if present
         world.lighting._probe_ambient = amb
-        f = r.draw(world, SIM_DT)
+        f = shot(r, world)
         print(f"ambient {amb:.2f}  {stats(f)}")
         frames.append((f"ambient {amb:.2f}", f.copy()))
     sheet(frames, OUT / "ambient.png", cols=2, scale=0.5)

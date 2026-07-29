@@ -19,7 +19,7 @@ import pygame
 from . import paths, persist
 from .config import Config
 from .constants import (
-    AUTOSAVE_SEC, RENDER_H, RENDER_SIZE, RENDER_W, SCENES, SIM_DT, TARGET_FPS,
+    AUTOSAVE_SEC, RENDER_SIZE, SCENES, SIM_DT, TARGET_FPS,
 )
 from .render.renderer import Renderer
 from .shell.preview import Preview
@@ -132,6 +132,10 @@ class App:
         self._last_save = time.monotonic()
         self._last_wall = 0.0
         self._captures = 0
+        # Frame counter, used only to bake the HUD into the world frame at most
+        # once per frame - see _bake_hud.
+        self._frame_no = 0
+        self._hud_frame = -1
 
     # ---------------------------------------------------------- tray glue --
     def _tray_state(self) -> dict:
@@ -240,9 +244,14 @@ class App:
     def _frame(self) -> None:
         dt = self.clock.tick(TARGET_FPS) / 1000.0
         dt = min(dt, 0.1)                     # never let a stall bomb the sim
+        self._frame_no += 1
 
         self._drain_commands()
         pointer = self.preview.pump_events()
+        # Held WASD / arrows, polled after the event pump so a key released this
+        # frame has already been seen. Self-guarding: a hidden, unfocused or
+        # un-zoomed preview does nothing here.
+        self.preview.pan_keys(dt)
         self.tools.handle(pointer.get("pointer"), self.world, self.world.world_time)
         if pointer.get("closed"):
             self.cfg.show_window = False
@@ -260,14 +269,23 @@ class App:
 
         frame = self.renderer.draw(self.world, dt)
 
+        # One render, two destinations, and the HUD has to land differently on
+        # each - so the ordering below is load-bearing. The window gets it as a
+        # *screen-anchored* overlay painted straight onto the window surface,
+        # which is what keeps the panels in the window's corners while the world
+        # is zoomed and panned beneath them. Only afterwards does the wallpaper
+        # path bake the HUD into the shared frame, world-anchored, because a
+        # wallpaper is a bare image with no corner of its own to hold. Present
+        # first, bake second: the other order would put both copies on screen.
         if self.cfg.show_window:
-            self.preview.present(frame, overlay=self.tools.draw_overlay)
+            self.preview.present(frame, overlay=self._draw_window_overlay)
             self.preview.set_caption(self._hud())
 
         now = time.monotonic()
         if self.cfg.wallpaper_enabled and (now - self._last_wall) >= 1.0 / max(1, self.cfg.wallpaper_fps):
             self._last_wall = now
             try:
+                self._bake_hud(frame)
                 raw = pygame.image.tobytes(frame, "RGB")
                 self.wallpaper.submit(raw, RENDER_SIZE)
             except Exception:
@@ -275,6 +293,10 @@ class App:
 
         if self.args.capture and self._captures < self.args.capture:
             if self.world.tick_count % self.args.capture_every == 0:
+                # Captures are meant to look like the wallpaper, so they need
+                # the baked-in HUD too. _bake_hud is a no-op if the wallpaper
+                # push above already did it this frame.
+                self._bake_hud(frame)
                 self._save_capture(frame)
 
         if now - self._last_save >= AUTOSAVE_SEC:
@@ -285,6 +307,37 @@ class App:
             log.info("exit-after reached")
             self.running = False
 
+    def _draw_window_overlay(self, screen: pygame.Surface) -> None:
+        """Everything drawn in *window* pixels, after the world is scaled in.
+
+        The HUD goes down first and the tool palette on top, so a tooltip is
+        never buried under the stats panel. Both halves fail soft - an overlay
+        that raises must not cost the frame.
+        """
+        try:
+            self.renderer.draw_hud(screen, self.world)
+        except Exception:
+            log.debug("window hud draw failed", exc_info=True)
+        self.tools.draw_overlay(screen)
+
+    def _bake_hud(self, frame: pygame.Surface) -> None:
+        """Bake the HUD into the world frame, at most once per frame.
+
+        The wallpaper has no window for the panels to anchor to, so they are
+        drawn into the 1600x1000 image at exactly the position they have always
+        held, screen shake included. The once-per-frame guard is not an
+        optimisation: the wallpaper push and --capture consume the *same*
+        surface, and the panel is translucent, so a second blit would visibly
+        darken it.
+        """
+        if self._hud_frame == self._frame_no:
+            return
+        self._hud_frame = self._frame_no
+        try:
+            self.renderer.draw_hud(frame, self.world, shake=True)
+        except Exception:
+            log.debug("wallpaper hud draw failed", exc_info=True)
+
     def _hud(self) -> str:
         w = self.world
         pop = len(w.population.alive_agents())
@@ -294,7 +347,8 @@ class App:
                 f"gen {w.population.generation} - "
                 f"wood {w.stockpile.get('wood',0)} stone {w.stockpile.get('stone',0)} "
                 f"food {w.stockpile.get('food',0)}{zoom} - "
-                f"{self.clock.get_fps():.0f} fps  [wheel=zoom drag=pan 0=reset F11=full]")
+                f"{self.clock.get_fps():.0f} fps  "
+                f"[wheel=zoom wasd/arrows=pan 0=reset F11=full]")
 
     def _save_capture(self, frame: pygame.Surface) -> None:
         self._captures += 1

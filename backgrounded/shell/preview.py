@@ -248,16 +248,129 @@ class Preview:
             log.debug("preview: zoom failed: %s", exc)
             return self.zoom
 
+    def pan_world(self, dx: float, dy: float) -> bool:
+        """Slide the camera by a *world*-space offset. Returns True if it moved.
+
+        Sign convention is the plain one: +dx moves the camera right, so more of
+        what lies to the right comes into view. (:meth:`pan_by` is the odd one
+        out, because a drag has to move the world *with* the mouse.)
+
+        A no-op at ZOOM_MIN: the whole world is on screen, so there is nowhere
+        to pan to and letting the camera wander would only desync it from the
+        centre that zoom_at() snaps back to.
+        """
+        if self.zoom <= self.ZOOM_MIN + 1e-6 or self._screen is None:
+            return False
+        try:
+            before = (self.cam[0], self.cam[1])
+            self.cam[0] += dx
+            self.cam[1] += dy
+            self._clamp_cam()
+            return (self.cam[0], self.cam[1]) != before
+        except Exception:
+            return False
+
     def pan_by(self, dx_px: int, dy_px: int) -> None:
+        """Pan by a *window*-pixel delta with drag semantics.
+
+        Dragging right pushes the world right, which means the camera goes
+        left - hence the negation. Window pixels are converted through the
+        letterbox rect rather than the raw window size, or a drag drifts by the
+        width of the bars.
+        """
         if self.zoom <= self.ZOOM_MIN + 1e-6 or self._screen is None:
             return
         try:
             _, _, dw, dh = self._image_rect()
-            self.cam[0] -= dx_px * (self.size[0] / self.zoom) / max(1, dw)
-            self.cam[1] -= dy_px * (self.size[1] / self.zoom) / max(1, dh)
-            self._clamp_cam()
+            self.pan_world(-dx_px * (self.size[0] / self.zoom) / max(1, dw),
+                           -dy_px * (self.size[1] / self.zoom) / max(1, dh))
         except Exception:
             pass
+
+    # --- held-key panning ------------------------------------------------
+    # WASD and the arrow keys, polled rather than driven off KEYDOWN. Key repeat
+    # would deliver a nudge, a ~500 ms pause and then a stutter of nudges, which
+    # is not what "moves the screen around" means; polling gives one smooth
+    # continuous slide for as long as the key is down. It also consumes no
+    # events, so nothing else in the app can be starved of a keystroke by it.
+
+    #: Base rate, as a fraction of the world per second before the zoom taper
+    #: below. Applied per axis (to size[0] and size[1] respectively) so a
+    #: diagonal is isotropic on screen - the letterbox scales both axes equally,
+    #: so equal *fractions* per second are equal window pixels per second.
+    PAN_VIEW_FRAC = 0.62
+    #: World speed is divided by ``zoom ** PAN_ZOOM_EXP``. The two obvious
+    #: choices are both wrong at one end: a fixed world speed (exp 0) multiplies
+    #: into 8x the on-screen speed at ZOOM_MAX and the picture rockets past,
+    #: while a fixed *screen* speed (exp 1) crawls through the world when zoomed
+    #: in - 11 s to cross the pannable range at 8x. The square root splits them:
+    #: measured, 1.15 s to cross at 2x and 4.00 s at 8x, which reads as the same
+    #: gesture at both ends.
+    PAN_ZOOM_EXP = 0.5
+    #: Shift multiplier. Free, since the modifier is already in key.get_mods().
+    PAN_FAST = 2.5
+    #: Largest dt a single pan step will honour. A stall (or a debugger) must
+    #: not teleport the camera across the map on the frame it resumes.
+    PAN_MAX_DT = 0.1
+
+    _PAN_KEYS: tuple[tuple[tuple[int, ...], int, int], ...] = ()
+
+    def pan_keys(self, dt: float) -> bool:
+        """Poll WASD / arrows once per frame and slide the view. Never raises.
+
+        Returns True if the camera actually moved, which is only of interest to
+        tests - the frame loop ignores it.
+
+        Three guards, all deliberate: nothing happens while the window is hidden
+        or unfocused (a background window must not eat the user's typing),
+        nothing happens at ZOOM_MIN (the whole world is already on screen), and
+        the step is dt-scaled and dt-capped so the speed is the same at 15 fps
+        and 144 fps.
+        """
+        if self._failed or not self._created or not self._visible:
+            return False
+        if self.zoom <= self.ZOOM_MIN + 1e-6:
+            return False
+        try:
+            if not pygame.key.get_focused():
+                return False
+            keys = pygame.key.get_pressed()
+        except Exception:
+            return False
+        try:
+            if not self._PAN_KEYS:
+                # Built lazily: the pygame key constants are only guaranteed
+                # once display/key is initialised, and this module is imported
+                # long before that.
+                type(self)._PAN_KEYS = (
+                    ((pygame.K_d, pygame.K_RIGHT), 1, 0),
+                    ((pygame.K_a, pygame.K_LEFT), -1, 0),
+                    ((pygame.K_s, pygame.K_DOWN), 0, 1),
+                    ((pygame.K_w, pygame.K_UP), 0, -1),
+                )
+            dx = dy = 0
+            for codes, ax, ay in self._PAN_KEYS:
+                if any(keys[c] for c in codes):
+                    dx += ax
+                    dy += ay
+            # Opposite keys held together cancel, which is the right answer and
+            # falls out for free.
+            if not dx and not dy:
+                return False
+
+            step = max(0.0, min(self.PAN_MAX_DT, float(dt)))
+            if step <= 0.0:
+                return False
+            rate = self.PAN_VIEW_FRAC / (self.zoom ** self.PAN_ZOOM_EXP)
+            if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                rate *= self.PAN_FAST
+            if dx and dy:
+                rate *= 0.70710678      # a diagonal must not be 41% faster
+            return self.pan_world(dx * rate * self.size[0] * step,
+                                  dy * rate * self.size[1] * step)
+        except Exception as exc:
+            log.debug("preview: key pan failed: %s", exc)
+            return False
 
     def reset_view(self) -> None:
         self.zoom = 1.0
@@ -414,6 +527,11 @@ class Preview:
 
         Fullscreen is bound to F11 and Alt+Enter, and Escape leaves it - the
         three bindings people actually try. Double-clicking the view works too.
+
+        WASD and the arrows are deliberately *not* handled here: they are polled
+        in :meth:`pan_keys` so a held key pans smoothly instead of stuttering on
+        key repeat. They fall through the ``else`` below and are re-posted like
+        any other key this window does not own.
         """
         out = {"closed": False, "fullscreen": getattr(self, "_fullscreen", False),
                "zoom": self.zoom, "pointer": []}
@@ -462,7 +580,13 @@ class Preview:
                     now = pygame.time.get_ticks()
                     if ev.button in (2, 3):
                         # Right/middle: pan, and double-right toggles fullscreen.
-                        last = getattr(self, "_last_rclick_ms", 0)
+                        # Default far in the past, not 0: pygame.time.get_ticks()
+                        # counts from init, so a 0 default made the very first
+                        # right-click of a session - any click inside the first
+                        # 400 ms - read as the second half of a double-click and
+                        # throw the window into fullscreen instead of starting a
+                        # pan drag.
+                        last = getattr(self, "_last_rclick_ms", -10_000)
                         self._last_rclick_ms = now
                         if ev.button == 3 and now - last < 400:
                             out["fullscreen"] = self.toggle_fullscreen()

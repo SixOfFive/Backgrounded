@@ -100,6 +100,9 @@ class Renderer:
         # top of each other do not stack their status text into a smear.
         self._label_rects: list[pygame.Rect] = []
         self._frame = 0
+        # Last screen-shake offset baked into the returned frame, so draw_hud
+        # can match it on the wallpaper path.
+        self._shake: tuple[int, int] = (0, 0)
 
     # ------------------------------------------------------------- public --
     def draw(self, world, dt: float) -> pygame.Surface:
@@ -211,20 +214,55 @@ class Renderer:
             fx.draw_fog_overlay(s, fog, world.world_time,
                                 getattr(ev, "fog_color", None), dl)
 
-        # 12. stats panel. Deliberately after the light composite: it is UI,
-        # not part of the world, so it must stay readable in a black scene.
-        if self.show_stats:
-            hud.draw_stats(s, world, show_roster=self.show_roster)
-        if self.show_log:
-            hud.draw_log(s, world)
+        # 12. the HUD used to be blitted here, after the light composite so it
+        # stays readable in a black scene. It is drawn by :meth:`draw_hud`
+        # instead, because *where* it belongs depends on who is looking: the
+        # wallpaper is a bare image and needs it baked in, while the preview
+        # needs it on the window surface or zooming drags the panels off with
+        # the picture. app.py calls draw_hud once per output; see it for the
+        # ordering that keeps this to a single render.
 
         # screen shake: blit the composed scene at an offset
         dx, dy = ev.shake_offset() if hasattr(ev, "shake_offset") else (0, 0)
+        # Remembered so draw_hud can re-apply it on the wallpaper path. The HUD
+        # was drawn before this blit and therefore shook with the world; that is
+        # the wallpaper's long-standing look and is preserved deliberately.
+        self._shake = (int(dx), int(dy))
         if dx or dy:
             self.out.fill((0, 0, 0))
             self.out.blit(s, (int(dx), int(dy)))
             return self.out
         return s
+
+    def draw_hud(self, surf: "pygame.Surface | None", world,
+                 shake: bool = False) -> None:
+        """Paint the stats panel and the chronicle log onto *surf*.
+
+        Both anchor to *surf*'s own corners, so this lands top-right /
+        bottom-left of whatever it is handed - the 1600x1000 world frame on the
+        wallpaper and capture paths, or the real preview window surface, where
+        the panels then hold the window corner however the view is zoomed and
+        panned.
+
+        ``shake`` re-applies the earthquake offset :meth:`draw` baked into the
+        frame it returned. The wallpaper wants it (the HUD has always shaken
+        with the world there); the window overlay must not, because the window
+        itself is not what is shaking.
+
+        Never raises: both hud functions already swallow their own errors, and
+        the flags are read defensively because this sits on the frame loop.
+        """
+        if surf is None or world is None:
+            return
+        try:
+            off = self._shake if shake else (0, 0)
+            if self.show_stats:
+                hud.draw_stats(surf, world, show_roster=self.show_roster,
+                               offset=off)
+            if self.show_log:
+                hud.draw_log(surf, world, offset=off)
+        except Exception:
+            log.debug("hud draw failed", exc_info=True)
 
     # ------------------------------------------------------------ terrain --
     def _terrain_surface(self, terrain) -> pygame.Surface:
