@@ -33,6 +33,46 @@ log = logging.getLogger(__name__)
 
 PANEL_W = 268
 PAD = 9
+
+#: Multiplier applied to the finished stats panel and chronicle log.
+#:
+#: These panels used to be drawn into the 1600x1000 world surface and then
+#: scaled to the window along with everything else, so on a big display they
+#: grew with the picture. Screen-anchoring them (so they stay in the window
+#: corner through a zoom) means they are now blitted at their authored pixel
+#: size instead - which on a large or fullscreen window leaves 9-11 px text
+#: looking tiny, because it is no longer being magnified by the letterbox fit.
+#:
+#: Scaling the finished surface rather than re-authoring every font size and
+#: layout offset keeps the panel's internal geometry exactly as measured (the
+#: alternative touches ~20 hardcoded offsets and reflows the roster), at the
+#: cost of some softness in the glyphs. The panels are rebuilt at ~6 Hz and the
+#: scaled copy is cached alongside, so this costs one smoothscale per rebuild.
+HUD_SCALE = 1.6
+
+#: slot -> (source surface, scale it was built at, scaled result). The source is
+#: held by reference deliberately: comparing by id() alone would be unsound,
+#: since a freed surface's id can be handed to its replacement and we would
+#: serve stale pixels at the right size.
+_SCALED: dict[str, tuple[pygame.Surface, float, pygame.Surface]] = {}
+
+
+def _scaled(src: pygame.Surface, slot: str) -> pygame.Surface:
+    """*src* enlarged by :data:`HUD_SCALE`, cached until *src* is rebuilt."""
+    try:
+        if HUD_SCALE <= 1.001:
+            return src
+        hit = _SCALED.get(slot)
+        if hit is not None and hit[0] is src and abs(hit[1] - HUD_SCALE) < 1e-6:
+            return hit[2]
+        w = max(1, int(round(src.get_width() * HUD_SCALE)))
+        h = max(1, int(round(src.get_height() * HUD_SCALE)))
+        out = pygame.transform.smoothscale(src, (w, h))
+        _SCALED[slot] = (src, HUD_SCALE, out)
+        return out
+    except Exception:
+        log.debug("hud scale failed", exc_info=True)
+        return src
 LINE = 14
 
 #: Gap between a panel and the two edges of the target surface it hugs.
@@ -422,10 +462,12 @@ def draw_stats(surf: pygame.Surface, world, show_roster: bool = True,
             _panel_cache = _build(world, show_roster)
             _panel_key = key
         if _panel_cache is not None:
+            panel = _scaled(_panel_cache, "stats")
             # max(0, ...) so a window narrower than the panel still shows its
-            # left edge rather than pushing it off screen entirely.
-            x = max(0, surf.get_width() - PANEL_W - MARGIN)
-            surf.blit(_panel_cache, (x + int(offset[0]), MARGIN + int(offset[1])))
+            # left edge rather than pushing it off screen entirely. Measured off
+            # the *scaled* width, or the anchor would drift by the scale factor.
+            x = max(0, surf.get_width() - panel.get_width() - MARGIN)
+            surf.blit(panel, (x + int(offset[0]), MARGIN + int(offset[1])))
     except Exception:
         log.exception("hud draw failed")
 
@@ -576,8 +618,9 @@ def draw_log(surf: pygame.Surface, world, n: int = LOG_LINES,
             _log_cache = _build_log(tail)
             _log_key = key
         if _log_cache is not None:
-            y = max(0, surf.get_height() - _log_cache.get_height() - MARGIN)
-            surf.blit(_log_cache, (MARGIN + int(offset[0]), y + int(offset[1])))
+            panel = _scaled(_log_cache, "log")
+            y = max(0, surf.get_height() - panel.get_height() - MARGIN)
+            surf.blit(panel, (MARGIN + int(offset[0]), y + int(offset[1])))
     except Exception:
         log.exception("chronicle log draw failed")
 
