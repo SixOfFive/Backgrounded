@@ -74,7 +74,30 @@ class World:
         self.animals: AnimalRegistry = AnimalRegistry(seed=self.seed ^ 0xA17)
         self.ufo: Ufo = Ufo()
 
-        # Colony-level state
+        self._init_colony_state()
+        self._seed_population()
+
+    # ------------------------------------------------------------ startup --
+    def _init_colony_state(self) -> None:
+        """Colony-level defaults: everything that is a plain starting value
+        rather than generated or loaded content.
+
+        Called by ``__init__`` *and* by ``from_dict``, and that is the whole
+        point of it existing. ``from_dict`` builds with ``cls.__new__(cls)`` and
+        so never runs ``__init__``, which means a field initialised in only one
+        of the two places is simply absent on every loaded world. The failure is
+        near-silent: ``tick`` runs each subsystem behind ``_guarded``, so the
+        AttributeError is caught, logged once, and the subsystem is switched off
+        for the rest of the session instead of crashing.
+
+        ``auto_scene_rotate`` went exactly that way - set in ``__init__`` only,
+        so the first tick after a load disabled the whole "scene" step, taking
+        down both the 10-minute rotation and the ``sweep_claims`` harvest sweep
+        that shares ``_tick_scene``. Add new colony state here, never directly
+        in ``__init__``.
+        """
+        # Default only; from_dict overwrites it from the save, and app.py
+        # overwrites that again from config.json's auto_scene_change.
         self.auto_scene_rotate: bool = True     # flip scene every SCENE_ROTATE_SEC
         self.stockpile: dict[str, int] = {r: 0 for r in ALL_RESOURCES}
         self.build_queue: list[str] = []
@@ -93,9 +116,6 @@ class World:
         self.held_agent_ids: set[int] = set()
         self.held_prop_ids: set[int] = set()
 
-        self._seed_population()
-
-    # ------------------------------------------------------------ startup --
     def _pick_style(self) -> str:
         return str(self.rng.choice(["hills", "cliffs", "plateau", "chasm", "valley"]))
 
@@ -175,7 +195,13 @@ class World:
         ``scene_t`` means a manual scene pick from the tray resets the countdown,
         so a chosen scene holds for a full interval before the weather moves on."""
         ev = self.events
-        if self.auto_scene_rotate and float(getattr(ev, "scene_t", 0.0)) >= SCENE_ROTATE_SEC:
+        # getattr, not attribute access: this method is fail-soft-guarded, so a
+        # missing attribute here does not raise loudly - it silently disables the
+        # whole subsystem for the session. Defaulting rather than trusting the
+        # instance is what keeps a partially-built world (an old save, a future
+        # from_dict that forgets a field) rotating instead of quietly freezing.
+        if getattr(self, "auto_scene_rotate", True) and \
+                float(getattr(ev, "scene_t", 0.0)) >= SCENE_ROTATE_SEC:
             choices = [s for s in SCENES if s != ev.scene]
             if choices:
                 nxt = choices[self.pyrng.randrange(len(choices))]
@@ -588,6 +614,7 @@ class World:
             "events": self.events.to_dict(),
             "animals": self.animals.to_dict(),
             "ufo": self.ufo.to_dict(),
+            "auto_scene_rotate": bool(getattr(self, "auto_scene_rotate", True)),
             "stockpile": dict(self.stockpile),
             "build_queue": list(self.build_queue),
             "chronicle": list(self.chronicle),
@@ -604,9 +631,10 @@ class World:
         w.pyrng = random.Random(w.seed ^ 0x5EED)
         w.world_time = float(d.get("world_time", 0.0))
         w.tick_count = int(d.get("tick_count", 0))
-        w._disabled = set()
-        w.held_agent_ids = set()
-        w.held_prop_ids = set()
+        # __new__ skipped __init__, so lay down the same colony-level defaults
+        # it would have set and let the save overwrite the parts it carries.
+        # Do not open-code these: see _init_colony_state for why.
+        w._init_colony_state()
 
         def _sub(key, loader, fallback):
             try:
@@ -626,14 +654,20 @@ class World:
         w.animals = _sub("animals", AnimalRegistry.from_dict, AnimalRegistry)
         w.ufo = _sub("ufo", Ufo.from_dict, Ufo)
 
-        w.stockpile = {r: 0 for r in ALL_RESOURCES}
+        # Each of these starts from the _init_colony_state default above, so a
+        # save that predates a field still loads with that field's default.
         w.stockpile.update({k: int(v) for k, v in
                             (d.get("stockpile") or {}).items() if k in ALL_RESOURCES})
         w.build_queue = list(d.get("build_queue") or [])
-        w.chronicle = deque(d.get("chronicle") or [], maxlen=CHRONICLE_MAX)
-        w.stats = {"born": 0, "died": 0, "built": 0, "trees_felled": 0,
-                   "lightning_strikes": 0, "generations": 1}
+        w.chronicle.extend(d.get("chronicle") or [])
         w.stats.update({k: int(v) for k, v in (d.get("stats") or {}).items()})
+        # Persisted so a user who turns rotation off keeps it off across a
+        # restart. Note that in the packaged app this is belt-and-braces:
+        # config.json's auto_scene_change is the setting users actually reach,
+        # and app.py stamps it onto the world on every startup right after the
+        # load. It matters for anything that loads a world without going
+        # through App - tools/, tests, and the headless smoke run.
+        w.auto_scene_rotate = bool(d.get("auto_scene_rotate", True))
 
         if not w.population.alive_agents():
             log.info("loaded world had no survivors; seeding a new group")

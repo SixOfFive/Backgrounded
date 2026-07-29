@@ -198,14 +198,21 @@ def test_roundtrip(world) -> None:
         check(kinds_a == kinds_b, "in-flight actions preserved",
               f"{kinds_a} != {kinds_b}")
 
-    # and the clone must keep running
+    # and the clone must keep running -- *with every subsystem still live*.
+    # Ticking alone proves nothing: world._guarded swallows whatever a subsystem
+    # raises and disables it for the session, so a load path that forgets an
+    # attribute __init__ sets ticks along quite happily with the feature dead.
+    # auto_scene_rotate did that, silently killing both the scene rotation and
+    # the harvest-claim sweep on every loaded world.
     from backgrounded.constants import SIM_DT
     try:
         for _ in range(60):
             clone.tick(SIM_DT)
-        check(True, "loaded world keeps ticking")
+        check(not clone._disabled, "loaded world keeps ticking, nothing disabled",
+              f"disabled: {sorted(clone._disabled)}")
     except Exception as exc:
-        check(False, "loaded world keeps ticking", f"{type(exc).__name__}: {exc}")
+        check(False, "loaded world keeps ticking, nothing disabled",
+              f"{type(exc).__name__}: {exc}")
 
 
 def test_defensive_load() -> None:
@@ -219,7 +226,10 @@ def test_defensive_load() -> None:
         try:
             w = World.from_dict(blob)
             w.tick(1 / 30)
-            check(True, f"survives a {label} save")
+            # Same trap as the round-trip check: surviving is not enough, the
+            # first tick must not have quietly disabled anything either.
+            check(not w._disabled, f"survives a {label} save",
+                  f"disabled: {sorted(w._disabled)}")
         except Exception as exc:
             check(False, f"survives a {label} save", f"{type(exc).__name__}: {exc}")
 
