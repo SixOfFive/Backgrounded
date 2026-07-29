@@ -28,9 +28,12 @@ import numpy as np
 from ..constants import (
     BARRICADE_EDGE_FRAC,
     BARRICADE_MIN_POP,
+    CLEANUP_SCORE_MAX,
     CROSSING_MAX_SPAN,
     CROSSING_MIN_DEPTH,
     FARM_FIELD_SIZE,
+    LITTER_CLUSTER_FULL,
+    LITTER_CLUSTER_MIN,
     LADDER_MAX_W,
     LADDER_MIN_RISE,
     LADDER_MIN_W,
@@ -45,6 +48,7 @@ from ..constants import (
     RES_COOKED,
     RES_FIBRE,
     RES_FOOD,
+    RES_GARBAGE,
     RES_STONE,
     RES_WOOD,
     SCENE_BLIZZARD,
@@ -56,8 +60,10 @@ from .actions import (
     alive_agents,
     chronicle,
     colony_center,
+    densest_litter,
     find_prop,
     food_in_store,
+    free_litter_cluster,
     ground_y,
     hazards_of,
     is_night,
@@ -162,9 +168,15 @@ CROSSING_DECK_CLEAR = 8.0
 #: colony commits to building. Four founders land scattered across the map and
 #: spend the first half-minute walking toward each other, so an instantaneous
 #: "somebody is on the far side" is usually just somebody on their way home.
-#: Waiting is nearly free - a crossing takes minutes to build - and it is what
-#: keeps an ordinary map from being answered with a ladder it never needed.
-CUTOFF_DWELL = 45.0
+#:
+#: Was 45 s, and half of that was doing a job that ``STRANDED_DWELL`` now does
+#: better. This is a colony-wide integrator: it cannot tell *which* villager it
+#: is confirming, so the only way it could reject a man walking home was to
+#: outlast him. Rejecting him per-agent instead leaves this one job - riding out
+#: a survey that flickers because the terrain or the headcount moved - and 24 s
+#: is plenty for that. The 21 s bought back is 21 s off every crossing on every
+#: map, which is the cheapest lives-per-second in the whole planner.
+CUTOFF_DWELL = 24.0
 #: How fast that confirmation drains again while nothing is cut off. Under 1 so
 #: an intermittent split - the colony crossing a lethal gap several times a
 #: minute, which is the chasm case exactly - still converges on a decision.
@@ -180,6 +192,57 @@ LADDER_BARRIER_MAX_W = 220
 #: is nowhere to live, so it is somewhere people are stuck, not somewhere they
 #: are from.
 HOME_MIN_W = 150
+#: Walkable ground between two walls narrower than this is not a place, it is
+#: the floor of the thing in the way, and the two walls are one obstacle. This
+#: is the single most load-bearing number in the crossing planner: ``barriers()``
+#: reports one entry per *face* and splits the map at each face's midpoint, so a
+#: chasm arrives as two barriers with its own floor labelled as a region between
+#: them. Every part of the planner that reasoned about one face at a time got
+#: the chasm wrong - asked about the near wall, ``_bridge_pair`` finds the floor
+#: 200 px down with no rim to land on and answers "no gap here, use a ladder",
+#: so the rim-to-rim deck that is plainly the answer was never once proposed.
+#: Measured: seed 10 laddered a cliff 350 px away and left the chasm split, seed
+#: 70 built three ladders (one of them *down into* the hole) and left it split,
+#: seed 59 built nothing at all.
+OBSTACLE_ISLAND_W = 90
+#: Widest run of walls that may be merged into one obstacle. Past this the
+#: colony is looking at broken country rather than one thing to span, and no
+#: crossing it can afford would cover it anyway.
+OBSTACLE_MAX_W = 300
+#: How long a remembered fall keeps an obstacle marked lethal. Long enough that
+#: a crossing has time to go up on the evidence of the death that asked for it,
+#: short enough that a wall the colony has since learned to leave alone stops
+#: pulling work toward itself.
+HAZARD_MEMORY = 420.0
+#: How far outside an obstacle's rims a fall is still that obstacle's doing.
+#: Generous: people topple *while walking away from* a rim they just slipped on,
+#: and the body lands further out than the edge it went over.
+HAZARD_SLACK = 45.0
+#: Dwell for an obstacle that has already killed, or that is holding somebody
+#: down a hole. ``CUTOFF_DWELL`` exists to confirm that a split is real; a wall
+#: with a body at the foot of it needs no confirming, and neither does a man
+#: standing on a chasm floor. Measured deck times before this ran out to 587 s
+#: on seed 10, where all four fall deaths happened first.
+CUTOFF_DWELL_URGENT = 4.0
+#: How long a villager has to stay on the wrong side before that is stranding
+#: rather than a walk. The colony-wide charge cannot tell the difference - it
+#: integrates "is *anything* cut off" - so on any map with a wall on it somebody
+#: momentarily over an edge reads the same as somebody trapped.
+STRANDED_DWELL = 12.0
+#: ...and how long *one* villager on his own has to, which is far longer. One
+#: man over an edge is the weakest evidence of a split there is - every plateau
+#: and valley map produces one in the first minute - and acting on it at the
+#: same speed as a divided colony is what put a bridge in front of seed 7777's
+#: firepit.
+STRANDED_DWELL_LONE = 90.0
+#: A villager stuck inside an obstacle - on the chasm floor, at the bottom of
+#: his own quarry - is a rescue from the moment he is seen there. There is
+#: nothing down there to eat and no way back up.
+STRANDED_HOLE_DWELL = 6.0
+#: Below this the colony is genuinely short of a resource, and "every tree is
+#: across the gap" is a problem rather than an observation. With a full store
+#: the far bank is next month's wood, not today's.
+CUTOFF_SHORT_QTY = 8
 GRAVE_FRESH = 300.0
 CELEBRATION_FRESH = 30.0
 
@@ -189,17 +252,23 @@ ROLES: tuple[str, ...] = ("gatherer", "builder", "elder", "child", "lookout")
 # sustained jobs: gatherers lean to the fields (reliable food), builders to the
 # quarry (they are the ones who burn stone), so a normal colony visibly does
 # both without either job being a dedicated role of its own.
+#
+# `cleanup` is sweeping litter to the fire. Nobody's trade, so nobody's 1.00:
+# gatherers (already the fetch-and-carry role) take most of it, builders least
+# because pulling one off a site is the most expensive hour in the colony, and
+# children a fair share because "go and tidy that up" is exactly the job a camp
+# gives a child.
 ROLE_AFFINITY: dict[str, dict[str, float]] = {
     "gatherer": {"gather": 1.00, "build": 0.55, "social": 0.85, "watch": 0.35,
-                 "farm": 0.95, "mine": 0.55},
+                 "farm": 0.95, "mine": 0.55, "cleanup": 0.90},
     "builder":  {"gather": 0.60, "build": 1.00, "social": 0.70, "watch": 0.35,
-                 "farm": 0.50, "mine": 1.00},
+                 "farm": 0.50, "mine": 1.00, "cleanup": 0.40},
     "elder":    {"gather": 0.35, "build": 0.40, "social": 1.00, "watch": 0.55,
-                 "farm": 0.55, "mine": 0.30},
+                 "farm": 0.55, "mine": 0.30, "cleanup": 0.70},
     "lookout":  {"gather": 0.55, "build": 0.45, "social": 0.60, "watch": 1.00,
-                 "farm": 0.45, "mine": 0.55},
+                 "farm": 0.45, "mine": 0.55, "cleanup": 0.55},
     "child":    {"gather": 0.30, "build": 0.15, "social": 1.00, "watch": 0.10,
-                 "farm": 0.25, "mine": 0.10},
+                 "farm": 0.25, "mine": 0.10, "cleanup": 0.75},
 }
 _DEFAULT_AFFINITY = ROLE_AFFINITY["gatherer"]
 
@@ -447,9 +516,13 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
         s["Mine"] = 0.0
 
     # ------------------------------------------------------------ haul ------
+    # Garbage is excluded: the stockpile refuses it (see actions.stock_add), so
+    # winning this with an armful of sweepings would mean walking to the store
+    # to accomplish nothing. A sweeper interrupted mid-load drops it instead -
+    # `_c_clean` does that on the way out.
     s["HaulToStockpile"] = (
         _clamp01(0.42 + 0.42 * min(1.0, carry_qty / float(CARRY_CAP)))
-        if (carry_qty > 0 and carrying) else 0.0
+        if (carry_qty > 0 and carrying and carrying != RES_GARBAGE) else 0.0
     )
 
     # ------------------------------------------------------------ cook ------
@@ -459,6 +532,37 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
         s["CookFood"] = _clamp01(aff["gather"] * want)
     else:
         s["CookFood"] = 0.0
+
+    # --------------------------------------------------------- cleanup ------
+    # Sweeping litter to the fire. Everything about this score is deliberately
+    # meek:
+    #   * it needs a DENSE pile, never one stray item (`densest_litter` returns
+    #     None below LITTER_CLUSTER_MIN, so the job simply does not exist);
+    #   * it needs somewhere to burn it, so no firepit means no score;
+    #   * it needs empty hands - or hands already full of rubbish - so it never
+    #     competes with a live haul of something the colony actually wants. The
+    #     second half of that is not a nicety: gating on `carry_qty <= 0` alone
+    #     zeroes the score the instant a sweeper picks his first piece up, and a
+    #     zero score is dropped from the ranking entirely, so *any* re-score mid
+    #     sweep guaranteed he abandoned the job and put the load back down.
+    #     Measured: 74 loads shed against 63 delivered before this line.
+    #   * it is capped at CLEANUP_SCORE_MAX whatever the density, which is what
+    #     keeps it structurally under food, shelter, defence and building rather
+    #     than merely under them at today's numbers;
+    #   * and it is switched off entirely while the larder is genuinely low.
+    #     Tidying the camp is the definition of a job that can wait until the
+    #     colony is fed.
+    s["CleanLitter"] = 0.0
+    hands_ok = carry_qty <= 0 or carrying == RES_GARBAGE
+    if fire is not None and hands_ok and food_short < 0.75:
+        pile = densest_litter(world)
+        if pile is not None:
+            span = max(1.0, float(LITTER_CLUSTER_FULL - LITTER_CLUSTER_MIN))
+            dense = _clamp01((pile[1] - LITTER_CLUSTER_MIN) / span)
+            s["CleanLitter"] = min(
+                CLEANUP_SCORE_MAX,
+                aff.get("cleanup", 0.5) * (0.14 + 0.46 * dense),
+            )
 
     # ----------------------------------------------------------- plant ------
     trees = _count_props(world, _TREE_KINDS)
@@ -923,6 +1027,27 @@ def _mk_climb(agent: Any, world: Any) -> Action | None:
     return make_action("ClimbTo", ty=ground_y(world, ax) - 110.0)
 
 
+def _mk_clean(agent: Any, world: Any) -> Action | None:
+    """Sweep the densest pile nobody else has taken.
+
+    Returns None when there is nothing dense enough or every heap already has
+    somebody on it, so a stale score can never launch a job with no premise -
+    the villager drops straight through to the next-best thing instead of
+    spending a decision cycle on an action that fails on its first update.
+    """
+    if getattr(agent, "carrying", None) == RES_GARBAGE and \
+            int(getattr(agent, "carry_qty", 0) or 0) > 0:
+        # Already holding a swept load. Whether any heap is free is beside the
+        # point - he has an armful of rubbish and this is the only action in the
+        # colony that knows where to put it. The handler's start phase routes
+        # him straight to the fire.
+        return make_action("CleanLitter")
+    pile = free_litter_cluster(world, getattr(agent, "id", None))
+    if pile is None:
+        return None
+    return make_action("CleanLitter", cx=float(pile[0]))
+
+
 def _mk_follow(agent: Any, world: Any) -> Action | None:
     my_id = getattr(agent, "id", None)
     ax = float(getattr(agent, "x", 0.0))
@@ -961,6 +1086,7 @@ _MAKERS: dict[str, Callable[[Any, Any], Action | None]] = {
     "Lookout": _mk_lookout,
     "ClimbTo": _mk_climb,
     "FollowParent": _mk_follow,
+    "CleanLitter": _mk_clean,
 }
 
 
@@ -1124,6 +1250,13 @@ def update_director(world: Any, dt: float) -> None:
     except Exception:
         log.debug("assign_roles failed", exc_info=True)
 
+    # Falls and stranding are histories, and the 2 s colony pass is the only
+    # cadence that samples them often enough to be one. `find_cutoff` keeps them
+    # too, but it is cached for six seconds and skipped entirely on the maps
+    # with nothing in the way, and a body reaped into a grave before anybody
+    # looked is evidence gone for good.
+    _watch_colony(world)
+
     reg = structures_of(world)
     if reg is None:
         _publish(world, [], {})
@@ -1190,9 +1323,19 @@ def next_build_kind(world: Any, reg: StructureRegistry | None = None) -> str | N
     # Blocking work first, ahead of even the firepit. Everything below this line
     # is expansion - nicer, warmer, bigger - and none of it is worth anything
     # while a villager is stranded on the far side of a 300 px drop or the
-    # colony's only remaining wood is across one. This returns None on a map
-    # with no barrier, which is almost every map, so the ordinary order below is
-    # untouched.
+    # colony's only remaining wood is across one.
+    #
+    # What changed is not this ordering but what reaches it. `plan_crossing`
+    # used to answer "yes" for any map with a wall on it and somebody
+    # momentarily the other side of it, and preempting the firepit for that is
+    # how seed 7777 - a plateau, nobody trapped, nobody dying - bought a ladder
+    # and a bridge and finished a hut short of the colony that built neither.
+    # Deferring the crossing behind fire, stores and a roof was tried as the fix
+    # and measured worse across 44 seeds (13 falls against 16, and every
+    # crossing 200 s later), because on the maps that do need one the wait is
+    # paid in people. Gating what counts as blocking is the fix; the ordering
+    # was right all along. This still returns None on a map with no barrier,
+    # which is almost every map, so the ordinary order below is untouched.
     blocking = plan_crossing(world, reg)
     if blocking is not None:
         return str(blocking["kind"])
@@ -1266,6 +1409,7 @@ def _stake_out_site(world: Any, reg: StructureRegistry) -> None:
 #: what the director decided.
 _CUTOFF_LINES: dict[str, str] = {
     "stranded": "One of theirs is stranded on the far side; the colony staked out a {kind}.",
+    "falls": "Too many have gone over that edge; the colony staked out a {kind}.",
     "stockpile": "Cut off from the stores, the colony staked out a {kind}.",
     "firepit": "Cut off from the fire, the colony staked out a {kind}.",
     RES_WOOD: "Every tree left is across the gap; the colony staked out a {kind}.",
@@ -1280,7 +1424,12 @@ def _stake_line(world: Any, kind: str) -> str:
         try:
             cut = find_cutoff(world)
             if cut is not None:
-                tmpl = _CUTOFF_LINES.get(str(cut.get("reason")))
+                # The plan's own reason, not the survey's: the wall being staked
+                # out is the one the colony ranked worst, which is not always
+                # the candidate that made the survey fire.
+                plan = cut.get("plan") or {}
+                tmpl = _CUTOFF_LINES.get(str(plan.get("reason")
+                                             or cut.get("reason")))
                 if tmpl:
                     return tmpl.format(kind=kind)
         except Exception:
@@ -1533,6 +1682,216 @@ def _surface_of(world: Any) -> Any:
     return arr if arr.size >= 8 else None
 
 
+# ------------------------------------------------------- what is in the way --
+
+
+def _obstacles(
+    world: Any, lab: Any, bars: tuple[tuple[int, int, float], ...]
+) -> tuple[dict[str, Any], ...]:
+    """The walls, grouped into the things a colony actually has to cross.
+
+    ``Terrain.barriers()`` reports one entry per *face* and ``_build_reach``
+    splits the map at each face's midpoint, which makes barrier ``i`` the wall
+    between region ``i`` and region ``i+1``. That is exact and it is also why a
+    chasm cannot be answered one barrier at a time: it arrives as two barriers
+    with its own floor labelled as a region in between, so the near wall taken
+    alone has a 200 px drop on its far side and no rim to land a deck on.
+
+    Two walls are one obstacle when the ground between them is too narrow to be
+    anywhere (nobody lives on 44 px of chasm floor) and the pair is still short
+    enough that a single crossing could cover it.
+
+    Each entry is ``{"lo", "hi", "relief", "left", "right", "inner"}``: the
+    outer rims, the two regions the obstacle separates, and the region ids it
+    swallows. Cached against the terrain's ``epoch`` - this is pure geometry.
+    """
+    epoch = int(getattr(getattr(world, "terrain", None), "epoch", 0) or 0)
+    try:
+        if int(getattr(world, "_bhv_obs_epoch", -1)) == epoch:
+            cached = getattr(world, "_bhv_obs", None)
+            if cached is not None:
+                return cached
+    except Exception:
+        pass
+
+    groups: list[list[int]] = []
+    for i in range(len(bars)):
+        if groups:
+            first = groups[-1][0]
+            # `bars[i][0] - bars[i - 1][1]` is the walkable ground between the
+            # two faces - rim to rim - which is exactly the "is there anywhere
+            # to stand between them" question.
+            island = int(bars[i][0]) - int(bars[i - 1][1])
+            reach = int(bars[i][1]) - int(bars[first][0])
+            if island < OBSTACLE_ISLAND_W and reach <= OBSTACLE_MAX_W:
+                groups[-1].append(i)
+                continue
+        groups.append([i])
+
+    out: list[dict[str, Any]] = []
+    for g in groups:
+        lo = int(bars[g[0]][0])
+        hi = int(bars[g[-1]][1])
+        out.append({
+            "lo": lo,
+            "hi": hi,
+            "relief": max(float(bars[k][2]) for k in g),
+            # Barrier k divides region k from region k+1, so a group running
+            # k0..kn divides region k0 from region kn+1 and eats the rest.
+            "left": int(g[0]),
+            "right": int(g[-1]) + 1,
+            "inner": frozenset(range(int(g[0]) + 1, int(g[-1]) + 1)),
+            "mid": 0.5 * (lo + hi),
+        })
+    packed = tuple(out)
+    for name, value in (("_bhv_obs", packed), ("_bhv_obs_epoch", epoch)):
+        try:
+            setattr(world, name, value)
+        except Exception:
+            pass
+    return packed
+
+
+def _obstacle_holding(
+    obs: tuple[dict[str, Any], ...], region: int
+) -> dict[str, Any] | None:
+    """The obstacle whose interior swallowed ``region``, if any."""
+    for o in obs:
+        if region in o["inner"]:
+            return o
+    return None
+
+
+def _must_cross(o: dict[str, Any], home: int, region: int) -> bool:
+    """Does getting from ``home`` to ``region`` mean getting past ``o``?
+
+    Region ids increase left to right and an obstacle separates everything at
+    or left of ``left`` from everything at or right of ``right``, so this is
+    two integer comparisons rather than a graph walk.
+    """
+    if region in o["inner"]:
+        return True
+    if home in o["inner"]:
+        return True
+    if home <= o["left"] and region >= o["right"]:
+        return True
+    return home >= o["right"] and region <= o["left"]
+
+
+# ----------------------------------------------------- who is it hurting? --
+
+
+def _watch_colony(world: Any) -> None:
+    """Per-pass bookkeeping the crossing planner reads: falls, and stranding.
+
+    Both are histories rather than snapshots, and both are why the planner can
+    now tell a wall that is killing people from a wall that merely exists.
+    Deliberately driven off corpses rather than a death hook: ``behavior`` has
+    no business installing a module-level callback that would outlive the world
+    that wanted it, and a body lies where it landed until somebody digs a grave,
+    which is many director passes.
+
+    Never raises. This runs on the 2 s colony pass, forever, unattended.
+    """
+    try:
+        now = world_now(world)
+        roster = _roster(world)
+        lab, _bars = _reach(world)
+
+        # --- falls. Keyed by agent id so a corpse is counted once, not once
+        # per pass for the several minutes it lies there.
+        seen = getattr(world, "_bhv_hazard_seen", None)
+        if not isinstance(seen, set):
+            seen = set()
+        hazards = list(getattr(world, "_bhv_hazard", ()) or ())
+        for a in roster:
+            if getattr(a, "alive", True):
+                continue
+            if str(getattr(a, "death_cause", "")) != "fall":
+                continue
+            key = int(getattr(a, "id", 0) or 0) or id(a)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                hazards.append((float(a.x), now))
+            except (TypeError, ValueError):
+                pass
+        hazards = [(hx, ht) for hx, ht in hazards if now - ht <= HAZARD_MEMORY]
+        # Bounded, because this runs for hours: a body leaves the roster when it
+        # is buried and cannot come back, so an id no longer on it is an id that
+        # can never be double-counted again.
+        live_ids = {int(getattr(a, "id", 0) or 0) or id(a) for a in roster}
+        seen &= live_ids
+
+        # --- stranding. How long each living agent has been *continuously*
+        # outside the region holding the colony. A snapshot cannot tell a man
+        # trapped across a chasm from a man three steps down a slope on his way
+        # home, and treating the second as the first is what had seed 7777
+        # building crossings for a colony that was never divided.
+        strand = getattr(world, "_bhv_strand", None)
+        if not isinstance(strand, dict):
+            strand = {}
+        fresh: dict[int, tuple[int, float]] = {}
+        if lab is not None:
+            for a in roster:
+                if not getattr(a, "alive", True):
+                    continue
+                key = int(getattr(a, "id", 0) or 0) or id(a)
+                r = _region_of(lab, getattr(a, "x", None))
+                was = strand.get(key)
+                # Region ids are renumbered whenever a crossing joins two
+                # pieces of map, so "same region as last time" is the wrong
+                # test after an epoch bump; the clock restarting on a genuine
+                # move is the conservative direction to be wrong in.
+                same = was is not None and was[0] == r
+                fresh[key] = (r, float(was[1]) if same else now)
+        strand = fresh
+
+        for name, value in (("_bhv_hazard", hazards), ("_bhv_hazard_seen", seen),
+                            ("_bhv_strand", strand)):
+            try:
+                setattr(world, name, value)
+            except Exception:
+                pass
+    except Exception:
+        log.debug("colony watch failed", exc_info=True)
+
+
+def _roster(world: Any) -> list[Any]:
+    """Every agent including the dead - ``alive_agents`` drops the evidence."""
+    pop = getattr(world, "population", None)
+    roster = getattr(pop, "agents", None) if pop is not None else None
+    if isinstance(roster, (list, tuple)):
+        return list(roster)
+    try:
+        return list(roster) if roster is not None else list(alive_agents(world))
+    except Exception:
+        return list(alive_agents(world))
+
+
+def _hazard_hits(world: Any, o: dict[str, Any]) -> int:
+    """How many people this obstacle has killed lately."""
+    lo = float(o["lo"]) - HAZARD_SLACK
+    hi = float(o["hi"]) + HAZARD_SLACK
+    n = 0
+    for hx, _ht in getattr(world, "_bhv_hazard", ()) or ():
+        if lo <= hx <= hi:
+            n += 1
+    return n
+
+
+def _stranded_for(world: Any, agent: Any) -> float:
+    """Seconds this agent has been standing in the region it is standing in."""
+    now = world_now(world)
+    strand = getattr(world, "_bhv_strand", None)
+    if not isinstance(strand, dict):
+        return 0.0
+    key = int(getattr(agent, "id", 0) or 0) or id(agent)
+    rec = strand.get(key)
+    return max(0.0, now - float(rec[1])) if rec else 0.0
+
+
 def find_cutoff(world: Any) -> dict[str, Any] | None:
     """What the colony has been cut off from, or ``None`` if nothing.
 
@@ -1551,6 +1910,9 @@ def find_cutoff(world: Any) -> dict[str, Any] | None:
             return getattr(world, "_bhv_cut", None)
     except Exception:
         pass
+    # Ahead of the survey, not inside it: the survey reads these histories and
+    # a stub world that only ever calls find_cutoff still gets them kept.
+    _watch_colony(world)
     try:
         found = _compute_cutoff(world)
         plan = None if found is None else _crossing_geometry(world, found)
@@ -1651,14 +2013,47 @@ def _compute_cutoff(world: Any) -> dict[str, Any] | None:
     # Candidates are (weight, x, reason). Weight is how badly it hurts, and is
     # what decides which side of the colony gets its crossing first.
     cands: list[tuple[int, float, str]] = []
+    obs = _obstacles(world, lab, bars)
 
     # 1. Somebody is on the wrong side. This is the case the user named: a
     #    villager who mined the floor out from under himself, or who went over
     #    the rim and lived. Nothing else the colony is short of matters as much.
+    #
+    #    But "is standing in another region" is not stranding, and taking it for
+    #    stranding is what made the colony build for nothing. Regions split at
+    #    every wall on the map, agents wander over the low ones all day, and on
+    #    seed 7777 - a plateau, nobody trapped, nobody dying - that was enough
+    #    to buy a ladder and a bridge and finish the run a hut short of the
+    #    colony that built neither. Three things separate the real thing from
+    #    that, in rising order of how little patience each deserves: a *hole*
+    #    (nothing to eat down there, no way back up) is a rescue on sight; a
+    #    *divided colony* - two or more of them still over there a moment later
+    #    - is the case a crossing exists for; and one man off on his own is the
+    #    weakest evidence there is, so he has to still be out there a minute and
+    #    a half later before the colony drops what it is doing. Every plateau
+    #    and valley map has a lone wanderer over an edge in the first minute;
+    #    almost none of them have two.
+    trapped: set[float] = set()
+    away_from_home: list[tuple[Any, dict[str, Any] | None]] = []
     for a in alive:
         r = _region_of(lab, getattr(a, "x", None))
-        if r >= 0 and r != home:
-            cands.append((3, float(getattr(a, "x", center)), "stranded"))
+        if r < 0 or r == home:
+            continue
+        hole = _obstacle_holding(obs, r)
+        if _stranded_for(world, a) >= (STRANDED_HOLE_DWELL if hole is not None
+                                       else STRANDED_DWELL):
+            away_from_home.append((a, hole))
+    lone = len(away_from_home) < 2
+    for a, hole in away_from_home:
+        if hole is None and lone and _stranded_for(world, a) < STRANDED_DWELL_LONE:
+            continue
+        if hole is not None:
+            # Inside the thing in the way - the chasm floor, the bottom of his
+            # own quarry. Nothing down there to eat and no way back up, so this
+            # is the one stranding that cannot wait, and the obstacle holding
+            # him is marked so the dwell knows it.
+            trapped.add(float(hole["mid"]))
+        cands.append((3, float(getattr(a, "x", center)), "stranded"))
 
     # 2. The fire or the stores ended up across the gap. Both are *the* shared
     #    resource: everyone walks to them all day, so a split from either turns
@@ -1702,11 +2097,30 @@ def _compute_cutoff(world: Any) -> dict[str, Any] | None:
                     here += 1
                 elif r >= 0:
                     away.append(px)
-        if here == 0 and away:
+        # ...and the colony is actually short of it. With a full store the far
+        # bank is next month's wood rather than today's problem, and spending
+        # the build order on reaching it is the same waste as any other
+        # crossing nobody needed.
+        if here == 0 and away and stock_qty(world, _res) < CUTOFF_SHORT_QTY:
             cands.append((1, min(away, key=lambda px: abs(px - center)), _res))
 
     if not cands:
-        return None
+        # Nothing the colony can name is on the wrong side - and it can still be
+        # losing a villager a minute over the same rim. Seed 42 is the whole
+        # argument: three walls, nobody trapped, every resource at home, and
+        # seven people dead at the foot of one 392 px face while the survey
+        # reported a perfectly connected colony with nothing to build. A wall
+        # with bodies under it is a thing in the way whatever the reachability
+        # graph believes, so it gets to ask for a crossing on its own evidence.
+        lethal = [(o, _hazard_hits(world, o)) for o in obs]
+        lethal = [(o, n) for o, n in lethal if n]
+        if not lethal:
+            return None
+        o = max(lethal, key=lambda e: (e[1], -abs(e[0]["mid"] - center)))[0]
+        # A rim column belongs to the region it overlooks, so the outer rim on
+        # the far side is a point in the far region and needs no search.
+        cands.append((2, float(o["hi"] if home <= int(o["left"]) else o["lo"]),
+                      "falls"))
     # Worst problem first; among equals, the nearest one, because that is also
     # the cheapest to answer and the one the colony is walking into.
     weight, tx, reason = max(cands, key=lambda c: (c[0], -abs(c[1] - center)))
@@ -1716,6 +2130,12 @@ def _compute_cutoff(world: Any) -> dict[str, Any] | None:
         "home": int(home),
         "target": _region_of(lab, tx),
         "target_x": float(tx),
+        "trapped": frozenset(trapped),
+        # The whole list travels on, because which *barrier* to answer is not
+        # decided by whichever candidate hurts most. A colony must eventually
+        # cross every wall between it and the thing it wants, so the wall worth
+        # building at is the one doing the damage - see `_crossing_geometry`.
+        "cands": tuple(cands),
     }
 
 
@@ -1766,7 +2186,13 @@ def plan_crossing(
     cut = find_cutoff(world)
     if cut is None or cut.get("plan") is None:
         return None
-    if float(cut.get("charge", 0.0)) < CUTOFF_DWELL:
+    # The dwell is confirmation that the split is real, and an obstacle with a
+    # body at the foot of it - or a villager stuck inside it - is already
+    # confirmed. Waiting the full dwell there is not caution, it is the
+    # difference between a deck that prevents the next four deaths and one that
+    # arrives after them.
+    dwell = CUTOFF_DWELL_URGENT if cut["plan"].get("urgent") else CUTOFF_DWELL
+    if float(cut.get("charge", 0.0)) < dwell:
         return None
     reg = reg if reg is not None else structures_of(world)
     if reg is not None:
@@ -1798,14 +2224,30 @@ def plan_crossing(
 
 
 def _crossing_geometry(world: Any, cut: dict[str, Any]) -> dict[str, Any] | None:
-    """Turn a cutoff report into a sited bridge or ladder."""
+    """Turn a cutoff report into a sited bridge or ladder.
+
+    Which wall gets answered is decided here, and it is the question the old
+    version got wrong. It took the barrier nearest the colony centre between
+    home and whatever hurt most, on the reasoning that the near one is the
+    cheapest. But a colony has to cross *every* wall between it and the thing it
+    wants, so nearness ranks nothing - and meanwhile the wall that is actually
+    killing people may be in the other direction entirely. Measured on seed 42:
+    three walls, all seven fall deaths at the 392 px one, and the colony spent
+    the run bridging a 197 px wall two hundred pixels past it that nobody ever
+    died at and that left the killer untouched.
+
+    So: enumerate the obstacles, score each by what it is doing to the colony -
+    bodies first, then what is stranded or unreachable behind it - and stake out
+    the first one that a crossing can genuinely join. "Can genuinely join" is
+    the other half of the fix: a plan whose two ends do not land on the two
+    sides of the obstacle is not a crossing, it is a ladder into a hole, and
+    three of fourteen chasm colonies spent their wood on exactly that.
+    """
     lab, bars = _reach(world)
     surf = _surface_of(world)
     if lab is None or not bars or surf is None:
         return None
-    w = int(surf.size)
     home = int(cut["home"])
-    target_x = float(cut["target_x"])
 
     # Where the colony stands *inside* its own region - the crossing has to be
     # walkable-to, so it is measured from home, not from a centre that may have
@@ -1817,19 +2259,84 @@ def _crossing_geometry(world: Any, cut: dict[str, Any]) -> dict[str, Any] | None
             return None
         home_x = float(0.5 * (idx[0] + idx[-1]))
 
-    lo, hi = (home_x, target_x) if home_x <= target_x else (target_x, home_x)
-    between = [b for b in bars if lo <= 0.5 * (b[0] + b[1]) <= hi]
-    if not between:
-        return None
-    wall = min(between, key=lambda b: abs(0.5 * (b[0] + b[1]) - home_x))
-    a, c, relief = int(wall[0]), int(wall[1]), float(wall[2])
+    ranked = _rank_obstacles(world, lab, bars, home, cut, home_x)
+    for o in ranked:
+        plan = _site_crossing(world, lab, bars, surf, home, o, cut)
+        if plan is not None:
+            plan["urgent"] = bool(o["urgent"])
+            plan["obstacle"] = (int(o["lo"]), int(o["hi"]))
+            return plan
+    return None
+
+
+def _rank_obstacles(
+    world: Any, lab: Any, bars: tuple[tuple[int, int, float], ...], home: int,
+    cut: dict[str, Any], home_x: float
+) -> list[dict[str, Any]]:
+    """The obstacles worth answering, worst first.
+
+    Worst means: how many people it has killed, then how badly what is behind it
+    is wanted, and only then how close it is. Bodies outrank everything because
+    they are the only evidence that does not depend on the survey guessing right
+    - an obstacle with a fall death at the foot of it *is* the problem, whatever
+    the reachability graph thinks the colony is short of.
+    """
+    obs = _obstacles(world, lab, bars)
+    cands = cut.get("cands") or ((int(cut.get("weight", 1)), float(cut["target_x"]),
+                                  str(cut.get("reason", ""))),)
+    out: list[dict[str, Any]] = []
+    for o in obs:
+        weight = 0
+        reason = ""
+        near = float("inf")
+        for cw, cx, cr in cands:
+            if not _must_cross(o, home, _region_of(lab, cx)):
+                continue
+            d = abs(float(cx) - o["mid"])
+            if cw > weight or (cw == weight and d < near):
+                weight, reason, near = int(cw), str(cr), d
+        hits = _hazard_hits(world, o)
+        if not hits and not weight:
+            continue                    # in the way of nothing, hurting nobody
+        entry = dict(o)
+        entry["hits"] = int(hits)
+        entry["urgent"] = bool(hits) or o["mid"] in (cut.get("trapped") or ())
+        entry["weight"] = int(weight)
+        # Why *this* obstacle, which is not always why the survey fired: the
+        # chronicle should say what the colony noticed at the wall it is
+        # actually staking out.
+        entry["reason"] = reason or str(cut.get("reason", ""))
+        out.append(entry)
+    # Bodies first, then a man in the hole, then whatever is merely on the
+    # wrong side of it, and only then which is nearest. Nearness ranks nothing
+    # on its own: a colony has to cross every wall between it and what it wants,
+    # so "closest" is not "cheapest", it is just "first in line" - and the wall
+    # doing the killing is regularly not the one in front.
+    out.sort(key=lambda e: (-e["hits"], not e["urgent"], -e["weight"],
+                            abs(e["mid"] - home_x)))
+    return out
+
+
+def _site_crossing(
+    world: Any, lab: Any, bars: tuple[tuple[int, int, float], ...], surf: Any,
+    home: int, o: dict[str, Any], cut: dict[str, Any]
+) -> dict[str, Any] | None:
+    """A bridge or ladder that actually joins the two sides of ``o``."""
+    w = int(surf.size)
+    a, c, relief = int(o["lo"]), int(o["hi"]), float(o["relief"])
 
     # Columns strictly inside a wall are the wall itself - a deck that ends
-    # there ends in mid-air, and a builder sent to stand there falls.
+    # there ends in mid-air, and a builder sent to stand there falls. For a
+    # grouped obstacle the whole interior counts, floor included: the floor of a
+    # chasm is somewhere a deck must pass *over*, never somewhere it may land.
     on_wall = np.zeros(w, dtype=bool)
     for ba, bc, _r in bars:
         if bc - ba > 1:
             on_wall[ba + 1 : bc] = True
+    if c - a > 1:
+        on_wall[a + 1 : c] = True
+
+    far = int(o["right"]) if home <= int(o["left"]) else int(o["left"])
 
     # Two passes. First try to reach the thing that is actually cut off; if the
     # geometry will not allow that, settle for making the wall crossable at all.
@@ -1838,7 +2345,15 @@ def _crossing_geometry(world: Any, cut: dict[str, Any]) -> dict[str, Any] | None
     # 300 px chasm with a 99 px floor there is no ramp that reaches him, and the
     # rim-to-rim bridge is still worth building because it is what stops the
     # next four people going in after him.
-    for target in (int(cut["target"]), home):
+    tgt = int(cut["target"])
+    if tgt in o["inner"]:
+        # He is *in* the obstacle. Aiming at the hole is what produced a ladder
+        # from the near rim down onto the chasm floor (seed 70) - geometry that
+        # satisfies the survey, reaches the man, and leaves the gap exactly as
+        # lethal as it was. Aim past it; getting the two sides joined is what
+        # gets him out and what stops the next one going in.
+        tgt = far
+    for target in (tgt, far, home):
         # A gap is bridged; a face is laddered. The test is whether there is
         # ground across at roughly the same height to land on: a chasm has two
         # rims with a hole between them, a plateau edge has no far rim at all -
@@ -1847,42 +2362,49 @@ def _crossing_geometry(world: Any, cut: dict[str, Any]) -> dict[str, Any] | None
         if pair is not None:
             p, q = pair                 # p is the home-side end
             x0, x1 = (float(min(p, q)), float(max(p, q)))
-            return {
-                "kind": "bridge",
-                # Anchored on home ground at the near end, never mid-span: `x`
-                # is where a builder walks to, and the middle of a bridge is
-                # 300 px of open air until the last stage is stamped. The deck
-                # geometry travels in `span`, which the stamp and the renderer
-                # both read.
-                "x": float(np.clip(p, 4.0, w - 5.0)),
-                "y": float(min(surf[p], surf[q])),
-                "extra": {"w": (x1 - x0) + 18.0, "span": [x0, x1]},
-                "span": (x0, x1),
-                "reason": str(cut["reason"]),
-            }
+            if _joins(lab, o, x0, x1):
+                return {
+                    "kind": "bridge",
+                    # Anchored on home ground at the near end, never mid-span:
+                    # `x` is where a builder walks to, and the middle of a
+                    # bridge is 300 px of open air until the last stage is
+                    # stamped. The deck geometry travels in `span`, which the
+                    # stamp and the renderer both read.
+                    "x": float(np.clip(p, 4.0, w - 5.0)),
+                    "y": float(min(surf[p], surf[q])),
+                    "extra": {"w": (x1 - x0) + 18.0, "span": [x0, x1]},
+                    "span": (x0, x1),
+                    "reason": str(o.get("reason") or cut["reason"]),
+                }
 
         plan = _ladder_plan(world, surf, lab, a, c, relief, cut)
-        if plan is not None:
-            x0, x1 = plan["span"]
-            if (target == home
-                    or _reaches(lab, home, target, x0)
-                    or _reaches(lab, home, target, x1)):
-                return plan
+        if plan is not None and _joins(lab, o, *plan["span"]):
+            plan["reason"] = str(o.get("reason") or cut["reason"])
+            return plan
         if target == home:
             break                       # the unconstrained pass has run
     return None
 
 
-def _reaches(lab: Any, home: int, target: int, x: float) -> bool:
-    """Is ``x`` on the far side of home, and no further than the target?"""
-    r = _region_of(lab, x)
-    if r < 0 or r == home:
-        return False
-    if target == home:
-        return True
-    toward = 1 if target > home else -1
-    rel = (r - home) * toward
-    return 0 < rel <= abs(target - home)
+def _joins(lab: Any, o: dict[str, Any], x0: float, x1: float) -> bool:
+    """Would a crossing from ``x0`` to ``x1`` actually put the two sides of
+    ``o`` together?
+
+    The two ends have to land in the obstacle's own two outside regions - one
+    each, not both on the same side and neither inside it. Everything that gets
+    built and changes nothing fails exactly here: a ladder from the near rim
+    down onto the chasm floor has one end in ``inner``; a deck that clears the
+    obstacle *and* the next one along has an end past ``right``; a ramp too
+    short to shed the whole face keeps both ends on the home side. All three
+    were measured being built, and none of them joined anything - three of
+    fourteen chasm colonies finished the run still split, one of them the
+    deadliest seed in the sweep.
+
+    Cheap on purpose: region ids already encode reachability, so this is two
+    lookups rather than a re-survey of merged terrain.
+    """
+    ends = {_region_of(lab, x0), _region_of(lab, x1)}
+    return ends == {int(o["left"]), int(o["right"])}
 
 
 def _bridge_pair(
@@ -2076,12 +2598,27 @@ def _ladder_span(
     tall = max(rise, float(relief))
     longest = int(min(LADDER_BARRIER_MAX_W,
                       max(LADDER_MAX_W, round(tall / max(0.5, LADDER_SLOPE)) + 40)))
+    reached = False
     for run in range(LADDER_MIN_W, longest + 1, 2):
         x_foot = x_top + d * run
         if not (0 <= x_foot < w):
             return None                 # ran off the edge of the world
-        if low_region is not None and _region_of(lab, x_foot) != low_region:
-            break                       # past the far side of this wall
+        if low_region is not None:
+            # The foot has to come down on the far side of *this* wall - but a
+            # wall 59 columns wide has half of it labelled with the region above
+            # it, so the first several runs land on the face itself and are
+            # neither there yet nor past it. Stopping at the first mismatch
+            # abandoned the search before it began: the loop starts at
+            # LADDER_MIN_W = 22, and on seed 42 the 392 px face that killed
+            # seven people was refused at run 22 with the foot still 29 columns
+            # short of the region boundary. Every wall wider than about twice
+            # LADDER_MIN_W was unanswerable for the same reason, which is most
+            # of the walls worth answering.
+            if _region_of(lab, x_foot) != low_region:
+                if reached:
+                    break               # past the far side of this wall
+                continue                # still on the face, keep walking down
+            reached = True
         y_foot = float(surf[x_foot])
         if abs(y_foot - y_top) < LADDER_MIN_RISE * 0.8:
             continue                    # still on the lip, nothing descended

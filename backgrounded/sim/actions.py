@@ -26,6 +26,8 @@ from ..constants import (
     FARM_FIELD_SIZE,
     FARM_HARVEST_FOOD,
     FARM_TILL_SEC,
+    LITTER_CLUSTER_MIN,
+    LITTER_CLUSTER_R,
     MAT_DIRT,
     MAT_GRASS,
     MAT_STONE,
@@ -39,6 +41,7 @@ from ..constants import (
     RES_COOKED,
     RES_FIBRE,
     RES_FOOD,
+    RES_GARBAGE,
     RES_STONE,
     RES_WOOD,
     WALK_SPEED,
@@ -76,6 +79,7 @@ __all__ = [
     "agents_of", "agent_by_id", "structures_of", "props_of", "find_prop",
     "prop_alive", "hazards_of", "chronicle", "emit_speech",
     "celebrations_of", "push_celebration", "colony_center",
+    "litter_clusters", "densest_litter", "free_litter_cluster",
 ]
 
 # ------------------------------------------------------------------ tuning --
@@ -119,6 +123,7 @@ ACTION_KINDS: tuple[str, ...] = (
     "BuildStructure", "RepairStructure", "Eat", "Sleep", "WarmAtFire",
     "CookFood", "PlantSapling", "Farm", "Mine", "Converse", "Celebrate",
     "Mourn", "FleeFrom", "ClimbTo", "Lookout", "FollowParent", "Panic",
+    "CleanLitter",
 )
 
 _TREE_KINDS = ("tree", "pine", "oak", "deadtree")
@@ -261,6 +266,16 @@ def stock_qty(world: Any, res: str) -> int:
 
 def stock_add(world: Any, res: str, qty: int) -> int:
     if qty <= 0 or not res:
+        return 0
+    if res == RES_GARBAGE:
+        # The one resource the stockpile refuses. Enforced here, at the single
+        # choke point every deposit path goes through (_drop_all, the build
+        # fetch, the cook hand-off, the player's Feed tool), rather than in the
+        # cleanup action - because the thing that must never happen is garbage
+        # reaching the store by some route nobody thought of. Everything that
+        # reads colony wealth sums this dict, and sweepings are not wealth.
+        # Returning 0 also leaves the carrier's hand full, so an abandoned haul
+        # is dropped as litter by _c_clean instead of vanishing into the pile.
         return 0
     sp = stockpile_of(world)
     try:
@@ -588,6 +603,119 @@ def find_prop(
             best = p
     if best is not None and best_d <= max_dist:
         return best
+    return None
+
+
+# ------------------------------------------------------------------ litter --
+#: How long a cluster survey stays good. The scan is O(n log n) over at most
+#: LITTER_MAX props, but `score_actions` runs it per agent per AI tick and the
+#: cleanup handler asks again every time it re-targets, so it is cached exactly
+#: the way `behavior._farm_feasible` caches its prop-list walk. Four seconds is
+#: well under the time it takes anyone to walk to a pile, so nobody ever acts on
+#: a survey that has gone meaningfully stale.
+LITTER_SCAN_SEC = 4.0
+#: Distinct piles reported. Three is enough for the colony's whole workforce to
+#: spread out without the scan turning into a clustering algorithm.
+LITTER_MAX_CLUSTERS = 3
+
+
+def litter_positions(world: Any) -> list[float]:
+    """Sorted x of every piece of litter lying about."""
+    xs: list[float] = []
+    for p in props_of(world):
+        if _prop_kind(p) != "litter" or not prop_alive(p):
+            continue
+        try:
+            xs.append(float(getattr(p, "x", 0.0)))
+        except (TypeError, ValueError):
+            continue
+    xs.sort()
+    return xs
+
+
+def _scan_clusters(xs: list[float]) -> list[tuple[float, int]]:
+    """``[(centre_x, count), ...]`` for the densest non-overlapping piles.
+
+    Greedy over a sorted list with a sliding window of width ``2 *
+    LITTER_CLUSTER_R``: for each start index walk forward while the span fits,
+    keep the widest run, then strike those items out and look again. Linear per
+    pass and at most LITTER_MAX_CLUSTERS passes over <= LITTER_MAX items, which
+    is why this can afford to be exact rather than a bucketed approximation.
+
+    "Dense" is a count, never a single item: a lone speck can never be a job,
+    which is the behaviour the spec asked for in as many words.
+    """
+    out: list[tuple[float, int]] = []
+    pool = list(xs)
+    span = 2.0 * float(LITTER_CLUSTER_R)
+    for _ in range(LITTER_MAX_CLUSTERS):
+        n = len(pool)
+        if n < LITTER_CLUSTER_MIN:
+            break
+        best_i = best_j = 0
+        best_n = 0
+        j = 0
+        for i in range(n):
+            if j < i:
+                j = i
+            while j + 1 < n and pool[j + 1] - pool[i] <= span:
+                j += 1
+            if (j - i + 1) > best_n:
+                best_n, best_i, best_j = j - i + 1, i, j
+        if best_n < LITTER_CLUSTER_MIN:
+            break
+        # The mean, not the window midpoint: it puts the sweeper where the mess
+        # actually is when a run has a straggler at one end.
+        chunk = pool[best_i:best_j + 1]
+        out.append((sum(chunk) / len(chunk), best_n))
+        del pool[best_i:best_j + 1]
+    return out
+
+
+def litter_clusters(world: Any) -> list[tuple[float, int]]:
+    """Cached ``[(centre_x, count), ...]``, densest first. Never raises."""
+    now = world_now(world)
+    try:
+        t = float(getattr(world, "_act_litter_t", -1e9))
+        if 0.0 <= now - t < LITTER_SCAN_SEC:
+            cached = getattr(world, "_act_litter", None)
+            if isinstance(cached, list):
+                return cached
+    except Exception:
+        pass
+    try:
+        val = _scan_clusters(litter_positions(world))
+    except Exception:
+        log.debug("litter cluster scan failed", exc_info=True)
+        val = []
+    try:
+        setattr(world, "_act_litter", val)
+        setattr(world, "_act_litter_t", now)
+    except Exception:
+        pass
+    return val
+
+
+def densest_litter(world: Any) -> tuple[float, int] | None:
+    """The single worst pile, or None if nothing is dense enough to be a job."""
+    cl = litter_clusters(world)
+    return cl[0] if cl else None
+
+
+def free_litter_cluster(world: Any, agent_id: Any = None) -> tuple[float, int] | None:
+    """The densest pile nobody else is already sweeping, or ``None``.
+
+    Shared by the scorer's action-maker and by the handler's ``start`` phase so
+    the two cannot disagree. That matters more than it looks: ``choose_action``
+    skips a maker that returns ``None`` and moves straight down its ranking,
+    whereas an action that is created and then fails on its first update costs
+    the villager a whole decision cycle standing still. Same rule in both places
+    means a colony where every heap is taken just gets on with something else.
+    """
+    for cx, n in litter_clusters(world):
+        if _cluster_taken(world, cx, agent_id):
+            continue
+        return (cx, n)
     return None
 
 
@@ -1090,12 +1218,53 @@ def _carry_add(agent: Any, action: "Action", res: str, qty: int) -> None:
         stash[res] = int(stash.get(res, 0)) + int(qty)
 
 
+def _shed_litter(world: Any, x: float, n: int) -> int:
+    """Put `n` pieces of carried rubbish back on the ground around `x`.
+
+    Anything that takes garbage out of a villager's hands without burning it
+    routes through here, so the stuff is *put down*, never destroyed. That keeps
+    the density signal honest: an interrupted sweep leaves the mess where it was
+    dropped and the job can be picked up again, rather than the colony quietly
+    disposing of litter by getting scared of a wolf.
+
+    The import is local for the same reason the vignette and combat rehydrates
+    are: props.py must not appear on this module's import graph, since the rest
+    of actions.py reaches props purely duck-typed.
+    """
+    try:
+        from .props import drop_litter
+    except Exception:
+        return 0
+    reg = getattr(world, "props", None)
+    terr = getattr(world, "terrain", None)
+    if reg is None or terr is None:
+        return 0
+    rng = getattr(world, "pyrng", None)
+    now = world_now(world)
+    count = max(0, min(int(n), CARRY_CAP))
+    made = 0
+    for i in range(count):
+        try:
+            # Fan them out a little so a dropped armful reads as spilled rubbish
+            # rather than one speck standing in for eight.
+            spread = (float(i) - (count - 1) * 0.5) * 7.0
+            if drop_litter(reg, terr, float(x) + spread, rng, now) is not None:
+                made += 1
+        except Exception:
+            break
+    return made
+
+
 def _drop_all(agent: Any, action: "Action", world: Any) -> int:
     """Move everything the agent holds into the stockpile. Returns units moved."""
     moved = 0
     res = getattr(agent, "carrying", None)
     qty = int(getattr(agent, "carry_qty", 0) or 0)
-    if res and qty > 0:
+    if res == RES_GARBAGE and qty > 0:
+        # `stock_add` refuses garbage, so without this the armful would simply
+        # cease to exist the moment any other haul path unloaded it.
+        _shed_litter(world, float(getattr(agent, "x", 0.0)), qty)
+    elif res and qty > 0:
         moved += stock_add(world, res, qty)
     try:
         agent.carrying = None
@@ -2597,6 +2766,281 @@ def _h_mine(a: Action, ag: Any, w: Any, dt: float) -> None:
     a.phase = "start"
 
 
+#: Seconds spent stooping over each piece. Short - this is meant to read as
+#: someone moving along picking things up, not as a work session.
+CLEAN_PICK_SEC = 0.5
+#: How far from the pile's centre a sweeper will chase a stray piece. Just over
+#: the cluster radius, so he clears the pile he came for and does not wander off
+#: across the map following a trail of single items.
+CLEAN_RANGE = LITTER_CLUSTER_R + 30.0
+#: Give-up timers. Both generous relative to the work, both mandatory: this
+#: action can be started on a pile behind a chasm wall, and an unattended run
+#: must not park a villager against a cliff forever.
+CLEAN_WALK_TIMEOUT = 75.0
+CLEAN_TOTAL_TIMEOUT = 150.0
+
+
+def _nearest_litter(w: Any, x: float, cx: float, aid: Any) -> Any | None:
+    """Nearest unclaimed piece of litter to `x` that still belongs to the pile
+    centred on `cx`. Returns None once the pile is clear."""
+    best = None
+    best_d = float("inf")
+    now = world_now(w)
+    for p in props_of(w):
+        if _prop_kind(p) != "litter" or not prop_alive(p):
+            continue
+        try:
+            px = float(getattr(p, "x", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if abs(px - float(cx)) > CLEAN_RANGE:
+            continue
+        if aid is not None and prop_claimed_by_other(w, p, aid, now):
+            continue
+        d = abs(px - float(x))
+        if d < best_d:
+            best_d, best = d, p
+    return best
+
+
+def _cluster_taken(w: Any, cx: float, aid: Any) -> bool:
+    """Is somebody else already sweeping the pile centred on `cx`?
+
+    Asking "is any piece of this pile claimed" rather than "is the anchor
+    claimed": a sweeper re-claims whichever piece he is walking to on every
+    tick, so he always holds exactly one piece of his own pile, and the piece he
+    holds moves as he works along it. Testing only the anchor would let a second
+    villager shadow the same heap the moment the first picked the anchor up.
+    """
+    if aid is None:
+        return False
+    now = world_now(w)
+    for p in props_of(w):
+        if _prop_kind(p) != "litter" or not prop_alive(p):
+            continue
+        try:
+            if abs(float(getattr(p, "x", 0.0)) - float(cx)) > CLEAN_RANGE:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if prop_claimed_by_other(w, p, aid, now):
+            return True
+    return False
+
+
+def _h_clean(a: Action, ag: Any, w: Any, dt: float) -> None:
+    """Sweep the densest pile of litter and burn it in the nearest firepit.
+
+    Four phases: pick a pile, walk to it, work along it filling both arms, then
+    haul the load to a fire and tip it in. The load is :data:`RES_GARBAGE`, which
+    ``stock_add`` refuses outright - it can only ever end up burned or, if this
+    is interrupted, back on the ground via :func:`_shed_litter`.
+
+    Deliberately fails rather than improvising whenever the premise stops
+    holding: no dense pile, nowhere to burn it, hands already full. This is the
+    lowest-value job in the colony and it should evaporate at the first excuse.
+    """
+    aid = getattr(ag, "id", None)
+
+    if a.phase == "start":
+        held = int(getattr(ag, "carry_qty", 0) or 0)
+        if held > 0 and getattr(ag, "carrying", None) == RES_GARBAGE:
+            # He is already holding a swept load - a previous run that got
+            # interrupted between the heap and the fire. Finish that errand
+            # rather than starting a new one; nothing else in the colony knows
+            # what to do with garbage, so failing here would strand it in his
+            # hands until something abandoned the action for him.
+            a.data["got"] = held
+            a.data["burn_t0"] = float(a.t)
+            a.data.setdefault("cx", float(getattr(ag, "x", 0.0)))
+            a.phase = "burn"
+            return                  # pick the errand up again next tick
+        if held > 0:
+            # Hands full of something the colony wants. `_carry_add` would stash
+            # the rubbish behind it and the tip-in below reads the hand, so the
+            # load would arrive at the fire invisible.
+            a.failed = True
+            return
+        if nearest_structure(w, "firepit", ag.x, built_only=True) is None:
+            a.failed = True
+            return
+        pile = free_litter_cluster(w, aid)
+        anchor = _nearest_litter(w, pile[0], pile[0], aid) if pile else None
+        if pile is None or anchor is None:
+            a.failed = True         # nothing dense enough, or all of it taken
+            return
+        cx = pile[0]
+        a.data["cx"] = float(cx)
+        a.data["got"] = 0
+        a.data["pt"] = 0.0
+        a.target = getattr(anchor, "id", None)
+        claim_prop(w, anchor, ag)   # this pile is mine
+        a.phase = "approach"
+
+    cx = float(a.data.get("cx", getattr(ag, "x", 0.0)))
+
+    if a.phase == "approach":
+        a.pose = "walk"
+        rem = step_toward(ag, w, cx, dt, arrive=REACH)
+        if rem <= REACH:
+            a.phase = "collect"
+            a.data["pt"] = 0.0
+        elif a.t > CLEAN_WALK_TIMEOUT:
+            a.failed = True
+        return
+
+    if a.phase == "collect":
+        p = _nearest_litter(w, float(ag.x), cx, aid)
+        got = int(a.data.get("got", 0))
+        if p is None or got >= CARRY_CAP or a.t > CLEAN_TOTAL_TIMEOUT:
+            release_claim(w, a.target, ag)
+            if got > 0:
+                a.phase = "burn"
+                # The haul gets its own clock. Sharing `a.t` would mean a sweep
+                # that only just made the total timeout arrives at the burn
+                # phase already expired and dumps the load on the spot.
+                a.data["burn_t0"] = float(a.t)
+                return
+            a.failed = True
+            return
+        # Hold whatever piece is next, so a second sweeper picks a different
+        # pile rather than shadowing this one.
+        a.target = getattr(p, "id", None)
+        claim_prop(w, p, ag)
+        px = float(getattr(p, "x", ag.x))
+        if abs(px - float(ag.x)) > REACH:
+            a.pose = "walk"
+            step_toward(ag, w, px, dt, arrive=REACH)
+            a.data["pt"] = 0.0
+            return
+        a.pose = "forage"
+        _halt(ag)
+        _face(ag, px - float(ag.x))
+        a.data["pt"] = float(a.data.get("pt", 0.0)) + dt
+        if a.data["pt"] < CLEAN_PICK_SEC / max(0.3, _work_rate(ag)):
+            return
+        a.data["pt"] = 0.0
+        release_claim(w, a.target, ag)
+        _kill_prop(w, p)
+        _carry_add(ag, a, RES_GARBAGE, 1)
+        a.data["got"] = got + 1
+        return
+
+    if a.phase == "burn":
+        # The fire is tracked in `data`, not in `target`: `target` still holds
+        # the last claimed litter id, and `_c_clean` releases that claim by it.
+        fire = structure_by_id(w, a.data.get("fire"))
+        if fire is None or fire.kind != "firepit" or getattr(fire, "is_ruined", False):
+            fire = nearest_structure(w, "firepit", ag.x, built_only=True)
+            a.data["fire"] = getattr(fire, "id", None) if fire is not None else None
+        if fire is None:
+            # The fire burned down while we were sweeping. Put the load back on
+            # the ground rather than deleting it.
+            _shed_litter(w, float(getattr(ag, "x", 0.0)),
+                         int(getattr(ag, "carry_qty", 0) or 0))
+            _clear_carry(ag)
+            a.done = True
+            return
+        a.pose = "carry"
+        rem = step_toward(ag, w, float(fire.x), dt, arrive=FIRE_REACH,
+                          speed=WALK_SPEED * 0.92)
+        if rem > FIRE_REACH:
+            if a.t - float(a.data.get("burn_t0", 0.0)) > CLEAN_WALK_TIMEOUT:
+                _shed_litter(w, float(getattr(ag, "x", 0.0)),
+                             int(getattr(ag, "carry_qty", 0) or 0))
+                _clear_carry(ag)
+                a.done = True
+            return
+        _halt(ag)
+        qty = int(getattr(ag, "carry_qty", 0) or 0)
+        taken = 0
+        # Was the pit already burning rubbish? Only a load that *starts* a
+        # bonfire gets a line - topping one up is the same event continuing, and
+        # a keen colony tips a load in every couple of minutes.
+        fresh = float(getattr(fire, "garbage_left", 0.0) or 0.0) <= 0.0
+        fn = getattr(fire, "feed_garbage", None)
+        if callable(fn):
+            try:
+                taken = int(fn(qty))
+            except Exception:
+                taken = 0
+        if taken > 0:
+            if fresh:
+                chronicle(w, f"{getattr(ag, 'name', 'Someone')} tipped a "
+                             f"load of swept-up rubbish onto the fire.")
+            _adjust(ag, "morale", 0.03)
+        # Whatever the pit would not take stays IN HAND. It emphatically does not
+        # go back on the ground here: the pit refuses anything past
+        # BONFIRE_GARBAGE_CAP, so shedding the remainder at the villager's feet
+        # turned the whole job into a treadmill - measured, 1012 of 1181 pieces
+        # swept up over 45 minutes were tipped out again at the fire, one step
+        # from where they would be picked up next. Carrying it means the next
+        # delivery finishes the load once the blaze has burned down, which is
+        # also just what a person would do.
+        #
+        # Only a load with nowhere to go at all is put down (the walk-timeout
+        # branch above), because a villager holding rubbish forever would never
+        # pick up a resource again.
+        if taken >= qty:
+            _clear_carry(ag)
+        elif taken > 0:
+            _carry_take(ag, taken)
+        a.done = True
+        return
+
+    a.phase = "start"
+
+
+def _clear_carry(ag: Any) -> None:
+    """Empty the hands. Only ever used where the load has been accounted for."""
+    try:
+        ag.carrying = None
+        ag.carry_qty = 0
+    except Exception:
+        pass
+
+
+def _carry_take(ag: Any, qty: int) -> None:
+    """Remove *qty* from the load, keeping the remainder in hand.
+
+    Used where a destination accepts only part of what was brought - the fire
+    refusing rubbish past its cap - so the rest is still carried rather than
+    dumped. Empties the hands if that takes the load to nothing, because a
+    carrying kind with a zero quantity reads as "holding something" to the
+    renderer and to every ``_has_load`` check.
+    """
+    try:
+        left = int(getattr(ag, "carry_qty", 0) or 0) - max(0, int(qty))
+        if left > 0:
+            ag.carry_qty = left
+        else:
+            _clear_carry(ag)
+    except Exception:
+        pass
+
+
+def _c_clean(a: Action, ag: Any, w: Any) -> None:
+    """Release the claimed piece and put any swept load back down.
+
+    Mirrors :func:`_c_gather` on the claim, and goes one step further because
+    this action is the only one that carries something the stockpile will not
+    accept: a sweeper who bolts from a wolf has to *drop* his armful, or it
+    would ride around in his hands forever (nothing else knows what to do with
+    garbage) and the pile he took it from would read as cleaned.
+    """
+    try:
+        release_claim(w, a.target, ag)
+    except Exception:
+        pass
+    try:
+        if getattr(ag, "carrying", None) == RES_GARBAGE:
+            _shed_litter(w, float(getattr(ag, "x", 0.0)),
+                         int(getattr(ag, "carry_qty", 0) or 0))
+            _clear_carry(ag)
+    except Exception:
+        pass
+
+
 def _c_mine(a: Action, ag: Any, w: Any) -> None:
     """Drop the transient dust flag and free the boulder when a dig is cut short."""
     try:
@@ -2632,6 +3076,7 @@ _HANDLERS: dict[str, Callable[[Action, Any, Any, float], None]] = {
     "Lookout": _h_lookout,
     "FollowParent": _h_follow,
     "Panic": _h_panic,
+    "CleanLitter": _h_clean,
 }
 
 _CLEANUP: dict[str, Callable[[Action, Any, Any], None]] = {
@@ -2641,6 +3086,7 @@ _CLEANUP: dict[str, Callable[[Action, Any, Any], None]] = {
     "GatherWood": _c_gather,
     "GatherStone": _c_gather,
     "ForageBerries": _c_gather,
+    "CleanLitter": _c_clean,
 }
 
 # Sanity: every advertised kind must have a real handler.

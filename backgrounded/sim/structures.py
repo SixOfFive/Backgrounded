@@ -28,6 +28,11 @@ from typing import Any, Iterator
 from ..constants import (
     BARRICADE_DAMAGE,
     BARRICADE_RANGE,
+    BONFIRE_GARBAGE_CAP,
+    BONFIRE_LIGHT_COLOR,
+    BONFIRE_LIGHT_INTENSITY,
+    BONFIRE_LIGHT_RADIUS,
+    BONFIRE_SEC_PER_GARBAGE,
     HUT_AGE_WEIGHT,
     HUT_GROWTH_AGE_SEC,
     HUT_GROWTH_STORE_REF,
@@ -70,6 +75,22 @@ BURN_NEIGHBOUR_DIST = 70.0
 FIRE_FUEL_BURN = 1.0 / 240.0   # a full firepit burns for ~4 minutes
 FIRE_STOKE_PER_WOOD = 0.34
 RUIN_LINGER = 240.0         # seconds a collapsed structure stays as rubble
+
+#: Garbage burns *instead of* wood, not alongside it: while there is any in the
+#: pit, `_tick_upkeep` spends garbage and leaves ``state["fuel"]`` alone. That is
+#: what "it uses that as fuel primarily" means mechanically - a colony that
+#: sweeps up is a colony that saves firewood - and it is also why the transition
+#: is worth drawing: the pit is running on something different.
+#:
+#: Nothing comes back out. No charcoal, no ash resource, no stockpile credit;
+#: `feed_garbage` returns units accepted and touches nothing but this structure.
+GARBAGE_PER_SEC = 1.0 / max(0.5, float(BONFIRE_SEC_PER_GARBAGE))
+#: Seconds the bonfire's light takes to reach full reach, and how many units of
+#: garbage from the end it starts dying back down. Both exist so the night does
+#: not step-change by 250 px of light radius inside one frame - the whole effect
+#: is meant to read as a fire being built up and burning itself out.
+BONFIRE_RAMP_SEC = 2.0
+BONFIRE_FADE_UNITS = 4.0
 
 #: Sleepers a hut holds at growth 0 and at growth 1. A well-established hut in
 #: a well-stocked camp really is a bigger building, so it houses more people.
@@ -619,6 +640,61 @@ class Structure:
         if self.state["fuel"] > 0.0:
             self.state["lit"] = True
 
+    def feed_garbage(self, qty: int = 1) -> int:
+        """Tip swept-up rubbish into a built firepit. Returns units accepted.
+
+        Yields nothing whatsoever - no charcoal, no resource, no stockpile
+        credit. The units go in, they burn (see :data:`GARBAGE_PER_SEC`), and
+        they are gone. That asymmetry is the point: cleaning up costs the colony
+        a villager's time and buys it light, warmth and saved firewood, never
+        materials.
+
+        Accepting past :data:`BONFIRE_GARBAGE_CAP` is refused rather than
+        clamped silently-in-full, so the caller can tell it still has garbage in
+        hand and go and find another fire.
+        """
+        if self.kind != "firepit" or not self.built or self.is_ruined:
+            return 0
+        try:
+            want = int(qty)
+        except (TypeError, ValueError):
+            return 0
+        if want <= 0:
+            return 0
+        have = max(0.0, _as_float(self.state, "garbage", 0.0))
+        room = float(BONFIRE_GARBAGE_CAP) - have
+        take = int(min(float(want), math.floor(room)))
+        if take <= 0:
+            return 0
+        self.state["garbage"] = have + float(take)
+        # A pit with garbage in it is a lit pit: somebody has just set the heap
+        # going. Deliberately does NOT touch ``fuel`` - the wood the colony had
+        # banked is still banked, and is what the fire falls back to afterwards.
+        self.state["lit"] = True
+        return take
+
+    @property
+    def garbage_left(self) -> float:
+        """Units of rubbish still to burn. 0.0 for anything but a live firepit."""
+        if self.kind != "firepit" or self.is_ruined:
+            return 0.0
+        return max(0.0, _as_float(self.state, "garbage", 0.0))
+
+    @property
+    def bonfire_active(self) -> bool:
+        """True while this firepit is running on garbage rather than wood.
+
+        The single flag the renderer, the lightmap and the chronicle all key
+        off, so "is it a bonfire" cannot mean three slightly different things.
+        """
+        return (
+            self.kind == "firepit"
+            and self.built
+            and not self.is_ruined
+            and bool(self.state.get("lit"))
+            and self.garbage_left > 0.0
+        )
+
     @property
     def fire_active(self) -> bool:
         return (
@@ -626,7 +702,10 @@ class Structure:
             and self.built
             and not self.is_ruined
             and bool(self.state.get("lit"))
-            and float(self.state.get("fuel", 0.0)) > 0.0
+            and (
+                float(self.state.get("fuel", 0.0)) > 0.0
+                or self.garbage_left > 0.0
+            )
         )
 
     def light_source(self) -> dict[str, Any] | None:
@@ -642,6 +721,24 @@ class Structure:
                     "color": BURN_LIGHT_COLOR,
                     "intensity": 0.55 + 0.4 * grow,
                     "flicker": 0.55,
+                }
+            # A bonfire before an ordinary fire: this is the payoff of the whole
+            # cleanup loop, and it has to reach past the firepit's doorstep or
+            # nobody watching a wallpaper at night would ever notice it happened.
+            # Ramped over the first second and faded over the last four so the
+            # night does not step-change; the flicker is wilder than a banked
+            # fire's because a heap of rubbish burns unevenly.
+            if self.bonfire_active:
+                grow = _clamp01(_as_float(self.state, "bonfire_t", 0.0) / BONFIRE_RAMP_SEC)
+                dying = _clamp01(self.garbage_left / BONFIRE_FADE_UNITS)
+                k = max(0.25, grow * max(0.35, dying))
+                return {
+                    "x": float(self.x),
+                    "y": float(self.y - 16.0),
+                    "radius": float(BONFIRE_LIGHT_RADIUS) * (0.55 + 0.45 * k),
+                    "color": BONFIRE_LIGHT_COLOR,
+                    "intensity": float(BONFIRE_LIGHT_INTENSITY) * (0.55 + 0.45 * k),
+                    "flicker": 0.42,
                 }
             if self.fire_active:
                 fuel = _clamp01(float(self.state.get("fuel", 0.0)))
@@ -885,16 +982,57 @@ class Structure:
                 self._chronicle(world, f"The {self.kind} burned to the ground.")
                 return
         if self.kind == "firepit" and self.state.get("lit"):
-            fuel = float(self.state.get("fuel", 0.0)) - FIRE_FUEL_BURN * dt
-            if fuel <= 0.0:
-                self.state["fuel"] = 0.0
-                self.state["lit"] = False
-            else:
-                self.state["fuel"] = fuel
+            self._tick_fuel(dt, world)
         if self.kind == "totem" and self.built:
             self.state["glow"] = _clamp01(float(self.state.get("glow", 1.0)))
         if self.kind == "barricade" and self.built:
             self._tick_barricade(dt, world)
+
+    def _tick_fuel(self, dt: float, world: Any | None) -> None:
+        """Spend a lit firepit's fuel. **Garbage first, wood only after.**
+
+        The two are not interchangeable. Garbage is fast (:data:`GARBAGE_PER_SEC`
+        is ~6x the wood rate), yields nothing and turns the pit into a bonfire
+        while it lasts; wood is the slow, ordinary fuel. Burning garbage first
+        means a colony that sweeps up spends no firewood at all for a couple of
+        minutes, which is the whole reward for the chore.
+
+        Edge-triggered on both ends, off ``state["bonfire"]``, so the chronicle
+        gets exactly one line when it flares and one when it dies back - not one
+        a frame.
+        """
+        garbage = self.garbage_left
+        was_bonfire = bool(self.state.get("bonfire"))
+        if garbage > 0.0:
+            if not was_bonfire:
+                self.state["bonfire"] = True
+                self.state["bonfire_t"] = 0.0
+                self._chronicle(world, "The heap catches: the firepit roars up "
+                                       "into a bonfire.")
+            self.state["bonfire_t"] = _as_float(self.state, "bonfire_t", 0.0) + dt
+            left = garbage - GARBAGE_PER_SEC * dt
+            self.state["garbage"] = max(0.0, left)
+            if left <= 0.0:
+                # Back to exactly a plain firepit's state shape - no zeroed
+                # leftovers to persist, reload and reason about later.
+                for key in ("garbage", "bonfire", "bonfire_t"):
+                    self.state.pop(key, None)
+                # Burning out of garbage does NOT put the fire out: it drops
+                # back to whatever wood was banked, exactly as if the bonfire
+                # had never happened. Only a pit with neither goes dark.
+                self._chronicle(world, "The bonfire burns down to an ordinary fire.")
+                if float(self.state.get("fuel", 0.0)) <= 0.0:
+                    self.state["lit"] = False
+            return
+        if was_bonfire:                      # e.g. a save loaded mid-bonfire
+            for key in ("garbage", "bonfire", "bonfire_t"):
+                self.state.pop(key, None)
+        fuel = float(self.state.get("fuel", 0.0)) - FIRE_FUEL_BURN * dt
+        if fuel <= 0.0:
+            self.state["fuel"] = 0.0
+            self.state["lit"] = False
+        else:
+            self.state["fuel"] = fuel
 
     def _tick_barricade(self, dt: float, world: Any | None) -> None:
         """A built barricade wounds wild animals lingering within its spikes.
@@ -1008,6 +1146,7 @@ class Structure:
                 for k, v in state["delivered"].items()
                 if isinstance(v, (int, float))
             }
+        _sanitise_bonfire(kind, state)
         s = cls(
             id=_as_int(d, "id", 0),
             kind=kind,
@@ -1052,6 +1191,54 @@ def _clamp01(v: float) -> float:
     if math.isnan(f):
         return 0.0
     return 0.0 if f < 0.0 else (1.0 if f > 1.0 else f)
+
+
+def _sanitise_bonfire(kind: str, state: dict[str, Any]) -> None:
+    """Make the bonfire keys in a loaded ``state`` safe, in place.
+
+    The rule is *degrade to a plain firepit, never raise*. A save carrying
+    ``garbage: "lots"``, ``garbage: -3``, ``garbage: 1e9``, ``garbage: NaN`` or a
+    bonfire flag on a hut has to load as a perfectly ordinary building, because
+    the alternative - an exception inside ``StructureRegistry.from_dict`` - loses
+    the player's whole settlement to a typo. Every other loader in this file
+    works the same way; this is that policy applied to the three new keys.
+
+    Nothing here is reachable from a save this version wrote. It is entirely for
+    hand-edited files, files from a future build, and a half-flushed autosave.
+    """
+    if not isinstance(state, dict):
+        return
+    if kind != "firepit":
+        # Only a firepit can be a bonfire. Anything else carrying these keys is
+        # a corrupt or hand-edited save; drop them rather than letting a hut
+        # start reporting bonfire_active.
+        for key in ("garbage", "bonfire", "bonfire_t"):
+            state.pop(key, None)
+        return
+    raw = state.get("garbage")
+    qty = 0.0
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        try:
+            f = float(raw)
+        except (TypeError, ValueError):
+            f = 0.0
+        if math.isfinite(f) and f > 0.0:
+            qty = min(f, float(BONFIRE_GARBAGE_CAP))
+    if qty <= 0.0:
+        for key in ("garbage", "bonfire", "bonfire_t"):
+            state.pop(key, None)
+        return
+    state["garbage"] = qty
+    state["bonfire"] = bool(state.get("bonfire"))
+    t = state.get("bonfire_t")
+    ok = isinstance(t, (int, float)) and not isinstance(t, bool)
+    if ok:
+        try:
+            ok = math.isfinite(float(t)) and float(t) >= 0.0
+        except (TypeError, ValueError):
+            ok = False
+    if not ok:
+        state.pop("bonfire_t", None)
 
 
 # ---------------------------------------------------------------- registry --

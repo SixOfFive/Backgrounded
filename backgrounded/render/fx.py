@@ -1122,6 +1122,133 @@ def draw_ladder(
 
 
 # --------------------------------------------------------------------------
+# litter and bonfires
+# --------------------------------------------------------------------------
+
+#: Rubbish is drab on purpose. At wallpaper scale a hundred specks of anything
+#: saturated reads as confetti or, worse, as berries somebody should be picking.
+#: These sit close to dirt and dry grass so a piece is legible when you look at
+#: it and disappears into the ground when you are not - which is exactly what a
+#: dense pile has to do to be atmosphere rather than noise.
+LITTER_DARK: Color = (46, 42, 34)
+LITTER_BODY: Color = (104, 95, 76)
+LITTER_LIGHT: Color = (146, 136, 112)
+
+#: One sprite per silhouette, baked once. A piece of litter is 9x6 px, so the
+#: whole cache is four tiny surfaces and the per-frame cost of a hundred of them
+#: is a hundred blits of a 54 px sprite.
+_LITTER_CACHE: dict[int, pygame.Surface] = {}
+_LITTER_W, _LITTER_H = 9, 6
+
+
+def _litter_sprite(shape: int) -> pygame.Surface:
+    """Baked debris sprite for *shape* 0..3, bottom-centred on the ground."""
+    key = int(shape) & 3
+    hit = _LITTER_CACHE.get(key)
+    if hit is not None:
+        return hit
+    s = pygame.Surface((_LITTER_W, _LITTER_H), pygame.SRCALPHA)
+    if key == 0:                      # a crumpled scrap
+        pygame.draw.polygon(s, LITTER_BODY, [(1, 5), (3, 2), (6, 1), (8, 4), (5, 5)])
+        pygame.draw.line(s, LITTER_LIGHT, (3, 3), (6, 2))
+        pygame.draw.line(s, LITTER_DARK, (1, 5), (8, 5))
+    elif key == 1:                    # a gnawed bone / a snapped stick
+        pygame.draw.line(s, LITTER_BODY, (1, 4), (7, 3), 2)
+        pygame.draw.line(s, LITTER_LIGHT, (2, 3), (6, 3))
+        s.set_at((0, 4), LITTER_DARK)
+        s.set_at((8, 3), LITTER_DARK)
+    elif key == 2:                    # scattered shards
+        for px, py in ((1, 5), (4, 4), (7, 5), (5, 2)):
+            s.set_at((px, py), LITTER_BODY)
+            s.set_at((px, py - 1), LITTER_LIGHT)
+    else:                             # a small heap
+        pygame.draw.polygon(s, LITTER_BODY, [(1, 5), (4, 1), (8, 5)])
+        pygame.draw.line(s, LITTER_LIGHT, (4, 2), (6, 4))
+        pygame.draw.line(s, LITTER_DARK, (1, 5), (8, 5))
+    if len(_LITTER_CACHE) < 8:
+        _LITTER_CACHE[key] = s
+    return s
+
+
+def draw_litter(surf: pygame.Surface, x: float, y: float,
+                shape: int = 0, flip: bool = False) -> None:
+    """Blit one piece of litter with its base sitting on ``(x, y)``.
+
+    *flip* mirrors the sprite so a pile of the same shape does not read as a
+    row of stamps. Fails soft: a frame missing a speck of rubbish is still a
+    frame.
+    """
+    try:
+        spr = _litter_sprite(shape)
+        if flip:
+            spr = pygame.transform.flip(spr, True, False)
+        surf.blit(spr, (int(x) - _LITTER_W // 2, int(y) - _LITTER_H + 1))
+    except Exception:
+        return
+
+
+#: Flame palette, outside in. The core is deliberately near-white: a bonfire has
+#: to be the brightest thing on a night frame by a clear margin, and the light
+#: composite multiplies this down before the lightmap adds it back.
+BONFIRE_FLAME: tuple[Color, ...] = (
+    (176, 54, 16), (238, 116, 28), (255, 190, 66), (255, 244, 206),
+)
+
+
+def draw_bonfire(surf: pygame.Surface, x: float, y: float, width: float,
+                 height: float, t: float, strength: float = 1.0) -> None:
+    """A heaped, roaring fire centred on ``(x, y)`` (``y`` = the ground line).
+
+    Four nested teardrops, each narrower, shorter and hotter than the one
+    outside it, with the inner ones leaning on their own phase so the whole
+    thing writhes. *strength* 0..1 scales height and lick, so a bonfire visibly
+    builds and dies back rather than popping in and out.
+
+    Presentation only - no cache, because the shape is a function of ``t`` and
+    there are never more than a handful of firepits in a colony. Four polygons
+    each is cheaper than the cache lookup would be.
+    """
+    try:
+        k = clamp(float(strength), 0.0, 1.0)
+        if k <= 0.01:
+            return
+        w = max(6.0, float(width))
+        h = max(8.0, float(height)) * (0.55 + 0.45 * k)
+        cx, base = float(x), float(y)
+        # A dark bed of embers so the flames have something to stand on and the
+        # pit does not look like fire hovering over grass.
+        pygame.draw.ellipse(
+            surf, (58, 30, 18),
+            pygame.Rect(int(cx - w * 0.6), int(base - 4), int(w * 1.2), 8))
+        for i, col in enumerate(BONFIRE_FLAME):
+            f = 1.0 - i * 0.24                      # 1.00 .. 0.28
+            hw = w * 0.5 * f
+            top = base - h * f
+            # Each layer sways on its own phase and frequency; the inner ones
+            # faster, so the core flickers inside a steadier outer envelope.
+            sway = math.sin(t * (3.1 + i * 1.7) + i * 1.9) * w * 0.10 * (i + 1) * 0.4
+            lean = math.sin(t * (1.7 + i * 0.6)) * w * 0.06
+            pts = [
+                (cx - hw + lean, base),
+                (cx - hw * 0.55 + lean, base - h * f * 0.45),
+                (cx + sway, top),
+                (cx + hw * 0.55 + lean, base - h * f * 0.45),
+                (cx + hw + lean, base),
+            ]
+            pygame.draw.polygon(surf, col, [(int(px), int(py)) for px, py in pts])
+        # A few sparks lifting off the top, seeded off t so they climb and reset.
+        for i in range(3):
+            ph = (t * 0.8 + i * 0.37) % 1.0
+            sx = cx + math.sin(t * 2.3 + i * 2.1) * w * 0.35
+            sy = base - h * (0.9 + 0.6 * ph)
+            a = int(220 * (1.0 - ph) * k)
+            if a > 8:
+                surf.fill((255, 200, 120), pygame.Rect(int(sx), int(sy), 2, 2))
+    except Exception:
+        return
+
+
+# --------------------------------------------------------------------------
 # maintenance
 # --------------------------------------------------------------------------
 
@@ -1136,6 +1263,7 @@ def clear_caches() -> None:
     _FISSURE_CACHE.clear()
     _RAIN_TILE.clear()
     _SCRATCH.clear()
+    _LITTER_CACHE.clear()
 
 
 def cache_stats() -> dict[str, int]:

@@ -118,6 +118,25 @@ CROSSING_MAX_SPAN = 260.0
 #: thing that defeats a face is a ladder.
 CROSSING_MIN_DEPTH = 30.0
 
+#: Steepest |dy/dx| a deliberately *cut* chasm wall is allowed to reach.
+#:
+#: Not a look, a survival threshold. What kills at a chasm is a slip partway
+#: down a wall somebody is deliberately descending, and whether that slip kills
+#: depends on the gradient of the face and on nothing else - not its height, not
+#: how far the body still has to fall. _slip pitches you forward at a fixed
+#: 16 px/s while gravity pulls at GRAVITY, so the fall's own trajectory descends
+#: at a fixed rate; a face steeper than that falls away faster than the body
+#: does and you re-contact it much further down, or not at all. Driving the real
+#: fall integrator down synthetic faces: impact 282 px/s at gradient 12-13, 312
+#: at 13.5-14.5, and 342 at 15 - past FALL_LETHAL_SPEED (340). So a slip is
+#: self-arresting below about 14:1 and fatal above it, at any depth.
+#:
+#: 11 is that knee with margin for the two things that add to the wall's own
+#: gradient: the +-2 px wobble on the chasm floor, and the pre-existing slope of
+#: the ground the cut lands in (the blend interpolates *between* them, so a rim
+#: already tilting into the hole steepens the join).
+CHASM_SAFE_GRADIENT = 11.0
+
 # Palette used to assign identity colours to stickmen. Deliberately high
 # chroma so a single candle or lightning flash still reads them apart.
 STICK_PALETTE: list[tuple[int, int, int]] = [
@@ -141,6 +160,101 @@ RES_COOKED = "cooked"
 RES_FIBRE = "fibre"
 RES_HIDE = "hide"                 # taken from a killed animal; makes armour
 ALL_RESOURCES = (RES_WOOD, RES_STONE, RES_FOOD, RES_COOKED, RES_FIBRE, RES_HIDE)
+
+#: What a villager shoulders when he sweeps litter up. Deliberately **not** in
+#: ALL_RESOURCES: that tuple is what seeds ``World.stockpile``, and every
+#: colony-value reading in the sim (hut growth's store fraction, the population
+#: gate, the build director's availability maths) sums that dict. Garbage is a
+#: chore, not wealth - it must never make a settlement look richer, and it must
+#: never satisfy a build cost. ``actions.stock_add`` refuses it outright, so the
+#: guarantee holds even if some future haul path tries to bank it by accident.
+RES_GARBAGE = "garbage"
+
+# ------------------------------------------------------------------ litter --
+#: Mean seconds between one living villager dropping one piece of litter.
+#:
+#: This number is set against the pit's BURN RATE, not by taste, because getting
+#: it wrong breaks the feature in two visible ways at once. A firepit consumes a
+#: unit every BONFIRE_SEC_PER_GARBAGE seconds, i.e. about 4.3 a minute. At the
+#: original 75 s, nine villagers dropped 7.2 a minute - a 1.68x oversupply - and
+#: it was measured doing exactly what oversupply must do:
+#:
+#:   * the pit sat pinned at BONFIRE_GARBAGE_CAP and blazed for 81.5% of a
+#:     45-minute run (99% of it after the first load), so the bonfire stopped
+#:     being an event and became the permanent state of the world; and
+#:   * villagers swept up 1181 pieces to have 1012 of them refused at the pit and
+#:     tipped straight back onto the ground - a treadmill that looked like work.
+#:
+#: The corrected value was then measured too, because the failure is symmetric:
+#: at 420 s (~1.3 a minute) litter was so sparse that clusters never reached
+#: LITTER_CLUSTER_MIN, cleanup essentially never ran, and the bonfire fired 0.0%
+#: of a 25-minute run - the feature went silent, which is worse than it being
+#: too loud.
+#:
+#: 200 s puts nine villagers at ~2.7 a minute against the 4.3 a minute the pit
+#: can burn: about 63% utilisation, so clusters still build up where people work
+#: and get swept, while the pit has the headroom to burn down between loads
+#: instead of sitting pinned at its cap.
+LITTER_DROP_SEC = 200.0
+
+#: Hard ceiling on litter props alive at once. The prop loop is O(n) per tick and
+#: this thing runs unattended overnight - at the rate above, eight hours of nine
+#: villagers would be ~3400 props without a cap.
+#:
+#: Enforced by recycling the OLDEST piece rather than by refusing to drop a new
+#: one. That matters: a colony that has walled itself off from a pile it can no
+#: longer reach (the far side of a chasm) would otherwise sit at the cap forever
+#: and stop littering where it actually lives, and the feature would go quiet on
+#: exactly the maps that are most interesting.
+LITTER_MAX = 120
+
+#: Litter does **not** decay. A timer that quietly deleted it would be doing the
+#: colony's job for it: the whole point of the feature is that mess accumulates
+#: until somebody deals with it, and a decay fast enough to matter would make the
+#: cleanup job unnecessary while a decay slow enough not to would be invisible.
+#: The only sinks are a villager carrying it to a fire and the recycling cap.
+LITTER_DECAYS = False
+
+#: Half-width of the window a cluster is measured over, and how many pieces have
+#: to fall inside it before the colony treats it as *dense* rather than as one
+#: stray item. The user was explicit that a single dropped thing is not a job.
+LITTER_CLUSTER_R = 70.0
+LITTER_CLUSTER_MIN = 5
+#: Density at which the cleanup score saturates - past this it is not any more
+#: urgent, it is just more walking.
+LITTER_CLUSTER_FULL = 16
+
+#: Hard ceiling on the cleanup score, whatever the density. Sweeping up is the
+#: lowest-value job in the colony: it must sit under gathering (0.10-1.00),
+#: farming (0.18+), mining (0.30+), building, eating, sleeping, warming and
+#: everything combat_actions scores. Capping it absolutely - rather than trusting
+#: the formula to stay small - is what makes "never outranks food, shelter or
+#: defence" a property of the code instead of a property of today's tuning.
+#:
+#: 0.42 did not deliver that and was measured failing it: BuildStructure for a
+#: gatherer with a half-built hut and every material in store scores 0.362, so
+#: dense litter beat SHELTER outright, and Eat (hunger squared) only overtook at
+#: hunger 0.648, so a mildly hungry villager swept instead of eating beside a
+#: full larder. 0.30 restores the ordering it claims: under that same build at
+#: 0.362, and under Eat from hunger 0.548.
+CLEANUP_SCORE_MAX = 0.30
+
+# ----------------------------------------------------------------- bonfire --
+#: Seconds of fire one unit of garbage buys. Wood, for comparison, is
+#: FIRE_STOKE_PER_WOOD / FIRE_FUEL_BURN = 0.34 * 240 = 81.6 s per unit, so
+#: garbage burns nearly six times faster - it flares and is gone, which is what
+#: makes a bonfire an event rather than a new steady state.
+BONFIRE_SEC_PER_GARBAGE = 14.0
+#: Most garbage a single firepit will hold. Bounds the bonfire at 16 * 14 = 224 s
+#: however much a keen colony shovels in.
+BONFIRE_GARBAGE_CAP = 16.0
+#: The payoff. A well-fed firepit lights 96 + 96 px; a bonfire throws this far,
+#: which visibly lifts a whole night scene rather than a doorstep.
+BONFIRE_LIGHT_RADIUS = 330.0
+BONFIRE_LIGHT_INTENSITY = 1.05
+BONFIRE_LIGHT_COLOR = (255, 196, 120)
+#: How much bigger the pit itself is drawn while it roars.
+BONFIRE_DRAW_SCALE = 1.75
 
 # ------------------------------------------------------------------ combat --
 #: Stickmen have health only because something can now hurt them. Everything

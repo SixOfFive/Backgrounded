@@ -14,10 +14,12 @@ import numpy as np
 import pygame
 
 from ..constants import (
-    MATERIAL_COLORS, MAT_GRASS, RENDER_H, RENDER_SIZE, RENDER_W,
-    SCENE_BLIZZARD, SCENE_FLOOD, SCENE_SANDSTORM, SCENE_WILDFIRE,
+    BONFIRE_DRAW_SCALE, MATERIAL_COLORS, MAT_GRASS, RENDER_H, RENDER_SIZE,
+    RENDER_W, SCENE_BLIZZARD, SCENE_FLOOD, SCENE_SANDSTORM, SCENE_WILDFIRE,
 )
-from ..sim.structures import CROSSING_KINDS
+from ..sim.structures import (
+    BONFIRE_FADE_UNITS, BONFIRE_RAMP_SEC, CROSSING_KINDS,
+)
 from . import creatures, fx, hud, sky
 from .atlas import Atlas
 from .particles import ParticleSystem
@@ -346,6 +348,19 @@ class Renderer:
         for p in sorted(world.props.all(), key=lambda p: p.y):
             if not p.alive:
                 continue
+            # Litter is drawn here rather than baked into the atlas: it is four
+            # 9x6 px silhouettes with no stages, no variants worth baking and no
+            # growth ladder, and the atlas would answer with its 2x2 transparent
+            # "missing" surface for an unknown kind - i.e. the feature would be
+            # invisible while looking perfectly wired up.
+            if p.kind == "litter":
+                try:
+                    st = p.state if isinstance(p.state, dict) else {}
+                    fx.draw_litter(s, p.x, p.y, int(st.get("shape", 0) or 0),
+                                   bool(p.variant & 1))
+                except Exception:
+                    pass
+                continue
             try:
                 spr = self.atlas.get(p.kind, p.variant, state=p.state)
             except Exception:
@@ -368,8 +383,18 @@ class Renderer:
             if st.kind in CROSSING_KINDS:
                 self._draw_crossing(s, world, st)
                 continue
+            # A firepit running on swept-up rubbish is drawn as a bonfire:
+            # the same pit, scaled up, under a much taller flame. The sim owns
+            # the flag (Structure.bonfire_active); this only reads it, like
+            # everything else in here.
+            blaze = False
             try:
-                spr = self.atlas.get(st.kind, st.variant, stage=st.stage)
+                blaze = bool(getattr(st, "bonfire_active", False))
+            except Exception:
+                blaze = False
+            try:
+                spr = self.atlas.get(st.kind, st.variant, stage=st.stage,
+                                     scale=BONFIRE_DRAW_SCALE if blaze else 1.0)
             except Exception:
                 continue
             if spr is None:
@@ -377,6 +402,8 @@ class Renderer:
             r = spr.get_rect()
             r.midbottom = (int(st.x), int(st.y) + 2)
             s.blit(spr, r)
+            if blaze:
+                self._draw_bonfire(s, world, st)
             # occupied buildings glow: someone is asleep in there
             occ = self._occupants(world, st)
             if occ:
@@ -388,6 +415,28 @@ class Renderer:
                 pygame.draw.line(s, (120, 110, 80),
                                  (r.centerx - 14, r.top - 6),
                                  (r.centerx - 14 + w, r.top - 6), 2)
+
+    def _draw_bonfire(self, s: pygame.Surface, world, st) -> None:
+        """The blaze over a firepit burning garbage, plus its ember drizzle.
+
+        Strength rides the same two curves the sim's light source uses (a ramp
+        in, a fade as the heap runs down), so the flame and the pool of light it
+        throws grow and die together instead of one popping while the other
+        eases. Read-only, and swallowed whole on failure: a missing bonfire is a
+        cosmetic loss, a raised exception is a lost frame.
+        """
+        try:
+            state = getattr(st, "state", {}) or {}
+            age = float(state.get("bonfire_t", 0.0) or 0.0)
+            left = float(getattr(st, "garbage_left", 0.0) or 0.0)
+            k = max(0.2, min(1.0, age / BONFIRE_RAMP_SEC)
+                    * max(0.3, min(1.0, left / BONFIRE_FADE_UNITS)))
+            w = float(st.spec.width) * BONFIRE_DRAW_SCALE
+            fx.draw_bonfire(s, float(st.x), float(st.y) + 1.0,
+                            w * 0.7, w * 1.15, float(world.world_time), k)
+        except Exception:
+            log.debug("bonfire draw failed for #%s", getattr(st, "id", "?"),
+                      exc_info=True)
 
     def _draw_crossing(self, s: pygame.Surface, world, st) -> None:
         """Draw a bridge or a ladder, sampled off the live terrain surface.
@@ -745,7 +794,19 @@ class Renderer:
                 self.particles.emit("ember", 2, x=p.x, y=p.y - 10)
                 self.particles.emit("smoke", 1, x=p.x, y=p.y - 24)
         for st in world.structures.all():
-            if st.state.get("lit"):
+            if not st.state.get("lit"):
+                continue
+            # A bonfire throws a column of sparks rather than a firepit's single
+            # ember. It shares the pool's "ember" budget with burning props on
+            # purpose - a wildfire and a bonfire at once should compete for the
+            # same 500 particles, not double them.
+            if getattr(st, "bonfire_active", False):
+                self.particles.emit("ember", 5, x=(st.x - 13.0, st.x + 13.0),
+                                    y=(st.y - 30.0, st.y - 12.0),
+                                    vy=(-150.0, -55.0), life=(0.9, 2.4))
+                self.particles.emit("smoke", 2, x=(st.x - 9.0, st.x + 9.0),
+                                    y=st.y - 44.0)
+            else:
                 self.particles.emit("ember", 1, x=st.x, y=st.y - 8)
         if not world.is_night:
             return

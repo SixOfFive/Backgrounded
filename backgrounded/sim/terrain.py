@@ -39,7 +39,10 @@ compare instead of diffing a 1600-column array.
 Interfaces other modules rely on
 --------------------------------
 ``Terrain.chasm``            ``(x0, x1)`` of the cut gap or ``None`` - the
-                             bridge buildable (feature 9) needs this.
+                             bridge buildable (feature 9) needs this.  These are
+                             the *midpoints* of the two blended walls, not the
+                             rims: each wall reaches up to ``CHASM_WALL_MAX``
+                             further out again.
 ``Terrain.find_flat_span``   structure placement.
 ``Terrain.find_basins``      water/pond placement and the flood event.
 ``Terrain.deform``/``crater``/``add_layer``  mudslide, meteor, blizzard, ashfall.
@@ -61,6 +64,7 @@ import numpy as np
 
 from ..constants import (
     BARRIER_MIN_RELIEF,
+    CHASM_SAFE_GRADIENT,
     CROSSING_RAMP_PX,
     LADDER_MAX_W,
     LADDER_MIN_RISE,
@@ -102,6 +106,48 @@ HARD_MIN: float = RENDER_H * 0.10          # 80
 HARD_MAX: float = RENDER_H * 0.985         # 788
 
 CHASM_FLOOR: float = RENDER_H * 0.95       # 760
+
+# -- chasm walls -------------------------------------------------------------
+# The hole is not what kills at a chasm; the *walls* are.  Each wall is a
+# smoothstep blend from the rim down to the floor, ``2 * wall`` px wide and
+# straddling the declared span's edge, so half of it eats into the gap and half
+# spills outside.  A smoothstep's gradient peaks at 1.5x its average, which
+# gives the whole design in one line:
+#
+#     peak |dy/dx|  =  depth * 1.5 / (2 * wall)
+#
+# (predicted 12.8 against 12.9 measured, on a 341 px cut at wall 20).  Depth is
+# not a constant - it is the floor minus whatever the generated rim happened to
+# be, and across seeds that runs 168 to 495 px - so no single wall value can
+# hold every cut under CHASM_SAFE_GRADIENT.  At a flat wall of 20 the shallow
+# cuts come out over-blended and the deep ones still peak near 18.  The wall is
+# therefore derived per cut, per *side*, from the depth that side actually has.
+
+#: Lower bound on the derived wall.  A shallow cut needs nothing wider, and a
+#: crack with sharp edges is worth keeping where it is safe: this is the value
+#: the chasm was cut with before the wall became adaptive.
+CHASM_WALL_MIN: int = 9
+
+#: Ceiling on it.  The deepest cut the generation band allows is
+#: ``CHASM_FLOOR + 8 - HEIGHT_MIN`` = 488 px, which by the formula above wants a
+#: 34 px wall; 36 leaves the verification loop below a round-up of headroom on
+#: top of that.  It does bind occasionally (2 of 32 measured seeds) and the
+#: failure is soft when it does: the wall stops widening and comes out at
+#: whatever gradient the geometry gives, which is still nowhere near the ~14:1
+#: where a slip turns fatal - worst measured over those 32 seeds is 10.97.
+CHASM_WALL_MAX: int = 36
+
+#: Flat floor left between the two walls, px.  The gap still has to *read* as a
+#: gap and still has to be worth bridging, so the span is widened when the walls
+#: would otherwise eat it - 40 px is the narrowest floor the old fixed-wall cut
+#: ever produced (a 60 px gap at wall 9), so nothing gets narrower than what
+#: already shipped.
+CHASM_FLOOR_MIN: int = 40
+
+#: Re-cuts allowed while verifying the measured gradient against the predicted
+#: one.  Two is normally enough; the extra pair is for a rim whose own slope is
+#: fighting the blend.
+CHASM_WALL_TRIES: int = 4
 
 #: ``slope()`` is a central difference over this many pixels total.
 SLOPE_SPAN: float = 5.0
@@ -183,6 +229,41 @@ def _normalise(f: np.ndarray) -> np.ndarray:
     if hi - lo < 1e-6:
         return np.full_like(f, 0.5)
     return (f - lo) / (hi - lo)
+
+
+def _wall_for_depth(depth: float) -> int:
+    """Blend half-width a ``depth`` px drop needs to stay under the limit.
+
+    Straight inversion of ``peak = depth * 1.5 / (2 * wall)``.  A first guess
+    only - :meth:`Terrain._cut_chasm` measures what it actually got and widens
+    again if the ground the cut landed in was tilting into the hole.
+    """
+    try:
+        d = float(depth)
+    except (TypeError, ValueError):
+        return CHASM_WALL_MIN
+    if not np.isfinite(d) or d <= 0.0:
+        return CHASM_WALL_MIN
+    need = d * 1.5 / (2.0 * max(1.0, float(CHASM_SAFE_GRADIENT)))
+    return int(np.clip(np.ceil(need), CHASM_WALL_MIN, CHASM_WALL_MAX))
+
+
+def _wall_for_peak(wall: int, peak: float) -> int:
+    """The wall a *measured* peak gradient says the cut should have had.
+
+    Gradient scales as 1/wall, so the correction is one multiply.  The extra
+    pixel is not superstition: the peak is read off a 5 px central difference of
+    a wobbled surface, and landing exactly on the limit leaves it free to round
+    back over on the next re-cut.
+    """
+    try:
+        p = float(peak)
+    except (TypeError, ValueError):
+        return int(wall)
+    if not np.isfinite(p) or p <= float(CHASM_SAFE_GRADIENT):
+        return int(wall)
+    scaled = np.ceil(float(wall) * p / max(1.0, float(CHASM_SAFE_GRADIENT))) + 1.0
+    return int(np.clip(scaled, CHASM_WALL_MIN, CHASM_WALL_MAX))
 
 
 def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
@@ -449,15 +530,17 @@ class Terrain:
         if style == "chasm":
             t._cut_chasm(rng)
 
+        # The *zone*, not the declared span: an escarpment landing on the outer
+        # half of a chasm wall would re-steepen the face the cut just softened.
         shelf = t._carve_shelf(rng)
-        t._carve_cliff(rng, avoid=(shelf, t.chasm))
+        t._carve_cliff(rng, avoid=(shelf, t._chasm_zone()))
         t._clip_gen()
 
         # -- guarantee sweep ------------------------------------------------
         for _ in range(3):
             if t._has_cliff():
                 break
-            t._carve_cliff(rng, avoid=(shelf, t.chasm), force=True)
+            t._carve_cliff(rng, avoid=(shelf, t._chasm_zone()), force=True)
             t._clip_gen()
         for _ in range(3):
             if t._has_shelf(120):
@@ -500,10 +583,13 @@ class Terrain:
         """Clip to the generation band, sparing the chasm floor."""
         lo = np.full(self.W, HEIGHT_MIN, dtype=np.float32)
         hi = np.full(self.W, HEIGHT_MAX, dtype=np.float32)
-        if self.chasm is not None:
-            c0, c1 = self.chasm
-            a = max(0, int(c0) - 14)
-            b = min(self.W, int(c1) + 14)
+        # The whole wall, not just the declared span: a wall crosses HEIGHT_MAX
+        # somewhere down its face, and clipping the columns past the window back
+        # up to 736 would put a hard step exactly where the blend was smooth.
+        zone = self._chasm_zone(4)
+        if zone is not None:
+            a = max(0, zone[0])
+            b = min(self.W, zone[1])
             if b > a:
                 hi[a:b] = np.float32(CHASM_FLOOR + 8.0)
         np.clip(self.height, lo, hi, out=self.height)
@@ -512,27 +598,128 @@ class Terrain:
         # caching against it yet (no overlay exists until a structure finishes).
         self.touch()
 
-    def _cut_chasm(self, rng: np.random.Generator) -> None:
-        """Cut a 60-120 px gap most of the way down the screen, for a bridge."""
-        w = self.W
-        gw = int(rng.integers(60, 121))
-        cx = int(rng.integers(int(w * 0.28), int(w * 0.72)))
-        x0 = int(np.clip(cx - gw // 2, 30, w - 30 - gw))
-        x1 = x0 + gw
-        wall = 9
-        floor = float(CHASM_FLOOR) + float(rng.uniform(-5.0, 5.0))
+    def _chasm_zone(self, pad: int = 0) -> tuple[int, int] | None:
+        """The cut *including its walls*, widened by ``pad``.  Columns, unclipped.
 
-        a = max(0, x0 - wall)
-        b = min(w, x1 + wall)
+        ``chasm`` is the declared span, and its edges are the blend *midpoints*,
+        not the rims: each wall reaches up to ``CHASM_WALL_MAX`` outside it.
+        Anything that has to stay off the cut has to stay off the walls too -
+        flattening or clipping the outer half of a wall puts a step back in the
+        one place this whole exercise exists to keep smooth.
+
+        Sized off the cap rather than off the wall this particular cut used, so
+        the answer does not depend on state that a terrain restored from a save
+        never had: ``_cut_chasm`` does not run on load, only the span is stored.
+        The cost is a slightly generous exclusion around a shallow cut, which
+        every caller here can afford.
+        """
+        if self.chasm is None:
+            return None
+        try:
+            c0, c1 = int(self.chasm[0]), int(self.chasm[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+        m = CHASM_WALL_MAX + max(0, int(pad))
+        return c0 - m, c1 + m
+
+    def _stamp_chasm(
+        self,
+        x0: int,
+        x1: int,
+        wl: int,
+        wr: int,
+        floor: float,
+        rng: np.random.Generator,
+    ) -> None:
+        """Blend the floor in across ``[x0, x1]`` with per-side wall widths."""
+        w = self.W
+        # A zero wall would divide to inf rather than raise, and a clipped
+        # smoothstep of inf is a step function - i.e. the sheerest possible
+        # wall, arrived at silently, which is the exact opposite of the point.
+        wl = max(1, int(wl))
+        wr = max(1, int(wr))
+        a = max(0, x0 - wl)
+        b = min(w, x1 + wr)
+        if b <= a:
+            return
         idx = np.arange(a, b)
-        left = _smoothstep((idx - (x0 - wall)) / float(2 * wall))
-        right = 1.0 - _smoothstep((idx - (x1 - wall)) / float(2 * wall))
+        left = _smoothstep((idx - (x0 - wl)) / float(2 * wl))
+        right = 1.0 - _smoothstep((idx - (x1 - wr)) / float(2 * wr))
         mask = np.clip(np.minimum(left, right), 0.0, 1.0)
         wobble = floor + rng.uniform(-2.0, 2.0, size=idx.size)
         cur = self.height[a:b].astype(np.float64)
         self.height[a:b] = (cur * (1.0 - mask) + wobble * mask).astype(np.float32)
+
+    def _cut_chasm(self, rng: np.random.Generator) -> None:
+        """Cut a 60-120 px gap most of the way down the screen, for a bridge.
+
+        The gap is the feature; the *walls* are the hazard, and they are sized
+        rather than picked.  Each side gets the blend width its own depth needs
+        to keep the face under ``CHASM_SAFE_GRADIENT`` - see the notes on
+        ``CHASM_WALL_MIN`` above for why one number cannot serve both a 168 px
+        cut and a 495 px one.  Per side, not per cut, because the two rims are
+        rarely the same height: sizing both walls off the deeper one would spend
+        the gap's whole width blending a side that never needed it.
+
+        The prediction is then *verified*, because it is a prediction about a
+        blend in isolation and the ground it lands in has a slope of its own
+        that adds to it.  Cutting onto a snapshot rather than onto the running
+        heightmap is what makes a re-cut possible: measure the face an agent
+        would actually feel, and if it came out steep, throw the cut away and do
+        it again wider.
+
+        The span itself grows if the walls would otherwise eat the floor, so a
+        deep cut is a wide cut rather than a V.  It never shrinks below the
+        60-120 px it always drew.
+        """
+        w = self.W
+        gw = int(rng.integers(60, 121))
+        cx = int(rng.integers(int(w * 0.28), int(w * 0.72)))
+        floor = float(CHASM_FLOOR) + float(rng.uniform(-5.0, 5.0))
+        pre = self.height.copy()
+
+        # First guess from the untouched ground at the nominal rims.
+        probe0 = int(np.clip(cx - gw // 2, 30, w - 30 - gw))
+        wl = _wall_for_depth(floor - float(pre[probe0]))
+        wr = _wall_for_depth(floor - float(pre[min(w - 1, probe0 + gw)]))
+
+        x0, x1 = probe0, probe0 + gw
+        for _ in range(max(1, CHASM_WALL_TRIES)):
+            span = max(gw, wl + wr + CHASM_FLOOR_MIN)
+            lo = 30 + wl
+            hi = max(lo, w - 30 - wr - span)
+            x0 = int(np.clip(cx - span // 2, lo, hi))
+            x1 = min(w - 1, x0 + span)
+
+            self.height[:] = pre
+            self._stamp_chasm(x0, x1, wl, wr, floor, rng)
+
+            sl = np.abs(self.column_slope(raw=True))
+            # +-3 px past each blend: that is the reach of the central
+            # difference, so the toe of the wall is included rather than
+            # measured half in and half out of the flat above it.
+            nl = _wall_for_peak(wl, self._span_peak(sl, x0 - wl - 3, x0 + wl + 3))
+            nr = _wall_for_peak(wr, self._span_peak(sl, x1 - wr - 3, x1 + wr + 3))
+            # Also how the loop terminates against the cap: _wall_for_peak
+            # clamps to CHASM_WALL_MAX, so a side already there asks for no
+            # more and reads as converged.
+            if nl <= wl and nr <= wr:
+                break
+            # Monotone: a re-cut only ever widens, so the loop cannot oscillate
+            # between two shapes and burn its whole budget doing it.
+            wl = max(wl, nl)
+            wr = max(wr, nr)
+
         self.chasm = (x0, x1)
         self.touch()
+
+    def _span_peak(self, absslope: np.ndarray, a: int, b: int) -> float:
+        """Worst ``|dy/dx|`` between columns ``a`` and ``b`` inclusive."""
+        a = int(max(0, min(int(a), self.W - 1)))
+        b = int(max(0, min(int(b), self.W - 1)))
+        if b < a or absslope.size < self.W:
+            return 0.0
+        return float(np.max(absslope[a : b + 1]))
 
     def _carve_shelf(self, rng: np.random.Generator) -> tuple[int, int] | None:
         """Flatten the already-flattest window into a genuinely level shelf.
@@ -554,10 +741,13 @@ class Terrain:
         bad = np.zeros(n, dtype=bool)
         bad[: min(40, n)] = True
         bad[max(0, n - 40) :] = True
-        if self.chasm is not None:
-            c0, c1 = self.chasm
+        # Keep clear of the walls, not just the gap: a shelf is *perfectly*
+        # flat, and one whose ramp overlapped a wall would leave a step where
+        # the two profiles met.
+        zone = self._chasm_zone(12)
+        if zone is not None:
             starts = np.arange(n)
-            bad |= (starts + span > c0 - 40) & (starts < c1 + 40)
+            bad |= (starts + span > zone[0]) & (starts < zone[1])
         if not bad.all():
             score = np.where(bad, np.inf, score)
         i0 = int(np.argmin(score))
@@ -881,10 +1071,12 @@ class Terrain:
         steep = np.abs(self.column_slope(raw=True)) > MAX_SLOPE_CLIMB
 
         # A ladder into the chasm is not the crossing the colony needs, and the
-        # bridge already owns that span.  Keep the two structures off each other.
-        if self.chasm is not None:
-            c0, c1 = self.chasm
-            steep[max(0, int(c0) - 20) : min(w, int(c1) + 20)] = False
+        # bridge already owns that span.  Keep the two structures off each other
+        # - over the whole wall, since a softened wall is a longer steep run and
+        # its outer end now reaches well past the declared span.
+        zone = self._chasm_zone(8)
+        if zone is not None:
+            steep[max(0, zone[0]) : min(w, zone[1])] = False
         # Nor onto something already bridged or laddered.
         for ov in (self.deck, self.climb):
             if ov is not None and ov.size == w:

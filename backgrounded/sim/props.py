@@ -13,6 +13,8 @@ Kinds
 ``water``    a pond filling a terrain basin (decorative + flood anchor)
 ``grave``    left where a stickman died, permanent
 ``scorch``   burn scar left by fire or lightning, fades away
+``litter``   rubbish a villager dropped; inert, never a resource node, only a
+             cleanup crew or the recycling cap takes it away
 
 Driving it from World.tick
 --------------------------
@@ -58,7 +60,15 @@ from typing import TYPE_CHECKING, Callable, Iterator
 
 import numpy as np
 
-from ..constants import MAT_ASH, MAT_DIRT, MAT_GRASS, MAT_SAND, MAT_STONE
+from ..constants import (
+    LITTER_DROP_SEC,
+    LITTER_MAX,
+    MAT_ASH,
+    MAT_DIRT,
+    MAT_GRASS,
+    MAT_SAND,
+    MAT_STONE,
+)
 
 try:  # pragma: no cover - constants predate the population director
     from ..constants import REGROW_MAX as _REGROW_MAX
@@ -82,6 +92,8 @@ __all__ = [
     "plant_sapling",
     "place_grave",
     "place_scorch",
+    "drop_litter",
+    "litter_count",
     "growth_factor",
     "KINDS",
     "FLAMMABLE",
@@ -99,10 +111,12 @@ KIND_WATER = "water"
 KIND_GRAVE = "grave"
 KIND_SCORCH = "scorch"
 KIND_CROP = "crop"        # a farmed food plant; grows, is harvested, regrows
+KIND_LITTER = "litter"    # inert rubbish a villager dropped; fuel, not a resource
 
 KINDS: tuple[str, ...] = (
     KIND_TREE, KIND_SAPLING, KIND_ROCK, KIND_BUSH,
     KIND_BOULDER, KIND_WATER, KIND_GRAVE, KIND_SCORCH, KIND_CROP,
+    KIND_LITTER,
 )
 
 #: A crop grows over this long, then reads ripe until a farmer harvests it, at
@@ -297,6 +311,14 @@ def _default_state(kind: str) -> dict:
         return {"radius": float(SCORCH_RADIUS), "age": 0.0, "fade": 1.0}
     if kind == KIND_CROP:
         return {"growth": 0.0, "ripe": False, "burning": False, "burn_t": 0.0}
+    if kind == KIND_LITTER:
+        # Two ints and nothing that ticks. Litter is the one kind with no
+        # behaviour at all - it sits where it was dropped until somebody picks
+        # it up - so giving it a timer would cost a branch per prop per frame
+        # for a thing that never changes. ``shape`` picks the debris silhouette
+        # (see render), ``drop_t`` is the world clock it landed on, kept purely
+        # so a debug pass can tell fresh mess from old.
+        return {"shape": 0, "drop_t": 0.0}
     return {}
 
 
@@ -837,6 +859,147 @@ def place_scorch(
     )
 
 
+# -------------------------------------------------------------------- litter --
+
+
+def litter_count(reg: PropRegistry) -> int:
+    """How many pieces of litter are lying about. Cheap: one pass, no allocs."""
+    n = 0
+    try:
+        for p in reg:  # type: ignore[union-attr]
+            if p.alive and p.kind == KIND_LITTER:
+                n += 1
+    except Exception:
+        return 0
+    return n
+
+
+def drop_litter(
+    reg: PropRegistry,
+    terrain: "Terrain",
+    x: float,
+    rng: object = None,
+    now: float = 0.0,
+) -> Prop | None:
+    """Drop one piece of litter at ``x``, honouring :data:`LITTER_MAX`.
+
+    ``rng`` may be anything with ``random()`` - in practice ``world.pyrng``, so
+    the roll stays on the seeded stream. It only picks the debris silhouette;
+    the position is the dropper's.
+
+    At the cap the **oldest** piece is recycled rather than the drop refused.
+    See the constant for why: refusing would let one unreachable pile freeze
+    littering everywhere else on the map for the rest of the run.
+    """
+    if not isinstance(reg, PropRegistry):
+        return None
+    try:
+        px = float(np.clip(_f(x), 2.0, float(terrain.W - 3)))
+        py = float(terrain.ground_y(px))
+    except Exception:
+        return None
+    try:
+        if litter_count(reg) >= max(1, int(LITTER_MAX)):
+            oldest = None
+            for p in reg:
+                if p.alive and p.kind == KIND_LITTER and (
+                    oldest is None or p.id < oldest.id
+                ):
+                    oldest = p          # ids ascend, so lowest id is oldest
+            if oldest is not None:
+                reg.remove(oldest)
+    except Exception:
+        pass
+    shape = 0
+    try:
+        fn = getattr(rng, "random", None)
+        if callable(fn):
+            shape = int(float(fn()) * 4.0) & 3
+    except Exception:
+        shape = 0
+    return reg.spawn(
+        KIND_LITTER,
+        px,
+        py,
+        scale=1.0,
+        hp=1.0,
+        variant=(int(px) * 2654435761 + shape) & 0xFFFF,
+        state={"shape": shape, "drop_t": _f(now, 0.0)},
+    )
+
+
+def _litter_droppers(world: object) -> list:
+    """Living, outdoor agents off whatever shape of world we were handed.
+
+    Duck-typed like the rest of this module's world contact: the registry is
+    ticked by the real World, by the module smoke test, and by a bare stub in
+    other modules' self-tests, and none of them may be able to break littering
+    (or, worse, the whole prop loop) by not having a population.
+    """
+    roster: object = None
+    pop = getattr(world, "population", None)
+    if pop is not None:
+        fn = getattr(pop, "alive_agents", None)
+        if callable(fn):
+            try:
+                roster = fn()
+            except Exception:
+                roster = None
+        if roster is None:
+            roster = getattr(pop, "agents", None)
+    if roster is None:
+        roster = getattr(world, "agents", None)
+    if not isinstance(roster, (list, tuple)):
+        return []
+    out = []
+    for a in roster:
+        try:
+            if not getattr(a, "alive", True):
+                continue
+            # Indoors: the speck would be drawn under a hut, and a sleeper is
+            # not "normal activity" in any case.
+            if getattr(a, "inside", None) is not None:
+                continue
+            out.append(a)
+        except Exception:
+            continue
+    return out
+
+
+def _tick_litter(
+    reg: PropRegistry, terrain: "Terrain", world: object, dt: float
+) -> None:
+    """Roll each living villager for a dropped piece of litter.
+
+    Poisson-ish: probability ``dt / LITTER_DROP_SEC`` per agent per tick, which
+    at 30 Hz is ~0.00044 - far too small to double-fire, so one roll per agent
+    per tick is both correct and the cheapest possible form.
+
+    **All randomness comes from ``world.pyrng``**, the seeded python stream, not
+    from the numpy generator this module ticks with and not from bare
+    ``random.*``. Two runs of the same seed must litter identically or nothing
+    measured on top of this is comparable.
+    """
+    if world is None or dt <= 0.0:
+        return
+    pyrng = getattr(world, "pyrng", None)
+    roll = getattr(pyrng, "random", None)
+    if not callable(roll):
+        return                      # no seeded stream: do not litter at all
+    agents = _litter_droppers(world)
+    if not agents:
+        return
+    chance = dt / max(1.0, float(LITTER_DROP_SEC))
+    now = _f(getattr(world, "world_time", 0.0), 0.0)
+    for a in agents:
+        try:
+            if roll() >= chance:
+                continue
+            drop_litter(reg, terrain, float(getattr(a, "x", 0.0)), pyrng, now)
+        except Exception:
+            continue
+
+
 # ------------------------------------------------------------------- ticking --
 
 
@@ -915,6 +1078,14 @@ def tick_props(
         pass
     try:
         _regrow(reg, terrain, rng, step, events, grow)
+    except Exception:
+        pass
+    # Littering is driven from here rather than from the agent loop because this
+    # is the one per-tick pass that already owns the registry and the terrain,
+    # and because a dropped piece is a *prop* - putting the spawn anywhere else
+    # would mean a second module reaching into PropRegistry every frame.
+    try:
+        _tick_litter(reg, terrain, world, step)
     except Exception:
         pass
 
@@ -1081,7 +1252,13 @@ def _tick_boulder(
     if force < 30.0:
         return
     for other in reg.within(p.x, BOULDER_HIT_R):
-        if other.id == p.id or other.kind in (KIND_WATER, KIND_SCORCH, KIND_BOULDER):
+        # Litter is excluded with the other unhittable kinds so that the only
+        # things that ever remove it are the two documented sinks (a villager
+        # carrying it to a fire, and the recycling cap). A boulder quietly
+        # flattening a pile would be a third, invisible one.
+        if other.id == p.id or other.kind in (
+            KIND_WATER, KIND_SCORCH, KIND_BOULDER, KIND_LITTER
+        ):
             continue
         other.hp = max(0.0, other.hp - BOULDER_DAMAGE * dt * (force / 100.0))
         if other.hp <= 0.0 and other.alive:
@@ -1467,6 +1644,8 @@ def _spawn_on_ground(
 
 
 if __name__ == "__main__":  # pragma: no cover - run with: python -m backgrounded.sim.props
+    import random as _pyrandom
+
     from .terrain import Terrain as _T
 
     _terr = _T.generate(11, "hills")
@@ -1632,6 +1811,51 @@ if __name__ == "__main__":  # pragma: no cover - run with: python -m backgrounde
     _b1, _b3 = _burn_secs(1.0), _burn_secs(3.0)
     print(f"tree burns out: x1 {_b1:.1f}s  x3 {_b3:.1f}s  (must match)")
     assert abs(_b1 - _b3) < 0.1 and abs(_b1 - BURN_SEC["tree"]) < 0.2, (_b1, _b3)
+
+    # ---------------------------------------------------------------- litter --
+    from ..constants import LITTER_DECAYS as _DECAYS
+
+    class _LW:  # stands in for World: littering needs pyrng, agents, world_time
+        def __init__(self, xs: list[float]) -> None:
+            self.pyrng = _pyrandom.Random(4)
+            self.world_time = 0.0
+            self.agents = [type("A", (), {"x": x, "alive": True, "inside": None})()
+                           for x in xs]
+
+    _lt = _T.generate(5, "hills")
+    _lr = PropRegistry()
+    _lw = _LW([300.0, 320.0, 340.0, 900.0])
+    for _ in range(int(600 * 30)):                 # ten sim-minutes, four people
+        _lr.tick(_lt, np.random.default_rng(5), 1 / 30, _lw)
+    _n = len(_lr.all_of(KIND_LITTER))
+    print(f"litter after 600s with 4 people: {_n}  (expect ~{4 * 600 / LITTER_DROP_SEC:.0f})")
+    assert _n > 0, "nobody littered at all"
+    assert abs(_n - 4 * 600 / LITTER_DROP_SEC) < 20, _n
+
+    # Same seed, same litter - the drop rolls come off world.pyrng, so a run
+    # that is not reproducible here is not reproducible anywhere.
+    _lr2 = PropRegistry()
+    _lw2 = _LW([300.0, 320.0, 340.0, 900.0])
+    for _ in range(int(600 * 30)):
+        _lr2.tick(_lt, np.random.default_rng(5), 1 / 30, _lw2)
+    assert [p.to_dict() for p in _lr2.all_of(KIND_LITTER)] == \
+           [p.to_dict() for p in _lr.all_of(KIND_LITTER)], "littering is not seeded"
+
+    # ...and it does NOT decay. This is the assertion that makes LITTER_DECAYS a
+    # decision rather than a comment: flipping it means changing this test too.
+    assert not _DECAYS
+    _lw.agents = []                                # everyone leaves; nobody drops
+    for _ in range(int(900 * 30)):
+        _lr.tick(_lt, np.random.default_rng(5), 1 / 30, _lw)
+    assert len(_lr.all_of(KIND_LITTER)) == _n, "litter decayed on its own"
+
+    # The cap recycles the oldest rather than refusing to drop.
+    _lw.agents = _LW([500.0] * 6).agents
+    for _ in range(int(4000 * 30)):
+        _lr.tick(_lt, np.random.default_rng(5), 1 / 30, _lw)
+    _capped = len(_lr.all_of(KIND_LITTER))
+    print(f"litter cap holds at {_capped} (max {LITTER_MAX})")
+    assert _capped <= LITTER_MAX, _capped
 
     # Persistence round trip.
     _rt = PropRegistry.from_dict(_reg.to_dict())
