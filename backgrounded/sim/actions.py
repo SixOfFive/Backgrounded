@@ -873,6 +873,25 @@ def _plant(agent: Any, gy: float) -> None:
     agent.fall_t = 0.0
 
 
+def _pin_aloft(agent: Any, y: float) -> None:
+    """Hold an agent at *y*, off the ground, without gravity charging up.
+
+    The mirror of :func:`_plant`, for actions that park a body above the
+    terrain: up a watchtower, or inside a hut floor. apply_physics still runs
+    over them every tick, and _fall_step reads "above the ground" as "falling",
+    so vy grows by GRAVITY*dt against a body that gets re-pinned before it can
+    move and reaches TERMINAL_VY (900 px/s) inside a second. Nothing looks wrong
+    until the action ends and sets them back down: the next physics tick reads
+    that stored 900 as the impact speed, and every lookout that ever came down
+    a tower died of a fall it never took. Zeroing vy each tick keeps the
+    accumulator empty, so the only speed on the books is the one tick's worth
+    physics is entitled to - about 30 px/s, against a lethal 340.
+    """
+    agent.y = float(y)
+    agent.vy = 0.0
+    agent.fall_t = 0.0
+
+
 def _clear_blocked(agent: Any) -> None:
     try:
         agent._blocked_t = 0.0
@@ -1696,9 +1715,15 @@ def _h_sleep(a: Action, ag: Any, w: Any, dt: float) -> None:
     # Park them at the hut's centre. They are not drawn while inside, but the
     # position still matters: it is where they reappear on waking, and it keeps
     # any light they carry (a candle) shining from the right building.
+    #
+    # _pin_aloft, because the 2px lift below clears GROUND_SNAP: physics counts
+    # a sleeper as airborne and charges gravity at them all night. That never
+    # killed anyone - the drop is short enough to land every other tick at
+    # ~60 px/s against a lethal 340 - but it is the same trap the lookout fell
+    # into, and it only stayed safe while the offset stayed tiny.
     try:
         ag.x = float(hut.x)
-        ag.y = float(hut.y) - 2.0
+        _pin_aloft(ag, float(hut.y) - 2.0)
         ag.inside = int(hut.id)
     except Exception:
         pass
@@ -1718,7 +1743,7 @@ def _c_sleep(a: Action, ag: Any, w: Any) -> None:
         hut.leave(int(getattr(ag, "id", 0)))
     if a.data.get("in"):
         try:
-            ag.y = ground_y(w, ag.x)
+            _plant(ag, ground_y(w, ag.x))
         except Exception:
             pass
     # Always clear this, even if the hut is gone: an agent left flagged as
@@ -2143,7 +2168,7 @@ def _h_lookout(a: Action, ag: Any, w: Any, dt: float) -> None:
         y0 = float(a.data.get("y0", ag.y))
         try:
             ag.x = float(tower.x)
-            ag.y = y0 + (top - y0) * k
+            _pin_aloft(ag, y0 + (top - y0) * k)
         except Exception:
             pass
         _adjust(ag, "fatigue", 0.02 * dt)
@@ -2156,7 +2181,7 @@ def _h_lookout(a: Action, ag: Any, w: Any, dt: float) -> None:
     _halt(ag)
     try:
         ag.x = float(tower.x)
-        ag.y = top
+        _pin_aloft(ag, top)
     except Exception:
         pass
     a.data["wt"] = float(a.data.get("wt", 0.0)) + dt
@@ -2189,8 +2214,11 @@ def _c_lookout(a: Action, ag: Any, w: Any) -> None:
     if tower is not None:
         tower.leave(int(getattr(ag, "id", 0)))
     if a.data.get("in"):
+        # _plant, not a bare y write: this is a teleport down the tower, and
+        # leaving vy as physics last left it makes the arrival read as an
+        # impact at that speed.
         try:
-            ag.y = ground_y(w, ag.x)
+            _plant(ag, ground_y(w, ag.x))
         except Exception:
             pass
     # Always clear this, even if the hut is gone: an agent left flagged as
