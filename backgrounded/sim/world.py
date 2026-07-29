@@ -19,7 +19,8 @@ import numpy as np
 
 from ..constants import (
     AI_TICKS, ALL_RESOURCES, DAY_LENGTH_SEC, FOOD_PER_HEAD_TO_GROW,
-    MAX_POP, MIN_POP, MORALE_TO_GROW, POP_BIRTH_COOLDOWN, POP_PER_HUT,
+    MAX_POP, MIN_POP, MORALE_TO_GROW, MORPH_LABELS,
+    POP_BIRTH_COOLDOWN, POP_PER_HUT,
     REGROW_MAX, REGROW_PER_HEAD, RENDER_H, RENDER_W,
     RES_COOKED, RES_FOOD, RES_STONE, RES_WOOD, SAVE_VERSION,
     SCENE_LABELS, SCENE_NIGHT_STORM, SCENE_ROTATE_SEC, SCENES,
@@ -72,7 +73,12 @@ class World:
         # do not march in lockstep.
         self.events: EventSystem = EventSystem(scene=scene, seed=self.seed ^ 0x513)
         self.animals: AnimalRegistry = AnimalRegistry(seed=self.seed ^ 0xA17)
-        self.ufo: Ufo = Ufo()
+        # The ufo was the one subsystem left unseeded: Ufo() with no seed falls
+        # back to an unseeded module RNG, so two runs of the same world seed
+        # differed in ufo.seed and next_in from the first tick - the abduction
+        # landed at a different minute each time and no seeded comparison of a
+        # long run could be trusted. Same offset trick as above.
+        self.ufo: Ufo = Ufo(seed=self.seed ^ 0x71F)
 
         # Colony-level state
         self.auto_scene_rotate: bool = True     # flip scene every SCENE_ROTATE_SEC
@@ -119,6 +125,10 @@ class World:
             alive[0].holds_candle = True
             alive[0].role = "elder"
         self.log_event(f"A group of {n} arrives in a new land.")
+        # After the arrival line, so the chronicle reads in the order it
+        # happened: the group lands, then you notice one of them is odd.
+        for founder in alive:
+            self._log_morph(founder)
 
     @property
     def agents(self) -> list:
@@ -175,7 +185,13 @@ class World:
         ``scene_t`` means a manual scene pick from the tray resets the countdown,
         so a chosen scene holds for a full interval before the weather moves on."""
         ev = self.events
-        if self.auto_scene_rotate and float(getattr(ev, "scene_t", 0.0)) >= SCENE_ROTATE_SEC:
+        # getattr, not attribute access: this method is fail-soft-guarded, so a
+        # missing attribute here does not raise loudly - it silently disables the
+        # whole subsystem for the session. Defaulting rather than trusting the
+        # instance is what keeps a partially-built world (an old save, a future
+        # from_dict that forgets a field) rotating instead of quietly freezing.
+        if getattr(self, "auto_scene_rotate", True) and \
+                float(getattr(ev, "scene_t", 0.0)) >= SCENE_ROTATE_SEC:
             choices = [s for s in SCENES if s != ev.scene]
             if choices:
                 nxt = choices[self.pyrng.randrange(len(choices))]
@@ -421,6 +437,25 @@ class World:
         self.log_event(names.describe_event("born" if born else "arrived",
                                             name=s.name, generation=gen,
                                             rng=self.pyrng))
+        self._log_morph(s)
+
+    def _log_morph(self, s: Stickman) -> None:
+        """Chronicle a rare odd-bodied villager, right after their arrival line.
+
+        names.describe_event has no template kind for a body, so the sentence is
+        built straight from MORPH_LABELS. Guarded because this hangs off three
+        spawn paths - including the one that rescues a colony below MIN_POP -
+        and none of them may fail over a log line.
+        """
+        try:
+            if not s.is_mutant():
+                return
+            phrase = MORPH_LABELS.get(s.morph)
+            if phrase:
+                self.log_event(f"{s.name} is {phrase}.")
+        except Exception:
+            log.debug("morph chronicle failed for %r", getattr(s, "name", "?"),
+                      exc_info=True)
 
     def spawn_visitor(self, x: float) -> str | None:
         """Player's Spawn tool: a newcomer appears at x, if there is room."""
@@ -440,6 +475,7 @@ class World:
         self.log_event(names.describe_event("arrived", name=s.name,
                                             generation=s.generation,
                                             rng=self.pyrng))
+        self._log_morph(s)
         return None
 
     def _rebuild_lights(self) -> None:
@@ -588,6 +624,7 @@ class World:
             "events": self.events.to_dict(),
             "animals": self.animals.to_dict(),
             "ufo": self.ufo.to_dict(),
+            "auto_scene_rotate": bool(getattr(self, "auto_scene_rotate", True)),
             "stockpile": dict(self.stockpile),
             "build_queue": list(self.build_queue),
             "chronicle": list(self.chronicle),
@@ -607,6 +644,14 @@ class World:
         w._disabled = set()
         w.held_agent_ids = set()
         w.held_prop_ids = set()
+        # from_dict builds the instance with __new__, so anything set only in
+        # __init__ is simply absent here. Leaving this one out meant every
+        # *reloaded* world raised AttributeError on its first _tick_scene and -
+        # because subsystem ticks are fail-soft - silently disabled the "scene"
+        # subsystem for the rest of the session, killing both the 10-minute
+        # scene rotation and the harvest-claim sweep. Persisted so a user who
+        # turns rotation off keeps it off across a restart.
+        w.auto_scene_rotate = bool(d.get("auto_scene_rotate", True))
 
         def _sub(key, loader, fallback):
             try:
@@ -624,7 +669,7 @@ class World:
         w.lighting = _sub("lighting", Lighting.from_dict, Lighting)
         w.events = _sub("events", EventSystem.from_dict, EventSystem)
         w.animals = _sub("animals", AnimalRegistry.from_dict, AnimalRegistry)
-        w.ufo = _sub("ufo", Ufo.from_dict, Ufo)
+        w.ufo = _sub("ufo", Ufo.from_dict, lambda: Ufo(seed=w.seed ^ 0x71F))
 
         w.stockpile = {r: 0 for r in ALL_RESOURCES}
         w.stockpile.update({k: int(v) for k, v in

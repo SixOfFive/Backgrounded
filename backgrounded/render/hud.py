@@ -97,6 +97,239 @@ def name_tag(name: str, color: tuple[int, int, int],
     return surf
 
 
+# =========================================================== activity label ==
+# What a stickman is *doing*, as a phrase you can read at wallpaper scale from
+# across the room. Two lookups: (kind, phase) first, then kind alone. The phase
+# pass matters because nearly every action walks somewhere before it works, and
+# "chopping wood" floating over someone still crossing the map reads as a bug.
+#
+# Phrases are lower case, present tense and short on purpose. They sit above the
+# head at 9 px and two neighbours standing a body-width apart must not merge
+# into a wall of text, so anything over ~18 characters is the wrong answer here
+# however good the copy is.
+
+_ACTIVITY_BY_PHASE: dict[tuple[str, str], str] = {
+    ("GatherWood", "approach"): "finding a tree",
+    ("GatherWood", "work"): "chopping wood",
+    ("GatherWood", "deliver"): "hauling wood",
+    ("GatherStone", "approach"): "finding stone",
+    ("GatherStone", "work"): "breaking rock",
+    ("GatherStone", "deliver"): "hauling stone",
+    ("ForageBerries", "approach"): "seeking berries",
+    ("ForageBerries", "work"): "picking berries",
+    ("ForageBerries", "deliver"): "hauling food",
+    ("BuildStructure", "fetch"): "fetching timber",
+    ("BuildStructure", "approach"): "hauling to site",
+    ("BuildStructure", "work"): "building",
+    ("RepairStructure", "approach"): "off to repair",
+    ("RepairStructure", "work"): "repairing",
+    ("Eat", "approach"): "off to eat",
+    ("Eat", "eat"): "eating",
+    ("Sleep", "approach"): "heading to bed",
+    ("Sleep", "sleep"): "sleeping",
+    ("WarmAtFire", "approach"): "seeking warmth",
+    ("WarmAtFire", "warm"): "warming up",
+    ("CookFood", "fetch"): "fetching food",
+    ("CookFood", "approach"): "off to the fire",
+    ("CookFood", "cook"): "cooking",
+    ("CookFood", "deliver"): "storing a meal",
+    ("PlantSapling", "approach"): "finding a spot",
+    ("PlantSapling", "plant"): "planting a tree",
+    ("Farm", "approach"): "off to the field",
+    ("Farm", "till"): "tilling a field",
+    ("Farm", "harvest"): "harvesting",
+    ("Farm", "deliver"): "hauling crops",
+    ("Mine", "approach"): "off to the quarry",
+    ("Mine", "dig"): "mining",
+    ("Converse", "approach"): "going to chat",
+    ("Converse", "talk"): "chatting",
+    ("Celebrate", "approach"): "joining in",
+    ("Celebrate", "dance"): "dancing",
+    ("Mourn", "approach"): "paying respects",
+    ("Mourn", "bow"): "mourning",
+    ("Lookout", "approach"): "off to the tower",
+    ("Lookout", "ascend"): "climbing up",
+    ("Lookout", "watch"): "keeping watch",
+    ("CraftSpear", "approach"): "fetching wood",
+    ("CraftSpear", "work"): "carving a spear",
+    ("CraftArmour", "approach"): "fetching hide",
+    ("CraftArmour", "work"): "making armour",
+    ("FightAnimal", "approach"): "closing in",
+    ("FightAnimal", "fight"): "fighting",
+}
+
+#: Fallback per kind, used whenever the phase is one the table above does not
+#: name (every machine starts in "start", and several never leave it).
+_ACTIVITY: dict[str, str] = {
+    "Wander": "wandering",
+    "GatherWood": "chopping wood",
+    "GatherStone": "quarrying",
+    "ForageBerries": "foraging",
+    "HaulToStockpile": "hauling",
+    "BuildStructure": "building",
+    "RepairStructure": "repairing",
+    "Eat": "eating",
+    "Sleep": "sleeping",
+    "WarmAtFire": "warming up",
+    "CookFood": "cooking",
+    "PlantSapling": "planting a tree",
+    "Farm": "farming",
+    "Mine": "mining",
+    "Converse": "chatting",
+    "Celebrate": "celebrating",
+    "Mourn": "mourning",
+    "FleeFrom": "fleeing",
+    "ClimbTo": "climbing",
+    "Lookout": "keeping watch",
+    "FollowParent": "tagging along",
+    "Panic": "panicking",
+    "CraftSpear": "carving a spear",
+    "CraftArmour": "making armour",
+    "FightAnimal": "fighting",
+    "FleeAnimal": "running away",
+    "Vignette": "idling",          # only reached if the vignette lost its label
+}
+
+
+def _humanise(kind: str) -> str:
+    """Last-ditch phrasing for a kind no table above knows.
+
+    A new behaviour module, or a save written by a later build, must never put
+    a bare identifier like ``TendBeehive`` on the user's wallpaper - it looks
+    like a leaked internal, because it is one. Splitting the camel case and
+    lower-casing is wrong-but-readable, which is the correct failure here.
+    """
+    out = "".join((" " + c.lower() if c.isupper() and i else c.lower())
+                  for i, c in enumerate(str(kind)))
+    return out.strip() or "idle"
+
+
+def _vignette_label(act) -> str:
+    """The hand-written phrase off a cosmetic vignette, or "" if this is not one.
+
+    Vignettes carry copy an author wrote ("throws a cartwheel"), which beats
+    anything generated from a kind, so it wins outright wherever it exists.
+    Both shapes are accepted: the live VignetteAction exposes ``.label``, while
+    a rehydrated one may only have stashed the string in ``data``.
+    """
+    try:
+        label = getattr(act, "label", None)
+        if isinstance(label, str) and label.strip():
+            return label.strip()
+        vig = getattr(act, "vignette", None)
+        if isinstance(vig, str) and vig.strip():
+            return vig.strip()
+        label = getattr(vig, "label", None)
+        if isinstance(label, str) and label.strip():
+            return label.strip()
+        data = getattr(act, "data", None)
+        if isinstance(data, dict):
+            label = data.get("label")
+            if isinstance(label, str) and label.strip():
+                return label.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def activity_of(agent) -> str:
+    """A short present-tense phrase for what *agent* is doing right now.
+
+    Returns "" for the dead and for anything unreadable, so callers can simply
+    skip drawing. Never raises: this is on the per-frame path for every agent.
+    """
+    try:
+        if not getattr(agent, "alive", True):
+            return ""
+        act = getattr(agent, "action", None)
+        if act is None:
+            return "idle"
+        label = _vignette_label(act)
+        if label:
+            return label
+        kind = str(getattr(act, "kind", "") or "")
+        if not kind:
+            return "idle"
+        phase = str(getattr(act, "phase", "") or "")
+        phrase = _ACTIVITY_BY_PHASE.get((kind, phase))
+        if phrase is None:
+            phrase = _ACTIVITY.get(kind)
+        if phrase is None:
+            phrase = _humanise(kind)
+        return phrase
+    except Exception:
+        return ""
+
+
+#: Plate and text colours for the activity tag. Deliberately *not* the agent's
+#: identity colour - the name plate above already carries identity, and ten
+#: hues of tiny text is noise. Pale grey on a near-opaque near-black plate is
+#: the one pairing that survives both the black night-storm and the white-out
+#: fog scene, because it reads against the plate rather than against the sky.
+ACT_TEXT = (208, 216, 230)
+ACT_PLATE = (5, 7, 12, 178)
+
+#: Longest phrase the plate will show. Sized off the real content, not the
+#: table above: the vignette engine writes whole sentences ("cups both hands
+#: and drinks what the sky gives it"), and cutting those at the ~18 characters
+#: the action phrases need turns good copy into rubble. 26 is about 140 px at
+#: 9 px - wide next to a 21 px stickman, but the overlap nudge in the renderer
+#: is what actually keeps a crowd readable, not a tighter cap here.
+ACT_MAX_CHARS = 26
+
+
+def _shorten(s: str, limit: int) -> str:
+    """Trim to *limit* characters on a word boundary, marking the cut.
+
+    Mid-word cuts ("cups both hands a..") read as a rendering fault rather than
+    as elision, which is the one thing a status label must never look like."""
+    if len(s) <= limit:
+        return s
+    cut = s[:limit - 2]
+    space = cut.rfind(" ")
+    if space >= limit // 2:              # only if a word boundary is near
+        cut = cut[:space]
+    return cut.rstrip(" ,;:") + ".."
+
+
+def activity_tag(text: str, dim: float = 1.0) -> "pygame.Surface | None":
+    """A small rounded plate reading what a stickman is doing.
+
+    Returns None for empty text so the caller can skip the blit outright.
+
+    `dim` only ever fades to 0.55, not to the 0.30 the name plate allows: the
+    name is bold and coloured and survives being crushed, a 9 px grey line does
+    not. It is also quantised to 8 steps before it reaches the cache key -
+    it comes from a continuous light sample, so passing it through raw would
+    mint a fresh surface per agent per frame and turn this module's glyph cache
+    into a churn machine, which is the one cost it exists to avoid.
+    """
+    s = str(text or "").strip()
+    if not s:
+        return None
+    s = _shorten(s, ACT_MAX_CHARS)
+    d = 0.55 if dim < 0.55 else (1.0 if dim > 1.0 else dim)
+    q = round(d * 8.0) / 8.0
+    key = ("__act__", s, q)
+    surf = _text_cache.get(key)
+    if surf is not None:
+        return surf
+    if len(_text_cache) > _TEXT_CACHE_MAX:
+        _text_cache.clear()
+    col = (int(ACT_TEXT[0] * q), int(ACT_TEXT[1] * q), int(ACT_TEXT[2] * q))
+    glyphs = _font(9).render(s, True, col)
+    padx, pady = 3, 1
+    surf = pygame.Surface((glyphs.get_width() + padx * 2,
+                           glyphs.get_height() + pady * 2), pygame.SRCALPHA)
+    try:
+        pygame.draw.rect(surf, ACT_PLATE, surf.get_rect(), border_radius=3)
+    except TypeError:                    # a pygame too old for rounded corners
+        surf.fill(ACT_PLATE)
+    surf.blit(glyphs, (padx, pady))
+    _text_cache[key] = surf
+    return surf
+
+
 def _need_color(v: float) -> tuple[int, int, int]:
     return GOOD if v < 0.45 else (WARN if v < 0.75 else BAD)
 
@@ -116,26 +349,14 @@ def _clock(world) -> str:
 
 
 def _doing(agent) -> str:
-    """What to show in the 'doing' column - the vignette reads better than the
-    action kind when one is running, because it is written as a phrase."""
-    act = getattr(agent, "action", None)
-    if act is None:
-        return "idle"
-    vig = getattr(act, "vignette", None) or (act.data.get("vignette")
-                                             if getattr(act, "data", None) else None)
-    label = getattr(vig, "label", None)
-    if isinstance(vig, str):
-        label = vig
-    if label:
-        return str(label)
-    kind = str(getattr(act, "kind", "") or "idle")
-    # BuildStructure -> Build Structure, then trim to fit the column
-    out = "".join((" " + c if c.isupper() and i else c)
-                  for i, c in enumerate(kind)).strip()
-    phase = getattr(act, "phase", None)
-    if phase and phase not in ("start", "work"):
-        out = f"{out} ({phase})"
-    return out
+    """What to show in the roster's 'doing' column.
+
+    Shares :func:`activity_of` with the label drawn above the stickman's head,
+    so the panel and the world can never disagree about what someone is up to -
+    they used to, because this column spelled out the raw kind ("Gather Wood")
+    while the label read a phrase.
+    """
+    return activity_of(agent) or "idle"
 
 
 _panel_cache: pygame.Surface | None = None

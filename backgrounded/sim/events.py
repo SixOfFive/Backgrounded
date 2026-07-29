@@ -50,19 +50,27 @@ import numpy as np
 from ..constants import (
     MAT_ASH,
     MAT_DIRT,
+    MAT_LAVA,
     MAT_MUD,
+    MAT_SAND,
     MAT_SNOW,
+    MAT_STONE,
     RENDER_H,
     RENDER_W,
     SCENE_ASHFALL,
     SCENE_AURORA,
     SCENE_BLIZZARD,
     SCENE_CLEAR,
+    SCENE_EARTHQUAKE,
+    SCENE_ECLIPSE,
     SCENE_FLOOD,
     SCENE_FOG,
+    SCENE_HEATWAVE,
     SCENE_METEOR,
     SCENE_MUDSLIDE,
     SCENE_NIGHT_STORM,
+    SCENE_SANDSTORM,
+    SCENE_VOLCANO,
     SCENE_WILDFIRE,
     SCENES,
 )
@@ -160,6 +168,134 @@ SNOW_MAX_DEPTH = 3.2             # px the ground rises under a full snow layer
 SNOW_RATE = 0.055                # px/s
 ASH_MAX_DEPTH = 2.4
 ASH_RATE = 0.030
+SAND_MAX_DEPTH = 2.8
+#: Slower than snow on purpose. Sand is the only accumulation the colony has to
+#: watch *arrive*: a blizzard is over in ten minutes and the snow melts back in
+#: the next clear scene, but nothing in the sim ever lifts sand again, so the
+#: drift creeping across the map is the permanent mark this scene leaves. At
+#: 0.032 px/s a full layer takes ~88 s of storm - a seventh of the slot - which
+#: is long enough that you can see the desert winning.
+SAND_RATE = 0.032
+
+#: The colour the haze wash is drawn in for the fog scene. Duplicated from
+#: ``fx._FOG_GREY`` rather than imported, because sim/ may never import render/:
+#: the two must agree by hand, and a test asserts they do (a mismatch would
+#: silently retint the fog scene, which is exactly what generalising the wash
+#: was not allowed to do).
+HAZE_GREY: tuple[int, int, int] = (198, 202, 208)
+#: ...and the sandstorm's. Warm, dirty and light enough to wash a night scene up
+#: to a brown murk rather than smearing the frame with mud.
+HAZE_SAND: tuple[int, int, int] = (196, 158, 96)
+#: ...and the eruption's: ash lit from underneath. Darker and far redder than
+#: either of the others, because this haze is not being lit by the sky - the sky
+#: has gone - it is being lit by what is on the ground.
+HAZE_EMBER: tuple[int, int, int] = (150, 74, 54)
+
+#: Peak haze density for the sandstorm. Below the fog scene's 0.85 deliberately:
+#: fog is a *still* wash you look through, whereas this one has grit streaking
+#: across it and a hard colour cast behind it, and stacking all three at fog's
+#: strength buries the colony instead of obscuring it.
+SAND_HAZE = 0.72
+#: Wind amplitude and gust multiplier. Both are the highest in the file - the
+#: night storm sits at 0.85/1.0 and the blizzard at 0.95/0.9 - because the gust
+#: channel is the only part of this scene the *lighting* can see: it feeds
+#: Lighting.wind_gust, which is what makes every torch in the colony gutter
+#: together as a squall goes through.
+SAND_WIND = 0.95
+SAND_GUST = 1.30
+#: Grit only bites while it is actually blowing hard, so the harm arrives in
+#: squalls you can watch rather than as a constant tax.
+SAND_STING_GUST = 0.55
+SAND_STING_RATE = 0.55           # hp/s of scouring while a squall is up
+#: ...and the health no amount of sandstorm will take anyone below. This is a
+#: hard floor, not a tuning target: the scene is meant to be an atmosphere piece,
+#: and the surrounding disasters have taught this file repeatedly that "usually
+#: survivable" becomes "wiped the colony" on the one seed that stacks two
+#: hazards. A scene that *cannot* reduce anyone below it needs no luck, and the
+#: 1/6 hp/s regen puts the difference back within a couple of minutes of the
+#: storm passing.
+#:
+#: The exact number is set by what *else* can hurt a stickman, not by how hard
+#: the sand ought to feel. Wounds are one pool, so a floor is a standing
+#: discount on everyone's margin against a wolf pack for the whole scene, and
+#: that indirect cost is the only one this scene can actually levy. Measured
+#: over 40 seeds x 600 s of sandstorm with nothing but this dial moved: deaths
+#: by mauling were 22 with the scour off entirely, 27 at 75, and 37 at 62, and
+#: final population 3.73 / 3.77 / 3.55. At 62 the storm was killing people it
+#: never touched. At 75 the population is indistinguishable from not scouring at
+#: all, and the cost is a quarter of a health bar you can watch in the HUD.
+SAND_HEALTH_FLOOR = 75.0
+
+#: --- heatwave / drought ---------------------------------------------------
+#: Seconds for the drought to reach full depth. Deliberately an order of
+#: magnitude slower than the 6 s ``intensity`` envelope every other scene rides
+#: on: this is the only scene whose cost is *economic*, and an economy that
+#: halts the instant the weather turns is a switch, not a drought. Ramping over
+#: three quarters of a minute means the colony's food curve bends rather than
+#: breaking, which is the difference between hardship and a cliff.
+HEAT_RAMP_SEC = 45.0
+#: Share of natural recovery the drought takes away at full heat. Everything
+#: that grows back on its own funnels through ``props.growth_factor`` - sapling
+#: growth, berry regrow, crop ripening and the reseeding that repopulates a
+#: felled map - so this one number is the whole economic bite. 0.80 leaves a
+#: fifth of normal: berries still come back, just far too slowly to feed anyone,
+#: which is what makes the colony eat into the stockpile instead of living hand
+#: to mouth off the bushes. It is a multiplier applied *live* and never a
+#: subtraction, so nothing about the economy is permanently damaged - the moment
+#: the scene ends the factor is 1.0 again (see _drought_hook).
+#:
+#: Measured over 12 seeds, each warmed up for 900 s and then forked into a full
+#: 600 s heatwave slot and an identical 600 s of clear skies from the same save.
+#: Food gained over the slot: +102 with the drought against +235 without, so the
+#: colony's larder fills at 44% of its normal rate. Berries left standing on the
+#: map at the end: 10.1 against 26.8 - the wild is stripped and does not come
+#: back, which is the thing you can actually watch happen. Population 6.4
+#: against 5.8 and deaths 3.00 against 2.58: within noise, which is the point.
+#: This scene is meant to cost the colony its momentum, not its people.
+#:
+#: The rotation picks its next scene at random, so three heatwave slots can land
+#: in a row. Stressed at 1800 s of unbroken drought over 6 seeds: no wipes, the
+#: smallest colony still standing at 2, and the mean going 3.8 -> 6.2 with food
+#: 177 -> 380. A drought slows the colony down; it never runs it out.
+HEAT_DROUGHT_DEPTH = 0.80
+#: Snow left by a previous blizzard goes this many times faster than the normal
+#: thaw. Free texture: ``_melt_snow`` takes dt as a plain scale, so a heatwave
+#: arriving on a white map visibly strips it back inside a minute.
+HEAT_THAW_MUL = 3.5
+#: Extra fatigue per second of full heat, on top of the baseline
+#: ``entities.FATIGUE_PER_SEC`` (1/600). At 1/900 that is a two-thirds surcharge
+#: on staying awake, which the colony pays in *sleep* - and sleep is time not
+#: spent gathering. That indirect cost is the intended one; fatigue itself is
+#: not a lethal need (only hunger and cold are), which is exactly why this scene
+#: is allowed to touch it and is not allowed to touch hunger.
+HEAT_FATIGUE_RATE = 1.0 / 900.0
+#: ...and the fatigue no amount of heat will push anyone past. A hard ceiling
+#: rather than a tuning target, in the shape SAND_HEALTH_FLOOR uses: an agent at
+#: 1.0 fatigue drops everything to sleep, so a scene that could pin the whole
+#: colony there would stop the economy dead rather than slowing it. Below the
+#: cap the heat merely makes people tired sooner; the last stretch to exhaustion
+#: is always the agent's own working day.
+HEAT_FATIGUE_CAP = 0.80
+#: Warmth (1 = freezing) bled off per second of full heat. The needs model has
+#: no heatstroke - warmth is a one-sided cold clock - so the honest translation
+#: of "sweltering" is that nobody is cold, day or night. It is the one thing the
+#: scene gives back, and it is genuinely worth something: a heatwave night is the
+#: only night in the game where the colony does not have to break off work and
+#: crowd the firepit.
+HEAT_RELIEF_RATE = 1.0 / 200.0
+#: Gap between attempts at a brush fire, seconds. The wildfire scene relights
+#: every 70-140 s; this is two to four times as slow *and* gated on the drought
+#: being deep (below), so a ten-minute heatwave sees two or three ignitions at
+#: the very most and often none at all. Fire is the scene's only body count and
+#: it has to stay an event you notice, not a background hazard. Measured over
+#: the 12-seed pairs described under HEAT_DROUGHT_DEPTH: 3.00 deaths per slot
+#: against the control's 2.58, i.e. the brush costs the colony roughly one extra
+#: life every second heatwave.
+HEAT_IGNITE_MIN, HEAT_IGNITE_MAX = 190.0, 380.0
+#: ...and how dry it has to get first. Below this the brush simply will not take,
+#: so the first minute of the scene is always safe and an ignition reads as a
+#: consequence of the drought rather than of the weather changing.
+HEAT_IGNITE_HEAT = 0.55
 
 #: Fire is tuned as "rare but nasty" rather than "constant and survivable".
 #: props.py spreads fire on its own and a burnt tree is wood the colony never
@@ -188,6 +324,237 @@ FIRE_RELIGHT_MIN, FIRE_RELIGHT_MAX = 70.0, 140.0
 STRIKE_PANIC = 1.5               # panic seconds for everyone near a bolt
 STRIKE_PANIC_R = 130.0           # ...and how near that is
 
+#: The eclipse is the one scene that is an *event on a clock* rather than a
+#: weather state: it happens once, near the top of the scene, and is over. The
+#: scene rotation gives every scene 600 s, so these three add up to well under
+#: that on purpose - the sun goes out, it comes back, and the colony gets the
+#: rest of the slot to recover in ordinary daylight. Driven off ``scene_t``, so
+#: the whole thing is a pure function of scene age: deterministic, seed-free,
+#: and identical after a save/load.
+ECLIPSE_INGRESS = 60.0           # first bite to totality
+ECLIPSE_TOTALITY = 26.0          # the hold, with the sky dark
+ECLIPSE_EGRESS = 55.0            # light coming back
+#: Fraction of the ambient the shadow can take at full totality. 0.85 against
+#: the scene's flat 0.90 daylight leaves ambient at 0.135 - within a whisker of
+#: SCENE_AURORA's 0.15 night, which is the darkest the project already ships and
+#: is known to still read on a desktop. It is applied to *ambient*, never to the
+#: finished frame, which is what makes the torches the brightest thing on screen
+#: instead of dimming with everything else (see Lighting.ambient_dim).
+ECLIPSE_MAX_DIM = 0.85
+
+#: The earthquake is a scene of *punctuation*, not of weather. A continuous
+#: rumble reads as a broken renderer rather than a disaster, so the quiet is an
+#: order of magnitude longer than the shaking: at these numbers a 600 s slot
+#: runs 14-22 tremors and spends about 6% of its life actually moving.
+QUAKE_LEAD_IN = 9.0              # calm before the first tremor of the scene
+QUAKE_REST_MIN, QUAKE_REST_MAX = 15.0, 44.0
+QUAKE_TREMOR_MIN, QUAKE_TREMOR_MAX = 2.0, 5.5
+#: Peak screen-shake amplitude of the weakest and strongest tremor. add_shake
+#: clamps at 18 and the renderer blits the *whole frame* at this offset, so
+#: anything near that ceiling is unreadable rather than dramatic.
+QUAKE_MAG_MIN, QUAKE_MAG_MAX = 5.0, 13.0
+#: At or above this peak a tremor is a "big one": it tears the ground open,
+#: cracks the buildings and earns a line in the chronicle. Below it the world
+#: merely shakes. Roughly a third of tremors clear the bar.
+QUAKE_BIG_MAG = 9.0
+
+#: Fissures are capped hard on *both* axes, because this map kills by falling.
+#: Terrain.deform's 'smooth' blend ramps over min(span // 2, DEFORM_EDGE = 24)
+#: px, so a scar's steepest slope is about 1.57 * depth / that ramp. Tying depth
+#: to half-width via QUAKE_FISSURE_ASPECT pins every scar at ~1.5 whatever size
+#: it rolls: above MAX_SLOPE_WALK (0.9), so it is an obstacle that has to be
+#: climbed round, and comfortably under MAX_SLOPE_CLIMB (2.6), so it is never a
+#: cliff. Depth matters independently: at GRAVITY 900 a free fall needs ~64 px
+#: to reach FALL_LETHAL_SPEED (340 px/s), so a 26 px ceiling cannot kill even if
+#: somebody does drop straight in. Measured over 10 seeds x 600 s: zero deaths
+#: attributable to the terrain this scene carves.
+QUAKE_FISSURE_HALF_MIN, QUAKE_FISSURE_HALF_MAX = 15.0, 26.0
+QUAKE_FISSURE_ASPECT = 0.95
+QUAKE_FISSURE_DEPTH_MAX = 26.0
+QUAKE_FISSURE_OPEN_SEC = 1.4     # seconds of tearing before a scar is fully open
+QUAKE_FISSURE_MAX = 5            # most scars one run of the scene will leave
+#: px between scar centres. Without it a run of big tremors walks a line of
+#: overlapping notches across the map and they merge into one unbounded trench -
+#: which is exactly the mass grave the depth cap exists to prevent.
+QUAKE_FISSURE_GAP = 110.0
+#: Refuse to open a scar where the ground already sits this far below the
+#: shoulders either side of it. Measured against the local shoulders rather than
+#: an absolute height so it is slope-neutral: it blocks digging an old crater or
+#: last scene's fissure deeper without blocking honest hillsides.
+QUAKE_FISSURE_SINK = 34.0
+#: px either side of an open scar that reads as dangerous while the ground moves.
+#: behaviour widens whatever it is given by 1.45x when it picks a flee target,
+#: and up to QUAKE_FISSURE_MAX scars can be live at once, so this number is
+#: really "what share of the map is off limits during a tremor": at 78 it was
+#: over half of it, the colony spent the shaking running instead of working, and
+#: the scene finished with fewer people than it started even though nothing it
+#: did was lethal. 46 keeps each scar a place you walk around.
+QUAKE_HAZARD_R = 46.0
+#: Deliberately absent: this scene sets no ``agent.panic``. The flag lets an
+#: agent step off drops it would normally refuse, and measured over 10 seeds x
+#: 600 s it was the entire cost of the scene - falls went 15 (clear-sky control)
+#: -> 39 with the flag -> 20 with only the hazard, for identical shaking,
+#: identical scars and identical building damage. Deaths per run went 4.90 ->
+#: 2.60 against a 2.40 control, and the colony went back to *growing* through
+#: the scene (3.4 -> 4.0) instead of shrinking to the MIN_POP floor (3.4 ->
+#: 2.5). Nothing here can kill, so nothing here needs the reckless kind of
+#: urgency: hazards() moves people out of the way perfectly well without it.
+#: See _warn_slide, which learned the same lesson the same way.
+
+#: Share of a structure's max hp a tremor takes at the epicentre, tapering to
+#: nothing at QUAKE_DAMAGE_R. A fraction rather than a flat number so a 120 hp
+#: bridge and a 40 hp firepit both take a crack rather than a demolition.
+QUAKE_STRUCT_FRAC = 0.14
+#: ...and the floor no tremor will damage a building below. This is the single
+#: dial that keeps the scene survivable rather than merely non-lethal: huts gate
+#: population growth and firepits gate warmth, so a scene that flattens them
+#: costs the colony far more than the bodies it never took. Buildings come out
+#: of a bad quake cracked and get repaired between tremors (structures.damaged()
+#: is already a standing repair job) instead of coming out as rubble.
+QUAKE_STRUCT_FLOOR = 0.20
+QUAKE_DAMAGE_R = 240.0
+QUAKE_BOULDER_R = 150.0          # boulders this near the epicentre shake loose
+QUAKE_BOULDER_MAX = 2            # ...and at most this many per tremor
+
+#: --- volcanic eruption ----------------------------------------------------
+#: Seconds of scene before the ground opens. The sky has already turned and the
+#: ash is already falling by then, so the eruption reads as the arrival of
+#: something that was visibly on its way rather than as a switch being thrown.
+#: A threshold crossing of ``scene_t``, in the shape the eclipse and the
+#: sandstorm use: nothing to initialise, nothing to clear, nothing to
+#: round-trip, and a save loaded past the moment simply never fires it.
+VOLCANO_ERUPT_AT = 5.0
+#: ...and when a second vent tears open, well into the slot. One vent is a
+#: disaster you walk away from in one direction; two is a decision.
+VOLCANO_SECOND_VENT_AT = 250.0
+#: Most flows alive at once, counting any left cooling by a previous eruption.
+#: A hard cap rather than a tuning number: the rotation is free to hand this
+#: scene two slots in a row, and an unbounded list of flows is an unbounded
+#: share of the map under lava.
+LAVA_MAX_FLOWS = 3
+#: px the front advances per second. Deliberately a thirtieth of WALK_SPEED
+#: (34 px/s): the flow must never be able to *catch* anybody, only to arrive
+#: where they are standing. It is the ground going away underneath a job, not a
+#: monster - which is what makes "lethal and avoidable" true by construction
+#: rather than by tuning.
+LAVA_SPREAD = 1.1
+#: ...and how far one vent will ever reach, either side. This is the balance
+#: dial of the scene. Two vents at the top of the range is 660 px of a 1600 px
+#: map, and only at the very end of a ten-minute slot; the roll usually gives
+#: less, and half of it has crusted to stone within a minute of the weather
+#: moving on.
+LAVA_HALF_MIN, LAVA_HALF_MAX = 100.0, 165.0
+#: Seconds for an abandoned flow to congeal once the vent stops feeding it.
+#:
+#: This is the answer to "does cooled lava revert?", and the answer is *yes, to
+#: stone*, for a reason that is nothing to do with geology: the material map is
+#: permanent state. Nothing in the sim ever repaints a column back, so a scene
+#: that left MAT_LAVA behind would leave a live, lethal, permanently growing
+#: lava field for every future rotation to inherit and would own the whole map
+#: inside an evening. Congealing to MAT_STONE keeps the scar - the eruption
+#: really happened, and it really did change the ground - while bounding the
+#: damage to a material the colony can walk over, build beside and mine.
+LAVA_COOL_SEC = 75.0
+#: Below this heat the crust has closed over: the flow still glows, but it no
+#: longer burns and the AI stops giving it a wide berth. Without the cutoff the
+#: colony would keep its distance from a field of cold stone for a minute after
+#: the danger had passed.
+LAVA_LETHAL_HEAT = 0.35
+#: px between the points a flow is sampled at when it is handed to the fire-harm
+#: path, and the most points one flow may contribute. The step sits comfortably
+#: inside BURN_TOUCH_DIST (22 px) so the front is a continuous hot line rather
+#: than stepping stones with cold gaps between them; the cap keeps the per-agent
+#: distance scan bounded however wide the front gets.
+LAVA_SAMPLE_STEP = 18.0
+LAVA_SAMPLE_MAX = 24
+#: px beyond the edge of the flow that reads as dangerous to the AI. Kept small
+#: for the reason QUAKE_HAZARD_R spells out at length: behaviour widens whatever
+#: it is handed by 1.45x when it picks a flee target, and a hazard covering half
+#: the map makes the colony spend the scene running instead of working - which
+#: on this terrain kills more people by falling than the hazard itself ever
+#: does. 40 px is about one panicked stride past the edge of the heat.
+LAVA_HAZARD_PAD = 40.0
+#: How far from the colony the vent tries to open, in px, and how many places it
+#: looks before settling. A vent under the firepit is not a disaster anybody can
+#: respond to - it is a coin flip that ends the settlement - and the entire
+#: claim of this scene is that it is survivable by moving.
+LAVA_VENT_CLEAR = 520.0
+LAVA_VENT_TRIES = 8
+#: ...and how far the second vent keeps off the first. Two fronts that overlap
+#: are not twice the disaster, they are a *trap*: behaviour flees the nearest
+#: hazard, so a villager caught between two vents 170 px apart runs out of one
+#: flow and straight into the other. Measured on the seed that produced that
+#: layout, eight of its thirty-five deaths were people who died mid-flee.
+LAVA_VENT_SPLIT = 420.0
+#: How hard the picker avoids opening a vent that *severs the map*.
+#:
+#: The failure this exists to stop is quieter than being burned and much worse to
+#: watch: a flow that opens between the colony and a map edge walls off the strip
+#: beyond it, and anyone standing there is cut off from the stockpile. They do not
+#: burn - they starve, in a flee/eat/sleep livelock, while hundreds of food sit in
+#: a store they can no longer reach. Measured on seed 20260728: five of seven
+#: deaths were hunger, four of them inside nineteen seconds, with ~300 food in the
+#: stockpile and the victims pinned at x = 17..43 behind a flow spanning 191..417.
+#:
+#: The fix is geometric rather than behavioural: score down any vent that would
+#: leave a walkable pocket behind it, so the picker prefers a front backed onto
+#: the map edge (which strands nobody) over an island in the middle. The weight is
+#: set so a severed pocket cannot be paid for by the distance term - that term
+#: caps at LAVA_VENT_CLEAR, and it was precisely "get as far from home as
+#: possible" that was steering vents into the middle of the far half of the map.
+LAVA_ORPHAN_WEIGHT = 3.2
+#: Seconds of contact with the flow before it kills, against BURN_DEATH_SEC's
+#: 3.5 for a burning tree. Less than half, because molten rock and a campfire
+#: should not share a fuse - and because with the turn-back ring in place the
+#: 3.5 s version was survivable *by construction*: at flee speed (2.1x walk, so
+#: 71 px/s) an agent clears 245 px in that time, which is wider than any flow
+#: this scene builds, so nobody who ran ever died and the lava was lethal only
+#: on paper. At 1.6 s the margin is 114 px: walking into the front and turning
+#: straight round is survivable, being caught in the middle of one is not.
+#: Measured over 16 seeds x 600 s: lava deaths went from 1 to 10, i.e. from
+#: "never" to roughly one every other eruption, while total deaths went 3.75 ->
+#: 4.31 against a clear-sky control's 3.56. The people it kills are the ones who
+#: were already in trouble, and the colony still comes out of the slot with the
+#: headcount it went in with.
+LAVA_DEATH_SEC = 1.6
+#: px from the flow at which a villager drops whatever job it was walking to and
+#: re-decides (see _lava_interrupts). Bounded on both sides, and both bounds are
+#: load-bearing:
+#:
+#: * above BURN_TOUCH_DIST (22 px), so the ordinary case is somebody stopping at
+#:   the edge unhurt rather than stopping because they are already alight;
+#: * strictly *below* LAVA_HAZARD_PAD (40 px), so anyone this interrupts is
+#:   guaranteed to be inside the ring ``hazards`` publishes and will therefore
+#:   score FleeFrom on the re-score it just forced. At 46 - i.e. outside the
+#:   hazard ring - the band between the two rings was a livelock: the villager
+#:   dropped the job, found no danger to flee, picked the same job again, took
+#:   one step and dropped it again. Measured at 1048 abandonments of the same
+#:   GatherWood in a single ten-minute slot.
+LAVA_TURN_BACK = 34.0
+#: Seconds for a building standing in the flow to go from whole to rubble.
+#: Slow enough to watch happen, and slow enough that a sleeper evicted by the
+#: collapse still has a long way to run before the front reaches him.
+LAVA_RUINS_SEC = 15.0
+#: Peak screen shake of the eruption itself, and of the swells that follow it.
+#: The eruption is allowed to be violent (add_shake clamps at 18 and the
+#: earthquake's biggest tremor is 13); the swells are not, because they run for
+#: the rest of the slot and a wallpaper that never stops moving is a wallpaper
+#: nobody keeps.
+VOLCANO_ERUPT_SHAKE = 11.0
+VOLCANO_SWELL_SHAKE = 3.2
+#: Peak haze density. Below the sandstorm's 0.72 and well below the fog's 0.85:
+#: this wash is dark rather than bright, so it *removes* contrast much faster
+#: per unit than either of those, and the lava has to keep punching through it.
+VOLCANO_HAZE = 0.42
+#: Ash falls harder here than in the ashfall scene - that scene is the aftermath,
+#: this one still has the vent open - but onto the same ASH_MAX_DEPTH ceiling, so
+#: the drift arrives sooner and stops in the same place.
+VOLCANO_ASH_MUL = 1.7
+#: Snow goes faster than it would in a clear scene, for the same free-texture
+#: reason the heatwave thaws it: a red-hot map that keeps last week's snowfield
+#: reads as two scenes fighting over the same ground.
+VOLCANO_THAW_MUL = 2.5
+
 SHAKE_DECAY = 3.4                # exponential decay rate of screen shake
 
 #: scene -> handler method name. Kept as strings so the instance holds no
@@ -203,6 +570,11 @@ _HANDLERS: dict[str, str] = {
     SCENE_ASHFALL: "_scene_ashfall",
     SCENE_AURORA: "_scene_aurora",
     SCENE_FOG: "_scene_fog",
+    SCENE_ECLIPSE: "_scene_eclipse",
+    SCENE_EARTHQUAKE: "_scene_earthquake",
+    SCENE_SANDSTORM: "_scene_sandstorm",
+    SCENE_HEATWAVE: "_scene_heatwave",
+    SCENE_VOLCANO: "_scene_volcano",
 }
 
 #: plausible successors, weighted. Storms clear, fires leave ash, etc.
@@ -218,6 +590,10 @@ _TRANSITIONS: dict[str, dict[str, float]] = {
     SCENE_METEOR:      {SCENE_WILDFIRE: 3, SCENE_CLEAR: 3, SCENE_ASHFALL: 2,
                         SCENE_NIGHT_STORM: 2},
     SCENE_ASHFALL:     {SCENE_CLEAR: 4, SCENE_NIGHT_STORM: 2, SCENE_BLIZZARD: 1},
+    # An eruption ends in its own fallout far more often than it ends in blue
+    # sky, and the ashfall scene is exactly that aftermath: the vent has closed,
+    # the column is still coming down.
+    SCENE_VOLCANO:     {SCENE_ASHFALL: 5, SCENE_WILDFIRE: 2, SCENE_CLEAR: 2},
 }
 
 _FLAMMABLE = ("tree", "bush", "sapling", "shrub", "log", "grass", "hut", "wall",
@@ -547,6 +923,86 @@ def _ignite(world: Any, prop: Any) -> bool:
         return False
 
 
+def _nudge_boulder(prop: Any, vx: float) -> bool:
+    """Start a boulder rolling. Returns True if it is now in motion.
+
+    props.nudge() is a module function rather than a method, so importing it
+    here would be the first hard coupling from events to props in the file.
+    Duck-typed instead, exactly as _ignite is: try a ``nudge`` method if some
+    future prop grows one, otherwise write the two state keys props.nudge sets.
+    """
+    if prop is None:
+        return False
+    fn = getattr(prop, "nudge", None)
+    if callable(fn):
+        try:
+            fn(float(vx))
+            return True
+        except Exception:
+            pass
+    state = getattr(prop, "state", None)
+    if not isinstance(state, dict):
+        return False
+    try:
+        state["rolling"] = True
+        state["vx"] = float(vx)
+        return True
+    except Exception:
+        return False
+
+
+def _clean_rgb(v: Any, default: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Coerce a loaded colour back to three bytes, or fall back to *default*.
+
+    JSON round-trips a tuple as a list, and a hand-edited save can hold anything
+    at all - so this is the same defensive shape ``from_dict`` already uses for
+    ``tint``, factored out because there are now two colours to load.
+    """
+    try:
+        r, g, b = (int(c) for c in tuple(v)[:3])
+    except (TypeError, ValueError):
+        return default
+    return (max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b)))
+
+
+def _clean_fissure(d: dict[str, Any]) -> dict[str, Any]:
+    """Re-clamp one loaded scar back inside the caps that created it."""
+    half = _clamp(_fnum(d.get("half"), QUAKE_FISSURE_HALF_MIN),
+                  QUAKE_FISSURE_HALF_MIN, QUAKE_FISSURE_HALF_MAX)
+    target = _clamp(_fnum(d.get("target"), half * QUAKE_FISSURE_ASPECT),
+                    0.0, QUAKE_FISSURE_DEPTH_MAX)
+    return {
+        "x": _clamp(_fnum(d.get("x"), RENDER_W * 0.5), 0.0, float(RENDER_W)),
+        "half": half,
+        "depth": _clamp(_fnum(d.get("depth"), 0.0), 0.0, target),
+        "target": target,
+        "y": _clamp(_fnum(d.get("y"), RENDER_H * 0.7), 0.0, float(RENDER_H)),
+        "seed": int(_fnum(d.get("seed"), 1.0)) & 0xFFFFF,
+    }
+
+
+def _clean_lava(d: dict[str, Any]) -> dict[str, Any]:
+    """Re-clamp one loaded flow back inside the caps that created it.
+
+    Every field is bounded by another: ``half`` cannot exceed the reach the vent
+    rolled, and ``paint`` - the debt this flow owes the material map - cannot
+    exceed the reach it has actually advanced to. A hand-edited save asking for
+    a 900 px flow would otherwise repaint most of the world to stone the moment
+    it started cooling.
+    """
+    cap = _clamp(_fnum(d.get("max"), LAVA_HALF_MAX), 0.0, LAVA_HALF_MAX)
+    half = _clamp(_fnum(d.get("half"), 0.0), 0.0, cap)
+    return {
+        "x": _clamp(_fnum(d.get("x"), RENDER_W * 0.5), 0.0, float(RENDER_W)),
+        "half": half,
+        "max": cap,
+        "hot": _clamp(_fnum(d.get("hot"), 0.0)),
+        "paint": _clamp(_fnum(d.get("paint"), 0.0), 0.0, half),
+        "y": _clamp(_fnum(d.get("y"), RENDER_H * 0.7), 0.0, float(RENDER_H)),
+        "seed": int(_fnum(d.get("seed"), 1.0)) & 0xFFFFF,
+    }
+
+
 def _extinguish(prop: Any) -> None:
     fn = getattr(prop, "extinguish", None)
     if callable(fn):
@@ -587,9 +1043,52 @@ class EventSystem:
         self.snow: float = 0.0                 # 0..1
         self.ash: float = 0.0                  # 0..1
         self.fog: float = 0.0                  # 0..1 mist density (renderer wash)
+        #: Colour of that wash. The haze is a *density* channel plus a colour so
+        #: one renderer path can serve every low-visibility scene: fog keeps the
+        #: grey it has always had, the sandstorm asks for tan, and anything added
+        #: later only has to name a colour. Published rather than derived from
+        #: ``scene`` in the renderer so the two cannot drift, and round-tripped
+        #: through to_dict so a save taken mid-storm reloads the same murk.
+        self.fog_color: tuple[int, int, int] = HAZE_GREY
+        #: 0..1 depth of the solar eclipse. Read by the sky (dark gradient,
+        #: stars, the occluded disc), by fx (the horizon twilight ring) and, via
+        #: _publish, by Lighting.ambient_dim - which is where the actual
+        #: darkness lives. Zero in every scene but SCENE_ECLIPSE.
+        self.eclipse: float = 0.0
+        #: 0..1 drought depth. One channel serves both halves of SCENE_HEATWAVE:
+        #: the renderer scales its ground shimmer by it, and ``_drought_hook``
+        #: turns it into the multiplier on ``world.regrowth_factor`` that stalls
+        #: every natural-recovery rate in props.py. Deliberately *one* field and
+        #: not two - the look and the economics are the same envelope, and a
+        #: second field would be a second thing to initialise here, clear in
+        #: _reset_scene_state and round-trip through to_dict, which is where this
+        #: file's renderer-facing channels have historically gone wrong. Zero in
+        #: every scene but the heatwave.
+        self.heat: float = 0.0
         self.gust: float = 0.0                 # 0..1 candle guttering strength
         self.water_level: float | None = None  # y of the flood line, or None
         self.quake_t: float = 0.0              # seconds of quake left
+        #: Open ground scars, as ``{x, half, depth, target, y, seed}``. Read by
+        #: the renderer (which darkens the notch the sim carved) and by
+        #: ``hazards`` (which makes villagers give them a wide berth while the
+        #: ground is moving). Only SCENE_EARTHQUAKE ever fills this; it is
+        #: cleared on every scene change, so the *terrain* keeps the scar but the
+        #: crack overlay leaves with the weather that made it.
+        self.fissures: list[dict[str, Any]] = []
+        #: Molten flows, as ``{x, half, max, hot, paint, y, seed}``. ``half`` is
+        #: how far the front has advanced either side of the vent, ``hot`` is
+        #: 1.0 while the vent feeds it and falls to zero as it congeals, and
+        #: ``paint`` is how much of the material map is currently claimed (so
+        #: the crust can be handed back to MAT_STONE from the outside in).
+        #: Read by the renderer (the emissive band and its light), by
+        #: ``hazards`` (villagers give the front a wide berth) and by
+        #: ``_lava_step`` (which burns whoever is standing in one).
+        #:
+        #: Unlike ``fissures`` this is *deliberately not cleared* on a scene
+        #: change - see _reset_scene_state. The flow is painted into the shared
+        #: material map, and dropping the bookkeeping would strand a permanent
+        #: lethal lava field there with nothing left alive to cool it.
+        self.lava: list[dict[str, Any]] = []
 
         # renderer-facing transients --------------------------------------
         self.pending: list[dict[str, Any]] = []
@@ -609,8 +1108,19 @@ class EventSystem:
         self.next_strike: float = self._rng.uniform(2.0, 6.0)
         self.next_meteor: float = self._rng.uniform(1.0, 3.0)
         self.next_ignite: float = 0.5
+        #: Earthquake pacing. Seeded off a plain constant rather than a draw from
+        #: ``_rng`` on purpose: an extra draw here (and in _reset_scene_state)
+        #: would shift the seeded stream every other scene rides, so identical
+        #: seeds would stop replaying identically the moment this scene existed.
+        self.next_tremor: float = QUAKE_LEAD_IN
+        self.tremor_mag: float = 0.0           # peak shake of the current tremor
+        self.tremor_len: float = 0.0           # ...and how long it was given
         self.snow_depth: float = 0.0
         self.ash_depth: float = 0.0
+        #: Like snow_depth and ash_depth this is *not* cleared on a scene change:
+        #: the drift is in the heightmap and the material map, and the ground
+        #: does not un-bury itself because the weather moved on.
+        self.sand_depth: float = 0.0
         self._snow_prev: list[int] | None = None
         self.slide_phase: str = "idle"
         self.slide_x0: float = 0.0
@@ -677,6 +1187,11 @@ class EventSystem:
                 self.shake_amp = 0.0
         self.rumble = max(0.0, self.rumble - dt * 0.8)
         self.fireflies = False
+        # Lava is a transient too - a slow one. It lives here rather than in the
+        # volcano handler on purpose: the flow is painted into the shared
+        # material map, so *something* has to keep cooling it after the rotation
+        # has moved on to a clear afternoon. See _lava_step.
+        self._lava_step(world, dt)
 
     def _tick_panic(self, world: Any, dt: float) -> None:
         """Run the panic clock down.
@@ -708,6 +1223,92 @@ class EventSystem:
                 lig.wind_gust = _clamp(self.gust)
             except Exception:
                 pass
+            try:
+                # Unconditional, every tick, in every scene - not inside the
+                # eclipse handler. That is what makes the eclipse impossible to
+                # leak: ``self.eclipse`` is zero everywhere else, so this writes
+                # 1.0 back the moment the shadow passes or the rotation moves on,
+                # and a save loaded mid-eclipse recomputes the right factor on its
+                # first tick without anyone re-deriving it.
+                lig.ambient_dim = 1.0 - ECLIPSE_MAX_DIM * _clamp(self.eclipse)
+            except Exception:
+                pass
+        # Unconditional, every tick, in every scene - for the reason spelled out
+        # above the eclipse line. The hook lifts itself when self.heat is zero,
+        # so a save loaded mid-drought re-installs it and any scene that follows
+        # one is guaranteed to get its economy back without having to know the
+        # heatwave ever existed.
+        self._drought_hook(world)
+
+    def _drought_hook(self, world: Any) -> None:
+        """Install (or lift) the drought multiplier on ``world.regrowth_factor``.
+
+        ``props.growth_factor(world)`` is the single funnel every natural
+        recovery rate in the sim goes through - sapling growth, berry regrow,
+        crop ripening and the reseeding that repopulates a stripped map - and it
+        resolves that rate by looking up ``regrowth_factor`` on the world and
+        calling it. Wrapping that one callable is therefore the entire economic
+        effect of the scene, with no edit to props.py or world.py and no second
+        channel for the two to disagree about.
+
+        Three details are load-bearing:
+
+        * The wrapper is a **callable**, not a plain number. ``growth_factor``
+          would happily accept a float attribute, but shadowing a method with a
+          float is a landmine for any future caller that writes
+          ``world.regrowth_factor()`` - it would raise TypeError inside
+          World._guarded and disable a whole subsystem for the session.
+        * It reads ``self.heat`` **live** rather than capturing a multiplier, so
+          the drought lifts the instant the field is zeroed, including on the
+          tick where _reset_scene_state runs after we have already published.
+        * It records the callable it replaced and refuses to stack, so a reload
+          (which builds a fresh EventSystem against the same World) replaces the
+          old wrapper instead of nesting a second drought inside it.
+
+        Fails soft in every direction: a world with no ``__dict__`` (slots, or a
+        test stub) simply gets no drought, which costs the scene its economics
+        and nothing else.
+        """
+        d = getattr(world, "__dict__", None)
+        if not isinstance(d, dict):
+            return
+        cur = d.get("regrowth_factor")
+        if getattr(cur, "_drought_owner", None) is self and self.heat > 0.0:
+            return                              # already installed, still wanted
+
+        # Peel off any wrapper - ours and no longer wanted, or a stale one left
+        # behind by the EventSystem a reload replaced - so that `cur` below is
+        # whatever the World genuinely had. Popping is the normal case: the real
+        # World defines regrowth_factor on the class, so an empty instance dict
+        # is what "no drought" looks like.
+        if getattr(cur, "_drought_owner", None) is not None:
+            prev = getattr(cur, "_drought_prev", None)
+            if prev is None:
+                d.pop("regrowth_factor", None)
+            else:
+                d["regrowth_factor"] = prev
+            cur = prev
+        if self.heat <= 0.0:
+            return
+
+        # Resolved only now the instance dict is clean, so this cannot pick up
+        # the wrapper we were about to replace and recurse into itself.
+        base = cur if cur is not None else getattr(world, "regrowth_factor", None)
+
+        def _drought(_base: Any = base, _ev: "EventSystem" = self) -> float:
+            raw = 1.0
+            if callable(_base):
+                try:
+                    raw = _fnum(_base(), 1.0)
+                except Exception:
+                    raw = 1.0
+            elif isinstance(_base, (int, float)) and not isinstance(_base, bool):
+                raw = float(_base)
+            return raw * max(0.0, 1.0 - HEAT_DROUGHT_DEPTH * _clamp(_ev.heat))
+
+        _drought._drought_owner = self          # type: ignore[attr-defined]
+        _drought._drought_prev = cur            # type: ignore[attr-defined]
+        d["regrowth_factor"] = _drought
 
     def _tick_pending(self, world: Any, dt: float) -> None:
         if not self.pending:
@@ -1000,6 +1601,299 @@ class EventSystem:
         self.fog = _approach(self.fog, 0.85 * self.intensity, 0.35, dt)
         self._melt_snow(world, dt)
 
+    # ====================================================== scene: eclipse ==
+    def _scene_eclipse(self, world: Any, dt: float) -> None:
+        """A bright day the sun is taken out of, and then given back.
+
+        Unlike every other scene in this file the eclipse is *timed*, not held:
+        it runs a slow ingress, a short totality and an egress off ``scene_t``
+        (see ``eclipse_strength``) and is finished inside two and a half minutes,
+        after which the slot plays out as ordinary daylight. Deliberately no
+        hazards, no accumulation, no panic and no deaths - the colony is meant to
+        walk out of this with the same headcount it walked in with. The only
+        thing that changes is the light, and the point of the scene is what that
+        does to the torches: ``_publish`` turns this channel into
+        ``Lighting.ambient_dim``, so the ambient the light composite runs against
+        collapses while every flame keeps its full brightness.
+
+        Note ``self.intensity`` is *not* used to gate the strength. The 6 s entry
+        envelope every other scene rides is invisible against a 60 s ingress, and
+        folding it in would mean the timeline no longer matched ``scene_t`` - the
+        one property that keeps this deterministic across a save/load.
+        """
+        self._approach_env(dt, rate=0.35)          # clear out any lingering rain
+        self._set_wind(dt, 0.18, 0.22, slow=0.13, fast=0.44)
+        self.ember_rate = 0.0
+        self.water_level = None
+        self.fog = _approach(self.fog, 0.0, 0.40, dt)
+        self._melt_snow(world, dt)
+
+        t1 = self.scene_t
+        t0 = max(0.0, t1 - dt)
+        self.eclipse = _clamp(eclipse_strength(t1))
+
+        # The world goes cold and steel-coloured as the light goes; back to
+        # neutral white as it returns.
+        k = self.eclipse
+        self.tint = (int(255 - 105 * k), int(255 - 87 * k), int(255 - 55 * k))
+        # False dusk: the fireflies are fooled, which is a real and very cheap
+        # detail - they come out at totality and go back in when the sun does.
+        self.fireflies = k > 0.75
+
+        # Beats are fired on *threshold crossings* rather than from a stored
+        # "have I said this yet" flag, so they need no extra field in __init__,
+        # no clearing in _reset_scene_state and no round-trip in to_dict - and a
+        # save loaded mid-eclipse silently skips the lines it already printed
+        # instead of repeating them.
+        hold_end = ECLIPSE_INGRESS + ECLIPSE_TOTALITY
+        if t0 < 2.0 <= t1:
+            _chronicle(world, "A shadow begins to eat the sun.")
+        if t0 < ECLIPSE_INGRESS <= t1:
+            _chronicle(world, "The sun goes dark.")
+        if t0 < hold_end <= t1:
+            _chronicle(world, "A sliver of light returns.")
+        if t0 < hold_end + ECLIPSE_EGRESS <= t1:
+            _chronicle(world, "The sun is whole again.")
+            # It has happened; there is nothing left for this scene to do. If
+            # auto-advance is on the weather may move along early, and if it is
+            # not, the 600 s rotation collects it in its own time.
+            self._want_advance = True
+
+    # =================================================== scene: earthquake ==
+    def _scene_earthquake(self, world: Any, dt: float) -> None:
+        """Long quiet, then a few violent seconds. The ground is the hazard.
+
+        The shape of the scene is a metronome with a very long gap: a tremor
+        arrives, swells, tears something and rolls off, and then nothing happens
+        for half a minute. Everything that makes it dangerous is bounded at the
+        point it is created rather than moderated afterwards - the scars have a
+        capped depth *and* a capped steepness (see QUAKE_FISSURE_*), buildings
+        have a damage floor they cannot be taken below, and boulders are the only
+        thing let loose that can move on its own.
+
+        The reason it is written that way: this map's fall system is lethal and
+        the panic flag makes agents walk off ledges they would otherwise refuse,
+        so a terrain-deforming scene that tunes for "usually survivable" ends up
+        killing by accident on the one seed that stacks two scars. A scene that
+        *cannot* carve a lethal drop needs no luck.
+        """
+        # Dust, not weather: the ash channel is borrowed purely as a particle
+        # budget (no _accumulate call, so nothing settles on the ground). It
+        # kicks up fast when the ground moves and hangs in the air afterwards,
+        # which is why the two rates are so far apart.
+        shaking = self.quake_t > 0.0
+        dust = 0.60 * _clamp(self.tremor_mag / QUAKE_MAG_MAX) if shaking else 0.0
+        self._approach_env(dt, ash=dust, rate=1.2 if shaking else 0.16)
+        self._set_wind(dt, 0.16, 0.20, slow=0.11, fast=0.37)
+        self.tint = (232, 208, 172)
+        self.ember_rate = 0.0
+        self.water_level = None
+        self.fireflies = False
+        self.fog = _approach(self.fog, 0.0, 0.40, dt)
+        self._melt_snow(world, dt)
+        # No _expire_panic call, because nothing here raises the flag. The
+        # scenes that do have to lower it again; a scene that does not would
+        # only be draining somebody else's fright (an animal's, the saucer's)
+        # at double rate for no reason - tick() already runs _tick_panic.
+
+        if shaking:
+            self._tremor_shake()
+        else:
+            self.tremor_mag = 0.0
+            self.next_tremor -= dt * (0.4 + 0.6 * self.intensity)
+            if self.next_tremor <= 0.0:
+                self._start_tremor(world)
+        self._open_fissures(world, dt)
+
+    def _start_tremor(self, world: Any) -> None:
+        """Kick off one tremor and apply everything it does in the same instant.
+
+        The damage is one-shot at the leading edge rather than spread over the
+        shaking, because that is what a shock *is*: the buildings crack when it
+        arrives, and the rest of the tremor is the world ringing afterwards.
+        """
+        mag = self._rng.uniform(QUAKE_MAG_MIN, QUAKE_MAG_MAX)
+        self.tremor_mag = mag
+        self.tremor_len = self._rng.uniform(QUAKE_TREMOR_MIN, QUAKE_TREMOR_MAX)
+        self.next_tremor = self._rng.uniform(QUAKE_REST_MIN, QUAKE_REST_MAX)
+        self.trigger_quake(world, self.tremor_len, mag)
+
+        # Epicentres favour where people are, for the same reason the mudslide
+        # aims: a scene whose every event lands on empty hillside is a screen
+        # saver. It is safe to aim here in a way it is not there, because
+        # nothing this method does can kill - the worst outcome is a cracked hut
+        # and a scar somebody has to walk round.
+        epi = self._rng.uniform(60.0, RENDER_W - 60.0)
+        crowd = _agents(world)
+        if crowd and self._rng.random() < 0.7:
+            who = crowd[self._rng.randrange(len(crowd))]
+            epi = _clamp(_fnum(getattr(who, "x", epi), epi)
+                         + self._rng.uniform(-120.0, 120.0), 60.0, RENDER_W - 60.0)
+
+        if mag < QUAKE_BIG_MAG:
+            self._shake_props(world, epi, mag * 0.45)
+            return
+
+        opened = self._open_fissure(world, epi)
+        cracked = self._shake_structures(world, epi, mag)
+        self._shake_props(world, epi, mag)
+        # One line per tremor would flush the 10-entry chronicle in three
+        # minutes, so only the big ones speak, and they say which kind of big.
+        if opened:
+            _chronicle(world, "The ground tears open with a crack like thunder.")
+        elif cracked:
+            _chronicle(world, "A violent tremor shakes the settlement.")
+        else:
+            _chronicle(world, "The whole valley shudders.")
+
+    def _tremor_shake(self) -> None:
+        """The shake envelope, per tick, while the ground is moving. That is the
+        whole of it: everything this scene does to people goes through
+        hazards(), and everything it does to the world happened at the shock."""
+        # quake_t counts *down*, so this runs 1 -> 0 across the tremor. A flat
+        # amplitude reads as a stuck renderer; a half-sine arrives, peaks and
+        # rolls off the way a real shock does. The 0.25 floor keeps the ground
+        # alive at both ends instead of fading to a dead stop.
+        left = _clamp(self.quake_t / max(0.2, self.tremor_len))
+        env = 0.25 + 0.75 * math.sin(math.pi * _clamp(1.0 - left))
+        self.add_shake(self.tremor_mag * env)
+
+    def _open_fissure(self, world: Any, x: float) -> bool:
+        """Register a new scar near *x*. Returns True if one actually opened.
+
+        Nothing is deformed here - the scar is recorded with ``depth`` 0 and a
+        capped ``target``, and ``_open_fissures`` tears it down to that over
+        QUAKE_FISSURE_OPEN_SEC. Splitting it that way is what lets the ground be
+        seen opening rather than blinking into its final shape.
+        """
+        if len(self.fissures) >= QUAKE_FISSURE_MAX:
+            return False
+        half = self._rng.uniform(QUAKE_FISSURE_HALF_MIN, QUAKE_FISSURE_HALF_MAX)
+        cx = _clamp(x + self._rng.uniform(-90.0, 90.0),
+                    half + 10.0, RENDER_W - half - 10.0)
+        for f in self.fissures:
+            if abs(_fnum(f.get("x"), -1e9) - cx) < QUAKE_FISSURE_GAP:
+                return False                    # would merge into a trench
+        if self._already_hollow(world, cx, half):
+            return False                        # do not dig an old hole deeper
+        self.fissures.append({
+            "x": float(cx), "half": float(half), "depth": 0.0,
+            "target": float(min(QUAKE_FISSURE_DEPTH_MAX, half * QUAKE_FISSURE_ASPECT)),
+            "y": float(_ground_y(world, cx)),
+            "seed": int(self._rng.randrange(1 << 20)),
+        })
+        return True
+
+    @staticmethod
+    def _already_hollow(world: Any, cx: float, half: float) -> bool:
+        """True if the ground at *cx* already sits in a dip of its own.
+
+        Measured against the two shoulders just outside the span rather than
+        against any absolute height, so it is slope-neutral: an honest hillside
+        passes, an old crater or a scar from a previous run of this scene does
+        not. Without it a long session pockmarks the same low ground over and
+        over until the cap that bounds a *single* fissure stops meaning anything.
+        """
+        gy = _ground_y(world, cx)
+        shoulder = 0.5 * (_ground_y(world, cx - half * 2.5)
+                          + _ground_y(world, cx + half * 2.5))
+        return (gy - shoulder) > QUAKE_FISSURE_SINK
+
+    def _open_fissures(self, world: Any, dt: float) -> None:
+        """Deepen every scar that has not finished opening. Idempotent once they
+        have: a fissure at its target is never deformed again, which is what
+        keeps a 600 s scene from grinding a 26 px notch into a canyon."""
+        if not self.fissures:
+            return
+        rate = QUAKE_FISSURE_DEPTH_MAX / max(0.2, QUAKE_FISSURE_OPEN_SEC)
+        for f in self.fissures:
+            depth = _fnum(f.get("depth"), 0.0)
+            target = min(QUAKE_FISSURE_DEPTH_MAX, _fnum(f.get("target"), 0.0))
+            if depth >= target - 1e-3:
+                continue
+            step = min(target - depth, rate * dt)
+            cx = _fnum(f.get("x"), 0.0)
+            half = max(4.0, _fnum(f.get("half"), 8.0))
+            # +dy digs. The 'smooth' blend Terrain.deform defaults to is doing
+            # the real safety work here: it ramps the walls over half the span
+            # instead of cutting a vertical step an agent can fall down.
+            _deform(world, cx - half, cx + half, step)
+            _paint(world, cx - half * 0.6, cx + half * 0.6, MAT_STONE)
+            f["depth"] = depth + step
+
+    def _shake_structures(self, world: Any, x: float, mag: float) -> int:
+        """Crack the buildings near the epicentre. Returns how many took damage.
+
+        Never demolishes: QUAKE_STRUCT_FLOOR is the share of max hp below which
+        this refuses to push a structure, so an unlucky run of tremors leaves a
+        settlement of cracked huts to repair rather than a field of rubble.
+        """
+        span = max(1.0, QUAKE_MAG_MAX - QUAKE_BIG_MAG)
+        scale = _clamp((mag - QUAKE_BIG_MAG) / span, 0.35, 1.0)
+        hurt = 0
+        for st in _iter(world, ("structures",)):
+            if not getattr(st, "built", False) or getattr(st, "is_ruined", False):
+                continue
+            d = abs(_fnum(getattr(st, "x", 1e9), 1e9) - x)
+            if d > QUAKE_DAMAGE_R:
+                continue
+            max_hp = max(1.0, _fnum(getattr(st, "max_hp", 60.0), 60.0))
+            hp = _fnum(getattr(st, "hp", max_hp), max_hp)
+            amount = max_hp * QUAKE_STRUCT_FRAC * scale * (1.0 - d / QUAKE_DAMAGE_R)
+            amount = min(amount, hp - max_hp * QUAKE_STRUCT_FLOOR)
+            if amount < 0.5:
+                continue
+            fn = getattr(st, "damage", None)
+            if not callable(fn):
+                continue
+            try:
+                fn(float(amount), "earthquake")
+            except TypeError:
+                try:
+                    fn(float(amount))
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            hurt += 1
+        return hurt
+
+    def _shake_props(self, world: Any, x: float, mag: float) -> None:
+        """Knock the loose furniture about: boulders roll, everything else whips.
+
+        Boulders are the one thing here that keeps moving after the tremor -
+        props.py already runs them downhill and lets them smash what they hit -
+        so they are rationed hard (QUAKE_BOULDER_MAX per tremor) and only the
+        ones genuinely near the epicentre go.
+        """
+        strength = _clamp(mag / QUAKE_MAG_MAX)
+        rolled = 0
+        for p in _iter(world, ("props",)):
+            if not getattr(p, "alive", True):
+                continue
+            px = _fnum(getattr(p, "x", 1e9), 1e9)
+            d = abs(px - x)
+            if d > QUAKE_BOULDER_R:
+                continue
+            near = 1.0 - d / QUAKE_BOULDER_R
+            if str(getattr(p, "kind", "")) == "boulder":
+                if rolled >= QUAKE_BOULDER_MAX or self._rng.random() > near * strength:
+                    continue
+                push = self._rng.uniform(45.0, 110.0) * strength
+                if _nudge_boulder(p, push if px >= x else -push):
+                    rolled += 1
+                continue
+            # Trees and bushes just thrash. props.tick bleeds ``sway`` off on
+            # its own, so this needs no cleanup and cannot leak into the next
+            # scene the way a deformation would.
+            state = getattr(p, "state", None)
+            if isinstance(state, dict):
+                try:
+                    state["sway"] = min(1.0, _fnum(state.get("sway"), 0.0)
+                                        + 0.7 * near * strength)
+                except Exception:
+                    continue
+
     # ===================================================== scene: wildfire ==
     def _scene_wildfire(self, world: Any, dt: float) -> None:
         self._approach_env(dt, rate=0.6)
@@ -1040,7 +1934,11 @@ class EventSystem:
         """Everything currently alight, prop or structure, in any scene."""
         return [p for p in _props(world) if self._is_alight(p)]
 
-    def _fire_harms_agents(self, world: Any, dt: float, burning: list[Any]) -> None:
+    def _fire_harms_agents(self, world: Any, dt: float, burning: list[Any],
+                           extra: list[tuple[float, float]] | None = None,
+                           phrase: str = "burned in the wildfire.",
+                           panic: bool = True, shelters: bool = False,
+                           lethal_sec: float = BURN_DEATH_SEC) -> None:
         """Burn anyone standing in the flames; scare anyone merely near them.
 
         Contact is measured as a *horizontal* reach with a loose vertical sanity
@@ -1048,18 +1946,58 @@ class EventSystem:
         slope - which is most of this map - an agent sharing a tree's column was
         already 20-30px "away" and never accumulated a single burn tick, so
         ``BURN_DEATH_SEC`` was unreachable and feature 30 never fired.
+
+        *extra* is a list of bare ``(x, y)`` hot spots with no object behind
+        them, and *phrase* is what the chronicle says when one of them kills.
+        Together they are what lets the volcano's lava front reuse this path
+        rather than grow a second damage model beside it: a flow is sampled into
+        a row of points (see ``_lava_points``) and burns at exactly the rate,
+        reach and forgiveness a wildfire does.
+
+        *panic* exists for the same caller and is the difference between a
+        dangerous scene and a lethal one. A wildfire is a handful of *points*, so
+        the FLEE_DIST ring around it is small and the reckless flag it raises
+        costs a life now and then. A lava front is a continuous *line* up to
+        300 px long, so the same ring is a band across a fifth of the map with
+        the whole colony inside it, panicking every tick - and a panicking
+        stickman is allowed over ledges a calm one refuses. Measured over four
+        seeds x 600 s of eruption: falls came out at 5, 22, 4 and 17 against a
+        clear-sky control's 1, 5, 1 and 6, with only 14 lava deaths between them.
+        The lava was killing three people by cliff for every one it burned. It
+        passes ``panic=False`` and leans on ``hazards`` instead, which walks
+        people out of the way without making them careless - the lesson
+        SCENE_EARTHQUAKE and _warn_slide both wrote down before this.
+
+        *shelters* says a roof counts, and exists because a sleeper cannot save
+        himself: behaviour explicitly refuses to interrupt Sleep for anything,
+        so an agent in a hut the flow reaches would burn in his bed with no
+        decision available to him - which is the one death this scene is not
+        allowed to hand out. The lava damages the *building* instead (see
+        ``_lava_consumes``); its collapse evicts the occupants onto the ground,
+        awake, and from there they burn like everybody else. Off by default,
+        because a wildfire burning a hut down around its sleepers is exactly
+        what a wildfire is for.
+
+        *lethal_sec* is the contact time before it kills. Molten rock is not a
+        campfire and the two should not share a fuse: BURN_DEATH_SEC is tuned so
+        that brushing past a burning tree is survivable, which is right for a
+        tree and absurd for a lava flow.
         """
         fires = [(_fnum(getattr(p, "x", 1e9), 1e9), _fnum(getattr(p, "y", 1e9), 1e9))
                  for p in burning]
+        if extra:
+            fires.extend(extra)
         if not fires:
             return
         for ag in _agents(world):
+            if shelters and getattr(ag, "inside", None) is not None:
+                continue                        # under a roof; see the docstring
             aid = _aid(ag)
             ax = _fnum(getattr(ag, "x", 1e9), 1e9)
             ay = _fnum(getattr(ag, "y", 1e9), 1e9)
             fx, fy = min(fires, key=lambda f: abs(ax - f[0]))
             gap = abs(ax - fx)
-            if gap < FLEE_DIST:
+            if panic and gap < FLEE_DIST:
                 away = ax + (140.0 if ax >= fx else -140.0)
                 _panic(world, ag, away, BURN_PANIC, "fire")
             if aid is None:
@@ -1076,11 +2014,11 @@ class EventSystem:
                     ag.morale = _clamp(_fnum(getattr(ag, "morale", 0.5), 0.5) - dt * 0.25)
                 except Exception:
                     pass
-                if burnt >= BURN_DEATH_SEC:
+                if burnt >= lethal_sec:
                     self._burning.pop(aid, None)
                     if _kill(world, ag, "fire"):
                         _chronicle(world, f"{getattr(ag, 'name', 'A stickman')} "
-                                          f"burned in the wildfire.")
+                                          f"{phrase}")
             elif aid in self._burning:
                 # Getting clear is survivable: the timer bleeds off faster than
                 # it filled, so anyone who runs within a second or two lives.
@@ -1261,16 +2199,296 @@ class EventSystem:
                 except Exception:
                     break
 
+    # ==================================================== scene: sandstorm ==
+    def _scene_sandstorm(self, world: Any, dt: float) -> None:
+        """The arid sibling of the blizzard: no visibility, hard driving wind,
+        and sand piling up against everything.
+
+        Structurally it is the blizzard - the same ``_accumulate`` drift, with
+        MAT_SAND instead of MAT_SNOW - crossed with the fog scene's haze wash,
+        now carrying a colour so this one comes out tan. What is deliberately
+        *not* borrowed is the blizzard's lethality. A blizzard kills through the
+        ``warmth`` need, which is a real clock with a real death at the end of
+        it; this scene has no equivalent, and it should not grow one. It is an
+        atmosphere piece: the cost of a sandstorm is that the colony spends ten
+        minutes working blind, at reduced light, with the drift swallowing the
+        ground - not a pile of bodies.
+
+        Nothing here sets ``agent.panic`` and nothing publishes a hazard, both
+        for the reason SCENE_EARTHQUAKE writes out at length: the panic flag
+        lets an agent walk off drops it would otherwise refuse, and this map
+        kills by falling. A hazard would be no better - the storm is the whole
+        map, so there is nowhere for ``hazards_of`` to send anybody.
+        """
+        # No precipitation channel at all: the grit is airborne, not falling, so
+        # rain/snow/ash all bleed to zero and the renderer draws the blowing
+        # particles off the wind and the haze instead.
+        self._approach_env(dt, rate=0.40)
+        self._sand_wind(dt)
+        self.tint = (228, 190, 128)
+        self.ember_rate = 0.0
+        self.water_level = None
+        self.fireflies = False          # nothing flies in this
+
+        # Visibility. Same wash the fog scene uses, asked for in tan.
+        self.fog = _approach(self.fog, SAND_HAZE * self.intensity, 0.30, dt)
+        self.fog_color = HAZE_SAND
+
+        # Melt first, then drift. _melt_snow only repaints columns that are
+        # still MAT_SNOW, so a column the sand has already claimed is left
+        # alone: the desert buries last week's blizzard rather than the thaw
+        # undoing this scene's own work a tick after it lands.
+        self._melt_snow(world, dt)
+        self.sand_depth = self._accumulate(world, dt, MAT_SAND, self.sand_depth,
+                                           SAND_MAX_DEPTH, SAND_RATE, False)
+
+        self._sand_scours(world, dt)
+        self._sand_smothers(world, dt)
+
+        # Beats on threshold crossings of scene_t, exactly as the eclipse does
+        # them: no "have I said this" flag to add to __init__, to clear in
+        # _reset_scene_state and to round-trip, and a save loaded mid-storm
+        # silently skips the lines it has already printed instead of repeating
+        # them into a 10-entry chronicle.
+        t1 = self.scene_t
+        t0 = max(0.0, t1 - dt)
+        if t0 < 3.0 <= t1:
+            _chronicle(world, "The horizon turns brown. Sand is coming.")
+        if t0 < 75.0 <= t1:
+            _chronicle(world, "Grit hisses against everything that stands.")
+
+    def _sand_wind(self, dt: float) -> None:
+        """Drive the wind hard, and drive it *one way*.
+
+        ``_set_wind`` builds its target from ``_noise``, which is signed and
+        crosses zero every few seconds - right for weather that merely blows
+        about, wrong for a storm front, which reads as a broken desk fan if it
+        reverses twice a minute. So the direction is fixed for the whole scene
+        and only the strength is modulated.
+
+        The direction comes off ``self.seed`` rather than a draw from ``_rng``.
+        Two reasons, both learned elsewhere in this file: a draw would shift the
+        seeded stream every other scene rides, and a stored field would need
+        clearing and round-tripping. A bit of the seed costs nothing, replays
+        identically, and survives a save/load with no new state - at the price
+        that one world always has the same prevailing wind, which is a feature.
+        """
+        sign = 1.0 if (self.seed >> 11) & 1 else -1.0
+        # 0.62..1.0 of full strength: it surges and eases, but never lets go.
+        surge = 0.62 + 0.38 * (0.5 + 0.5 * self._noise(0.33, 1.61))
+        target = sign * _clamp(SAND_WIND * surge) * self.intensity
+        self.wind = _approach(self.wind, target, 1.2, dt)
+        # Gust rides a faster beat than the wind so the torches gutter *within*
+        # a squall rather than only between them.
+        g = 0.5 + 0.5 * math.sin(self.t * 2.9 + 0.4)
+        self.gust = _clamp(abs(self.wind) * (0.45 + 0.55 * g) * SAND_GUST)
+
+    def _sand_scours(self, world: Any, dt: float) -> None:
+        """Sting anyone caught in the open while a squall is up.
+
+        Hard-bounded rather than tuned: the damage taken is capped at whatever
+        would bring the agent down to SAND_HEALTH_FLOOR, so the arithmetic makes
+        a sandstorm death impossible instead of merely unlikely. That matters
+        more than the rate does - the rate only decides how quickly somebody
+        reaches a floor they cannot pass.
+
+        Being indoors is complete cover, which is the one behavioural texture
+        the scene has: the colony does not need new AI to look like it is
+        sheltering, because the villagers who happen to be inside visibly come
+        out unmarked.
+        """
+        if self.gust < SAND_STING_GUST:
+            return
+        bite = SAND_STING_RATE * dt * self.intensity
+        if bite <= 0.0:
+            return
+        for ag in _agents(world):
+            try:
+                if getattr(ag, "inside", None) is not None:
+                    continue            # under a roof; the grit cannot reach
+                hp = _fnum(getattr(ag, "health", 0.0), 0.0)
+                take = min(bite, hp - SAND_HEALTH_FLOOR)
+                if take <= 0.0:
+                    continue
+                hurt = getattr(ag, "hurt", None)
+                if callable(hurt):
+                    # Armour applies, so a hide cloak takes even less than the
+                    # cap - which can only ever push health further above it.
+                    hurt(take, "sandstorm")
+                else:
+                    ag.health = hp - take
+            except Exception:
+                break                   # an unfamiliar agent shape: stop, quietly
+
+    def _sand_smothers(self, world: Any, dt: float) -> None:
+        """Sand puts fires out, the way rain does in the storm scene.
+
+        Same shape as ``_rain_douses`` - one prop per successful roll, so a
+        hillside of burning trees goes out over a minute rather than all at once
+        - and it is the only thing in this scene that helps the colony. A
+        wildfire rolling into a sandstorm should end.
+        """
+        if self.intensity < 0.35:
+            return
+        if self._rng.random() > dt * 0.30 * self.intensity:
+            return
+        for p in _props(world):
+            if self._is_alight(p):      # structures included - they burn too
+                _extinguish(p)
+                break
+
+    # ===================================================== scene: heatwave ==
+    def _scene_heatwave(self, world: Any, dt: float) -> None:
+        """A glaring, motionless drought. The scene that bites the economy.
+
+        Every other disaster in this file is paid for in bodies. This one is
+        paid for in *time*: nothing explodes, nobody drowns, and the colony
+        simply stops being able to live off the land. The drought multiplier
+        (see ``_drought_hook``) throttles every natural recovery rate in
+        props.py, so berries stop coming back, crops stop ripening and a felled
+        map stops reseeding itself; meanwhile ``_heat_saps`` makes everyone tired
+        sooner, which they answer by sleeping, which is more time not gathering.
+        The colony has to eat its stockpile, and the interesting question for ten
+        minutes is whether it built one.
+
+        Two deliberate softenings keep that from becoming a wipe. Hunger is not
+        touched at all - it is one of the two needs that actually kills, and a
+        scene that both stops the food growing *and* speeds the clock down to
+        starvation would compound into an extinction on any seed that started
+        lean. And warmth is pushed the other way: it is sweltering, so nobody is
+        cold, day or night, which is a genuine gift on a map where a clear night
+        pulls the whole colony off work and around the firepit.
+
+        Nothing here sets ``agent.panic`` directly. The only thing that can is a
+        brush fire, which ``_heat_ignites`` allows at a third of the wildfire
+        scene's rate and only once the drought is deep.
+        """
+        wt = _fnum(getattr(world, "world_time", self.t), self.t)
+        # Bone dry: every precipitation channel is driven to zero, faster than
+        # any other scene does it, because a rain shower bleeding out over the
+        # first few seconds of a drought reads as a mistake.
+        self._approach_env(dt, rate=0.50)
+        # Barely moving air. The stillness is half the look: it is the only
+        # scene in the file with no particles, no haze and no wind to watch, so
+        # the flat calm is what tells you something is wrong.
+        self._set_wind(dt, 0.08, 0.10, slow=0.06, fast=0.23)
+        self.tint = (255, 238, 196)
+        self.ember_rate = 0.0
+        self.water_level = None
+        self.fog = _approach(self.fog, 0.0, 0.40, dt)
+        self.fireflies = is_night(wt)      # a hot still night is exactly their weather
+        # Whatever the last blizzard left goes fast. _melt_snow takes dt as a
+        # plain scale, so the multiplier costs nothing and a heatwave landing on
+        # a white map strips it inside a minute, which is a better transition
+        # than watching snow sit under a white-hot sky for ten of them.
+        self._melt_snow(world, dt * HEAT_THAW_MUL)
+
+        # The drought envelope. Chases ``intensity`` (itself a 6 s ramp) but at
+        # a 45 s rate, so the economic effect arrives slowly enough that the
+        # colony's food curve bends rather than snapping. Everything else in the
+        # scene - the shimmer, the fatigue, the ignition gate - hangs off this
+        # one number, so they all ramp together.
+        self.heat = _approach(self.heat, self.intensity, 1.0 / HEAT_RAMP_SEC, dt)
+
+        self._heat_saps(world, dt)
+        self._heat_ignites(world, dt)
+        burning = self._burning_props(world)
+        if burning:
+            # Same contact model the wildfire uses, reached far less often. A
+            # fire nobody can be hurt by is scenery, and this scene has exactly
+            # one danger in it.
+            self._fire_harms_agents(world, dt, burning)
+
+        # Beats on threshold crossings of scene_t, as the eclipse and sandstorm
+        # do them: no "have I said this" flag to add to __init__, clear in
+        # _reset_scene_state and round-trip, and a save loaded mid-drought skips
+        # the lines it has already printed rather than repeating them.
+        t1 = self.scene_t
+        t0 = max(0.0, t1 - dt)
+        if t0 < 4.0 <= t1:
+            _chronicle(world, "The wind dies and the light turns white.")
+        if t0 < 100.0 <= t1:
+            _chronicle(world, "The ground is cracking. Nothing is growing.")
+        if t0 < 340.0 <= t1:
+            _chronicle(world, "The colony is eating into its stores.")
+
+    def _heat_saps(self, world: Any, dt: float) -> None:
+        """Tire everyone out in the sun, and take the cold away from everyone.
+
+        The fatigue is hard-capped rather than tuned, in the shape
+        ``_sand_scours`` uses for health: the heat can carry an agent up to
+        HEAT_FATIGUE_CAP and no further, so it can never be the thing that pins
+        a villager at 1.0 and drops them where they stand. That matters more
+        than the rate does - a colony asleep in a field is a colony that has
+        stopped gathering, which would turn an economic scene into a starvation
+        one by the back door.
+
+        Shade is complete cover, exactly as it is for the sandstorm's grit, and
+        for the same reason: it gives the scene a behavioural texture for free.
+        The villagers who happen to be indoors come out rested, so the huts
+        visibly earn their keep without a line of new AI.
+        """
+        k = self.heat
+        if k <= 0.0:
+            return
+        tire = HEAT_FATIGUE_RATE * k * dt
+        # Negative in this scene: exposure_rate is signed, and the heatwave is
+        # the only entry that gives warmth back rather than taking it.
+        chill = self.exposure_rate() * dt
+        for ag in _agents(world):
+            try:
+                if tire > 0.0 and getattr(ag, "inside", None) is None:
+                    fat = _fnum(getattr(ag, "fatigue", 0.0), 0.0)
+                    if fat < HEAT_FATIGUE_CAP:
+                        ag.fatigue = min(HEAT_FATIGUE_CAP, fat + tire)
+                if chill != 0.0:
+                    ag.warmth = _clamp(_fnum(getattr(ag, "warmth", 0.0), 0.0) + chill)
+            except Exception:
+                break                   # an unfamiliar agent shape: stop, quietly
+
+    def _heat_ignites(self, world: Any, dt: float) -> None:
+        """Occasionally set the dry brush alight.
+
+        Reuses ``next_ignite``, which already exists, is already cleared in
+        _reset_scene_state and is already round-tripped - so the scene's only
+        stochastic element needs no new state. The timer is rolled on every
+        attempt whether or not the fire actually starts, which is what keeps the
+        draws on ``_rng`` at a fixed cadence: a gate that skipped the draw would
+        make the seeded stream depend on the drought depth.
+
+        One fire at a time. props.py runs its own spread, so a single ignition
+        is a fire *front*, not a burnt bush, and the wood it eats is wood the
+        colony never gets to build with - which is this scene's currency anyway.
+        """
+        self.next_ignite -= dt
+        if self.next_ignite > 0.0:
+            return
+        self.next_ignite = self._rng.uniform(HEAT_IGNITE_MIN, HEAT_IGNITE_MAX)
+        if self.heat < HEAT_IGNITE_HEAT:
+            return                      # not dry enough yet; the brush will not take
+        if self._burning_props(world):
+            return                      # something is already alight; let it run
+        x = self._rng.uniform(40.0, RENDER_W - 40.0)
+        # A short reach, unlike the wildfire's map-wide search: a drought fire
+        # starts where the brush happens to be, not wherever the map's last
+        # flammable thing is standing.
+        p = _nearest_flammable(world, x, 240.0)
+        if p is not None and _ignite(world, p):
+            _chronicle(world, "Dry brush catches alight in the heat.")
+
     def exposure_rate(self) -> float:
         """Extra ``warmth`` (0..1, 1 = freezing) per second from the weather.
 
-        Already applied by ``tick``; exposed for UI/telemetry so entities.py
-        does not need to apply it a second time.
+        Signed: negative means the weather is *warming* people, which only the
+        heatwave does. Already applied by ``tick``; exposed for UI/telemetry so
+        entities.py does not need to apply it a second time.
         """
         if self.scene == SCENE_BLIZZARD:
             return 0.012 * self.intensity
         if self.scene == SCENE_NIGHT_STORM:
             return 0.004 * self.rain
+        if self.scene == SCENE_HEATWAVE:
+            return -HEAT_RELIEF_RATE * self.heat
         return 0.0
 
     # ======================================================== scene: flood ==
@@ -1478,6 +2696,34 @@ class EventSystem:
             out.append({"kind": "meteor", "x": _fnum(m.get("x1"), RENDER_W * 0.5),
                         "y": _fnum(m.get("y1"), RENDER_H * 0.7),
                         "radius": METEOR_WARN_R})
+        # A scar is only frightening while the ground is actually moving. Once
+        # the tremor passes it is just difficult terrain, and villagers have to
+        # be allowed to walk back over it or half the map goes permanently
+        # out of bounds for the rest of the scene.
+        if self.quake_t > 0.0:
+            for f in self.fissures:
+                if not isinstance(f, dict):
+                    continue
+                out.append({"kind": "quake", "x": _fnum(f.get("x"), RENDER_W * 0.5),
+                            "y": _fnum(f.get("y"), RENDER_H * 0.7),
+                            "radius": QUAKE_HAZARD_R + _fnum(f.get("half"), 0.0)})
+        # Lava, in *any* scene - not just the volcano. A flow left cooling by the
+        # scene before this one is still hot enough to kill for the best part of
+        # a minute, and a hazard that vanished with the weather would leave the
+        # colony walking cheerfully back into it. The ring shrinks with the flow
+        # as it congeals and stops being published at all once the crust closes
+        # (LAVA_LETHAL_HEAT), which is the same test the burn path uses - the
+        # thing they run from and the thing that hurts them cannot disagree.
+        for f in self.lava:
+            if not isinstance(f, dict):
+                continue
+            hot = _clamp(_fnum(f.get("hot"), 0.0))
+            if hot < LAVA_LETHAL_HEAT:
+                continue
+            reach = max(0.0, _fnum(f.get("half"), 0.0) * hot)
+            out.append({"kind": "lava", "x": _fnum(f.get("x"), RENDER_W * 0.5),
+                        "y": _fnum(f.get("y"), RENDER_H * 0.7),
+                        "radius": reach + LAVA_HAZARD_PAD})
         return out
 
     def _expire_panic(self, world: Any, dt: float) -> None:
@@ -1506,6 +2752,367 @@ class EventSystem:
         self.ash_depth = self._accumulate(world, dt, MAT_ASH, self.ash_depth,
                                           ASH_MAX_DEPTH, ASH_RATE, False)
 
+    # ====================================================== scene: volcano ==
+    def _scene_volcano(self, world: Any, dt: float) -> None:
+        """The ashfall scene with the vent still open, and lava coming out of it.
+
+        Two things happen at once and they are deliberately separate. The *air*
+        is an escalation of SCENE_ASHFALL - heavier fall, a red-black sky, a dark
+        haze, embers - and costs the colony nothing but visibility. The *ground*
+        is the hazard: a vent opens away from the settlement and crawls outward
+        at a thirtieth of walking pace, painting MAT_LAVA as it goes.
+
+        That asymmetry is the design. The spectacle is free and constant, so the
+        scene reads from across the room for its whole ten minutes; the danger is
+        slow, local and telegraphed by a chronicle beat and a quake, so the cost
+        of it is measured in the jobs the colony abandons rather than in bodies.
+        Anyone who stands in it dies - through the wildfire's own burn path, at
+        the wildfire's own contact time - and ``hazards`` tells the AI where it
+        is, so anyone who is merely near it leaves.
+
+        Everything to do with the flow itself lives in ``_lava_step``, which runs
+        from the shared per-tick path in every scene. This handler only decides
+        *when* the ground opens; the cleanup is not its business, and that is
+        what makes the cleanup impossible to forget.
+        """
+        # Air. Ash on the ashfall scene's own channel and ceiling, just faster.
+        self._approach_env(dt, ash=1.0, rate=0.35)
+        self._set_wind(dt, 0.50, 0.62, slow=0.19, fast=0.83)
+        self.tint = (255, 104, 62)
+        self.ember_rate = 0.60 + 0.40 * self.intensity
+        self.water_level = None
+        self.fireflies = False          # nothing comes out in this
+        self.fog = _approach(self.fog, VOLCANO_HAZE * self.intensity, 0.25, dt)
+        self.fog_color = HAZE_EMBER
+        self._melt_snow(world, dt * VOLCANO_THAW_MUL)
+        self.ash_depth = self._accumulate(world, dt, MAT_ASH, self.ash_depth,
+                                          ASH_MAX_DEPTH, ASH_RATE * VOLCANO_ASH_MUL,
+                                          False)
+        # _accumulate repaints a growing share of *random* columns, and some of
+        # them are columns the flow already owns, so the lava is re-asserted
+        # after it. Without this the front comes out speckled with ash the tick
+        # it is drawn - the two are writing to the same array.
+        for f in self.lava:
+            self._lava_paint(world, f)
+
+        # Ground. Beats on threshold crossings of scene_t, the shape the eclipse
+        # and the sandstorm use: no "have I erupted yet" flag to add to
+        # __init__, to clear in _reset_scene_state and to round-trip, and a save
+        # loaded past a beat quietly skips it instead of firing it twice.
+        t1 = self.scene_t
+        t0 = max(0.0, t1 - dt)
+        if t0 < 2.0 <= t1:
+            _chronicle(world, "The sky goes the colour of a burn. Ash begins to fall.")
+        if t0 < VOLCANO_ERUPT_AT <= t1:
+            self._erupt(world, "The ground splits open and lava comes out of it.")
+        if t0 < VOLCANO_SECOND_VENT_AT <= t1:
+            self._erupt(world, "A second vent tears open. The flow has them from two sides.")
+
+        # ...and the rumble between them. Pulsed rather than constant: the
+        # earthquake scene learned that continuous shaking reads as a broken
+        # renderer, and this one runs for the full slot. ``** 3`` on a slow sine
+        # gives a swell every seventy seconds that is only really felt for about
+        # ten of them, so most of the scene is still. Off ``self.t`` rather than
+        # ``scene_t`` so two eruptions in a row do not beat in lockstep.
+        if self.lava:
+            swell = math.sin(self.t * 0.09)
+            if swell > 0.0:
+                self.add_shake(VOLCANO_SWELL_SHAKE * swell ** 3 * self.intensity)
+
+    def _erupt(self, world: Any, line: str) -> None:
+        """Open a vent: pick the ground, tear it, shake the world, say so."""
+        if len(self.lava) >= LAVA_MAX_FLOWS:
+            return                      # already as much lava as this map gets
+        x = self._pick_vent(world)
+        self.lava.append({
+            "x": float(x),
+            "half": 8.0,                # it starts as a crack, not a lake
+            "max": self._rng.uniform(LAVA_HALF_MIN, LAVA_HALF_MAX),
+            "hot": 1.0,
+            "paint": 0.0,
+            "y": _ground_y(world, x),
+            "seed": self._rng.randrange(1 << 20),
+        })
+        self.trigger_quake(world, 3.4, VOLCANO_ERUPT_SHAKE)
+        # A long, warm flash rather than the lightning's hard white one: this is
+        # a glow welling up out of the ground, not a strike.
+        _flash(world, 0.50, 2.4, (255, 132, 52))
+        _chronicle(world, line)
+
+    def _pick_vent(self, world: Any) -> float:
+        """Where the ground opens: away from the colony, and high up if it can be.
+
+        Several candidates scored rather than one draw, because both terms are
+        load-bearing. Distance from what the colony has built is the balance
+        decision - a vent that opens under the firepit is not a disaster anyone
+        can respond to - and height is the flavour one: lava that wells out of
+        the high ground reads as a mountain, lava that appears in the valley the
+        huts are standing in reads as a bug.
+
+        Falls back to the middle of the map if the world has nothing to measure
+        against, which is what a stub world in a test looks like.
+        """
+        h = _height(world)
+        lo, hi = 140.0, float(RENDER_W) - 140.0
+        home = self._colony_x(world)
+        best_x, best_score = (lo + hi) * 0.5, -1e18
+        for _ in range(LAVA_VENT_TRIES):
+            x = self._rng.uniform(lo, hi)
+            # Distance credit stops accruing past LAVA_VENT_CLEAR: beyond that
+            # the vent is already out of the colony's way, and letting the term
+            # keep growing would pin every eruption to whichever map edge the
+            # settlement is furthest from.
+            score = min(abs(x - home), LAVA_VENT_CLEAR)
+            if h is not None:
+                gy = float(h[int(_clamp(x, 0.0, float(h.size - 1)))])
+                score += (RENDER_H - gy) * 0.35     # y grows downward: high = small y
+            # Crowding an existing flow is penalised hard enough that no other
+            # term can pay for it: two overlapping fronts are a trap rather than
+            # a bigger disaster, because behaviour flees the nearest hazard and
+            # will happily run out of one flow into the other.
+            for other in self.lava:
+                gap = abs(x - _fnum(other.get("x"), x))
+                if gap < LAVA_VENT_SPLIT:
+                    score -= (LAVA_VENT_SPLIT - gap) * 4.0
+            score -= self._orphan_width(x, home) * LAVA_ORPHAN_WEIGHT
+            if score > best_score:
+                best_x, best_score = x, score
+        return best_x
+
+    @staticmethod
+    def _orphan_width(x: float, home: float) -> float:
+        """Width of the strip a flow at *x* would cut off from *home*, in px.
+
+        Measured at the front's full extent (half-width plus the hazard pad the
+        AI actually flees), because the question is not how wide the lava is now
+        but how wide the wall gets before it stops growing. Zero means the front
+        reaches the map edge on its far side, so there is nowhere behind it to be
+        stranded - which is the shape this scene wants.
+        """
+        reach = LAVA_HALF_MAX + LAVA_HAZARD_PAD
+        if x <= home:                       # colony to the right: pocket is left
+            return max(0.0, (x - reach) - 0.0)
+        return max(0.0, float(RENDER_W) - (x + reach))
+
+    @staticmethod
+    def _colony_x(world: Any) -> float:
+        """Mean x of what the colony has built, falling back to where it stands."""
+        for group in (_iter(world, ("structures",)), _agents(world)):
+            xs = [_fnum(getattr(o, "x", None), float("nan")) for o in group]
+            xs = [x for x in xs if x == x]
+            if xs:
+                return sum(xs) / len(xs)
+        return RENDER_W * 0.5
+
+    def _lava_step(self, world: Any, dt: float) -> None:
+        """Advance, cool and repaint every flow, then burn whoever is in one.
+
+        Called from ``_tick_transients``, i.e. **every tick in every scene**, and
+        that is the entire cleanup story. The growth term is gated on the volcano
+        scene being the current one, so the front stops dead the moment the
+        rotation moves on; the cooling term is not, so the crust closes over,
+        the columns are handed back to MAT_STONE from the outside in, and the
+        entry drops off this list when there is nothing left of it. Nothing has
+        to remember to tidy up: a save loaded three scenes later still finishes
+        cooling the flow it was carrying, and a handler that somehow stops
+        running leaves lava that goes cold rather than lava that stays hot for
+        the rest of the session.
+        """
+        if not self.lava:
+            return
+        erupting = self.scene == SCENE_VOLCANO
+        live: list[dict[str, Any]] = []
+        for f in self.lava:
+            if not isinstance(f, dict):
+                continue
+            cap = _clamp(_fnum(f.get("max"), LAVA_HALF_MAX), 0.0, LAVA_HALF_MAX)
+            half = _clamp(_fnum(f.get("half"), 0.0), 0.0, cap)
+            hot = _clamp(_fnum(f.get("hot"), 0.0))
+            if erupting:
+                half = min(cap, half + LAVA_SPREAD * dt * self.intensity)
+                hot = 1.0
+            else:
+                hot = max(0.0, hot - dt / LAVA_COOL_SEC)
+            f["max"], f["half"], f["hot"] = cap, half, hot
+            self._lava_paint(world, f)
+            if hot > 0.0:
+                live.append(f)
+        self.lava = live[:LAVA_MAX_FLOWS]
+
+        self._lava_consumes(world, dt)
+        points = self._lava_points(world)
+        if points:
+            self._lava_interrupts(world, points)
+            # Only the flow, with no burning props folded in. Tempting as it is
+            # to do both in one pass, this call runs in *every* scene - including
+            # a wildfire that follows an eruption while the flow is still cooling
+            # - and that scene is already running its own pass over the same
+            # props, with the same per-agent burn timer. Standing in a burning
+            # tree that is itself inside a lava flow does then charge two ticks a
+            # frame and kills in half the time, which is the right answer anyway.
+            self._fire_harms_agents(world, dt, [], extra=points, panic=False,
+                                    shelters=True, lethal_sec=LAVA_DEATH_SEC,
+                                    phrase="was caught by the lava.")
+
+    def _lava_interrupts(self, world: Any, points: list[tuple[float, float]]) -> None:
+        """Make anyone who reaches the edge of the flow drop what they are doing.
+
+        This is the other half of ``_lava_consumes``, and it exists for the same
+        gap in the AI. Behaviour re-decides only when the action it is running
+        ends, and ``emergency_override`` knows about floods and burning props and
+        nothing else - so a villager whose job is on the *far side* of the flow
+        walks straight into it, and the 1-D pathing means "the far side" is a
+        third of the colony's map. Measured before this existed, twenty-seven of
+        one seed's deaths were people crossing, all within fifty px of the same
+        edge, none of them with any business being there.
+
+        Abandoning the action is the whole fix: on the next tick behaviour has
+        to choose again, FleeFrom is top-scoring by construction (they are
+        standing inside the hazard ring this same system published), and they
+        turn round on their own. ``Action.abandon`` rather than a poke at
+        ``failed`` because it is the sanctioned path - it releases the hut slot,
+        the tower slot and the harvest claim the job was holding.
+
+        Deliberately *not* the panic flag, which would also force the re-score:
+        panic lets an agent take drops it would otherwise refuse, and on this
+        terrain that trades burns for falls roughly one for one (measured on one
+        seed: 13 burns + 22 falls with the flag, 35 burns + 4 falls without it).
+        The turn-back ring is a little wider than the flames reach, so the
+        ordinary case is somebody stopping at the edge unhurt rather than
+        somebody stopping because they are already alight.
+        """
+        for ag in _agents(world):
+            try:
+                if getattr(ag, "inside", None) is not None:
+                    continue            # sheltered; the building is what burns
+                act = getattr(ag, "action", None)
+                kind = getattr(act, "kind", "") if act is not None else ""
+                if not kind or kind in ("FleeFrom", "Panic"):
+                    continue            # already leaving
+                ax = _fnum(getattr(ag, "x", 1e9), 1e9)
+                if min(abs(ax - px) for px, _ in points) > LAVA_TURN_BACK:
+                    continue
+                act.abandon(ag, world)
+            except Exception:
+                break                   # an unfamiliar agent shape: stop, quietly
+
+    def _lava_consumes(self, world: Any, dt: float) -> None:
+        """Swallow what the flow has reached: props outright, buildings slowly.
+
+        This is not decoration. It is the single most important safety mechanism
+        in the scene, and it is here because of what the AI does *not* do:
+        ``behavior.emergency_override`` re-decides an in-flight job for a flood,
+        for a burning prop or for a raised panic flag, and for nothing else - so
+        a villager walking to a job inside the flow keeps walking, and a
+        villager working inside the flow keeps working, for the thirteen to
+        twenty seconds the job takes. Contact kills in BURN_DEATH_SEC (3.5 s).
+
+        Measured before this existed, one seed lost *eighteen people to the same
+        tree*: the front rolled over a wood target, the tree stayed the best job
+        on the map, and gatherer after gatherer walked into the lava for it.
+        Taking the prop away ends the action - its target stops existing, so the
+        handler fails it - and *that* forces the re-score that lets the hazard
+        ring do its job. Fixing it in the AI would be the other option, but
+        behaviour is not this scene's to change, and "the lava ate the tree" is
+        the truer statement anyway.
+
+        Buildings are damaged rather than removed, because ``collapse`` evicts
+        the sleepers inside (and world._free_orphaned_sleepers then puts them
+        back on the ground, awake, where they can run). Slow enough to watch:
+        a hut in the flow is rubble in about fifteen seconds.
+        """
+        spans = [(_fnum(f.get("x"), 0.0),
+                  max(0.0, _fnum(f.get("half"), 0.0) * _clamp(_fnum(f.get("hot"), 0.0))))
+                 for f in self.lava
+                 if isinstance(f, dict) and _fnum(f.get("hot"), 0.0) >= LAVA_LETHAL_HEAT]
+        if not spans:
+            return
+        reg = getattr(world, "props", None)
+        drop = getattr(reg, "remove", None)
+        for p in _iter(world, ("props",)):
+            try:
+                px = _fnum(getattr(p, "x", 1e9), 1e9)
+                if not any(abs(px - cx) <= half for cx, half in spans):
+                    continue
+                if callable(drop):
+                    drop(p)
+                else:
+                    p.alive = False
+            except Exception:
+                break               # an unfamiliar prop registry: stop, quietly
+        for st in _iter(world, ("structures",)):
+            try:
+                sx = _fnum(getattr(st, "x", 1e9), 1e9)
+                if not any(abs(sx - cx) <= half for cx, half in spans):
+                    continue
+                hurt = getattr(st, "damage", None)
+                if callable(hurt):
+                    hurt(_fnum(getattr(st, "max_hp", 100.0), 100.0)
+                         * dt / LAVA_RUINS_SEC, "lava")
+            except Exception:
+                break
+
+    def _lava_paint(self, world: Any, f: dict[str, Any]) -> None:
+        """Claim the hot span for MAT_LAVA and hand the cooled shoulders back.
+
+        ``paint`` records how much of the material map this flow currently owns,
+        which is what makes the reversion exact: as ``hot`` falls the live span
+        shrinks, and the difference between the two - and only that difference -
+        is repainted MAT_STONE. The flow therefore congeals from its edges
+        inward and leaves a stone scar the width it reached, rather than either
+        vanishing all at once or leaving live lava behind.
+
+        The 1 px threshold on that debt is load-bearing, not an optimisation.
+        Cooling retreats about a twentieth of a pixel per tick, so a version that
+        advanced ``paint`` on every tick regardless never accumulated a whole
+        column to hand back and quietly congealed *nothing*: the flow went cold,
+        dropped off the list, and left its full width painted MAT_LAVA for good.
+        ``paint`` may only move when the map has actually been written.
+        """
+        try:
+            x = _fnum(f.get("x"), RENDER_W * 0.5)
+            live = max(0.0, _fnum(f.get("half"), 0.0) * _clamp(_fnum(f.get("hot"), 0.0)))
+            painted = max(0.0, _fnum(f.get("paint"), 0.0))
+            if live > 0.5:
+                _paint(world, x - live, x + live, MAT_LAVA)
+            if painted - live > 1.0 or (live <= 0.0 < painted):
+                _paint(world, x - painted, x - live, MAT_STONE)
+                _paint(world, x + live, x + painted, MAT_STONE)
+                f["paint"] = live
+            elif live > painted:
+                f["paint"] = live       # the front took new ground this tick
+        except Exception:
+            return
+
+    def _lava_points(self, world: Any) -> list[tuple[float, float]]:
+        """The hot part of every flow, as (x, y) points sitting on the ground.
+
+        The fire-harm path measures contact horizontally against a list of
+        burning *things*, so a flow is handed to it as a row of hot points a
+        little closer together than BURN_TOUCH_DIST. That is what lets the lava
+        reuse the wildfire's damage path outright instead of growing a second
+        one: the same contact time before it kills, the same faster cool-off for
+        anyone who runs, and the same short panic radius that keeps people from
+        bolting off a ledge they were nowhere near.
+        """
+        out: list[tuple[float, float]] = []
+        for f in self.lava:
+            if not isinstance(f, dict):
+                continue
+            hot = _clamp(_fnum(f.get("hot"), 0.0))
+            if hot < LAVA_LETHAL_HEAT:
+                continue                # crusted over; it glows but it cannot burn
+            x = _fnum(f.get("x"), RENDER_W * 0.5)
+            live = max(0.0, _fnum(f.get("half"), 0.0) * hot)
+            n = int(min(float(LAVA_SAMPLE_MAX), live * 2.0 / LAVA_SAMPLE_STEP + 1.0))
+            if n <= 1:
+                out.append((x, _ground_y(world, x)))
+                continue
+            for i in range(n):
+                px = x - live + 2.0 * live * (i / (n - 1))
+                out.append((px, _ground_y(world, px)))
+        return out
+
     # ================================================= quakes / shake / fx ==
     def trigger_quake(self, world: Any, duration: float = 2.5,
                       magnitude: float = 6.0) -> None:
@@ -1520,13 +3127,22 @@ class EventSystem:
                     self.trigger_quake(world, self._rng.uniform(2.0, 4.5), 6.0)
             return
         self.quake_t = max(0.0, self.quake_t - dt)
-        self.add_shake(6.0 if self.quake_t > 0.6 else 3.0)
-        if self._rng.random() < dt * 0.35:
+        # SCENE_EARTHQUAKE owns all three of these for itself: it drives its own
+        # shake envelope (a flat 6.0 here would flatten the swell), it carves
+        # capped, spaced scars that this ad-hoc gap would stack an unbounded
+        # trench on top of, and it chronicles its own beats - a line per tremor
+        # would flush the 10-entry log every three minutes. The rng draw still
+        # happens either way so the seeded stream is identical in every other
+        # scene, which is the whole reason the scene test is not written first.
+        own = self.scene == SCENE_EARTHQUAKE
+        if not own:
+            self.add_shake(6.0 if self.quake_t > 0.6 else 3.0)
+        if self._rng.random() < dt * 0.35 and not own:
             x = self._rng.uniform(30.0, RENDER_W - 30.0)
             w = self._rng.uniform(6.0, 16.0)
             _deform(world, x - w, x + w, self._rng.uniform(4.0, 11.0))
             _paint(world, x - w, x + w, MAT_DIRT)
-        if self.quake_t <= 0.0:
+        if self.quake_t <= 0.0 and not own:
             _chronicle(world, "The ground stops shaking.")
 
     def add_shake(self, amplitude: float) -> None:
@@ -1569,6 +3185,42 @@ class EventSystem:
         self.rumble = 0.0
         self.ember_rate = 0.0
         self.fog = 0.0
+        # Back to grey with it. The density going to zero already hides the
+        # wash, so a stale tan here is invisible *until* the next low-visibility
+        # scene forgets to set a colour - at which point fog would quietly come
+        # back as a sandstorm. Reset the colour with the channel it belongs to.
+        self.fog_color = HAZE_GREY
+        # Cleared here as well as in __init__: _publish reads it every tick in
+        # every scene to drive Lighting.ambient_dim, so a stale non-zero value
+        # would leave the *next* scene sitting under an eclipse that has no
+        # handler to lift it.
+        self.eclipse = 0.0
+        # Zeroing this is what *lifts the drought*: the wrapper installed on
+        # world.regrowth_factor reads this field live rather than capturing a
+        # number, so the multiplier is back to 1.0 on the very same tick the
+        # scene changes - which matters, because _reset_scene_state runs from
+        # World._tick_scene, i.e. after events.tick has already published for
+        # this frame but before props.tick reads the factor. _drought_hook then
+        # removes the wrapper outright on the next tick.
+        self.heat = 0.0
+        # The heightmap keeps every scar the quake tore - that is the point of
+        # the scene - but the crack overlay and the hazard ring must not survive
+        # into the next weather, or a clear afternoon inherits a set of no-go
+        # zones nothing is left to explain.
+        self.fissures.clear()
+        # ``self.lava`` is deliberately NOT cleared here, and it is the one piece
+        # of scene state in this file that must not be. A flow is painted into
+        # the shared material map, and this list is the only record of which
+        # columns it took and how to give them back: dropping it would strand a
+        # lethal, unowned lava field on the map for the rest of the session and
+        # every session after it, growing by one field per eruption. What stops
+        # the flow instead is _lava_step's growth gate - the front only advances
+        # while SCENE_VOLCANO is the current scene, so a scene change freezes it
+        # on the spot and the cooling path repaints it to stone over the next
+        # LAVA_COOL_SEC.
+        self.next_tremor = QUAKE_LEAD_IN
+        self.tremor_mag = 0.0
+        self.tremor_len = 0.0
         self._submerged.clear()
         self._buried.clear()
         self._burning.clear()
@@ -1621,9 +3273,17 @@ class EventSystem:
             "snow": float(self.snow),
             "ash": float(self.ash),
             "fog": float(self.fog),
+            "fog_color": list(self.fog_color),
+            "eclipse": float(self.eclipse),
+            "heat": float(self.heat),
             "gust": float(self.gust),
             "water_level": None if self.water_level is None else float(self.water_level),
             "quake_t": float(self.quake_t),
+            "fissures": [dict(f) for f in self.fissures if isinstance(f, dict)],
+            "lava": [dict(f) for f in self.lava if isinstance(f, dict)],
+            "next_tremor": float(self.next_tremor),
+            "tremor_mag": float(self.tremor_mag),
+            "tremor_len": float(self.tremor_len),
             "pending": [dict(p) for p in self.pending if isinstance(p, dict)],
             "strikes": [dict(s) for s in self.strikes],
             "meteors": [dict(m) for m in self.meteors],
@@ -1634,6 +3294,7 @@ class EventSystem:
             "shake_t": float(self.shake_t),
             "snow_depth": float(self.snow_depth),
             "ash_depth": float(self.ash_depth),
+            "sand_depth": float(self.sand_depth),
             "snow_prev": self._snow_prev,
             "slide_phase": self.slide_phase,
             "slide_x0": float(self.slide_x0),
@@ -1670,10 +3331,26 @@ class EventSystem:
         ev.snow = _clamp(_fnum(d.get("snow"), 0.0))
         ev.ash = _clamp(_fnum(d.get("ash"), 0.0))
         ev.fog = _clamp(_fnum(d.get("fog"), 0.0))
+        ev.fog_color = _clean_rgb(d.get("fog_color"), HAZE_GREY)
+        ev.eclipse = _clamp(_fnum(d.get("eclipse"), 0.0))
+        ev.heat = _clamp(_fnum(d.get("heat"), 0.0))
         ev.gust = _clamp(_fnum(d.get("gust"), 0.0))
         wl = d.get("water_level")
         ev.water_level = None if wl is None else _fnum(wl, 0.0)
         ev.quake_t = max(0.0, _fnum(d.get("quake_t"), 0.0))
+        # Re-clamped rather than trusted: a hand-edited save that asks for a
+        # 400 px fissure would otherwise carve a lethal chasm on the first tick
+        # after load, which is precisely what the caps upstream exist to stop.
+        ev.fissures = [_clean_fissure(f) for f in _listof(d.get("fissures"))
+                       if isinstance(f, dict)][:QUAKE_FISSURE_MAX]
+        # Same treatment, and for a sharper reason: ``paint`` is what the flow
+        # owes the material map back, so a save that arrived with a 900 px one
+        # would repaint most of the world to stone as it cooled.
+        ev.lava = [_clean_lava(f) for f in _listof(d.get("lava"))
+                   if isinstance(f, dict)][:LAVA_MAX_FLOWS]
+        ev.next_tremor = max(0.0, _fnum(d.get("next_tremor"), QUAKE_LEAD_IN))
+        ev.tremor_mag = _clamp(_fnum(d.get("tremor_mag"), 0.0), 0.0, QUAKE_MAG_MAX)
+        ev.tremor_len = _clamp(_fnum(d.get("tremor_len"), 0.0), 0.0, QUAKE_TREMOR_MAX)
         ev.pending = [dict(p) for p in _listof(d.get("pending")) if isinstance(p, dict)][:32]
         ev.strikes = [dict(s) for s in _listof(d.get("strikes")) if isinstance(s, dict)][:6]
         ev.meteors = [dict(m) for m in _listof(d.get("meteors")) if isinstance(m, dict)][:12]
@@ -1689,6 +3366,7 @@ class EventSystem:
         ev.shake_t = max(0.0, _fnum(d.get("shake_t"), 0.0))
         ev.snow_depth = _clamp(_fnum(d.get("snow_depth"), 0.0), 0.0, SNOW_MAX_DEPTH)
         ev.ash_depth = _clamp(_fnum(d.get("ash_depth"), 0.0), 0.0, ASH_MAX_DEPTH)
+        ev.sand_depth = _clamp(_fnum(d.get("sand_depth"), 0.0), 0.0, SAND_MAX_DEPTH)
         prev = d.get("snow_prev")
         if isinstance(prev, list) and prev:
             try:
@@ -1717,6 +3395,34 @@ class EventSystem:
 def _smooth(u: float) -> float:
     u = _clamp(u)
     return u * u * (3.0 - 2.0 * u)
+
+
+def eclipse_strength(scene_t: float) -> float:
+    """Eclipse darkness, 0..1, as a pure function of the scene's age in seconds.
+
+    Public and side-effect free so a test (or a future HUD) can ask "what will
+    this look like at t=70?" without building a world.
+
+    The ``** 2.2`` is the whole character of the scene. A linear ramp reads as
+    somebody sliding a brightness fader for a minute; the real thing keeps
+    looking like an ordinary bright day until the sun is most of the way gone
+    and then drops away in the last fifteen seconds. Squaring the ingress buys
+    exactly that: at the halfway point of the ingress this returns 0.22, i.e.
+    the world has lost a fifth of its light while the disc is already 60% eaten
+    (the renderer derives disc coverage back out of this value - see
+    sky._eclipse_cover - so the two can never drift apart).
+    """
+    t = _fnum(scene_t, 0.0)
+    if t <= 0.0:
+        return 0.0
+    if t < ECLIPSE_INGRESS:
+        return _smooth(t / ECLIPSE_INGRESS) ** 2.2
+    hold_end = ECLIPSE_INGRESS + ECLIPSE_TOTALITY
+    if t < hold_end:
+        return 1.0
+    if t < hold_end + ECLIPSE_EGRESS:
+        return _smooth(1.0 - (t - hold_end) / ECLIPSE_EGRESS) ** 2.2
+    return 0.0                                  # passed; ordinary daylight again
 
 
 def _listof(v: Any) -> list[Any]:

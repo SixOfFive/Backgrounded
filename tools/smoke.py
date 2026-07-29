@@ -207,6 +207,15 @@ def test_roundtrip(world) -> None:
     except Exception as exc:
         check(False, "loaded world keeps ticking", f"{type(exc).__name__}: {exc}")
 
+    # ...and keep running *intact*. "Keeps ticking" is not enough on its own:
+    # World.tick guards every subsystem and disables any that raises, so a
+    # reloaded world missing an attribute set only in __init__ ticks along
+    # perfectly happily with a subsystem silently switched off for the rest of
+    # the session. That is exactly how a dead scene rotation shipped while all
+    # 25 checks passed, so the clone is now held to the same bar as a fresh one.
+    check(not clone._disabled, "no subsystem disabled itself after a reload",
+          str(sorted(clone._disabled)))
+
 
 def test_defensive_load() -> None:
     section("defensive load")

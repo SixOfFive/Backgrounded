@@ -55,6 +55,13 @@ from ..constants import (
     ARMOUR_NONE,
     HEALTH_REGEN_PER_SEC,
     MAX_HEALTH,
+    MORPH_GIRTH_MAX,
+    MORPH_GIRTH_MIN,
+    MORPH_NONE,
+    MORPH_SCALE_MAX,
+    MORPH_SCALE_MIN,
+    MORPH_SPAWN_CHANCE,
+    MORPH_TABLE,
     STICK_PALETTE,
     WALK_SPEED,
     WEAPON_NONE,
@@ -82,6 +89,8 @@ log = logging.getLogger(__name__)
 __all__ = [
     "AGENT_HEIGHT", "GRAVE_DELAY", "GRAVITY", "Stickman", "Population",
     "color_for_id", "on_death", "clear_death_listeners",
+    "morph_scales", "normalise_morph", "roll_morph",
+    "MIN_DRAWN_HEIGHT", "MAX_DRAWN_HEIGHT",
     "ROLE_GATHERER", "ROLE_BUILDER", "ROLE_ELDER", "ROLE_CHILD",
     "ROLE_LOOKOUT", "ROLES", "ADULT_ROLES",
 ]
@@ -92,6 +101,16 @@ __all__ = [
 #: a 1280x800 world is the smallest size at which a two-pixel-wide figure still
 #: reads as a *pose* rather than a smudge, once the frame is upscaled to 2560.
 AGENT_HEIGHT = 26.0
+
+#: Bounds on the *composed* drawn height (role scale x morph scale). Height is
+#: not free to be anything: below ~12 px a figure stops reading as a pose once
+#: the frame is upscaled to the desktop, and above ~42 px the body no longer
+#: matches the constants the physics is written around (GROUND_SNAP,
+#: STEP_DROP_MAX, the STEP_PROBE lookahead), so a giant would start clipping
+#: ledges its feet should catch on. Cheaper to clamp here than to make every
+#: physics constant a function of body size.
+MIN_DRAWN_HEIGHT = 12.0
+MAX_DRAWN_HEIGHT = 42.0
 
 GRAVITY = 900.0             # px/s^2
 TERMINAL_VY = 900.0         # px/s, matches the lethal threshold scale
@@ -233,6 +252,70 @@ def color_for_id(agent_id: int) -> tuple[int, int, int]:
     return STICK_PALETTE[_i(agent_id) % len(STICK_PALETTE)]
 
 
+# ------------------------------------------------------------ body morphs --
+# An agent stores only the *name* of its morph; these three functions are the
+# only readers of the table. Keeping the lookup in one place is what lets a
+# corrupt or future name degrade to an ordinary body everywhere at once instead
+# of raising somewhere deep in the render path.
+def morph_scales(name: Any) -> tuple[float, float]:
+    """``(height scale, girth)`` for a morph name. Unknown names are ordinary.
+
+    Always returns finite, clamped numbers, so callers can multiply by them
+    without checking anything.
+    """
+    if not isinstance(name, str) or not name:
+        return (1.0, 1.0)
+    entry = MORPH_TABLE.get(name)
+    if not entry:
+        return (1.0, 1.0)
+    try:
+        scale, girth = float(entry[0]), float(entry[1])
+    except Exception:
+        return (1.0, 1.0)
+    if not (math.isfinite(scale) and math.isfinite(girth)):
+        return (1.0, 1.0)
+    return (_clamp(scale, MORPH_SCALE_MIN, MORPH_SCALE_MAX),
+            _clamp(girth, MORPH_GIRTH_MIN, MORPH_GIRTH_MAX))
+
+
+def normalise_morph(name: Any) -> str:
+    """A morph name safe to store. Anything unrecognised becomes the normal body.
+
+    This is the load-bearing half of "a corrupt save must not raise": a name
+    from a newer build, a hand-edited save or a junk type is dropped at the
+    boundary rather than carried around as a value nothing can interpret.
+    """
+    try:
+        return name if (isinstance(name, str) and name in MORPH_TABLE) else MORPH_NONE
+    except Exception:
+        return MORPH_NONE
+
+
+def roll_morph(rng: Any) -> str:
+    """Roll a body for one newcomer. Overwhelmingly returns ``MORPH_NONE``.
+
+    *rng* must be a seeded stream (``world.pyrng``). Unlike the cosmetic rolls
+    around it there is deliberately **no** fallback to the module RNG: a mutant
+    that appears in only some runs of a seed would quietly destroy seed
+    reproducibility, and a run with nothing to roll from is better off with an
+    ordinary villager than with an unrepeatable one.
+    """
+    if rng is None:
+        return MORPH_NONE
+    try:
+        r = float(rng.random())
+    except Exception:
+        return MORPH_NONE
+    if not (0.0 <= r < 1.0):
+        return MORPH_NONE
+    acc = 0.0
+    for name, chance in MORPH_SPAWN_CHANCE.items():
+        acc += max(0.0, _f(chance, 0.0))
+        if r < acc:
+            return normalise_morph(name)
+    return MORPH_NONE
+
+
 # -------------------------------------------------------- terrain adapters --
 # Terrain belongs to another module and may be absent, partial or mid-rewrite.
 # Every read goes through these so a broken Terrain degrades to flat ground
@@ -270,6 +353,11 @@ class Stickman:
     id: int = 0
     name: str = "?"
     color: tuple[int, int, int] = (206, 214, 226)   # identity colour, persisted
+
+    #: Rare body morph: "" for the ordinary build, otherwise a key of
+    #: constants.MORPH_TABLE ("giant", "tiny", "stout", "lanky"). Only the name
+    #: lives on the agent - see morph_scales() for the numbers it means.
+    morph: str = MORPH_NONE
 
     # --- kinematics -------------------------------------------------------
     x: float = 0.0
@@ -358,25 +446,57 @@ class Stickman:
 
     @property
     def head_y(self) -> float:
-        """Approximate y of the top of the head."""
-        return self.y - AGENT_HEIGHT * (0.72 if self.role == ROLE_CHILD else 1.0)
+        """Approximate y of the top of the head.
+
+        Derived from :meth:`height` rather than from AGENT_HEIGHT directly, so
+        it follows the role *and* the morph - a giant's head is not where an
+        ordinary one's is, and anything hanging a label or a bubble off this
+        would otherwise put it through the skull.
+        """
+        return self.y - self.height()
 
     def height(self) -> float:
-        """Drawn height for this agent - children are smaller, elders stoop."""
+        """Drawn height - children are smaller, elders stoop, morphs rescale.
+
+        The morph *multiplies* the role height instead of replacing it, so a
+        giant child is still recognisably a child. The clamp is what makes that
+        composition safe: a tiny child would otherwise solve to 11 px, which is
+        a smudge once the frame is upscaled, and a giant elder must stay inside
+        the band the physics constants assume (see MIN/MAX_DRAWN_HEIGHT).
+        """
+        h = AGENT_HEIGHT
         if self.role == ROLE_CHILD:
-            return AGENT_HEIGHT * 0.68
-        if self.role == ROLE_ELDER:
-            return AGENT_HEIGHT * 0.94
-        return AGENT_HEIGHT
+            h *= 0.68
+        elif self.role == ROLE_ELDER:
+            h *= 0.94
+        h *= morph_scales(self.morph)[0]
+        return _clamp(h, MIN_DRAWN_HEIGHT, MAX_DRAWN_HEIGHT)
+
+    def girth(self) -> float:
+        """Width factor for this body; 1.0 is the ordinary build.
+
+        Read by render/ to widen the stance and thicken the lines. It is not a
+        height multiplier: girth is exactly the axis that separates "fat" from
+        "big", which a single scale cannot express on a stick figure.
+        """
+        return morph_scales(self.morph)[1]
+
+    def is_mutant(self) -> bool:
+        """True for the rare odd-bodied villagers (a known morph, not "")."""
+        try:
+            return isinstance(self.morph, str) and self.morph in MORPH_TABLE
+        except Exception:
+            return False
 
     def hand_anchor(self) -> tuple[float, float]:
         """Roughly where the front hand is - candle light attaches here.
 
         An approximation on purpose: lighting.py lives in sim/ and cannot ask
-        render/ for the exact skeletal hand joint.
+        render/ for the exact skeletal hand joint. The horizontal reach carries
+        the girth so a broad villager's light does not sit inside their chest.
         """
         h = self.height()
-        return (self.x + self.facing * 0.20 * h, self.y - 0.46 * h)
+        return (self.x + self.facing * 0.20 * h * self.girth(), self.y - 0.46 * h)
 
     def is_child(self) -> bool:
         return self.role == ROLE_CHILD
@@ -525,6 +645,8 @@ class Stickman:
     def summary(self) -> str:
         """One-line human description - chronicle, tooltips and debug."""
         bits = [f"{self.name} ({role_label(self.role)}, gen {self.generation})"]
+        if self.is_mutant():
+            bits.append(self.morph)
         if not self.alive:
             cause = f" ({self.death_cause})" if self.death_cause else ""
             bits.append(f"dead{cause}")
@@ -906,6 +1028,7 @@ class Stickman:
             "id": int(self.id),
             "name": str(self.name),
             "color": [int(c) for c in self.color],
+            "morph": str(self.morph),
             "x": float(self.x), "y": float(self.y),
             "vx": float(self.vx), "vy": float(self.vy),
             "facing": int(self.facing),
@@ -959,6 +1082,10 @@ class Stickman:
         s.id = _i(d.get("id"), 0)
         s.name = _s(d.get("name"), None) or f"Agent{s.id}"
         s.color = _color(d.get("color"), color_for_id(s.id))
+        # A morph name from a newer build, a truncated save or a hand edit is
+        # dropped here rather than stored: the body degrades to normal, which is
+        # invisible, instead of raising in the middle of a load.
+        s.morph = normalise_morph(d.get("morph"))
         s.x = _clamp(_f(d.get("x"), 0.0), _EDGE_MIN, _EDGE_MAX)
         s.y = _f(d.get("y"), DEFAULT_GROUND_Y)
         s.vx = _clamp(_f(d.get("vx"), 0.0), -TERMINAL_VY, TERMINAL_VY)
@@ -1158,10 +1285,16 @@ class Population:
         gen = self.generation if generation is None else max(0, _i(generation, 0))
         self.generation = max(self.generation, gen)
 
+        # The one place a mutant is created. Rolled from the caller's seeded
+        # stream and nowhere else, so a seed replays the same rare bodies; with
+        # no rng this returns "" rather than reaching for a module RNG.
+        morph = roll_morph(rng)
+
         s = Stickman(
             id=agent_id,
             name=chosen,
             color=color_for_id(agent_id),
+            morph=morph,
             x=_clamp(_f(x, 0.0), _EDGE_MIN, _EDGE_MAX),
             y=_f(y, DEFAULT_GROUND_Y),
             facing=1 if _rand_of(rng) < 0.5 else -1,
@@ -1390,4 +1523,26 @@ if __name__ == "__main__":   # pragma: no cover - headless smoke test
         victim.update_needs(1.0 / 30.0)
     assert not victim.alive and victim.death_cause == CAUSE_STARVED, victim.summary()
     print("attrition:", victim.summary())
+
+    # Morphs: rare, seeded, round-tripping, and degrading on junk.
+    counts: dict[str, int] = {}
+    pop2 = Population()
+    seeded = random.Random(99)
+    for _ in range(4000):
+        m = roll_morph(seeded)
+        counts[m] = counts.get(m, 0) + 1
+    odd = sum(v for k, v in counts.items() if k)
+    print("morph roll over 4000:", counts, "-> mutant rate", round(odd / 4000, 4))
+    assert 0.03 < odd / 4000 < 0.12, counts
+    assert roll_morph(None) == MORPH_NONE, "unseeded rolls must never mutate"
+
+    giant = pop2.spawn(300.0, 400.0, rng=seeded)
+    giant.morph = "giant"
+    assert giant.height() > AGENT_HEIGHT and giant.is_mutant(), giant.summary()
+    back = Stickman.from_dict(giant.to_dict())
+    assert back.morph == "giant" and back.height() == giant.height(), back.summary()
+    junk = Stickman.from_dict({"id": 5, "morph": "wyrm"})
+    assert junk.morph == MORPH_NONE and junk.height() == AGENT_HEIGHT, junk.morph
+    assert Stickman.from_dict({"id": 6, "morph": ["nope"]}).morph == MORPH_NONE
+    print("morph round-trip ok:", back.summary(), round(back.height(), 1), "px")
     clear_death_listeners()

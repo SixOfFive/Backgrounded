@@ -1299,6 +1299,19 @@ def action_from_dict(d: Any) -> Any:
             return v
     except Exception:
         log.debug("vignette rehydrate unavailable", exc_info=True)
+    # combat_actions registers its four kinds into _HANDLERS as an import side
+    # effect, and nothing on the cold-start path imports it - behaviour only
+    # pulls it in lazily the first time it scores a threat. Until then
+    # Action.from_dict sees CraftSpear/FightAnimal/... as unknown kinds and
+    # silently rewrites them to Wander, so a save taken mid-hunt reloaded with
+    # the hunter strolling away from the wolf (and, since the head labels read
+    # the action, announcing "wandering" while doing it). Importing it here
+    # rather than at module scope keeps the dependency one-way: combat_actions
+    # imports this module, so the reverse cannot be a top-level import.
+    try:
+        from . import combat_actions          # noqa: F401  (registers handlers)
+    except Exception:
+        log.debug("combat actions unavailable for rehydrate", exc_info=True)
     return Action.from_dict(d if isinstance(d, dict) else {})
 
 

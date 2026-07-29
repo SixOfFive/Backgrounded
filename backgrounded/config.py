@@ -17,6 +17,7 @@ class Config:
     show_window: bool = True          # preview visible by default, per spec
     show_stats: bool = True           # top-right colony/roster panel
     show_names: bool = True           # name plates above each stickman
+    show_activity: bool = True        # "chopping wood" plate above each stickman
     show_log: bool = True             # last-10 chronicle log, lower-left
     wallpaper_enabled: bool = True
     scene: str = SCENE_NIGHT_STORM    # opening scene, per spec

@@ -35,11 +35,16 @@ from ..constants import (
     SCENE_AURORA,
     SCENE_BLIZZARD,
     SCENE_CLEAR,
+    SCENE_EARTHQUAKE,
+    SCENE_ECLIPSE,
     SCENE_FLOOD,
     SCENE_FOG,
+    SCENE_HEATWAVE,
     SCENE_METEOR,
     SCENE_MUDSLIDE,
     SCENE_NIGHT_STORM,
+    SCENE_SANDSTORM,
+    SCENE_VOLCANO,
     SCENE_WILDFIRE,
 )
 
@@ -91,6 +96,43 @@ _SCENE_AMBIENT: dict[str, tuple[float, float]] = {
     # Fog: a flat grey day. Not dark - fog scatters light - but low-contrast, and
     # the overlay does the rest of the work in the renderer.
     SCENE_FOG:         (0.40, 0.66),
+    # Eclipse: flat *bright day*, whatever the world clock says. An eclipse is a
+    # daytime event by definition and the scene rotation is happy to start one at
+    # 3am, so - exactly as aurora pins itself to midnight - this one pins itself
+    # to noon and the sky renderer pins its solar clock to match. The darkness is
+    # not in this curve at all: it comes from ``Lighting.ambient_dim`` below, so
+    # the drop is a *shadow crossing a bright day* rather than an early dusk.
+    SCENE_ECLIPSE:     (0.90, 0.90),
+    # Earthquake: an ordinary day and an ordinary night, pulled down a notch by
+    # the dust the tremors keep throwing into the air. Not a dark scene - the
+    # whole point of it is watching the ground move, which needs to be visible -
+    # so the night sits above the storm's and the day below a clear one.
+    SCENE_EARTHQUAKE:  (0.44, 0.78),
+    # Sandstorm: a brown-out. Airborne grit is opaque in a way falling snow is
+    # not, so the day sits well below the blizzard's 0.66 - but *only* just
+    # below, because this is a visibility scene and the whole payoff is watching
+    # silhouettes work through the murk. The night is lifted above a clear
+    # night's 0.34 rather than dropped: dust scatters the torchlight back down
+    # instead of letting it escape, so a sandstorm at 3am is a dirty orange
+    # glow, not a black screen.
+    SCENE_SANDSTORM:   (0.38, 0.56),
+    # Heatwave: the brightest day in the table, on purpose. This is the only
+    # scene whose whole visual claim is *glare* - there is no weather to look
+    # at, no particles and no haze, so if the day does not sit above a clear
+    # one there is nothing to tell the two apart. The night is lifted well above
+    # a clear night's 0.34 for the same reason the sandstorm's is: the ground
+    # spent all afternoon storing the heat and gives it back after dark, so a
+    # heatwave at 3am is a close, pale night rather than a black one.
+    SCENE_HEATWAVE:    (0.46, 1.00),
+    # Eruption: the darkest *day* in the table by a wide margin, and a night that
+    # is barely darker than it. That gap is the whole point - an ash column turns
+    # noon into dusk, so the scene has to read the same at either end of the
+    # clock, and the thing the eye is meant to lock onto is the lava, which is
+    # drawn emissively *after* the light composite. Pushing the ambient any
+    # higher would put a grey wash over the one bright object on screen; pushing
+    # it lower would leave the colony as a rumour between torches, and this is a
+    # scene the villagers have to be seen *running* in.
+    SCENE_VOLCANO:     (0.24, 0.40),
 }
 _DEFAULT_AMBIENT: tuple[float, float] = (0.22, 0.88)
 
@@ -114,6 +156,34 @@ _SCENE_RGB: dict[str, tuple[float, float, float]] = {
     SCENE_ASHFALL:     (0.98, 0.62, 0.50),
     SCENE_AURORA:      (0.72, 0.88, 1.00),   # cool blue-green night cast
     SCENE_FOG:         (0.86, 0.88, 0.90),   # desaturated toward grey
+    # Eclipsed sunlight is famously *steely* - the shadow eats the low-angle red
+    # first - so the cast is a whisper cool. Deliberately mild: this multiplies
+    # the ambient in every phase of the scene, including the bright minutes
+    # before and after, where the day must still read as an ordinary day.
+    SCENE_ECLIPSE:     (0.94, 0.96, 1.00),
+    # Rock flour hanging in the air: warm, dry and slightly jaundiced. Blue is
+    # what settling dust scatters away first, so that is the channel that goes.
+    SCENE_EARTHQUAKE:  (1.00, 0.92, 0.76),
+    # Suspended sand is the strongest colour cast in the file, and deliberately
+    # so: it is what stops the scene reading as "the earthquake, but windier".
+    # Blue is scattered out almost completely by grains that size, green goes
+    # with it, and red comes through - which is why a real dust storm turns the
+    # world the colour of weak tea rather than merely dimming it.
+    SCENE_SANDSTORM:   (1.00, 0.80, 0.48),
+    # Bleached rather than tinted. A heatwave is not a colour cast in the way a
+    # dust storm is - the air is clear - so red is left at full and only the
+    # blue end comes down, which reads as sunlight that has stopped being
+    # neutral without ever looking like smoke. Mild on purpose: this multiplies
+    # an ambient already pinned to 1.00, and any harder cast turns the noon
+    # glare orange, which is the wildfire's look, not this one's.
+    SCENE_HEATWAVE:    (1.00, 0.96, 0.84),
+    # The strongest cast in the file, and one channel short of monochrome: what
+    # little light reaches the ground has been through kilometres of ash, and ash
+    # eats blue first and green next. Deliberately harder than the ashfall
+    # scene's (0.98, 0.62, 0.50), because that scene is the *aftermath* - this
+    # one still has the vent open, and the difference between them has to be
+    # visible from across the room.
+    SCENE_VOLCANO:     (1.00, 0.46, 0.30),
 }
 
 _MAX_FLASHES = 8
@@ -295,6 +365,22 @@ class Lighting:
         self.t: float = 0.0              # local clock, drives flicker
         self.wind_gust: float = 0.0      # 0..1, set by EventSystem; guttering
         self.last_ambient: float = 0.5   # cached result of ambient()
+        #: Multiplier on the scene's day/night ambient curve, 1.0 = untouched.
+        #:
+        #: The eclipse scene owns this. It exists because the only way to make a
+        #: darkness that *torches cut through* is to lower the level the light
+        #: composite works against: the renderer fills the lightmap with the
+        #: ambient and then adds each torch on top, so a smaller fill means a
+        #: bigger relative contribution from every flame. Multiplying the
+        #: finished frame down instead would scale the torches by exactly the
+        #: same factor and the scene would just look like somebody turned the
+        #: brightness knob.
+        #:
+        #: ``EventSystem._publish`` rewrites this every tick in every scene from
+        #: its published ``eclipse`` channel, so it returns to 1.0 on its own the
+        #: instant the eclipse passes or the scene rotates - no other scene has
+        #: to know it exists, and nothing has to remember to clean it up.
+        self.ambient_dim: float = 1.0
         self._flash_total: float = 0.0
         self._flash_color: tuple[int, int, int] = (0, 0, 0)
 
@@ -477,9 +563,15 @@ class Lighting:
 
     # -------------------------------------------------------------- ambient --
     def ambient_base(self, scene: str, world_time: float) -> float:
-        """The day/night curve for this scene, 0..1, before any flash."""
+        """The day/night curve for this scene, 0..1, before any flash.
+
+        ``ambient_dim`` (see __init__) scales the curve down; it is 1.0 in every
+        scene but an eclipse, so this is the ordinary curve unless something has
+        deliberately taken the light away.
+        """
         lo, hi = _SCENE_AMBIENT.get(scene, _DEFAULT_AMBIENT)
-        return _clamp(lo + (hi - lo) * daylight_factor(world_time))
+        base = lo + (hi - lo) * daylight_factor(world_time)
+        return _clamp(base * _clamp(self.ambient_dim))
 
     def ambient(self, scene: str, world_time: float) -> float:
         """Ambient light level including the active flash term, 0..1."""
@@ -563,6 +655,7 @@ class Lighting:
             "t": float(self.t),
             "wind_gust": float(self.wind_gust),
             "last_ambient": float(self.last_ambient),
+            "ambient_dim": float(self.ambient_dim),
             "sources": [s.to_dict() for s in self.sources],
             "flashes": [f.to_dict() for f in self.flashes],
         }
@@ -575,6 +668,10 @@ class Lighting:
         lig.t = max(0.0, _as_float(d.get("t"), 0.0))
         lig.wind_gust = _clamp(_as_float(d.get("wind_gust"), 0.0))
         lig.last_ambient = _clamp(_as_float(d.get("last_ambient"), 0.5))
+        # Persisted so the very first frame after a load - which is drawn before
+        # the first EventSystem tick gets to rewrite it - still shows the world
+        # at the darkness it was saved at. Every tick after that recomputes it.
+        lig.ambient_dim = _clamp(_as_float(d.get("ambient_dim"), 1.0))
         raw_sources = d.get("sources")
         if isinstance(raw_sources, list):
             lig.sources = [LightSource.from_dict(s) for s in raw_sources[:_MAX_SOURCES]]

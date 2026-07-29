@@ -495,19 +495,27 @@ def draw_rain_overlay(surf: pygame.Surface, intensity: float, wind: float = 0.0,
 
 
 # --------------------------------------------------------------------------
-# fog overlay (a grey wash that swallows the distance)
+# haze overlay (a coloured wash that swallows the distance)
 # --------------------------------------------------------------------------
 
 _FOG_CACHE: dict[tuple, pygame.Surface] = {}
+#: Default wash colour - fog, and the value ``events.HAZE_GREY`` must match.
+#: sim/ may not import render/, so the two are kept in step by hand.
 _FOG_GREY = (198, 202, 208)
 
 
-def _fog_layer(w: int, h: int, inten: float) -> pygame.Surface:
-    """A full-frame grey wash whose opacity rises toward the ground, built from
-    a tiny gradient strip and cached per intensity bucket (fog ramps smoothly,
-    so ~8 buckets are indistinguishable from continuous)."""
+def _fog_layer(w: int, h: int, inten: float, color: Color) -> pygame.Surface:
+    """A full-frame wash whose opacity rises toward the ground, built from a
+    tiny gradient strip and cached per (colour, intensity bucket) - haze ramps
+    smoothly, so ~8 buckets are indistinguishable from continuous.
+
+    The gradient itself is deliberately colour-independent: every scene that
+    uses this is claiming the same physical thing (suspended particles you are
+    standing *inside*, densest where they have furthest to settle), so only the
+    tint changes between fog and a sandstorm.
+    """
     bucket = max(0, min(8, int(round(inten * 8))))
-    key = (w, h, bucket)
+    key = (w, h, bucket, color)
     hit = _FOG_CACHE.get(key)
     if hit is not None:
         return hit
@@ -516,25 +524,279 @@ def _fog_layer(w: int, h: int, inten: float) -> pygame.Surface:
     for y in range(256):
         f = y / 255.0
         a = int(255 * g * (0.30 + 0.55 * f))       # a haze everywhere, thick low down
-        strip.set_at((0, y), (_FOG_GREY[0], _FOG_GREY[1], _FOG_GREY[2],
+        strip.set_at((0, y), (color[0], color[1], color[2],
                               max(0, min(255, a))))
     surf = pygame.transform.smoothscale(strip, (max(1, w), max(1, h)))
-    if len(_FOG_CACHE) > 16:
+    # Nine buckets per colour, so the cap has to clear a couple of scenes' worth
+    # or a rotation between two hazed scenes would thrash the cache every frame.
+    if len(_FOG_CACHE) > 40:
         _FOG_CACHE.clear()
     _FOG_CACHE[key] = surf
     return surf
 
 
-def draw_fog_overlay(surf: pygame.Surface, intensity: float, t: float = 0.0) -> None:
-    """Wash the whole frame toward a flat grey - the look of standing in fog.
+def _as_rgb(value: Any, default: Color) -> Color:
+    """Coerce anything the sim might publish into an (r, g, b) byte triple."""
+    try:
+        r, g, b = (int(c) for c in tuple(value)[:3])
+    except (TypeError, ValueError):
+        return default
+    return (max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b)))
 
-    *intensity* 0..1. Drawn late (after the light composite) so it dims the lit
-    scene rather than being multiplied away by the ambient. Fails soft."""
+
+def draw_fog_overlay(surf: pygame.Surface, intensity: float, t: float = 0.0,
+                     color: Any = None, daylight: float = 1.0) -> None:
+    """Wash the whole frame toward a flat colour - the look of standing inside
+    weather you cannot see through.
+
+    *intensity* 0..1; *color* is the haze tint, defaulting to fog's grey.
+    Drawn late (after the light composite) so it dims the lit scene rather than
+    being multiplied away by the ambient.
+
+    *daylight* (0..1) is what keeps the haze honest about the time of day. The
+    wash is applied over the finished frame, so without it the overlay is the
+    one thing in the scene the day/night cycle cannot touch: measured, a fog at
+    midnight came out at 113 mean against 128 at noon - a 12% swing, while every
+    other daylight-sensitive scene swings several-fold - so fog rotating in at
+    2am read as broad daylight. Fog at night is a dark murk, not a white sheet.
+    Quantised to eight steps before it reaches the tint so a continuously moving
+    sun cannot thrash the layer cache. Fails soft.
+    """
     try:
         inten = clamp(float(intensity), 0.0, 1.0)
         if inten <= 0.02:
             return
-        surf.blit(_fog_layer(*surf.get_size(), inten), (0, 0))
+        tint = _FOG_GREY if color is None else _as_rgb(color, _FOG_GREY)
+        dl = round(clamp(float(daylight), 0.0, 1.0) * 8.0) / 8.0
+        # Floor rather than a straight multiply: haze is lit by whatever light
+        # there is, and a colony's torches under fog should still show it as a
+        # glow rather than leaving the night looking merely clear.
+        k = 0.26 + 0.74 * dl
+        tint = (int(tint[0] * k), int(tint[1] * k), int(tint[2] * k))
+        surf.blit(_fog_layer(*surf.get_size(), inten, tint), (0, 0))
+    except Exception:
+        return
+
+
+# --------------------------------------------------------------------------
+# eclipse twilight ring
+# --------------------------------------------------------------------------
+
+_ECLIPSE_BAND_CACHE: dict[tuple, pygame.Surface] = {}
+_ECLIPSE_BAND_COLOR = (216, 124, 62)
+#: Where the sky meets the ridges, as a fraction of frame height. Mirrors
+#: sky.HORIZON_FRAC; duplicated rather than imported because fx sits *below*
+#: sky in the render layering and must not depend on it.
+_ECLIPSE_BAND_Y = 0.53
+#: Darkness below which there is no ring at all. The 360-degree sunset is a
+#: totality effect - it appears when the shadow cone is overhead and there is
+#: still lit atmosphere on every horizon, not while the day is merely dimmer.
+_ECLIPSE_BAND_ONSET = 0.45
+_ECLIPSE_BAND_PEAK = 0.42        # scales the additive punch; see below
+
+
+def _eclipse_band(w: int, h: int, level: int) -> pygame.Surface:
+    """Warm horizon band, cached per intensity bucket.
+
+    Built as an RGB surface with the intensity baked into the *colour* rather
+    than an alpha, because it is blitted additively - BLEND_RGB_ADD ignores the
+    source alpha, so encoding strength there would silently do nothing.
+    """
+    key = (w, h, level)
+    hit = _ECLIPSE_BAND_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    g = level / 8.0
+    ys = np.linspace(0.0, 1.0, 256, dtype=np.float32)
+    # Gaussian centred on the horizon, a little wider below it than above so the
+    # glow sits *on* the land rather than floating over it.
+    d = (ys - _ECLIPSE_BAND_Y) / np.where(ys < _ECLIPSE_BAND_Y, 0.070, 0.105).astype(np.float32)
+    prof = np.exp(-d * d) * (g * _ECLIPSE_BAND_PEAK)
+    rgb = prof[:, None] * np.asarray(_ECLIPSE_BAND_COLOR, dtype=np.float32)[None, :]
+    strip = pygame.surfarray.make_surface(
+        np.clip(rgb, 0.0, 255.0).astype(np.uint8).reshape(1, 256, 3))
+    surf = pygame.transform.smoothscale(strip, (max(1, w), max(1, h)))
+    if len(_ECLIPSE_BAND_CACHE) > 16:
+        _ECLIPSE_BAND_CACHE.clear()
+    _ECLIPSE_BAND_CACHE[key] = surf
+    return surf
+
+
+def draw_eclipse_twilight(surf: pygame.Surface, strength: float) -> None:
+    """Add the ring of sunset that circles the horizon during totality.
+
+    *strength* is the scene's published eclipse darkness, 0..1; the onset ramp is
+    applied here so callers stay a one-liner. Additive, and drawn *after* the
+    light composite: this is light arriving from beyond the shadow, not part of
+    the lit world, so multiplying it down with everything else would delete the
+    one cue that tells a viewer this darkness is not just night. Fails soft.
+    """
+    try:
+        u = clamp(float(strength), 0.0, 1.0)
+        band = clamp((u - _ECLIPSE_BAND_ONSET) / (1.0 - _ECLIPSE_BAND_ONSET), 0.0, 1.0)
+        if band <= 0.02:
+            return
+        level = max(1, min(8, int(round(band * 8))))
+        w, h = surf.get_size()
+        surf.blit(_eclipse_band(w, h, level), (0, 0),
+                  special_flags=pygame.BLEND_RGB_ADD)
+    except Exception:
+        return
+
+
+# --------------------------------------------------------------------------
+# earthquake fissures
+# --------------------------------------------------------------------------
+
+_FISSURE_CACHE: dict[tuple, pygame.Surface] = {}
+_FISSURE_DARK = (11, 9, 8)          # the inside of the crack: near-black
+_FISSURE_LIP = (108, 98, 84)        # freshly broken rock along the rim
+
+
+def _fissure_sprite(width: int, depth: int, seed: int) -> pygame.Surface:
+    """A jagged black crack ``width`` px across at the rim, ``depth`` px deep.
+
+    The heightmap already carries the dip the sim carved, so this is only the
+    part a heightmap cannot express: that the dip is *open*. A tapered dark
+    wedge with a broken-rock lip is enough to turn a smooth notch into a hole.
+
+    Cached per (width, depth, seed). The sim opens a handful of scars and their
+    geometry stops changing once they finish opening, so all but the first
+    second and a half of a scar's life is a cache hit and a blit.
+    """
+    key = (width, depth, seed)
+    hit = _FISSURE_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    surf = pygame.Surface((max(1, width), max(1, depth)), pygame.SRCALPHA)
+    rng = random.Random(seed)
+    steps = max(3, depth // 3)
+    left: Polyline = []
+    right: Polyline = []
+    mid = width * 0.5
+    for i in range(steps + 1):
+        u = i / steps
+        # ``** 0.75`` rather than a straight taper: a linear wedge reads as a
+        # drawn triangle, whereas a crack stays wide most of the way down and
+        # then closes quickly, which is what rock actually does.
+        half = mid * (1.0 - u) ** 0.75
+        wob = (rng.random() - 0.5) * width * 0.12
+        y = u * max(1, depth - 1)
+        left.append((mid - half + wob, y))
+        right.append((mid + half + wob, y))
+
+    poly = left + right[::-1]
+    if len(poly) >= 3:
+        pygame.draw.polygon(surf, (*_FISSURE_DARK, 238), poly)
+        pygame.draw.lines(surf, (*_FISSURE_LIP, 140), False, left, 1)
+        pygame.draw.lines(surf, (*_FISSURE_LIP, 140), False, right, 1)
+
+    if len(_FISSURE_CACHE) > 24:
+        _FISSURE_CACHE.clear()
+    _FISSURE_CACHE[key] = surf
+    return surf
+
+
+def draw_fissures(surf: pygame.Surface, cracks: Sequence[Any]) -> None:
+    """Darken the ground scars an earthquake tore open.
+
+    *cracks* is a plain ``(x, ground_y, width, depth, seed)`` sequence - this
+    module never reads sim state, so the caller resolves the terrain height
+    itself. Each crack hangs from its own ground point, which is what keeps it
+    registered with the notch once the light composite has flattened the
+    contour. Fails soft: a scar that does not draw is a cosmetic loss.
+    """
+    if not cracks:
+        return
+    batch: list[tuple[pygame.Surface, tuple[int, int]]] = []
+    for crack in cracks:
+        try:
+            x, gy, width, depth, seed = crack
+            w = int(clamp(float(width), 4.0, 160.0))
+            d = int(clamp(float(depth), 2.0, 120.0))
+            spr = _fissure_sprite(w, d, int(seed) & 0xFFFFF)
+            batch.append((spr, (int(float(x) - w * 0.5), int(float(gy)) - 1)))
+        except Exception:
+            continue
+    blit_batch(surf, batch)
+
+
+# --------------------------------------------------------------------------
+# lava flows
+# --------------------------------------------------------------------------
+
+#: The three tones of a flow, from the crusted rim inward to the incandescent
+#: channel. Warmer and much brighter than MATERIAL_COLORS[MAT_LAVA] (200,78,24),
+#: which is the flat band the terrain pass already painted underneath this: that
+#: one has been through the light composite and is sitting at whatever the ash
+#: cloud left of the ambient, so the whole job here is to put back the light the
+#: flow is producing *itself*.
+_LAVA_CRUST = (128, 26, 10)
+_LAVA_BODY = (238, 84, 20)
+_LAVA_CORE = (255, 214, 128)
+#: Colour and reach of the glow it throws onto everything around it.
+_LAVA_GLOW = (255, 92, 26)
+_LAVA_GLOW_R = 150.0
+#: px between glow sprites along the flow. Each is a cached radial blit, so this
+#: is the cost dial: at 96 a full-width flow costs four of them.
+_LAVA_GLOW_STEP = 96.0
+
+
+def draw_lava_flow(surf: pygame.Surface, flows: Sequence[Any], t: float = 0.0) -> None:
+    """Draw molten flows as emissive bands following the ground.
+
+    *flows* is a plain ``[(points, heat), ...]`` sequence - this module never
+    reads sim state, so the caller samples the terrain and hands over the
+    contour. ``points`` is a list of ``(x, y)`` along the surface and ``heat``
+    is 0..1, the flow's own temperature.
+
+    Drawn *after* the light composite, for the reason the UFO beam is: this is
+    light the world is emitting, not light falling on it, and multiplying it
+    down by an ambient the same eruption has just crushed would leave the one
+    bright thing on screen as dark as everything else.
+
+    The bright core is dashed and the dashes travel, which is the only thing
+    here that says the rock is *moving*: a static band reads as painted ground
+    no matter how orange it is. Fails soft - a frame without lava is still a
+    frame.
+    """
+    try:
+        for flow in flows:
+            pts, heat = flow[0], clamp(float(flow[1]), 0.0, 1.0)
+            if heat <= 0.02 or len(pts) < 2:
+                continue
+            # Glow first, so the band itself is drawn over its own halo rather
+            # than being washed out by it.
+            span = abs(float(pts[-1][0]) - float(pts[0][0]))
+            steps = max(1, int(span / _LAVA_GLOW_STEP) + 1)
+            for i in range(steps):
+                u = i / max(1, steps - 1) if steps > 1 else 0.5
+                idx = int(u * (len(pts) - 1))
+                gx, gy = pts[idx]
+                blit_light(surf, gx, gy, _LAVA_GLOW_R * (0.55 + 0.45 * heat),
+                           _LAVA_GLOW, 0.42 * heat)
+
+            line = [(int(px), int(py)) for px, py in pts]
+            pygame.draw.lines(surf, _LAVA_CRUST, False, line, max(3, int(9 * heat)))
+            pygame.draw.lines(surf, _LAVA_BODY, False, line, max(1, int(5 * heat)))
+
+            # Travelling bright dashes along the channel. One line call per lit
+            # run rather than per segment, so a full-width flow is a handful of
+            # calls however finely the caller sampled it.
+            phase = float(t) * 0.55
+            run: list[tuple[int, int]] = []
+            for i, p in enumerate(line):
+                lit = ((i * 0.11 - phase) % 1.0) < 0.42
+                if lit:
+                    run.append(p)
+                    continue
+                if len(run) >= 2:
+                    pygame.draw.lines(surf, _LAVA_CORE, False, run, 2)
+                run = []
+            if len(run) >= 2:
+                pygame.draw.lines(surf, _LAVA_CORE, False, run, 2)
     except Exception:
         return
 
@@ -568,10 +830,36 @@ def draw_heat_shimmer(surf: pygame.Surface, rect: Sequence[int], t: float,
                  + np.sin(phase * 0.31 - t * 4.3) * amt * 0.45)
         # stronger near the bottom of the region (close to the heat source)
         shift *= np.clip(rows / max(1.0, h - 1.0), 0.0, 1.0) ** 0.6
-        cols = np.arange(w, dtype=np.float32)[:, None]
-        idx = np.clip(np.rint(cols + shift[None, :]), 0, w - 1).astype(np.int32)
-        rows_i = np.broadcast_to(np.arange(h, dtype=np.int32)[None, :], (w, h))
-        out = src[idx, rows_i]
+
+        # Whole-pixel shifts applied as run-length slice copies. Every column in
+        # a row moves by the same amount, so the obvious ``src[idx, rows]``
+        # gather is doing per-pixel work to express a per-row fact: it
+        # materialises two int32 arrays the size of the region and reads through
+        # them, which measured at ~6 ms for the 1600x220 ground band the
+        # heatwave scene asks for, against ~0.5 ms for the slices below. That is
+        # the difference between an effect that fits inside a 60 Hz frame and
+        # one that eats a third of it, and the output is identical: the same
+        # rounded shift, and the same clamp-to-edge on the columns the shift
+        # pulls in from outside the region.
+        k = np.rint(shift).astype(np.int32)
+        np.clip(k, -(w - 1), w - 1, out=k)
+        out = np.empty_like(src)
+        start = 0
+        for i in range(1, h + 1):
+            if i < h and k[i] == k[start]:
+                continue                    # same shift; keep growing the run
+            s = int(k[start])
+            dst, col = out[:, start:i], src[:, start:i]
+            if s == 0:
+                dst[:] = col
+            elif s > 0:                     # sample from further right
+                dst[:w - s] = col[s:]
+                dst[w - s:] = col[w - 1:w]
+            else:                           # ...or further left
+                n = -s
+                dst[n:] = col[:w - n]
+                dst[:n] = col[0:1]
+            start = i
         surf.blit(_surface_from_rgb(out), clip_rect.topleft)
     except Exception:
         return
@@ -654,6 +942,8 @@ def clear_caches() -> None:
     _LIGHT_CACHE.clear()
     _LIGHT_CACHE_BYTES = 0
     _VIGNETTE_CACHE.clear()
+    _ECLIPSE_BAND_CACHE.clear()
+    _FISSURE_CACHE.clear()
     _RAIN_TILE.clear()
     _SCRATCH.clear()
 
@@ -664,6 +954,7 @@ def cache_stats() -> dict[str, int]:
         "lights": len(_LIGHT_CACHE),
         "vignettes": len(_VIGNETTE_CACHE),
         "rain_tiles": len(_RAIN_TILE),
+        "fissures": len(_FISSURE_CACHE),
         "scratch": len(_SCRATCH),
     }
 

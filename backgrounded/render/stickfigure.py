@@ -28,6 +28,8 @@ from typing import Any, Callable, Sequence
 import pygame
 
 from ..constants import (
+    MORPH_GIRTH_MAX,
+    MORPH_GIRTH_MIN,
     RENDER_H,
     RENDER_W,
     RES_COOKED,
@@ -36,7 +38,14 @@ from ..constants import (
     RES_STONE,
     RES_WOOD,
 )
-from ..sim.entities import AGENT_HEIGHT, GRAVE_DELAY, ROLE_CHILD, ROLE_ELDER, Stickman
+from ..sim.entities import (
+    AGENT_HEIGHT,
+    GRAVE_DELAY,
+    ROLE_CHILD,
+    ROLE_ELDER,
+    Stickman,
+    morph_scales,
+)
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +104,16 @@ _SHIN = 0.245
 _UARM = 0.155
 _FARM = 0.145
 _HEADR = 0.115
+
+# How hard a body's girth pushes on the drawing. Both are blends, not raw
+# multiplies: at girth 1.0 they evaluate to exactly 1.0, so an ordinary figure
+# is pixel-for-pixel what it was before morphs existed, and the extremes of
+# MORPH_TABLE stay inside a body you can still read. Spread widens the stance
+# and the limb swing (the strongest cue that someone is *wide* rather than
+# merely tall); the head grows more gently, because a head scaled as hard as
+# the shoulders reads as a toddler rather than as bulk.
+_GIRTH_SPREAD_K = 0.70
+_GIRTH_HEAD_K = 0.60
 
 #: Default silhouette colour for agents outside every light source.
 SILHOUETTE: tuple[int, int, int] = (9, 10, 14)
@@ -206,6 +225,9 @@ class Skeleton:
     height: float = AGENT_HEIGHT
     facing: int = 1
     pose: str = "idle"
+    #: Width factor already baked into the joint positions above; carried so the
+    #: line weights (and any other module drawing off this skeleton) can match.
+    girth: float = 1.0
 
     @property
     def front_hand(self) -> tuple[float, float]:
@@ -243,12 +265,38 @@ def _height_of(s: Stickman) -> float:
                 return h
         except Exception:
             pass
+    # Fallback for anything only duck-typed as an agent (tools, tests, a save
+    # loaded by an older Stickman). Rebuild role x morph by hand rather than
+    # silently drawing a mutant at ordinary size.
     role = getattr(s, "role", "")
     if role == ROLE_CHILD:
-        return AGENT_HEIGHT * 0.68
-    if role == ROLE_ELDER:
-        return AGENT_HEIGHT * 0.94
-    return AGENT_HEIGHT
+        h = AGENT_HEIGHT * 0.68
+    elif role == ROLE_ELDER:
+        h = AGENT_HEIGHT * 0.94
+    else:
+        h = AGENT_HEIGHT
+    return h * morph_scales(getattr(s, "morph", ""))[0]
+
+
+def _girth_of(s: Stickman) -> float:
+    """Width factor for this body. 1.0 is the ordinary build.
+
+    Same shape as :func:`_height_of`: ask the agent first, fall back to the
+    morph table, and never let a junk value out - a non-finite girth would
+    propagate into every joint coordinate on the figure.
+    """
+    fn = getattr(s, "girth", None)
+    if callable(fn):
+        try:
+            g = float(fn())
+            if math.isfinite(g) and MORPH_GIRTH_MIN <= g <= MORPH_GIRTH_MAX:
+                return g
+        except Exception:
+            pass
+    try:
+        return float(morph_scales(getattr(s, "morph", ""))[1])
+    except Exception:
+        return 1.0
 
 
 # --------------------------------------------------------- pose functions --
@@ -544,15 +592,25 @@ def build_skeleton(s: Stickman, t: float, pose: str | None = None) -> Skeleton:
     except Exception:
         log.debug("pose %s failed", name, exc_info=True)
         p = _Pose()
-    return _solve(s, p, height, name)
+    return _solve(s, p, height, name, _girth_of(s))
 
 
-def _solve(s: Stickman, p: _Pose, h: float, name: str) -> Skeleton:
+def _solve(s: Stickman, p: _Pose, h: float, name: str,
+           girth: float = 1.0) -> Skeleton:
+    # Girth is applied in *body-local* space, before facing and before the
+    # whole-body rot, so a broad villager stays coherently broad while lying
+    # down or mid-cartwheel instead of shearing as the body turns.
+    g = girth if math.isfinite(girth) else 1.0
+    g = MORPH_GIRTH_MIN if g < MORPH_GIRTH_MIN else (
+        MORPH_GIRTH_MAX if g > MORPH_GIRTH_MAX else g)
+    spread = 1.0 - _GIRTH_SPREAD_K + _GIRTH_SPREAD_K * g
+    head_g = 1.0 - _GIRTH_HEAD_K + _GIRTH_HEAD_K * g
+
     hip_h = h * _HIP * (1.0 - 0.30 * p.crouch)
     l_thigh, l_shin = h * _THIGH, h * _SHIN
     l_torso = h * _TORSO
     l_ua, l_fa = h * _UARM, h * _FARM
-    head_r = h * _HEADR
+    head_r = h * _HEADR * head_g
 
     sin, cos = math.sin, math.cos
     hip = (0.0, -hip_h)
@@ -594,7 +652,7 @@ def _solve(s: Stickman, p: _Pose, h: float, name: str) -> Skeleton:
     oy = float(getattr(s, "y", 0.0)) + p.bob + lie_dy
 
     def xf(pt: tuple[float, float]) -> tuple[float, float]:
-        px, py = pt[0] * fx, pt[1]
+        px, py = pt[0] * fx * spread, pt[1]
         if rot:
             dy0 = py - piv_y
             px, py = px * cr - dy0 * sr, piv_y + px * sr + dy0 * cr
@@ -605,7 +663,7 @@ def _solve(s: Stickman, p: _Pose, h: float, name: str) -> Skeleton:
         head_r=head_r,
         knees=[xf(k) for k in knees], feet=[xf(f) for f in feet],
         elbows=[xf(e) for e in elbows], hands=[xf(hh) for hh in hands],
-        height=h, facing=int(fx), pose=name,
+        height=h, facing=int(fx), pose=name, girth=g,
     )
 
 
@@ -659,8 +717,15 @@ def _draw(surf: pygame.Surface, s: Stickman, t: float,
     # Thin limbs, one step heavier for the torso. At this scale a uniform 2px
     # figure fuses into a blob - the weight difference is what keeps the arms
     # and legs readable against the body.
-    w = 1 if h < 30.0 else 2
-    tw = w + 1
+    #
+    # Girth is drawn as *weight* as well as width: a stout villager's limbs and
+    # torso are fatter lines, which is what stops a broad stance from reading as
+    # a thin man doing the splits. The torso keeps its one-step lead over the
+    # limbs at every girth, and an ordinary body (girth 1.0) rounds back to the
+    # exact widths this used before.
+    base_w = 1 if h < 30.0 else 2
+    w = max(1, int(round(base_w * sk.girth)))
+    tw = max(w + 1, int(round((base_w + 1) * sk.girth)))
 
     # far limbs -> torso -> near limbs -> head: cheapest possible depth cue
     _line(surf, far, sk.hip, sk.knees[1], w)
@@ -1057,14 +1122,19 @@ if __name__ == "__main__":   # pragma: no cover - visual smoke test
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
     pygame.init()
 
+    from ..constants import MORPH_TABLE
+
     CELL_W, CELL_H, COLS = 96, 92, 6
-    rows = (len(POSES) + 2 + COLS - 1) // COLS
+    # ...plus one walking cell per morph, so "fat" and "big" can be compared
+    # side by side rather than taken on trust.
+    cells = list(POSES) + ["dead", "silhouette", "morph:"] + \
+        [f"morph:{m}" for m in MORPH_TABLE]
+    rows = (len(cells) + COLS - 1) // COLS
     sheet = pygame.Surface((CELL_W * COLS, CELL_H * rows))
     sheet.fill((16, 18, 24))
 
     rng = random.Random(4)
     pop = Population()
-    cells = list(POSES) + ["dead", "silhouette"]
     for i, pose in enumerate(cells):
         cx = (i % COLS) * CELL_W + CELL_W // 2
         cy = (i // COLS) * CELL_H + CELL_H - 22
@@ -1077,6 +1147,9 @@ if __name__ == "__main__":   # pragma: no cover - visual smoke test
         a.say(("food", "?", "sleep", "heart", "fire", "hut")[i % 6], 9.9)
         if pose == "dead":
             a.alive = False
+        elif pose.startswith("morph:"):
+            a.morph = pose.split(":", 1)[1]
+            a.pose_override = "walk"
         elif pose != "silhouette":
             a.pose_override = pose
         draw_stickman(sheet, a, 1.35,

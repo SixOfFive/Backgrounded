@@ -15,7 +15,7 @@ import pygame
 
 from ..constants import (
     MATERIAL_COLORS, MAT_GRASS, RENDER_H, RENDER_SIZE, RENDER_W,
-    SCENE_BLIZZARD, SCENE_FLOOD, SCENE_WILDFIRE,
+    SCENE_BLIZZARD, SCENE_FLOOD, SCENE_SANDSTORM, SCENE_WILDFIRE,
 )
 from . import creatures, fx, hud, sky
 from .atlas import Atlas
@@ -28,6 +28,41 @@ log = logging.getLogger(__name__)
 # in its identity colour. Feature 36.
 SILHOUETTE_CUTOFF = 0.30
 SILHOUETTE_COLOR = (14, 15, 22)
+
+# Heat shimmer geometry, in px. The band is measured off the live heightmap
+# rather than fixed, so it follows a map the disasters have reshaped. It reaches
+# SHIMMER_RISE above the highest ground (rising air) and SHIMMER_BELOW under the
+# lowest (so the ground line itself is inside the distorted region and boils),
+# and SHIMMER_MAX_H caps the whole thing: fx.draw_heat_shimmer snapshots and
+# rebuilds the rect it is handed, so its cost is linear in area and a map with
+# 400 px of relief would otherwise turn a cheap effect into a full-frame one.
+# Measured at 1600x220: ~5 ms a frame on top of a ~5 ms base draw, which fits
+# inside the 60 Hz budget with room to spare and is only paid in this scene.
+SHIMMER_RISE = 92
+SHIMMER_BELOW = 24
+SHIMMER_MAX_H = 220
+#: px of horizontal displacement at zero and at full drought. The low end is
+#: kept just above fx.draw_heat_shimmer's own 0.4 px cutoff so the effect fades
+#: in continuously instead of popping on.
+SHIMMER_MIN_PX, SHIMMER_MAX_PX = 0.5, 3.2
+
+# Lava geometry. The flow is sampled onto the live heightmap every LAVA_SAMPLE_PX
+# so the band follows a contour the disasters keep rewriting, and LAVA_SAMPLES
+# caps the work however wide the front gets (a full-width flow at 8 px is ~42
+# points, which is already finer than the terrain the ridge pass draws).
+LAVA_SAMPLE_PX = 8.0
+LAVA_SAMPLES = 64
+#: ...and how many of those points get a light in the lightmap. Each one is a
+#: full radial blit the size of a firepit's, so this is the cost dial rather
+#: than a look dial: six across a flow overlap into one continuous wash.
+LAVA_LIGHTS = 6
+LAVA_LIGHT_R = 190.0
+LAVA_LIGHT_COLOR = (255, 104, 34)
+#: Embers per second per flow at full heat, split over three points along it.
+#: The particle pool caps "ember" at 500 and burning props draw on the same
+#: budget, so this is set to read as a constant drizzle of sparks rather than to
+#: saturate: at 26/s a flow holds roughly 40 in the air at once.
+LAVA_EMBERS_PER_SEC = 26.0
 
 
 class Renderer:
@@ -42,8 +77,22 @@ class Renderer:
         self.show_roster: bool = True
         self.show_names: bool = True
         self.show_log: bool = True
+        # Read straight off the stored config rather than waiting to be told.
+        # app.py sets the other three flags from its own Config instance and
+        # will overwrite this one with the same value the moment it learns to;
+        # self-loading in the meantime is what stops the flag being decorative.
+        try:
+            from ..config import Config
+            self.show_activity: bool = bool(
+                getattr(Config.load(), "show_activity", True))
+        except Exception:
+            log.debug("could not read show_activity from config", exc_info=True)
+            self.show_activity = True
         self._terrain_cache: pygame.Surface | None = None
         self._terrain_fingerprint: tuple | None = None
+        # Label plates already placed this frame, so two villagers standing on
+        # top of each other do not stack their status text into a smear.
+        self._label_rects: list[pygame.Rect] = []
         self._frame = 0
 
     # ------------------------------------------------------------- public --
@@ -52,8 +101,15 @@ class Renderer:
         s = self.scene
         ev = world.events
 
+        # Sampled once, up front, because three different passes want it: the
+        # ember emitter below, the lightmap (a flow lights what is around it)
+        # and the emissive band drawn after the composite. Empty in every scene
+        # but the eruption - and for the minute afterwards, while the flow the
+        # eruption left behind is still cooling.
+        lava = self._lava_flows(world)
+
         try:
-            self._emit_weather(world, dt)
+            self._emit_weather(world, dt, lava)
             self.particles.update(dt, world.terrain, ev)
         except Exception:
             log.exception("particle update failed")
@@ -65,8 +121,12 @@ class Renderer:
         # 3. distant weather
         self.particles.draw(s, layer="back")
 
-        # 4. terrain
+        # 4. terrain, then the scars an earthquake has torn in it. The scars go
+        # here and not later because they are *ground*: they must sit under
+        # everything that stands on the terrain, and the light composite must
+        # dim them along with the rest of the world.
         s.blit(self._terrain_surface(world.terrain), (0, 0))
+        self._draw_fissures(s, world)
 
         # 5-6. props then structures, painter-ordered by x for a little depth
         self._draw_props(s, world)
@@ -91,7 +151,24 @@ class Renderer:
             self._draw_water(s, world, ev.water_level)
 
         # 10. the light composite
-        self._composite_light(s, world)
+        self._composite_light(s, world, lava)
+
+        # Lava, immediately after it. The terrain pass has already painted the
+        # flat MAT_LAVA band under everything, which is right - it is ground -
+        # but the composite has just multiplied it down by an ambient this same
+        # scene crushed to a quarter. This puts the flow's own light back on top
+        # of the lit world, which is what makes it the brightest thing on screen
+        # instead of a dark orange stripe.
+        if lava:
+            fx.draw_lava_flow(s, lava, world.world_time)
+
+        # Heat haze over the ground, after the composite because it displaces
+        # what you can *see* - lit pixels, not the world's own geometry - and
+        # before the UFO, the lightning and the HUD, none of which are things
+        # the air between you and the ground is in front of.
+        heat = float(getattr(ev, "heat", 0.0) or 0.0)
+        if heat > 0.02:
+            self._draw_heat_shimmer(s, world, heat)
 
         # The saucer sits above the light pass: its beam is its own light and
         # should not be multiplied down into the night.
@@ -104,11 +181,29 @@ class Renderer:
         self._draw_lightning(s, world)
         fx.draw_vignette(s)
 
-        # fog wash sits above the whole lit world (so it dims it rather than
-        # being multiplied away), but below the HUD, which must stay readable.
+        # The eclipse's horizon ring, for the same reason and at the same layer
+        # as the fog wash: it is light coming in under the shadow from outside
+        # it, not part of the lit world, so the light composite must not have a
+        # say in it. Above the vignette so the corners keep their glow.
+        ecl = float(getattr(ev, "eclipse", 0.0) or 0.0)
+        if ecl > 0.02:
+            fx.draw_eclipse_twilight(s, ecl)
+
+        # The haze wash sits above the whole lit world (so it dims it rather
+        # than being multiplied away), but below the HUD, which must stay
+        # readable. Density and colour both come off the sim: the scene decides
+        # whether this is a grey fog or a tan sandstorm, not the renderer.
         fog = float(getattr(ev, "fog", 0.0) or 0.0)
         if fog > 0.02:
-            fx.draw_fog_overlay(s, fog, world.world_time)
+            # Hand it the daylight level too, or the wash - being painted over
+            # the finished frame - becomes the one part of the scene the
+            # day/night cycle cannot reach, and a 2am fog reads as noon.
+            try:
+                dl = sky.daylight(sky.day_phase(world.world_time, world.lighting))
+            except Exception:
+                dl = 1.0
+            fx.draw_fog_overlay(s, fog, world.world_time,
+                                getattr(ev, "fog_color", None), dl)
 
         # 12. stats panel. Deliberately after the light composite: it is UI,
         # not part of the world, so it must stay readable in a black scene.
@@ -153,9 +248,17 @@ class Renderer:
             while x2 < RENDER_W and int(mats[x2]) == m:
                 x2 += 1
             col = MATERIAL_COLORS.get(m, MATERIAL_COLORS[MAT_GRASS])
-            seg = [(x, float(h[x]))]
-            seg += [(xi, float(h[xi])) for xi in range(x, x2)]
-            seg += [(x2 - 1, float(h[x2 - 1]) + band), (x, float(h[x]) + band)]
+            # Both edges of the band follow the contour. Closing the polygon on
+            # two corner points instead - which is what this did - only draws a
+            # band where the run is flat: over a hill it fills the whole wedge
+            # between the skyline and a straight line joining the run's ends.
+            # It was invisible while every material was a muted earth tone
+            # against a near-black body, and became a lit orange tent the first
+            # time a volcanic flow painted a 300 px run of MAT_LAVA across a
+            # ridge. Two points per column rather than one, on a surface that is
+            # cached until the heightmap moves.
+            seg = [(xi, float(h[xi])) for xi in range(x, x2)]
+            seg += [(xi, float(h[xi]) + band) for xi in range(x2 - 1, x - 1, -1)]
             if len(seg) > 2:
                 pygame.draw.polygon(surf, col, seg)
             x = x2
@@ -167,6 +270,32 @@ class Renderer:
         self._terrain_cache = surf.convert_alpha()
         self._terrain_fingerprint = fp
         return self._terrain_cache
+
+    def _draw_fissures(self, s: pygame.Surface, world) -> None:
+        """Darken the gaps the earthquake tore open. A no-op in every other
+        scene, because nothing else ever fills ``events.fissures``.
+
+        The ground y is resolved here rather than being taken from the scar's
+        stored ``y``: that one records where the surface was when the crack
+        started, and the sim then digs the surface out from under it, so using
+        it would leave the crack floating a couple of dozen px above its hole.
+        """
+        fissures = getattr(world.events, "fissures", None)
+        if not fissures:
+            return
+        cracks: list[tuple[float, float, float, float, int]] = []
+        for f in list(fissures):
+            try:
+                depth = float(f.get("depth", 0.0))
+                if depth < 2.0:
+                    continue            # not open enough to read as a hole yet
+                x = float(f["x"])
+                cracks.append((x, world.terrain.ground_y(x),
+                               float(f.get("half", 12.0)) * 1.05, depth,
+                               int(f.get("seed", 1))))
+            except Exception:
+                continue
+        fx.draw_fissures(s, cracks)
 
     # -------------------------------------------------------------- props --
     def _draw_props(self, s: pygame.Surface, world) -> None:
@@ -257,6 +386,7 @@ class Renderer:
     # ------------------------------------------------------------- agents --
     def _draw_agents(self, s: pygame.Surface, world) -> None:
         lighting = world.lighting
+        self._label_rects.clear()
         for a in world.population.agents:
             if not a.alive and a.dead_t > 2.0:
                 continue
@@ -273,31 +403,120 @@ class Renderer:
                 draw_stickman(s, a, world.world_time, alpha_color=silhouette)
             except Exception:
                 log.exception("stickman draw failed for %s", getattr(a, "name", "?"))
-            if self.show_names and a.alive:
-                self._draw_name(s, a, lit)
+            if (self.show_names or self.show_activity) and a.alive:
+                self._draw_labels(s, a, lit)
 
-    def _draw_name(self, s: pygame.Surface, a, lit: float) -> None:
-        """Name plate above the head, in that stickman's identity colour.
+    def _draw_labels(self, s: pygame.Surface, a, lit: float) -> None:
+        """The plates above a stickman's head: what it is doing, then its name.
+
+        Both plates are placed as one block so the pair move together, and the
+        activity sits *above* the name rather than below it. Below reads more
+        naturally, but the name's bottom edge is already only ~11 px clear of a
+        21 px stickman's scalp, so a second line there would sit on the head.
+        Stacking upward keeps the figure clean at every scale.
 
         Faded with local light so labels do not flatten the night scene - an
         unlit figure gets a dim tag, matching the silhouette it is drawn as.
         """
         try:
             dim = 0.42 + 0.58 * max(0.0, min(1.0, float(lit)))
-            tag = hud.name_tag(str(a.name)[:12], tuple(a.color), dim)
-            r = tag.get_rect()
+            plates: list[pygame.Surface] = []
+            if self.show_activity:
+                act = hud.activity_tag(hud.activity_of(a), dim)
+                if act is not None:
+                    plates.append(act)
+            if self.show_names:
+                plates.append(hud.name_tag(str(a.name)[:12], tuple(a.color), dim))
+            if not plates:
+                return
+
+            gap = 1
+            width = max(p.get_width() for p in plates)
+            height = sum(p.get_height() for p in plates) + gap * (len(plates) - 1)
+            block = pygame.Rect(0, 0, width, height)
             # AGENT_HEIGHT above the feet, plus clearance for the speech bubble
-            r.midbottom = (int(a.x), int(a.y) - 32)
+            block.midbottom = (int(a.x), int(a.y) - 32)
             if a.speech:
-                r.top -= 10
-            r.left = max(1, min(r.left, RENDER_W - r.width - 1))
-            r.top = max(1, r.top)
-            s.blit(tag, r)
+                block.top -= 10
+            block.left = max(1, min(block.left, RENDER_W - block.width - 1))
+            block.top = max(1, block.top)
+            self._avoid_overlap(block)
+
+            y = block.top
+            for p in plates:
+                r = p.get_rect()
+                r.centerx = block.centerx
+                r.top = y
+                # Re-clamp per plate: they differ in width, so the widest one
+                # setting the block's edge does not keep the others on screen.
+                r.left = max(1, min(r.left, RENDER_W - r.width - 1))
+                s.blit(p, r)
+                y += p.get_height() + gap
+            self._label_rects.append(block)
         except Exception:
             pass
 
+    def _avoid_overlap(self, block: pygame.Rect) -> None:
+        """Nudge *block* upward until it clears the labels already drawn.
+
+        Villagers cluster - around a fire, a build site, a body - and two name
+        plates at the same height overlap into an unreadable smear. Lifting the
+        later one keeps both legible and still visibly anchored to its owner.
+        Bounded: a handful of passes, and never off the top of the screen.
+        """
+        for _ in range(6):
+            hit = block.collidelist(self._label_rects)
+            if hit < 0:
+                return
+            lift = block.bottom - self._label_rects[hit].top + 2
+            if lift <= 0 or block.top - lift < 1:
+                return
+            block.top -= lift
+
+    # --------------------------------------------------------------- lava --
+    def _lava_flows(self, world) -> list[tuple[list[tuple[float, float]], float]]:
+        """Sample each published flow onto the live ground contour.
+
+        ``events.lava`` carries a vent x, how far the front has advanced and how
+        hot it still is; the *shape* has to be read off the heightmap here,
+        because the flow lies on the ground and the ground is what the rest of
+        the scene keeps changing (ash settles on it, a tremor digs a notch in
+        it). Sampling per frame rather than caching for the same reason.
+
+        The live half-width is ``half * hot``, exactly as the sim computes it in
+        ``_lava_paint`` - so what is drawn is the span that is actually painted
+        MAT_LAVA, and the band cannot drift off the material it belongs to as
+        the flow congeals. Fails soft to no lava at all.
+        """
+        out: list[tuple[list[tuple[float, float]], float]] = []
+        try:
+            flows = getattr(world.events, "lava", None)
+            if not flows:
+                return out
+            ground = world.terrain.ground_y
+            for f in list(flows):
+                try:
+                    heat = max(0.0, min(1.0, float(f.get("hot", 0.0))))
+                    live = max(0.0, float(f.get("half", 0.0)) * heat)
+                    if heat <= 0.02 or live < 2.0:
+                        continue
+                    cx = float(f["x"])
+                    n = max(2, min(LAVA_SAMPLES, int(live * 2.0 / LAVA_SAMPLE_PX) + 1))
+                    pts = []
+                    for i in range(n):
+                        x = cx - live + 2.0 * live * (i / (n - 1))
+                        x = max(0.0, min(float(RENDER_W - 1), x))
+                        pts.append((x, ground(x) + 1.0))
+                    out.append((pts, heat))
+                except Exception:
+                    continue
+        except Exception:
+            log.debug("lava sampling failed", exc_info=True)
+        return out
+
     # -------------------------------------------------------------- light --
-    def _composite_light(self, s: pygame.Surface, world) -> None:
+    def _composite_light(self, s: pygame.Surface, world,
+                         lava: list[tuple[list[tuple[float, float]], float]] | None = None) -> None:
         lighting = world.lighting
         try:
             amb = float(lighting.ambient(world.events.scene, world.world_time))
@@ -329,6 +548,25 @@ class Renderer:
             r.center = (int(src.x), int(src.y))
             lm.blit(spr, r, special_flags=pygame.BLEND_RGB_ADD)
 
+        # A flow is a light source the size of a street, and it belongs in the
+        # lightmap rather than only in the emissive pass: what sells an eruption
+        # at night is not the orange band, it is the colony, the trees and the
+        # hillside behind them all picked out in red from below. Added here and
+        # not through lighting.sources because those are simulation state, and
+        # the sim has no business carrying a hundred px of derived geometry the
+        # renderer can sample off the heightmap for free.
+        for pts, heat in (lava or ()):
+            step = max(1, len(pts) // LAVA_LIGHTS)
+            for i in range(0, len(pts), step):
+                try:
+                    spr = fx.radial_light_surface(
+                        LAVA_LIGHT_R, LAVA_LIGHT_COLOR, 0.85 * heat)
+                except Exception:
+                    break
+                r = spr.get_rect()
+                r.center = (int(pts[i][0]), int(pts[i][1]))
+                lm.blit(spr, r, special_flags=pygame.BLEND_RGB_ADD)
+
         s.blit(lm, (0, 0), special_flags=pygame.BLEND_RGB_MULT)
 
     def _draw_lightning(self, s: pygame.Surface, world) -> None:
@@ -343,6 +581,36 @@ class Renderer:
             except Exception:
                 continue
 
+    def _draw_heat_shimmer(self, s: pygame.Surface, world, heat: float) -> None:
+        """Boil the ground band, scaled by how deep the drought has got.
+
+        Driven off the published ``events.heat`` channel rather than a scene
+        name test, for the same reason the eclipse ring and the haze wash are:
+        the sim decides how hot it is, the renderer only decides what that looks
+        like, and the two cannot drift apart. Every other scene leaves the
+        channel at zero, so this is a no-op everywhere else.
+
+        Fails soft and silently - a frame without shimmer is a frame that still
+        gets drawn, which on a wallpaper that runs unattended for hours is worth
+        far more than the effect is.
+        """
+        try:
+            h = world.terrain.height
+            y0 = int(float(np.min(h))) - SHIMMER_RISE
+            y1 = int(float(np.max(h))) + SHIMMER_BELOW
+            y0 = max(0, y0)
+            y1 = min(RENDER_H, y1)
+            if y1 - y0 > SHIMMER_MAX_H:
+                # Trim from the top: the interesting half is the ground line.
+                y0 = y1 - SHIMMER_MAX_H
+            if y1 - y0 < 16:
+                return
+            amount = SHIMMER_MIN_PX + (SHIMMER_MAX_PX - SHIMMER_MIN_PX) * min(1.0, heat)
+            fx.draw_heat_shimmer(s, (0, y0, RENDER_W, y1 - y0),
+                                 float(world.world_time), amount, band=5)
+        except Exception:
+            log.debug("heat shimmer failed", exc_info=True)
+
     def _draw_water(self, s: pygame.Surface, world, level: float) -> None:
         if level >= RENDER_H:
             return
@@ -353,9 +621,12 @@ class Renderer:
         pygame.draw.line(s, (120, 170, 220), (0, int(level)), (RENDER_W, int(level)), 2)
 
     # ------------------------------------------------------------ weather --
-    def _emit_weather(self, world, dt: float) -> None:
+    def _emit_weather(self, world, dt: float,
+                      lava: list[tuple[list[tuple[float, float]], float]] | None = None) -> None:
         ev = world.events
         scene = ev.scene
+        if lava:
+            self._emit_lava_sparks(lava, dt)
         if getattr(ev, "rain", 0) > 0.01:
             self.particles.emit("rain", int(90 * ev.rain * dt * 60 / 60),
                                 wind=ev.wind)
@@ -363,6 +634,8 @@ class Renderer:
             self.particles.emit("snow", int(40 * ev.snow), wind=ev.wind)
         if getattr(ev, "ash", 0) > 0.01:
             self.particles.emit("ash", int(25 * ev.ash), wind=ev.wind)
+        if scene == SCENE_SANDSTORM:
+            self._emit_grit(ev, dt)
         if scene == SCENE_WILDFIRE or world.props.burning():
             for p in world.props.burning():
                 self.particles.emit("ember", 2, x=p.x, y=p.y - 10)
@@ -374,3 +647,103 @@ class Renderer:
             return
         if scene not in (SCENE_BLIZZARD, SCENE_FLOOD) and getattr(ev, "rain", 0) < 0.1:
             self.particles.emit("firefly", 1)
+
+    def _emit_lava_sparks(self, lava, dt: float) -> None:
+        """Throw sparks and smoke off the flow.
+
+        Deliberately dt-scaled, like the sandstorm's grit and unlike the rain
+        and snow emitters above: this runs at whatever rate the app happens to
+        be compositing at, and a per-frame count would put sixteen times as many
+        sparks in the preview window as on the 4 Hz wallpaper push.
+
+        Only three launch points per flow, spread across it, rather than one per
+        sampled column: an emit() call is a numpy round trip and the particles
+        spread themselves out anyway once the ember kind's negative gravity has
+        carried them up. Read-only and fails soft - a full pool or a missing
+        channel just means no sparks this frame.
+        """
+        try:
+            step = max(0.0, min(0.25, float(dt)))
+            if step <= 0.0:
+                return
+            for pts, heat in lava:
+                n = int(LAVA_EMBERS_PER_SEC * heat * step)
+                if n <= 0 or len(pts) < 2:
+                    continue
+                for i in (0, len(pts) // 2, len(pts) - 1):
+                    x, y = pts[i]
+                    # Palette 17 is the lava tone; embers are drawn additively,
+                    # so they read as sparks rather than as orange confetti.
+                    self.particles.emit("ember", max(1, n // 3),
+                                        x=(x - 14.0, x + 14.0), y=(y - 6.0, y),
+                                        vx=(-26.0, 26.0), vy=(-120.0, -40.0),
+                                        life=(0.7, 2.1), size=(0.7, 2.0), color=17)
+                if self._frame % 3 == 0:
+                    mid = pts[len(pts) // 2]
+                    self.particles.emit("smoke", 1, x=(mid[0] - 30.0, mid[0] + 30.0),
+                                        y=(mid[1] - 20.0, mid[1]))
+        except Exception:
+            log.debug("lava spark emit failed", exc_info=True)
+
+    def _emit_grit(self, ev, dt: float) -> None:
+        """Drive sand across the frame along the sandstorm's signed wind.
+
+        The "dust" kind is reused rather than a new particle type being added:
+        it already has the physics grit wants - heavy, high drag, and it dies on
+        contact with the ground instead of settling into the permanent litter
+        that snow and ash leave. So all this has to supply is a launch and a
+        horizontal speed the drag can eat.
+
+        Seeded across the *whole* width rather than off the upwind edge, which
+        is the obvious way to write it and is wrong: the drag bleeds a grain's
+        speed off in about a second, so an edge spawn only ever puts grit in the
+        upwind third of the frame and the rest of the map stays suspiciously
+        calm. Spawning everywhere and letting each grain streak a few hundred px
+        gives a field that is moving uniformly, which is what a storm looks like.
+
+        Deliberately dt-scaled, unlike the snow and ash emitters above it: this
+        runs at whatever rate the app is compositing, and a per-frame count
+        would put sixteen times as much grit in the preview window as on the
+        4 Hz wallpaper push. Read-only and fails soft - a missing channel or a
+        full particle pool just means no grit this frame.
+        """
+        try:
+            wind = float(getattr(ev, "wind", 0.0) or 0.0)
+            haze = float(getattr(ev, "fog", 0.0) or 0.0)
+            if haze <= 0.05 or abs(wind) < 0.05:
+                return                  # still ramping in; nothing to blow yet
+            # Grains per second at full haze. The pool caps "dust" at 400 and
+            # mining/impact dust draws on the same budget, so this is set to
+            # settle around 330 rather than to saturate: measured over 240
+            # frames, 620/s holds 247 grains, 900/s holds ~330 and 1100/s pins
+            # the cap at 387, from which point the extra emit calls buy nothing
+            # and only starve the diggers of their dust.
+            n = int(900.0 * haze * max(0.0, min(0.25, float(dt))))
+            if n <= 0:
+                return
+            sign = 1.0 if wind >= 0.0 else -1.0
+            # Fast enough to read as driven, and _DRAG bleeds it off over ~1 s
+            # so the grains slow into the murk rather than crossing in a
+            # straight line. sorted() because ParticleSystem._spread hands a
+            # (lo, hi) pair to Generator.uniform, which *raises* on hi < lo -
+            # and emit() swallows that, so a leftward wind silently emitted
+            # nothing at all until the ordering was forced.
+            speed = 520.0 + 640.0 * min(1.0, abs(wind))
+            vx = tuple(sorted((sign * speed * 0.55, sign * speed)))
+            # Split across the two weather layers by hand: "dust" is not in the
+            # particle system's own _LAYERED set, so without this every grain
+            # would draw in front of the colony and the depth would be flat.
+            # Palette 9 is the pale dust and 10 the dark: the distant grains get
+            # the pale one so they sink into the tan wash, the near ones the
+            # dark so they read as individual grains crossing the frame.
+            back = max(1, int(n * 0.45))
+            for count, is_back, tone in ((back, True, 9), (n - back, False, 10)):
+                if count <= 0:
+                    continue
+                self.particles.emit(
+                    "dust", count, x=(-40.0, float(RENDER_W) + 40.0),
+                    y=(RENDER_H * 0.12, RENDER_H * 0.80),
+                    vx=vx, vy=(-45.0, 45.0), life=(0.65, 1.7),
+                    size=(0.5, 1.9), color=tone, back=is_back)
+        except Exception:
+            log.debug("grit emit failed", exc_info=True)

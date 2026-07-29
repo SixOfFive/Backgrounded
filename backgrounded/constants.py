@@ -219,11 +219,17 @@ SCENE_METEOR = "meteor"
 SCENE_ASHFALL = "ashfall"
 SCENE_AURORA = "aurora"          # calm deep-night sky lit by aurora ribbons
 SCENE_FOG = "fog"                # a still grey mist that swallows the distance
+SCENE_ECLIPSE = "eclipse"        # the sun is eaten, then given back
+SCENE_EARTHQUAKE = "earthquake"  # quiet, then the ground tears itself open
+SCENE_SANDSTORM = "sandstorm"    # a howling wall of grit; the arid blizzard
+SCENE_HEATWAVE = "heatwave"      # glaring, still drought; bites the economy
+SCENE_VOLCANO = "volcano"        # a vent opens and lava crawls out of it
 
 SCENES = (
     SCENE_NIGHT_STORM, SCENE_CLEAR, SCENE_WILDFIRE, SCENE_MUDSLIDE,
     SCENE_BLIZZARD, SCENE_FLOOD, SCENE_METEOR, SCENE_ASHFALL,
-    SCENE_AURORA, SCENE_FOG,
+    SCENE_AURORA, SCENE_FOG, SCENE_ECLIPSE, SCENE_EARTHQUAKE,
+    SCENE_SANDSTORM, SCENE_HEATWAVE, SCENE_VOLCANO,
 )
 
 #: The world flips to a fresh, randomly chosen scene this often (world-seconds).
@@ -242,7 +248,69 @@ SCENE_LABELS = {
     SCENE_ASHFALL:     "Volcanic Ashfall",
     SCENE_AURORA:      "Aurora Night",
     SCENE_FOG:         "Fog",
+    SCENE_ECLIPSE:     "Solar Eclipse",
+    SCENE_EARTHQUAKE:  "Earthquake",
+    SCENE_SANDSTORM:   "Sandstorm",
+    SCENE_HEATWAVE:    "Heatwave",
+    SCENE_VOLCANO:     "Volcanic Eruption",
 }
 
 # ------------------------------------------------------------------ saving --
 SAVE_VERSION = 1
+
+# ------------------------------------------------------------- body morphs --
+#: Almost every stickman is built the same. A rare few are not: a giant, a
+#: dwarf, a barrel of a man, a spindly one. They are a novelty you notice once
+#: in a while - never the norm - so the roll below is deliberately mean.
+MORPH_NONE = ""
+MORPH_GIANT = "giant"
+MORPH_TINY = "tiny"
+MORPH_STOUT = "stout"
+MORPH_LANKY = "lanky"
+
+#: name -> (height scale, girth). Only the *name* is stored on an agent; these
+#: two numbers are what actually drive the drawing, so a morph can be retuned
+#: here without touching a single save.
+#:
+#: The height scale multiplies the *role* height rather than replacing it, so a
+#: giant child is still visibly a child. Girth is the width factor: it broadens
+#: the stance, spreads the limbs, thickens the drawn lines and grows the head
+#: against the body. Without it "fat" and "big" are the same silhouette, since
+#: a stick figure scaled uniformly reads only as distance.
+#:
+#: ``tiny`` is deliberately given girth > 1: a small figure with ordinary
+#: proportions is indistinguishable from a child at this scale, and a squat one
+#: reads as a dwarf instead.
+MORPH_TABLE: dict[str, tuple[float, float]] = {
+    MORPH_GIANT: (1.45, 1.25),
+    MORPH_TINY:  (0.62, 1.20),
+    MORPH_STOUT: (0.96, 1.85),
+    MORPH_LANKY: (1.30, 0.62),
+}
+
+#: Hard bounds on whatever comes out of that table. Height is not purely
+#: cosmetic - it positions the candle light and the head - and the physics
+#: (GROUND_SNAP, STEP_DROP_MAX, the climb probe) is written for a body roughly
+#: AGENT_HEIGHT tall, so a table hand-edited to 5.0 must produce a strange
+#: villager rather than one that clips through terrain.
+MORPH_SCALE_MIN, MORPH_SCALE_MAX = 0.60, 1.60
+MORPH_GIRTH_MIN, MORPH_GIRTH_MAX = 0.55, 2.10
+
+#: Chance of each morph, rolled once per newcomer at spawn. Sums to 0.07: 93 of
+#: every 100 arrivals are ordinary, which is the point - a mutant should be
+#: something you notice and point at, not a fifth of the colony.
+MORPH_SPAWN_CHANCE: dict[str, float] = {
+    MORPH_GIANT: 0.015,
+    MORPH_TINY:  0.015,
+    MORPH_STOUT: 0.020,
+    MORPH_LANKY: 0.020,
+}
+
+#: Chronicle phrasing. names.describe_event has no template kind for a body, so
+#: world.py builds the line straight from these.
+MORPH_LABELS: dict[str, str] = {
+    MORPH_GIANT: "a giant, head and shoulders above the rest",
+    MORPH_TINY:  "no bigger than a stump, and quick with it",
+    MORPH_STOUT: "broad as a boulder",
+    MORPH_LANKY: "all elbows and shins",
+}
