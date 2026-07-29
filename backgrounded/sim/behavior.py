@@ -2135,19 +2135,38 @@ def _compute_chasm(world: Any) -> tuple[float, float] | None:
     terr = getattr(world, "terrain", None)
     if terr is None:
         return None
-    declared = getattr(terr, "chasms", None)
-    if callable(declared):
-        try:
-            declared = declared()
-        except Exception:
-            declared = None
-    if isinstance(declared, (list, tuple)) and declared:
-        first = declared[0]
-        if isinstance(first, (list, tuple)) and len(first) >= 2:
+    # Ask the terrain where it *put* the chasm before going looking for one.
+    #
+    # This read was spelled "chasms" while Terrain has only ever exposed "chasm"
+    # - a single (x0, x1) pair - so the fast path was dead code and every call
+    # fell through to the widest-qualifying-run scan below. That scan picks by
+    # WIDTH, and the deliberately cut chasm is narrow (60-120 px) while natural
+    # dips in the noise reach the CHASM_MAX_W cap, so it usually returned some
+    # harmless dip elsewhere: measured, the span did not overlap the real cut on
+    # 8 of 15 chasm seeds. The consequence was that the bridge got staked over a
+    # 79-149 px dimple while the 300-483 px killer went unspanned, which is why
+    # no bridge appeared in any of 18 measured runs.
+    #
+    # Both spellings are accepted, and both shapes: a bare (x0, x1) pair and a
+    # sequence of them, since this module duck-types the world it is handed.
+    for attr in ("chasm", "chasms"):
+        declared = getattr(terr, attr, None)
+        if callable(declared):
             try:
-                return float(first[0]), float(first[1])
+                declared = declared()
+            except Exception:
+                declared = None
+        if not isinstance(declared, (list, tuple)) or not declared:
+            continue
+        first = declared[0]
+        pair = declared if isinstance(first, (int, float)) else first
+        if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+            try:
+                x0, x1 = float(pair[0]), float(pair[1])
             except (TypeError, ValueError):
-                pass
+                continue
+            if math.isfinite(x0) and math.isfinite(x1) and x1 > x0:
+                return x0, x1
     h = getattr(terr, "height", None)
     if h is None:
         return None

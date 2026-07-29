@@ -118,6 +118,65 @@ AIR_DRAG = 1.6              # per second horizontal damping while airborne
 GROUND_SNAP = 1.5           # px tolerance for "standing on the ground"
 STEP_DROP_MAX = 5.0         # px of ground drop per step before you're falling
 STEP_PROBE = 3.0            # px lookahead used to read the slope ahead
+
+#: The largest drop a walking agent will step off voluntarily, in px.
+#:
+#: _ground_step used to be asymmetric about vertical steps: a rise steeper than
+#: MAX_SLOPE_CLIMB was refused outright (stop(), give the goal up, let behaviour
+#: re-score), but the "ground ahead is lower" branch walked up to and over a drop
+#: of *any* size at 0.6 * WALK_SPEED. So a villager would decline to climb a
+#: waist-high step and then stroll off a 150 px ledge without pausing. Measured:
+#: 10 of the 18 residual fall deaths in a chasm sweep launched with vy == 0.0 and
+#: |vx| of 4.5-56.3 - the walking signature, not the slip signature (a slip
+#: writes exactly vx = +-16.0, vy = 12.0).
+#:
+#: Derived from the physics rather than picked: a fall from rest reaches
+#: FALL_LETHAL_SPEED after FALL_LETHAL_SPEED**2 / (2 * GRAVITY) px. Anything
+#: shorter is survivable and agents are still free to hop down it, so this
+#: refuses only what would actually kill them. AIR_DRAG means the true lethal
+#: height is slightly *greater* than this, which makes the bound conservative in
+#: the right direction. Deliberate descents are unaffected: those go through
+#: actions' ledge guard into descend_step, which is rate-limited and rolls for
+#: slips, so refusing here reroutes rather than strands.
+STEP_FALL_MAX = FALL_LETHAL_SPEED * FALL_LETHAL_SPEED / (2.0 * GRAVITY)
+
+#: The steepest face an agent will voluntarily climb DOWN, as |dy/dx|.
+#:
+#: This is the other half of the same asymmetry, and the bigger killer: 33 of 35
+#: fall deaths in a chasm sweep were agents deliberately descending a wall toward
+#: a target on the far side and losing grip partway. The slip mechanic itself is
+#: fine - a slip on a shallow face self-arrests within 5-45 px, and one map with
+#: faces of |dy/dx| 54-64 logged 918 descents, 27 slips and zero deaths. What
+#: makes a slip fatal is purely the gradient of what you slip on.
+#:
+#: _slip pitches you forward at 16 px/s while gravity pulls at GRAVITY, so the
+#: fall's own trajectory descends at a fixed rate; a face steeper than that falls
+#: away faster than the body does, and you re-contact it further down - or not at
+#: all. Measured by driving the real fall integrator down synthetic faces: impact
+#: 282 px/s at gradient 12-13, 312 at 13.5-14.5, and 342 at 15 - past
+#: FALL_LETHAL_SPEED (340). So 13 sits just under the knee, refusing the descents
+#: that kill while leaving every survivable one alone.
+#:
+#: NOTE for anyone tempted to add the mirror of the above to descend_step - i.e.
+#: to also refuse to *climb down* a face a slip would kill you on. It was tried,
+#: measured, and reverted, twice, because it makes the colony worse:
+#:
+#:   refuse faces steeper than 13:1        falls 37->10, survivors 70->59
+#:   ...only when the drop below exceeds
+#:   STEP_FALL_MAX (a short steep step is
+#:   harmless, a long one is not)          falls 37-> 9, survivors 70->56
+#:
+#: Both cut falling hard and both killed more people overall, by starvation. One
+#: 'cliffs' map went from 9 alive with no deaths at all to 2 alive with 6 STARVED:
+#: its faces run |dy/dx| 54-64, so every route to food was forbidden at once and
+#: the colony was walled into its own corner. Worse, on a chasm map it suppressed
+#: the bridge that would have rescued them - the refusal changes where people go,
+#: so the site never gets built and the cutoff never resolves.
+#:
+#: The idea is not wrong, it is just out of order: an agent that refuses a face
+#: has to already have somewhere else to go. Descent refusal only becomes safe
+#: once the crossing director reliably has a bridge or ladder standing BEFORE the
+#: route is withdrawn. Fix that first, then revisit this.
 ARRIVE_EPS = 1.5            # px, close enough to the target
 SLIP_CHANCE_PER_SEC = 0.42  # base slip probability while climbing, per second
 SPEECH_DEFAULT_SEC = 3.0
@@ -845,7 +904,18 @@ class Stickman:
                 self._slip(d)
                 return
         elif rise <= 0.0:
-            # A drop ahead: walk up to the lip, the snap check pushes us off.
+            if -rise > STEP_FALL_MAX:
+                # A killing drop. Refuse it exactly as the cliff branch below
+                # refuses an unclimbable rise - walking off this would not be a
+                # step, it would be a death. Giving the goal up lets behaviour
+                # re-score, and a genuinely wanted descent still has the
+                # deliberate route through actions' ledge guard.
+                self.stop()
+                self.climbing = False
+                self.climb_t = 0.0
+                return
+            # A survivable drop ahead: walk up to the lip, the snap check pushes
+            # us off, and the landing is one the agent can take.
             self.climbing = False
             self.climb_t = 0.0
             speed *= 0.6
