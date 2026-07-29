@@ -47,6 +47,77 @@ FALL_LETHAL_SPEED = 340.0   # px/s downward impact that kills
 WALK_SPEED = 34.0           # px/s baseline
 CLIMB_SPEED = 15.0
 
+# --------------------------------------------------------------- crossings --
+# Geometry shared by Terrain's effective-surface overlay (which decides what an
+# agent can actually walk on), structures.py (which stamps a finished bridge or
+# ladder into it) and the renderer (which has to draw the same shape the
+# physics is using). One source of truth for all three, because a deck drawn
+# somewhere other than where it is walkable is worse than no deck at all.
+
+#: px of blend at each end of a stamped deck. The overlay is combined with the
+#: raw ground by "whichever surface is higher", so without a blend a deck
+#: sitting a few px proud of its rim is a step the walk code reads as a ledge.
+#: Ramping the last CROSSING_RAMP_PX down onto the raw ground guarantees the
+#: join is continuous wherever the rim actually turned out to be.
+CROSSING_RAMP_PX = 10.0
+
+#: Design slope of a ladder's ramp, |dy/dx|. Must stay under MAX_SLOPE_CLIMB or
+#: the physics refuses the face the ladder was built to make passable - that is
+#: the entire point of the structure. The margin below 2.6 is not cosmetic: the
+#: walk code also refuses a ledge when the ground drops more than CLIFF_DROP
+#: (46 px) within its 14 px lookahead, and 2.2 * 14 = 31 px clears that with
+#: room for the terrain under the ramp to be uneven.
+LADDER_SLOPE = 2.2
+#: Vertical face, in px, below which a ladder is not worth building - agents
+#: can already climb anything up to MAX_SLOPE_CLIMB unaided.
+LADDER_MIN_RISE = 55.0
+#: Bounds on the resulting footprint. The lower bound keeps a ladder from being
+#: a two-column curiosity; the upper stops one enormous escarpment from
+#: producing a 400 px ramp that reads as a landslide rather than a ladder.
+LADDER_MIN_W = 22
+LADDER_MAX_W = 130
+
+# ------------------------------------------------------------ reachability --
+# Terrain.regions()/barriers() split the map into the stretches agents can
+# actually move between. The thresholds below decide what counts as a wall.
+
+#: Vertical relief a slope-impassable stretch must have before it is treated as
+#: a barrier rather than as ordinary rough ground.
+#:
+#: Slope alone is not enough and was measured being useless on its own: cutting
+#: at |dy/dx| > MAX_SLOPE_CLIMB shatters an ordinary hills map into 150 pieces
+#: and a cliffs map into 141, because generation *guarantees* at least one such
+#: face on every map and agents climb the small ones all day. What actually
+#: stops a colony is a face it cannot climb (that is the slope test) which is
+#: also tall enough that the one route that does exist - descending it attached
+#: via Stickman.descend_step, then climbing the far side - is a coin flip on a
+#: life: a slip more than FALL_LETHAL_SPEED**2 / (2 * GRAVITY) = 64 px above the
+#: floor is fatal, and the descent takes relief/DESCENT_DROP_RATE seconds of
+#: rolling against SLIP_CHANCE_PER_SEC the whole way.
+#:
+#: 150 px is a bit over twice that lethal height, and is where the measurements
+#: land: across a 12-minute trace of ten seeds, every stretch that actually
+#: killed anybody had relief between 162 and 392 px, and the tallest stretch on
+#: the seeds that killed nobody at all was 144.
+#:
+#: It is deliberately not a clean separation, and cannot be: seeds 7 and 7777
+#: carry 172-263 px faces and lost nobody, because those colonies never had a
+#: reason to cross them. Relief is only half the test - behaviour.find_cutoff
+#: still has to find the colony *losing* something to the split before anything
+#: gets built.
+BARRIER_MIN_RELIEF = 150.0
+
+#: Widest crossing the colony will attempt as a single structure, px. Past this
+#: the far side is not "just over there" any more; the colony crosses the first
+#: barrier and re-surveys rather than staking one enormous bridge.
+CROSSING_MAX_SPAN = 260.0
+
+#: How far a gap has to sink below its *lower* rim before it counts as a hole to
+#: be bridged rather than a step to be laddered. A chasm sinks 250-320 px below
+#: its rims; a plateau edge sinks nothing at all - it is simply a face, and the
+#: thing that defeats a face is a ladder.
+CROSSING_MIN_DEPTH = 30.0
+
 # Palette used to assign identity colours to stickmen. Deliberately high
 # chroma so a single candle or lightning flash still reads them apart.
 STICK_PALETTE: list[tuple[int, int, int]] = [

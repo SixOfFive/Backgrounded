@@ -932,6 +932,196 @@ def shake_blit(dst: pygame.Surface, src: pygame.Surface, offset: Any,
 
 
 # --------------------------------------------------------------------------
+# crossings: bridges and ladders
+#
+# These two are drawn as geometry rather than baked into the atlas because
+# their size is not a property of the *kind*, it is a property of the gap. A
+# bridge spans whatever chasm the terrain generated (60-190 px on the maps
+# measured) and a ladder is as long as the face is tall; a fixed 108x32 sprite
+# stretched to fit would put planking where the walkable deck is not.
+#
+# Both take plain geometry - the caller samples the terrain and hands over
+# points - so what gets drawn is the same line the physics is standing on
+# rather than an independent guess at where it ought to be.
+#
+# Palette runs brighter than the atlas earth tones on purpose. The scene is
+# multiplied down by the ambient before any light is added back, and a crossing
+# is usually out over a gap with no fire near it, so it has nothing but its own
+# luminance and its rim highlight to stay legible with at night.
+# --------------------------------------------------------------------------
+
+CROSSING_WOOD: Color = (96, 70, 44)
+CROSSING_WOOD_LIGHT: Color = (140, 108, 68)
+CROSSING_WOOD_DARK: Color = (54, 40, 27)
+CROSSING_ROPE: Color = (150, 134, 100)
+CROSSING_RIM: Color = (198, 208, 224)
+
+#: px between planks / rungs. Sized to read at 1600x1000 without turning a
+#: 160 px span into a solid bar - about 22 planks across a typical chasm.
+CROSSING_PLANK_PITCH = 7.0
+CROSSING_RUNG_PITCH = 9.0
+#: px between the posts that carry the deck down onto whatever is below it.
+CROSSING_POST_PITCH = 34.0
+#: how far a post is allowed to reach down before it is simply not drawn -
+#: a bridge over a 300 px chasm should not sprout 300 px legs.
+CROSSING_POST_MAX = 62.0
+CROSSING_RAIL_H = 13.0
+
+
+def _crossing_alpha(ruined: bool) -> int:
+    return 120 if ruined else 255
+
+
+def draw_bridge(
+    surf: pygame.Surface,
+    deck: Sequence[Sequence[float]],
+    ground: Sequence[float] | None = None,
+    *,
+    progress: float = 1.0,
+    ruined: bool = False,
+) -> None:
+    """Draw a plank bridge along *deck*, a polyline of ``(x, y)`` deck points.
+
+    *ground* is the raw ground y under each deck point, used to stand the
+    support posts on something; omit it and the posts are skipped. *progress*
+    0..1 plants only that fraction of the planking, so a half-built bridge
+    reads as a half-built bridge. Fails soft and silently - a frame without a
+    bridge on it is still a frame.
+    """
+    try:
+        pts = [(float(p[0]), float(p[1])) for p in deck
+               if len(p) >= 2 and math.isfinite(float(p[0])) and math.isfinite(float(p[1]))]
+        if len(pts) < 2:
+            return
+        prog = clamp(float(progress), 0.0, 1.0)
+        alpha = _crossing_alpha(ruined)
+        x_lo, x_hi = pts[0][0], pts[-1][0]
+        span = max(1.0, x_hi - x_lo)
+
+        def y_at(x: float) -> float:
+            """Deck y at x, by linear search over the (small) sample list."""
+            if x <= pts[0][0]:
+                return pts[0][1]
+            if x >= pts[-1][0]:
+                return pts[-1][1]
+            for i in range(1, len(pts)):
+                if pts[i][0] >= x:
+                    x0, y0 = pts[i - 1]
+                    x1, y1 = pts[i]
+                    t = (x - x0) / max(1e-6, x1 - x0)
+                    return y0 + (y1 - y0) * t
+            return pts[-1][1]
+
+        # 1. support posts, drawn first so the deck sits on top of them.
+        if ground is not None and not ruined:
+            gl = [float(g) for g in ground]
+            if len(gl) == len(pts):
+                x = x_lo + CROSSING_POST_PITCH * 0.5
+                while x < x_hi:
+                    i = min(len(pts) - 1, int((x - x_lo) / span * (len(pts) - 1)))
+                    top = y_at(x)
+                    bot = min(gl[i], top + CROSSING_POST_MAX)
+                    if bot - top > 5.0:
+                        pygame.draw.line(surf, (*CROSSING_WOOD_DARK, alpha),
+                                         (int(x), int(top)), (int(x), int(bot)), 3)
+                        pygame.draw.line(surf, (*CROSSING_WOOD, alpha),
+                                         (int(x) - 1, int(top)), (int(x) - 1, int(bot)), 1)
+                    x += CROSSING_POST_PITCH
+
+        # 2. the deck: a dark bed, then alternating planks over it.
+        bed = [(int(px), int(py) + 2) for px, py in pts]
+        if len(bed) >= 2:
+            pygame.draw.lines(surf, (*CROSSING_WOOD_DARK, alpha), False, bed, 5)
+        planted = x_lo + span * prog
+        x = x_lo
+        i = 0
+        while x < planted:
+            py = y_at(x)
+            col = CROSSING_WOOD_LIGHT if i % 2 else CROSSING_WOOD
+            pygame.draw.line(surf, (*col, alpha),
+                             (int(x), int(py) - 2), (int(x), int(py) + 3), 3)
+            x += CROSSING_PLANK_PITCH
+            i += 1
+
+        # 3. the highlight along the walking line. This is the part that keeps
+        #    a bridge readable against a black sky at 3am, so it goes on last
+        #    and it is the brightest thing in the drawing.
+        lit = [(int(px), int(py) - 2) for px, py in pts if px <= planted]
+        if len(lit) >= 2:
+            pygame.draw.lines(surf, (*CROSSING_RIM, 150 if ruined else 210),
+                              False, lit, 1)
+
+        # 4. rope handrail, once the thing is far enough along to have one.
+        if prog > 0.55 and not ruined:
+            rail = [(int(px), int(py - CROSSING_RAIL_H)) for px, py in pts if px <= planted]
+            if len(rail) >= 2:
+                pygame.draw.lines(surf, (*CROSSING_ROPE, alpha), False, rail, 2)
+                pygame.draw.lines(surf, (*CROSSING_RIM, 90), False,
+                                  [(px, py - 1) for px, py in rail], 1)
+                step = max(1, len(rail) // 7)
+                for k in range(0, len(rail), step):
+                    rx, ry = rail[k]
+                    pygame.draw.line(surf, (*CROSSING_WOOD, alpha),
+                                     (rx, ry), (rx, int(y_at(rx))), 1)
+    except Exception:
+        return
+
+
+def draw_ladder(
+    surf: pygame.Surface,
+    foot: Sequence[float],
+    top: Sequence[float],
+    *,
+    progress: float = 1.0,
+    ruined: bool = False,
+) -> None:
+    """Draw a ladder leaning from *foot* ``(x, y)`` up to *top* ``(x, y)``.
+
+    Two rails with rungs between them, laid along the line the climb overlay
+    actually put there. *progress* 0..1 builds it from the foot upward.
+    """
+    try:
+        fx0, fy0 = float(foot[0]), float(foot[1])
+        tx0, ty0 = float(top[0]), float(top[1])
+        if not all(math.isfinite(v) for v in (fx0, fy0, tx0, ty0)):
+            return
+        dx, dy = tx0 - fx0, ty0 - fy0
+        length = math.hypot(dx, dy)
+        if length < 6.0:
+            return
+        prog = clamp(float(progress), 0.0, 1.0)
+        alpha = _crossing_alpha(ruined)
+        ux, uy = dx / length, dy / length            # along the ladder
+        # Perpendicular, normalised: the rails sit either side of the climb line.
+        px, py = -uy, ux
+        half = 5.0
+        end_t = length * prog
+
+        def at(t: float, off: float) -> tuple[int, int]:
+            return (int(fx0 + ux * t + px * off), int(fy0 + uy * t + py * off))
+
+        for off in (-half, half):
+            a, b = at(0.0, off), at(end_t, off)
+            pygame.draw.line(surf, (*CROSSING_WOOD, alpha), a, b, 3)
+            pygame.draw.line(surf, (*CROSSING_RIM, 120 if ruined else 170),
+                             at(0.0, off - 1.0), at(end_t, off - 1.0), 1)
+
+        t = CROSSING_RUNG_PITCH * 0.5
+        while t < end_t:
+            a, b = at(t, -half), at(t, half)
+            pygame.draw.line(surf, (*CROSSING_WOOD_LIGHT, alpha), a, b, 2)
+            t += CROSSING_RUNG_PITCH
+
+        # A stub at the foot so the ladder reads as resting on the ground
+        # rather than floating an inch above it.
+        if not ruined:
+            pygame.draw.line(surf, (*CROSSING_WOOD_DARK, alpha),
+                             at(-3.0, -half), at(-3.0, half), 4)
+    except Exception:
+        return
+
+
+# --------------------------------------------------------------------------
 # maintenance
 # --------------------------------------------------------------------------
 

@@ -17,6 +17,7 @@ from ..constants import (
     MATERIAL_COLORS, MAT_GRASS, RENDER_H, RENDER_SIZE, RENDER_W,
     SCENE_BLIZZARD, SCENE_FLOOD, SCENE_SANDSTORM, SCENE_WILDFIRE,
 )
+from ..sim.structures import CROSSING_KINDS
 from . import creatures, fx, hud, sky
 from .atlas import Atlas
 from .particles import ParticleSystem
@@ -63,6 +64,11 @@ LAVA_LIGHT_COLOR = (255, 104, 34)
 #: budget, so this is set to read as a constant drizzle of sparks rather than to
 #: saturate: at 26/s a flow holds roughly 40 in the air at once.
 LAVA_EMBERS_PER_SEC = 26.0
+
+#: px between samples when tracing a bridge deck off the terrain. Finer than
+#: the deck's end ramps (which are >= 10 px) so the join is drawn where it
+#: actually is, coarse enough that a 190 px chasm costs ~24 points, not 190.
+CROSSING_SAMPLE_PX = 8.0
 
 
 class Renderer:
@@ -317,6 +323,13 @@ class Renderer:
 
     def _draw_structures(self, s: pygame.Surface, world) -> None:
         for st in sorted(world.structures.all(), key=lambda st: st.y):
+            # Bridges and ladders are span-shaped, not sprite-shaped: how big
+            # they are is a property of the gap, not of the kind. They are
+            # drawn from the terrain's own surface so the planking lands
+            # exactly on the deck the physics is using.
+            if st.kind in CROSSING_KINDS:
+                self._draw_crossing(s, world, st)
+                continue
             try:
                 spr = self.atlas.get(st.kind, st.variant, stage=st.stage)
             except Exception:
@@ -337,6 +350,59 @@ class Renderer:
                 pygame.draw.line(s, (120, 110, 80),
                                  (r.centerx - 14, r.top - 6),
                                  (r.centerx - 14 + w, r.top - 6), 2)
+
+    def _draw_crossing(self, s: pygame.Surface, world, st) -> None:
+        """Draw a bridge or a ladder, sampled off the live terrain surface.
+
+        Read-only with respect to the sim, like everything else in here. For a
+        *finished* crossing the geometry comes from ``terrain.ground_y`` across
+        the structure's own span - which over a stamped crossing is the deck or
+        ramp itself - so the art and the walkable surface cannot drift apart.
+
+        An unfinished bridge is drawn along the line it is *aiming* at instead,
+        because sampling the ground there traces the wall of the chasm and
+        paints planking 300 px down the inside of it. Ropes strung across the
+        gap is both what building a bridge looks like and the honest signal
+        that this is not something to step onto yet.
+        """
+        try:
+            terrain = world.terrain
+            span = st.crossing_span()
+            if span is None:
+                return
+            x0, x1 = span
+            x0 = max(0.0, min(float(x0), RENDER_W - 1.0))
+            x1 = max(0.0, min(float(x1), RENDER_W - 1.0))
+            if x1 - x0 < 4.0:
+                return
+            ruined = bool(st.is_ruined)
+            prog = 1.0 if st.built else float(st.completion())
+
+            if st.kind == "ladder":
+                fx.draw_ladder(
+                    s,
+                    (x0, terrain.ground_y(x0)),
+                    (x1, terrain.ground_y(x1)),
+                    progress=prog,
+                    ruined=ruined,
+                )
+                return
+
+            # A sample every CROSSING_SAMPLE_PX is finer than the deck's own
+            # end ramps and far coarser than per-column, which keeps this at a
+            # couple of dozen points however wide the chasm turned out to be.
+            n = max(2, min(64, int((x1 - x0) / CROSSING_SAMPLE_PX) + 1))
+            xs = [x0 + (x1 - x0) * i / (n - 1) for i in range(n)]
+            standing = bool(st.built) and not ruined
+            if standing:
+                deck = [(x, terrain.ground_y(x)) for x in xs]
+            else:
+                deck = [(x, float(st.y)) for x in xs]
+            h = terrain.height
+            ground = [float(h[int(max(0, min(RENDER_W - 1, x)))]) for x in xs]
+            fx.draw_bridge(s, deck, ground, progress=prog, ruined=ruined)
+        except Exception:
+            log.debug("crossing draw failed for %s#%s", st.kind, st.id, exc_info=True)
 
     @staticmethod
     def _occupants(world, st) -> list:

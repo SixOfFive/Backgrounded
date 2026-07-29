@@ -28,7 +28,13 @@ import numpy as np
 from ..constants import (
     BARRICADE_EDGE_FRAC,
     BARRICADE_MIN_POP,
+    CROSSING_MAX_SPAN,
+    CROSSING_MIN_DEPTH,
     FARM_FIELD_SIZE,
+    LADDER_MAX_W,
+    LADDER_MIN_RISE,
+    LADDER_MIN_W,
+    LADDER_SLOPE,
     MAT_DIRT,
     MAT_GRASS,
     MAT_LAVA,
@@ -65,7 +71,13 @@ from .actions import (
     structures_of,
     world_now,
 )
-from .structures import Structure, StructureRegistry, structure_spec
+from .structures import (
+    CROSSING_KINDS,
+    Structure,
+    StructureRegistry,
+    plan_ladder,
+    structure_spec,
+)
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +88,8 @@ __all__ = [
     "assign_roles",
     "next_build_kind",
     "find_chasm",
+    "find_cutoff",
+    "plan_crossing",
     "HYSTERESIS_BONUS",
     "emergency_override",
     "ROLE_AFFINITY",
@@ -128,6 +142,44 @@ CHASM_DEPTH = 36.0
 CHASM_MIN_W = 26.0
 CHASM_MAX_W = 190.0
 CHASM_RECHECK = 20.0
+#: Seconds between reachability surveys. The terrain's own ``epoch`` invalidates
+#: this the instant the ground moves (a mine, a mudslide, a finished bridge), so
+#: this interval only covers the things the terrain does not know about - people
+#: walking, trees being felled, a stockpile going up.
+BARRIER_RECHECK = 6.0
+#: How much lower than the near rim the far side may be and still count as
+#: something to bridge *to* rather than climb *down* to. Generous, because
+#: ``Terrain.stamp_deck`` sizes its end ramps to whatever step is left over.
+CROSSING_RIM_TOL = 70.0
+#: A bridge shorter than this is not a bridge; use the ladder instead.
+CROSSING_MIN_SPAN = 10.0
+#: How far the ground between a deck's two ends may rise above the planking
+#: before the span is rejected. Small on purpose: the merge keeps whichever
+#: surface is higher, so anything much over this is a lump in the middle of the
+#: bridge rather than something the bridge crosses.
+CROSSING_DECK_CLEAR = 8.0
+#: How long the same barrier has to keep blocking the same thing before the
+#: colony commits to building. Four founders land scattered across the map and
+#: spend the first half-minute walking toward each other, so an instantaneous
+#: "somebody is on the far side" is usually just somebody on their way home.
+#: Waiting is nearly free - a crossing takes minutes to build - and it is what
+#: keeps an ordinary map from being answered with a ladder it never needed.
+CUTOFF_DWELL = 45.0
+#: How fast that confirmation drains again while nothing is cut off. Under 1 so
+#: an intermittent split - the colony crossing a lethal gap several times a
+#: minute, which is the chasm case exactly - still converges on a decision.
+CUTOFF_LEAK = 0.6
+#: A barrier-driven ladder may run this far, overriding LADDER_MAX_W. That cap
+#: is a taste rule for the general "is there a nice cliff to ladder" survey; a
+#: 392 px face that has the colony's wood behind it (seed 42) needs 178 px of
+#: run at LADDER_SLOPE and simply cannot be answered inside 130. A ramp the
+#: colony cannot build is not more tasteful than a long one.
+LADDER_BARRIER_MAX_W = 220
+#: A region narrower than this cannot be the colony's home, however many people
+#: happen to be standing in it. Roughly a hut plus its spacing: below that there
+#: is nowhere to live, so it is somewhere people are stuck, not somewhere they
+#: are from.
+HOME_MIN_W = 150
 GRAVE_FRESH = 300.0
 CELEBRATION_FRESH = 30.0
 
@@ -151,12 +203,19 @@ ROLE_AFFINITY: dict[str, dict[str, float]] = {
 }
 _DEFAULT_AFFINITY = ROLE_AFFINITY["gatherer"]
 
+#: A crossing outranks everything, including the firepit. It is the only kind of
+#: build that is *blocking*: while it is missing, half the colony's ground, its
+#: wood, or one of its people is on the far side of a drop that kills anyone who
+#: tries it. Nothing else the colony could be doing is worth more than that, and
+#: the old ordering - bridge behind a firepit, a stockpile, three huts, two
+#: barricades, a wall and a watchtower - meant a chasm map never got one at all.
 KIND_PRIORITY: dict[str, float] = {
+    "bridge": 1.10,
+    "ladder": 1.05,
     "firepit": 1.00,
     "stockpile": 0.92,
     "hut": 0.85,
     "grave": 0.80,
-    "bridge": 0.62,
     "barricade": 0.60,
     "wall": 0.58,
     "watchtower": 0.54,
@@ -165,6 +224,14 @@ KIND_PRIORITY: dict[str, float] = {
 
 _COLD_SCENES = (SCENE_BLIZZARD, SCENE_NIGHT_STORM)
 _TREE_KINDS = ("tree", "pine", "oak")
+_STONE_KINDS = ("rock", "boulder", "stone", "outcrop")
+_BUSH_KINDS = ("bush", "berry", "berrybush", "shrub")
+#: What a stranded region has to hold before the colony cares, by resource.
+_CUTOFF_SOURCES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (RES_WOOD, _TREE_KINDS),
+    (RES_STONE, _STONE_KINDS),
+    (RES_FOOD, _BUSH_KINDS),
+)
 
 
 def _clamp01(v: float) -> float:
@@ -1106,8 +1173,9 @@ def _publish(world: Any, queue: list[dict[str, Any]], needs: dict[str, int]) -> 
 
 
 def next_build_kind(world: Any, reg: StructureRegistry | None = None) -> str | None:
-    """What the colony wants next: firepit -> stockpile -> hut -> more huts ->
-    wall -> watchtower -> bridge (if a chasm exists) -> totem at a milestone."""
+    """What the colony wants next: a crossing if one is blocking, then
+    firepit -> stockpile -> hut -> more huts -> wall -> watchtower ->
+    bridge (if a chasm exists) -> totem at a milestone."""
     reg = reg if reg is not None else structures_of(world)
     if reg is None:
         return None
@@ -1118,6 +1186,16 @@ def next_build_kind(world: Any, reg: StructureRegistry | None = None) -> str | N
             return reg.count(kind, built_only=True)
         except Exception:
             return 0
+
+    # Blocking work first, ahead of even the firepit. Everything below this line
+    # is expansion - nicer, warmer, bigger - and none of it is worth anything
+    # while a villager is stranded on the far side of a 300 px drop or the
+    # colony's only remaining wood is across one. This returns None on a map
+    # with no barrier, which is almost every map, so the ordinary order below is
+    # untouched.
+    blocking = plan_crossing(world, reg)
+    if blocking is not None:
+        return str(blocking["kind"])
 
     if built("firepit") < 1:
         return "firepit"
@@ -1162,10 +1240,15 @@ def _stake_out_site(world: Any, reg: StructureRegistry) -> None:
         pending = reg.incomplete()
     except Exception:
         return
-    if len(pending) >= MAX_CONCURRENT_SITES:
-        return
     kind = next_build_kind(world, reg)
     if kind is None:
+        return
+    # A blocking crossing is allowed one slot over the concurrency cap. Without
+    # it a barrier that appears while two ordinary sites are already open - a
+    # miner opening a pit, which is exactly the case this exists for - waits for
+    # a hut to finish before anyone even stakes the way out.
+    cap = MAX_CONCURRENT_SITES + (1 if kind in CROSSING_KINDS else 0)
+    if len(pending) >= cap:
         return
     if any(s.kind == kind for s in pending):
         return
@@ -1174,8 +1257,35 @@ def _stake_out_site(world: Any, reg: StructureRegistry) -> None:
         return
     x, y, extra = site
     s = reg.create(kind, x, y, rng=rng_of(world), state=extra or None)
-    chronicle(world, f"The colony staked out a new {kind}.")
+    chronicle(world, _stake_line(world, kind))
     log.debug("director staked %s at %.0f", kind, x)
+
+
+#: Why a crossing is going up, in the chronicle's voice. Keyed by the reason
+#: :func:`find_cutoff` gave, so the log says what the colony noticed rather than
+#: what the director decided.
+_CUTOFF_LINES: dict[str, str] = {
+    "stranded": "One of theirs is stranded on the far side; the colony staked out a {kind}.",
+    "stockpile": "Cut off from the stores, the colony staked out a {kind}.",
+    "firepit": "Cut off from the fire, the colony staked out a {kind}.",
+    RES_WOOD: "Every tree left is across the gap; the colony staked out a {kind}.",
+    RES_STONE: "The stone is all on the far side; the colony staked out a {kind}.",
+    RES_FOOD: "The forage is all across the gap; the colony staked out a {kind}.",
+}
+
+
+def _stake_line(world: Any, kind: str) -> str:
+    """Chronicle line for a freshly staked site."""
+    if kind in CROSSING_KINDS:
+        try:
+            cut = find_cutoff(world)
+            if cut is not None:
+                tmpl = _CUTOFF_LINES.get(str(cut.get("reason")))
+                if tmpl:
+                    return tmpl.format(kind=kind)
+        except Exception:
+            pass
+    return f"The colony staked out a new {kind}."
 
 
 def pick_site(
@@ -1185,14 +1295,29 @@ def pick_site(
     spec = structure_spec(kind)
     center = colony_center(world)
 
-    if kind == "bridge":
+    if kind in CROSSING_KINDS:
+        # The reachability survey is the authority: it knows which side the
+        # colony is on and which barrier is the one in its way.
+        plan = plan_crossing(world, reg)
+        if plan is not None and plan["kind"] == kind:
+            return float(plan["x"]), float(plan["y"]), dict(plan["extra"])
+        if kind != "bridge":
+            return None
+        # Fallback for the legacy "there is a chasm, build a bridge eventually"
+        # entry in the build order, which fires with nothing actually blocked.
         span = find_chasm(world)
         if span is None:
             return None
         x0, x1 = span
-        cx = 0.5 * (x0 + x1)
         rim = min(ground_y(world, x0 - 4.0), ground_y(world, x1 + 4.0))
-        return cx, rim, {"w": (x1 - x0) + 18.0, "span": [float(x0), float(x1)]}
+        # Anchored at the near rim rather than mid-span: `x` is the spot a
+        # builder walks to, and mid-span is open air until the deck is stamped.
+        # It used to hand back 0.5 * (x0 + x1), which sent every builder over
+        # the edge of the gap they were there to bridge.
+        near = x0 if abs(x0 - center) <= abs(x1 - center) else x1
+        anchor = float(np.clip(near + (-4.0 if near == x0 else 4.0),
+                               4.0, float(RENDER_W - 5)))
+        return anchor, rim, {"w": (x1 - x0) + 18.0, "span": [float(x0), float(x1)]}
 
     # A barricade does not belong near the colony centre like everything else -
     # it belongs out at the edge the animals arrive from. Only the x-choice
@@ -1338,6 +1463,654 @@ def _barricade_site(
             return best_x, float(ground_y(world, best_x)), {}
 
     return None
+
+
+# ===========================================================================
+#  Reachability: has the colony been cut off, and what would fix it?
+# ===========================================================================
+#
+# Three steps, deliberately separated so each can be tested on its own:
+#
+#   _reach()        ask the terrain which stretches of map are connected
+#   find_cutoff()   decide whether the split actually costs the colony anything
+#   plan_crossing() turn that into a bridge or a ladder the director can stake
+#
+# The terrain owns the graph and caches it against its own ``epoch``, so digging
+# a pit, a mudslide or a finished deck all re-survey exactly once. Everything in
+# here is on the director's 2 s cadence, never per agent per tick.
+
+
+def _reach(world: Any) -> tuple[Any, tuple[tuple[int, int, float], ...]]:
+    """``(labels, barriers)`` from the terrain, or ``(None, ())`` if it cannot.
+
+    Duck-typed on purpose: the module-level smoke test and several unit stubs
+    hand ``choose_action`` a terrain with nothing but ``height`` and
+    ``ground_y``, and a colony must keep running against one of those.
+    """
+    terr = getattr(world, "terrain", None)
+    regions = getattr(terr, "regions", None)
+    barriers = getattr(terr, "barriers", None)
+    if not callable(regions) or not callable(barriers):
+        return None, ()
+    try:
+        lab = np.asarray(regions())
+        bars = tuple(barriers())
+    except Exception:
+        return None, ()
+    if lab.ndim != 1 or lab.size < 8:
+        return None, ()
+    return lab, bars
+
+
+def _region_of(lab: Any, x: Any) -> int:
+    """Region id under ``x``, clamped to the map. ``-1`` for a nonsense ``x``."""
+    try:
+        xf = float(x)
+    except (TypeError, ValueError):
+        return -1
+    if not np.isfinite(xf):
+        return -1
+    i = int(np.clip(int(xf), 0, int(lab.size) - 1))
+    return int(lab[i])
+
+
+def _surface_of(world: Any) -> Any:
+    """The terrain's effective surface as an array, or ``None``."""
+    terr = getattr(world, "terrain", None)
+    fn = getattr(terr, "surface", None)
+    if callable(fn):
+        try:
+            arr = np.asarray(fn(), dtype=np.float64)
+            if arr.ndim == 1 and arr.size >= 8:
+                return arr
+        except Exception:
+            pass
+    h = getattr(terr, "height", None)
+    try:
+        arr = np.asarray(h, dtype=np.float64).ravel()
+    except Exception:
+        return None
+    return arr if arr.size >= 8 else None
+
+
+def find_cutoff(world: Any) -> dict[str, Any] | None:
+    """What the colony has been cut off from, or ``None`` if nothing.
+
+    Returns ``{"reason", "home", "target", "target_x", "plan", "charge"}``, where
+    ``plan`` is the sited crossing that would fix it. Cached against the terrain's
+    ``epoch`` *and* a short wall-clock interval, because the answer also moves
+    when nothing about the ground does: people walk, trees get felled, a
+    stockpile finishes.
+    """
+    now = world_now(world)
+    epoch = int(getattr(getattr(world, "terrain", None), "epoch", 0) or 0)
+    try:
+        if (int(getattr(world, "_bhv_cut_epoch", -1)) == epoch
+                and 0.0 <= now - float(getattr(world, "_bhv_cut_t", -1e9))
+                < BARRIER_RECHECK):
+            return getattr(world, "_bhv_cut", None)
+    except Exception:
+        pass
+    try:
+        found = _compute_cutoff(world)
+        plan = None if found is None else _crossing_geometry(world, found)
+    except Exception:
+        log.debug("cutoff survey failed", exc_info=True)
+        found, plan = None, None
+    if found is not None:
+        found["plan"] = plan
+
+    charge = _charge(world, found is not None, now)
+    if found is not None:
+        found["charge"] = charge
+
+    for name, value in (("_bhv_cut", found), ("_bhv_cut_t", now),
+                        ("_bhv_cut_epoch", epoch)):
+        try:
+            setattr(world, name, value)
+        except Exception:
+            pass
+    return found
+
+
+def _charge(world: Any, wanted: bool, now: float) -> float:
+    """How chronically split the colony is, in seconds of confirmed trouble.
+
+    A leaky integrator over "is anything cut off right now", *not* a streak and
+    deliberately *not* keyed on which thing or which region. Both of the tighter
+    forms were written first and both were measured failing on the one map that
+    needs this most. On seed 5 the colony straddles a 300 px chasm and shuttles
+    across it all run: the ``(reason, home, target)`` signature flipped between
+    four values inside two minutes, and even keying on the proposed geometry
+    flipped, because half the surveys name the chasm *floor* as the far side -
+    a 99 px slot between two 300 px walls that nothing can be built into, so
+    those surveys correctly answer "nothing to build" and, keyed, wiped the
+    evidence for the bridge that the other half kept asking for.
+
+    Charging on the bare fact of a split and reading the geometry fresh at the
+    moment of commitment gets both: a wall the colony keeps walking into is
+    answered even though nobody is standing on the wrong side of it at any
+    particular survey, and what actually gets staked is a plan that is valid
+    *now* rather than one remembered from a minute ago.
+
+    The leak is asymmetric (``CUTOFF_LEAK`` < 1) so an intermittent split still
+    converges, while a colony that sorts itself out - the founding scatter on an
+    ordinary map - drains back to zero and stays there.
+    """
+    try:
+        last = float(getattr(world, "_bhv_cut_charge_t", now))
+    except (TypeError, ValueError):
+        last = now
+    elapsed = min(30.0, max(0.0, now - last))
+    try:
+        charge = float(getattr(world, "_bhv_cut_charge", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        charge = 0.0
+    charge += elapsed if wanted else -CUTOFF_LEAK * elapsed
+    charge = float(min(max(charge, 0.0), CUTOFF_DWELL * 3.0))
+    for name, value in (("_bhv_cut_charge", charge), ("_bhv_cut_charge_t", now)):
+        try:
+            setattr(world, name, value)
+        except Exception:
+            pass
+    return charge
+
+
+def _compute_cutoff(world: Any) -> dict[str, Any] | None:
+    lab, bars = _reach(world)
+    if lab is None or not bars:
+        return None                     # one connected map: nothing to answer
+
+    alive = alive_agents(world)
+    center = colony_center(world)
+
+    # Home is where the *people* are, not where the buildings are: the colony is
+    # the colonists. Ties go to the region holding the colony centre.
+    counts: dict[int, int] = {}
+    for a in alive:
+        r = _region_of(lab, getattr(a, "x", None))
+        if r >= 0:
+            counts[r] = counts.get(r, 0) + 1
+    if counts:
+        # A hole is not a home. On seed 5 two of three survivors were standing on
+        # the chasm floor - 99 px of gravel between two 300 px walls - and by
+        # simple headcount that outvoted the 640 px of open country the rest of
+        # the colony lives on, so the survey started planning a way *out* to the
+        # settlement instead of a way *over* the gap. Regions too narrow to put a
+        # hut on are only considered when there is nothing else.
+        roomy = {r: n for r, n in counts.items() if _region_w(world, r) >= HOME_MIN_W}
+        pool = roomy or counts
+        best_n = max(pool.values())
+        tied = [r for r, n in pool.items() if n == best_n]
+        home = tied[0] if len(tied) == 1 else _pick_home(world, lab, tied, center)
+    else:
+        home = _region_of(lab, center)
+    if home < 0:
+        return None
+
+    # Candidates are (weight, x, reason). Weight is how badly it hurts, and is
+    # what decides which side of the colony gets its crossing first.
+    cands: list[tuple[int, float, str]] = []
+
+    # 1. Somebody is on the wrong side. This is the case the user named: a
+    #    villager who mined the floor out from under himself, or who went over
+    #    the rim and lived. Nothing else the colony is short of matters as much.
+    for a in alive:
+        r = _region_of(lab, getattr(a, "x", None))
+        if r >= 0 and r != home:
+            cands.append((3, float(getattr(a, "x", center)), "stranded"))
+
+    # 2. The fire or the stores ended up across the gap. Both are *the* shared
+    #    resource: everyone walks to them all day, so a split from either turns
+    #    the whole colony into commuters over a lethal face.
+    reg = structures_of(world)
+    if reg is not None:
+        for kind in ("stockpile", "firepit"):
+            try:
+                standing = [s for s in reg.of_kind(kind)
+                            if getattr(s, "built", False)
+                            and not getattr(s, "is_ruined", False)]
+            except Exception:
+                standing = []
+            if not standing or any(_region_of(lab, s.x) == home for s in standing):
+                continue
+            far = min(standing, key=lambda s: abs(float(s.x) - center))
+            cands.append((2, float(far.x), kind))
+
+    # 3. Every last source of something is on the far side. Not "some of the
+    #    trees" - a colony with a tree at home is not cut off from wood, it just
+    #    has fewer of them - but the case where working the resource at all
+    #    means crossing.
+    by_kind: dict[str, list[tuple[int, float]]] = {}
+    for p in props_of(world):
+        if not prop_alive(p):
+            continue
+        k = str(getattr(p, "kind", None) or getattr(p, "type", None) or "").lower()
+        if not k:
+            continue
+        try:
+            px = float(getattr(p, "x", 0.0))
+        except (TypeError, ValueError):
+            continue
+        by_kind.setdefault(k, []).append((_region_of(lab, px), px))
+    for _res, kinds in _CUTOFF_SOURCES:
+        here = 0
+        away: list[float] = []
+        for k in kinds:
+            for r, px in by_kind.get(k, ()):
+                if r == home:
+                    here += 1
+                elif r >= 0:
+                    away.append(px)
+        if here == 0 and away:
+            cands.append((1, min(away, key=lambda px: abs(px - center)), _res))
+
+    if not cands:
+        return None
+    # Worst problem first; among equals, the nearest one, because that is also
+    # the cheapest to answer and the one the colony is walking into.
+    weight, tx, reason = max(cands, key=lambda c: (c[0], -abs(c[1] - center)))
+    return {
+        "reason": reason,
+        "weight": int(weight),
+        "home": int(home),
+        "target": _region_of(lab, tx),
+        "target_x": float(tx),
+    }
+
+
+def _region_w(world: Any, region: int) -> int:
+    """Width of a region in columns, or ``0`` if the terrain will not say."""
+    fn = getattr(getattr(world, "terrain", None), "region_bounds", None)
+    if not callable(fn):
+        return 0
+    try:
+        b = fn(int(region))
+    except Exception:
+        return 0
+    return (int(b[1]) - int(b[0])) if b else 0
+
+
+def _pick_home(world: Any, lab: Any, tied: list[int], center: float) -> int:
+    """Break a headcount tie: the colony centre first, then the bigger region.
+
+    Width matters and is not a tidiness rule. Four founders land scattered, and
+    on a chasm map two of them can land *on the chasm floor* (seeds 5 and 10 do
+    exactly that), which makes a 99 px slot between two 300 px walls tie 2-2
+    with the 575 px of open country everybody else is standing on. Calling the
+    hole "home" inverts the whole survey: the colony would then be planning a
+    crossing out toward its own settlement.
+    """
+    at_center = _region_of(lab, center)
+    if at_center in tied:
+        return at_center
+    return max(tied, key=lambda r: (_region_w(world, r), -r))
+
+
+# ---------------------------------------------------------------- planning --
+
+
+def plan_crossing(
+    world: Any, reg: StructureRegistry | None = None
+) -> dict[str, Any] | None:
+    """The crossing the colony needs next, or ``None``.
+
+    ``{"kind", "x", "y", "extra", "reason"}`` - ``kind`` is ``"bridge"`` or
+    ``"ladder"`` and the rest is exactly what :func:`pick_site` returns, so the
+    director stakes it out like any other building.
+
+    The vetoes are applied *here* rather than inside the cached survey, because
+    they change the moment a site is staked and a stale "yes" would jam the
+    build order behind a bridge that already exists.
+    """
+    cut = find_cutoff(world)
+    if cut is None or cut.get("plan") is None:
+        return None
+    if float(cut.get("charge", 0.0)) < CUTOFF_DWELL:
+        return None
+    reg = reg if reg is not None else structures_of(world)
+    if reg is not None:
+        try:
+            live = [s for s in reg
+                    if s.kind in CROSSING_KINDS and not getattr(s, "is_ruined", False)]
+        except Exception:
+            live = []
+        # One crossing at a time. A half-built bridge is already the answer to
+        # this barrier; asking for a second one every director pass would stall
+        # every other build behind a kind that never leaves the queue.
+        if any(not getattr(s, "built", False) for s in live):
+            return None
+    else:
+        live = []
+
+    plan = cut["plan"]
+    # Already spanned. Either it worked and the survey has not caught up, or it
+    # did not and building a second one on top will not help either.
+    x0, x1 = plan["span"]
+    for s in live:
+        try:
+            span = s.crossing_span()
+        except Exception:
+            span = None
+        if span and span[0] <= x1 and x0 <= span[1]:
+            return None
+    return plan
+
+
+def _crossing_geometry(world: Any, cut: dict[str, Any]) -> dict[str, Any] | None:
+    """Turn a cutoff report into a sited bridge or ladder."""
+    lab, bars = _reach(world)
+    surf = _surface_of(world)
+    if lab is None or not bars or surf is None:
+        return None
+    w = int(surf.size)
+    home = int(cut["home"])
+    target_x = float(cut["target_x"])
+
+    # Where the colony stands *inside* its own region - the crossing has to be
+    # walkable-to, so it is measured from home, not from a centre that may have
+    # been dragged across the gap by whoever is stranded on the far side.
+    home_x = colony_center(world)
+    if _region_of(lab, home_x) != home:
+        idx = np.flatnonzero(lab == home)
+        if idx.size == 0:
+            return None
+        home_x = float(0.5 * (idx[0] + idx[-1]))
+
+    lo, hi = (home_x, target_x) if home_x <= target_x else (target_x, home_x)
+    between = [b for b in bars if lo <= 0.5 * (b[0] + b[1]) <= hi]
+    if not between:
+        return None
+    wall = min(between, key=lambda b: abs(0.5 * (b[0] + b[1]) - home_x))
+    a, c, relief = int(wall[0]), int(wall[1]), float(wall[2])
+
+    # Columns strictly inside a wall are the wall itself - a deck that ends
+    # there ends in mid-air, and a builder sent to stand there falls.
+    on_wall = np.zeros(w, dtype=bool)
+    for ba, bc, _r in bars:
+        if bc - ba > 1:
+            on_wall[ba + 1 : bc] = True
+
+    # Two passes. First try to reach the thing that is actually cut off; if the
+    # geometry will not allow that, settle for making the wall crossable at all.
+    # Both are wanted and neither subsumes the other: a man at the bottom of a
+    # quarry wants a ladder *down to him*, not a deck over his head - but at a
+    # 300 px chasm with a 99 px floor there is no ramp that reaches him, and the
+    # rim-to-rim bridge is still worth building because it is what stops the
+    # next four people going in after him.
+    for target in (int(cut["target"]), home):
+        # A gap is bridged; a face is laddered. The test is whether there is
+        # ground across at roughly the same height to land on: a chasm has two
+        # rims with a hole between them, a plateau edge has no far rim at all -
+        # it is simply lower from here on, and the way back up is to climb.
+        pair = _bridge_pair(surf, lab, on_wall, a, c, home, target)
+        if pair is not None:
+            p, q = pair                 # p is the home-side end
+            x0, x1 = (float(min(p, q)), float(max(p, q)))
+            return {
+                "kind": "bridge",
+                # Anchored on home ground at the near end, never mid-span: `x`
+                # is where a builder walks to, and the middle of a bridge is
+                # 300 px of open air until the last stage is stamped. The deck
+                # geometry travels in `span`, which the stamp and the renderer
+                # both read.
+                "x": float(np.clip(p, 4.0, w - 5.0)),
+                "y": float(min(surf[p], surf[q])),
+                "extra": {"w": (x1 - x0) + 18.0, "span": [x0, x1]},
+                "span": (x0, x1),
+                "reason": str(cut["reason"]),
+            }
+
+        plan = _ladder_plan(world, surf, lab, a, c, relief, cut)
+        if plan is not None:
+            x0, x1 = plan["span"]
+            if (target == home
+                    or _reaches(lab, home, target, x0)
+                    or _reaches(lab, home, target, x1)):
+                return plan
+        if target == home:
+            break                       # the unconstrained pass has run
+    return None
+
+
+def _reaches(lab: Any, home: int, target: int, x: float) -> bool:
+    """Is ``x`` on the far side of home, and no further than the target?"""
+    r = _region_of(lab, x)
+    if r < 0 or r == home:
+        return False
+    if target == home:
+        return True
+    toward = 1 if target > home else -1
+    rel = (r - home) * toward
+    return 0 < rel <= abs(target - home)
+
+
+def _bridge_pair(
+    surf: Any, lab: Any, on_wall: Any, a: int, c: int, home: int, target: int
+) -> tuple[int, int] | None:
+    """Narrowest deck that spans the wall between rims ``a`` and ``c``.
+
+    Searches every pair of standable columns, one on each side, and takes the
+    shortest that qualifies - the cheapest crossing, which is what the colony
+    would pick and what costs the least wood. A pair qualifies when the two ends
+    are within ``CROSSING_RIM_TOL`` of each other in height (a deck is roughly
+    level; a 250 px step is a face, not a gap) and the ground between them dips
+    at least ``CROSSING_MIN_DEPTH`` below the lower end (there is actually a
+    hole to span).
+
+    Anchoring on the wall's own two rims is not enough and was measured failing:
+    on seed 8 the near rim *is* the chasm floor, 236 px below the far one, so no
+    deck could ever join them - while a pair 60 px further back on the home side
+    spans the whole chasm at a level the two rims share.
+
+    ``None`` means there is no gap here, only a face, and the answer is a ladder.
+
+    The between-the-ends maximum is what makes this affordable: it separates
+    into "highest ground from p to the wall", "the wall", and "the wall to q",
+    so the O(n^2) pair test is three broadcasts over ~260x260 rather than a
+    range query per pair.
+    """
+    w = int(surf.size)
+    span_max = int(CROSSING_MAX_SPAN)
+    left = np.arange(max(0, a - span_max), a + 1)
+    right = np.arange(c, min(w - 1, c + span_max) + 1)
+    if left.size == 0 or right.size == 0:
+        return None
+    # Home can be on either side of the wall. Getting this backwards costs the
+    # whole answer rather than mirroring it: with the near end forced onto the
+    # far side there are no candidate columns at all, so a perfectly good chasm
+    # reads as unbridgeable (seed 5, whenever the colony drifted right of it).
+    # Both arrays run *outward from the wall*, so a running maximum along each
+    # is "the highest ground between this column and the wall".
+    if int(lab[a]) == home:
+        P, Q = left[::-1], right
+    else:
+        P, Q = right, left[::-1]
+
+    ok_p = (~on_wall[P]) & (lab[P] == home)
+    ok_q = (~on_wall[Q]) & (lab[Q] != home)
+    # A deck has to land somewhere that helps. Region ids increase left to
+    # right, so "toward the target and no further" is two integer tests - and
+    # without them a pit dug in the middle of flat ground gets *bridged over*
+    # while the man who dug it stays at the bottom, which is a crossing that
+    # answers the geometry and ignores the problem.
+    if target != home:
+        toward = 1 if target > home else -1
+        rel = (lab[Q] - home) * toward
+        ok_q &= (rel > 0) & (rel <= abs(target - home))
+        if not ok_q.any():
+            return None
+    if not ok_p.any() or not ok_q.any():
+        return None
+
+    yp = surf[P]
+    yq = surf[Q]
+    pmax = np.maximum.accumulate(yp)
+    qmax = np.maximum.accumulate(yq)
+    pmin = np.minimum.accumulate(yp)
+    qmin = np.minimum.accumulate(yq)
+    wmax = float(surf[a : c + 1].max())
+    wmin = float(surf[a : c + 1].min())
+
+    span = np.abs(Q[None, :].astype(np.float64) - P[:, None])
+    good = ok_p[:, None] & ok_q[None, :]
+    good &= (span >= CROSSING_MIN_SPAN) & (span <= float(span_max))
+    good &= np.abs(yp[:, None] - yq[None, :]) <= CROSSING_RIM_TOL
+    deck = np.minimum(yp[:, None], yq[None, :])          # y of the planking
+    deepest = np.maximum(np.maximum(pmax[:, None], qmax[None, :]), wmax)
+    good &= (deepest - np.maximum(yp[:, None], yq[None, :])) >= CROSSING_MIN_DEPTH
+    # Nothing may stick up through the deck. The overlay merges by "whichever
+    # surface is higher", so a ridge between the two ends is not spanned - it
+    # pokes out of the planking and leaves the crossing broken in the middle.
+    # Measured on a quarry pit dug into seed 11: the pair test happily proposed
+    # a deck from the rim to a high spot *inside* the pit, straight through
+    # 45 px of intervening ground.
+    peak = np.minimum(np.minimum(pmin[:, None], qmin[None, :]), wmin)
+    good &= peak >= deck - CROSSING_DECK_CLEAR
+    if not good.any():
+        return None
+
+    k = int(np.argmin(np.where(good, span, np.inf)))
+    i, j = divmod(k, int(Q.size))
+    return int(P[i]), int(Q[j])
+
+
+def _ladder_plan(
+    world: Any, surf: Any, lab: Any, a: int, c: int, relief: float,
+    cut: dict[str, Any]
+) -> dict[str, Any] | None:
+    """A ladder against the wall between rims ``a`` and ``c``."""
+    span = _ladder_span(surf, a, c, relief, lab)
+    if span is None:
+        # Nothing verified against this face. The general survey may still find
+        # a workable ramp on it (it searches a little differently), so ask - but
+        # only take an answer that actually lands on the face we are stuck at.
+        got = plan_ladder(getattr(world, "terrain", None), 0.5 * (a + c))
+        if got is None:
+            return None
+        gx, gy, extra = got
+        raw = extra.get("span") if isinstance(extra, dict) else None
+        if not (isinstance(raw, (list, tuple)) and len(raw) >= 2):
+            return None
+        sx0, sx1 = float(min(raw[0], raw[1])), float(max(raw[0], raw[1]))
+        if sx1 < a - 4 or sx0 > c + 4:
+            return None
+        return {"kind": "ladder", "x": float(gx), "y": float(gy),
+                "extra": dict(extra), "span": (sx0, sx1),
+                "reason": str(cut["reason"])}
+
+    x0, x1, y0, y1 = span
+    # The foot is the low end: where a builder stands, and where a ladder rests.
+    foot_x, foot_y = (x0, y0) if y0 > y1 else (x1, y1)
+    return {
+        "kind": "ladder",
+        "x": float(foot_x),
+        "y": float(foot_y),
+        "extra": {"w": (x1 - x0) + 6.0, "span": [float(x0), float(x1)],
+                  "rise": [float(y0), float(y1)]},
+        "span": (float(x0), float(x1)),
+        "reason": str(cut["reason"]),
+    }
+
+
+def _ladder_span(
+    surf: Any, a: int, c: int, relief: float = 0.0, lab: Any = None
+) -> tuple[float, float, float, float] | None:
+    """Footprint of a ramp that defeats the wall between rims ``a`` and ``c``.
+
+    Returns ``(x0, x1, y0, y1)`` with ``x0 < x1`` - the arguments
+    ``Terrain.stamp_climb`` takes. The ramp runs from the lip out over the *low*
+    side, because the overlay only wins where it is above the rock: a ramp laid
+    over the high side is simply ignored and leaves the face as impassable as it
+    was.
+
+    Every length is verified by merging the proposed ramp onto the real ground
+    and measuring the worst gradient over ``3`` px - the span the physics judges
+    a step over. Sizing the run from the wall's height alone is not enough:
+    where the low ground keeps falling away past the lip, the foot lands below
+    where it was aimed and the "ramp" comes out steeper than the face.
+    """
+    w = int(surf.size)
+    a = int(np.clip(a, 0, w - 1))
+    c = int(np.clip(c, 0, w - 1))
+    y_a, y_c = float(surf[a]), float(surf[c])
+    rise = abs(y_a - y_c)
+    if rise < LADDER_MIN_RISE:
+        return None
+    # Smaller y is higher ground, so the lip is whichever rim is smaller, and
+    # the low side - where the ramp goes - is the other way.
+    if y_a <= y_c:
+        x_top, y_top, d = a, y_a, 1
+        low_side = c
+    else:
+        x_top, y_top, d = c, y_c, -1
+        low_side = a
+    # The foot has to come down in the region on the other side of *this* wall.
+    # Without it the search happily walks a "ramp" clear across the next gap as
+    # well: on seed 5 it proposed a 156 px near-level line from the chasm's near
+    # rim to the far plateau, which passes every gradient test because it is a
+    # bridge, and which leaves the wall it was asked about untouched.
+    low_region = None if lab is None else _region_of(lab, low_side)
+    # Slide the top anchor to the *innermost* column of the flat lip, i.e. as
+    # far over the face as the ground stays level. It matters: a straight ramp
+    # aimed one column short of the edge runs a pixel or two under the last of
+    # the rock, the merge picks the rock, and that 2 px flip is enough to read
+    # as 2.57 where the ground it replaced was 4.93 and the limit is 2.39. On
+    # seed 42 it is the difference between a 392 px face the colony can answer
+    # and one it cannot.
+    for _ in range(12):
+        nxt = x_top + d              # `d` points down the face, so this is into it
+        if not (0 <= nxt < w) or float(surf[nxt]) > y_top + 1.5:
+            break
+        x_top = nxt
+
+    limit = MAX_SLOPE_CLIMB * 0.92      # leave room for fractional-x sampling
+    # Shortest workable ramp wins, so the search crawls up from LADDER_MIN_W
+    # rather than starting at rise / LADDER_SLOPE. That shortcut is what
+    # Terrain.find_climb_face uses and it is wrong for a *pit*: the wall of a
+    # quarry drops 196 px in five columns but the floor climbs straight back up,
+    # so a 48 px ramp sheds the whole face while the shortcut refuses to look at
+    # anything under 89. `_ramp_gradient` is the judge either way - it merges
+    # the ramp onto the ground over a window that always contains the face - so
+    # starting low only costs iterations, and buys the cheapest ladder.
+    tall = max(rise, float(relief))
+    longest = int(min(LADDER_BARRIER_MAX_W,
+                      max(LADDER_MAX_W, round(tall / max(0.5, LADDER_SLOPE)) + 40)))
+    for run in range(LADDER_MIN_W, longest + 1, 2):
+        x_foot = x_top + d * run
+        if not (0 <= x_foot < w):
+            return None                 # ran off the edge of the world
+        if low_region is not None and _region_of(lab, x_foot) != low_region:
+            break                       # past the far side of this wall
+        y_foot = float(surf[x_foot])
+        if abs(y_foot - y_top) < LADDER_MIN_RISE * 0.8:
+            continue                    # still on the lip, nothing descended
+        # Deliberately *not* "has it shed the whole face": where the low ground
+        # rises again past the foot of a wall - a quarry floor, the far bank of
+        # a pit - the drop at the landing is a fraction of the wall's own
+        # relief, and demanding the full height there rejects every run. The
+        # gradient probe below is the real test and cannot be fooled: it merges
+        # the ramp onto the ground over a window that always contains the face,
+        # so a ramp that fails to cover it reads the bare rock and is refused.
+        lo_x, hi_x = (x_foot, x_top) if x_foot < x_top else (x_top, x_foot)
+        ya, yb = (y_foot, y_top) if x_foot < x_top else (y_top, y_foot)
+        if _ramp_gradient(surf, lo_x, hi_x, ya, yb) <= limit:
+            return float(lo_x), float(hi_x), float(ya), float(yb)
+    return None
+
+
+def _ramp_gradient(surf: Any, a: int, b: int, ya: float, yb: float) -> float:
+    """Worst ``|dy/dx|`` on a ramp once merged onto the ground it sits on."""
+    w = int(surf.size)
+    lo = max(0, a - 4)
+    hi = min(w - 1, b + 4)
+    prof = surf[lo : hi + 1].astype(np.float64, copy=True)
+    n = b - a + 1
+    i = a - lo
+    prof[i : i + n] = np.fmin(prof[i : i + n], np.linspace(ya, yb, n))
+    if prof.size <= 3:
+        return 0.0
+    return float(np.max(np.abs(prof[3:] - prof[:-3]))) / 3.0
 
 
 def find_chasm(world: Any) -> tuple[float, float] | None:

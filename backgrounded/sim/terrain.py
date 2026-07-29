@@ -12,6 +12,30 @@ Coordinate system (see docs/ARCHITECTURE.md section 3):
 Every mutator is written to fail soft: bad indices are clamped, NaNs are
 dropped, and nothing in here raises on a per-frame path.
 
+The effective surface
+---------------------
+``height`` is the *raw ground*.  What agents actually stand on is the
+**effective surface**: the raw ground with any finished crossing laid over it.
+Two overlays feed it, both one float per column with ``NaN`` meaning "nothing
+here", and both combined with the ground by "whichever surface is higher"
+(``fmin``, because y grows downward):
+
+``deck``   a finished bridge's planking, spanning a gap at rim height.
+``climb``  the ramp a finished ladder puts against a vertical face.  Columns
+           carrying a climb aid are additionally exempt from the cliff test -
+           making an unclimbable face climbable is what a ladder *is*.
+
+``ground_y``, ``slope``, ``column_slope`` and ``is_cliff`` all read the
+effective surface, which is why a stamped deck starts working for movement,
+cliff avoidance and prop/structure siting without any of those callers knowing
+that structures exist.  Generation, texturing, water and snow deliberately keep
+reading the raw ``height`` - a bridge is not geology, does not hold a lake and
+does not change what the rock under it is made of.
+
+``epoch`` counts every change to the surface (height or either overlay), so a
+caller that caches something derived from it can invalidate on an integer
+compare instead of diffing a 1600-column array.
+
 Interfaces other modules rely on
 --------------------------------
 ``Terrain.chasm``            ``(x0, x1)`` of the cut gap or ``None`` - the
@@ -19,15 +43,29 @@ Interfaces other modules rely on
 ``Terrain.find_flat_span``   structure placement.
 ``Terrain.find_basins``      water/pond placement and the flood event.
 ``Terrain.deform``/``crater``/``add_layer``  mudslide, meteor, blizzard, ashfall.
+``Terrain.stamp_deck``/``stamp_climb``/``clear_crossing``  finished bridges and
+                             ladders, driven from structures.py.
+``Terrain.find_climb_face``  where a ladder would be worth building.
+``Terrain.regions``/``barriers``  which stretches of the map agents can move
+                             between, and the walls between them.  Cached
+                             against ``epoch``; behaviour asks this to notice
+                             the colony has been cut off from something.
 """
 from __future__ import annotations
 
 import base64
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
 from ..constants import (
+    BARRIER_MIN_RELIEF,
+    CROSSING_RAMP_PX,
+    LADDER_MAX_W,
+    LADDER_MIN_RISE,
+    LADDER_MIN_W,
+    LADDER_SLOPE,
     MAT_ASH,
     MAT_DIRT,
     MAT_GRASS,
@@ -74,6 +112,13 @@ FLAT_SLOPE: float = 0.28
 
 #: Cosine falloff width used by :meth:`Terrain.deform` with ``blend='smooth'``.
 DEFORM_EDGE: int = 24
+
+#: px the reachability sweep looks ahead when judging a step.  Deliberately the
+#: same number as ``entities.STEP_PROBE``: that is the span the physics itself
+#: measures a step over, so the graph refuses exactly the steps the mover does.
+#: Imported by value rather than from entities - sim/terrain.py sits *under*
+#: entities in the import order and must not reach back up.
+BARRIER_PROBE: int = 3
 
 _BASE_CELLS: dict[str, float] = {
     "hills": 3.0,
@@ -214,10 +259,28 @@ class Terrain:
     style: str = "hills"
     #: ``(x0, x1)`` of the cut gap for the 'chasm' style, else ``None``.
     chasm: tuple[int, int] | None = None
+    #: Bridge planking laid over the raw ground, one y per column, ``NaN`` where
+    #: there is none.  ``None`` while nothing is stamped - which is the case in
+    #: almost every world, and is what keeps ``ground_y`` on its fast path.
+    deck: np.ndarray | None = None
+    #: Ladder ramps, same shape and same "NaN means absent" convention.  A
+    #: non-NaN column here is *climb-aided*: ``is_cliff`` is False on it and the
+    #: slope helpers clamp to ``MAX_SLOPE_CLIMB`` there.
+    climb: np.ndarray | None = None
 
     # ---------------------------------------------------------------- setup --
 
     def __post_init__(self) -> None:
+        # These are runtime caches, not state: they are rebuilt on demand and
+        # deliberately never serialised.  Assigned before anything else so that
+        # a mutator called during construction cannot find them missing.
+        self._epoch: int = 0
+        self._surf: np.ndarray | None = None
+        self._cmask: np.ndarray | None = None
+        self._surf_epoch: int = -1
+        self._reach: tuple[np.ndarray, tuple[tuple[int, int, float], ...]] | None = None
+        self._reach_epoch: int = -1
+
         self.W = int(self.W) if int(self.W) > 8 else RENDER_W
         self.height = np.asarray(self.height, dtype=np.float32).reshape(-1).copy()
         self.material = np.asarray(self.material, dtype=np.uint8).reshape(-1).copy()
@@ -229,6 +292,120 @@ class Terrain:
         if bad.any():
             self.height[bad] = RENDER_H * 0.72
         np.clip(self.height, HARD_MIN, HARD_MAX, out=self.height)
+
+        # An overlay that is the wrong length, unreadable, or entirely NaN is
+        # indistinguishable from "no crossings", and that is how a malformed or
+        # older save has to land: without one, not refusing to load.
+        self.deck = self._coerce_overlay(self.deck)
+        self.climb = self._coerce_overlay(self.climb)
+
+    def _coerce_overlay(self, arr: Any) -> np.ndarray | None:
+        """A contiguous float32 overlay of exactly ``W`` columns, or ``None``."""
+        if arr is None:
+            return None
+        try:
+            a = np.asarray(arr, dtype=np.float32).reshape(-1)
+        except Exception:
+            return None
+        if a.size != self.W or not bool(np.isfinite(a).any()):
+            return None
+        # An overlay is a *surface*, so it lives under the same hard clamp the
+        # heightmap does; NaNs survive the clip untouched and stay "absent".
+        return np.ascontiguousarray(np.clip(a, HARD_MIN, HARD_MAX), dtype=np.float32)
+
+    # ------------------------------------------------- effective surface --
+
+    @property
+    def epoch(self) -> int:
+        """Bumped by every change to the walkable surface.
+
+        Height *or* either overlay.  A caller memoising something expensive off
+        the surface - phase 2's reachability graph is the motivating one - can
+        hold ``(epoch, result)`` and invalidate on an int compare rather than
+        rescanning 1600 columns every tick to find out nothing moved.
+        """
+        return int(getattr(self, "_epoch", 0))
+
+    def touch(self) -> None:
+        """Declare the surface changed.  Cheap, never raises, safe to overcall.
+
+        Every mutator in here calls it.  It is public so that anything that
+        writes ``terrain.height`` in place from outside this module can keep the
+        invariant true without reaching into private state.
+        """
+        try:
+            self._epoch = int(getattr(self, "_epoch", 0)) + 1
+        except Exception:
+            self._epoch = 1
+        self._surf = None
+        self._cmask = None
+        self._reach = None
+
+    def _refresh(self) -> None:
+        """Rebuild the cached effective surface and climb-aid mask."""
+        s = self.height.copy()
+        for ov in (self.deck, self.climb):
+            if ov is not None and ov.size == s.size:
+                # fmin, not minimum: NaN means "no overlay here", and fmin is
+                # the one that yields the other operand rather than NaN.
+                np.fmin(s, ov, out=s)
+        self._surf = s
+        self._cmask = np.isfinite(self.climb) if self.climb is not None else None
+        self._surf_epoch = self._epoch
+
+    def surface(self) -> np.ndarray:
+        """The walkable surface: raw ground with any finished crossing on top.
+
+        Returns ``height`` itself - no copy, no work - in the overwhelmingly
+        common case where nothing is stamped, so the callers that hit this every
+        tick pay two identity checks rather than an array merge.  Do not write
+        to the result: it may be the live heightmap.
+        """
+        # `_epoch` rather than the `epoch` property: this is on the per-agent
+        # per-tick path and the property costs a getattr-with-default plus an
+        # int() every call for no benefit here.
+        if self.deck is None and self.climb is None:
+            return self.height
+        if self._surf is None or self._surf_epoch != self._epoch:
+            self._refresh()
+        return self._surf if self._surf is not None else self.height
+
+    def climb_aided(self, x: float) -> bool:
+        """True where a finished ladder makes the column passable."""
+        if self.climb is None:
+            return False
+        if self._cmask is None or self._surf_epoch != self._epoch:
+            self._refresh()
+        m = self._cmask
+        if m is None or m.size != self.W:
+            return False
+        try:
+            xf = float(x)
+        except (TypeError, ValueError):
+            return False
+        # NaN test written as a self-comparison: np.isfinite on a python float
+        # is a numpy call, and this runs several times per agent per tick. The
+        # two range tests below catch both infinities, so int() only ever sees
+        # a finite in-range value and cannot raise OverflowError.
+        if xf != xf:
+            return False
+        last = self.W - 1
+        i = 0 if xf < 0.0 else (last if xf >= last else int(xf))
+        # A ladder occupies whole columns but agents stand at fractional x, so
+        # either side of the boundary counts as on it.  Without this an agent at
+        # x.9 one column short of the ramp reads the unaided cliff.
+        return bool(m[i]) or (i < last and bool(m[i + 1]))
+
+    def has_deck(self, x: float) -> bool:
+        """True where a finished bridge's planking covers the column."""
+        d = self.deck
+        if d is None:
+            return False
+        try:
+            i = int(np.clip(int(float(x)) if np.isfinite(float(x)) else 0, 0, self.W - 1))
+        except (TypeError, ValueError):
+            return False
+        return bool(np.isfinite(d[i]))
 
     # ----------------------------------------------------------- generation --
 
@@ -315,6 +492,7 @@ class Terrain:
         edge = slice(894, 907)
         t.height[edge] = np.linspace(t.height[893], t.height[907], 13)
         np.clip(t.height, HEIGHT_MIN, HEIGHT_MAX, out=t.height)
+        t.touch()
         t.retexture()
         return t
 
@@ -329,6 +507,10 @@ class Terrain:
             if b > a:
                 hi[a:b] = np.float32(CHASM_FLOOR + 8.0)
         np.clip(self.height, lo, hi, out=self.height)
+        # Every generation carver funnels through here, so this one call keeps
+        # the epoch honest across the whole build even though nothing can be
+        # caching against it yet (no overlay exists until a structure finishes).
+        self.touch()
 
     def _cut_chasm(self, rng: np.random.Generator) -> None:
         """Cut a 60-120 px gap most of the way down the screen, for a bridge."""
@@ -350,6 +532,7 @@ class Terrain:
         cur = self.height[a:b].astype(np.float64)
         self.height[a:b] = (cur * (1.0 - mask) + wobble * mask).astype(np.float32)
         self.chasm = (x0, x1)
+        self.touch()
 
     def _carve_shelf(self, rng: np.random.Generator) -> tuple[int, int] | None:
         """Flatten the already-flattest window into a genuinely level shelf.
@@ -364,7 +547,7 @@ class Terrain:
         if n < 2:
             return None
 
-        sl = np.abs(self.column_slope())
+        sl = np.abs(self.column_slope(raw=True))
         win = np.lib.stride_tricks.sliding_window_view(sl, span)
         score = win.max(axis=1) + 0.25 * win.mean(axis=1)
 
@@ -391,6 +574,7 @@ class Terrain:
         prof[:edge] = ramp
         prof[span - edge :] = ramp[::-1]
         self.height[i0 : i0 + span] = (seg * (1.0 - prof) + target * prof).astype(np.float32)
+        self.touch()
         return (i0 + edge, i0 + span - edge)
 
     def _carve_cliff(
@@ -448,50 +632,77 @@ class Terrain:
 
     # --------------------------------------------------------- measurements --
 
-    def column_slope(self) -> np.ndarray:
+    def column_slope(self, raw: bool = False) -> np.ndarray:
         """Per-column ``dy/dx``, identical to :meth:`slope` at integer x.
 
         Central difference over ``SLOPE_SPAN`` px, edge-padded so the borders
         do not report phantom cliffs.
+
+        Reads the *effective* surface by default, so a finished bridge reads as
+        the flat deck it is.  ``raw=True`` asks about the bare geology instead,
+        which is what generation, texturing and snow accumulation want: a deck
+        is not a reason to call the rock under it flat.
         """
-        h = self.height.astype(np.float64)
+        h = (self.height if raw else self.surface()).astype(np.float64)
         w = self.W
         hp = np.pad(h, 3, mode="edge")
         ahead = 0.5 * (hp[5 : 5 + w] + hp[6 : 6 + w])      # ground_y(x + 2.5)
         behind = 0.5 * (hp[0:w] + hp[1 : 1 + w])           # ground_y(x - 2.5)
-        return (ahead - behind) / SLOPE_SPAN
+        sl = (ahead - behind) / SLOPE_SPAN
+        if not raw and self._cmask is not None and self._cmask.size == w:
+            # A ladder's ramp is climbable by construction, but the two columns
+            # where it meets the face still show the join in a 5 px central
+            # difference.  Clamping there keeps every consumer's "is this a
+            # cliff" answer consistent with is_cliff's.
+            sl = np.where(self._cmask, np.clip(sl, -MAX_SLOPE_CLIMB, MAX_SLOPE_CLIMB), sl)
+        return sl
 
     def _has_cliff(self) -> bool:
-        return bool(np.max(np.abs(self.column_slope())) > MAX_SLOPE_CLIMB)
+        return bool(np.max(np.abs(self.column_slope(raw=True))) > MAX_SLOPE_CLIMB)
 
     def _has_shelf(self, width: int) -> bool:
-        flat = np.abs(self.column_slope()) <= FLAT_SLOPE
+        flat = np.abs(self.column_slope(raw=True)) <= FLAT_SLOPE
         if self.chasm is not None:
             c0, c1 = self.chasm
             flat[max(0, c0 - 12) : min(self.W, c1 + 12)] = False
         return any((b - a) >= width for a, b in _runs(flat))
 
     def ground_y(self, x: float) -> float:
-        """Ground surface ``y`` at fractional ``x``, linearly interpolated."""
+        """Walkable surface ``y`` at fractional ``x``, linearly interpolated.
+
+        This is the effective surface, not the raw heightmap: over a finished
+        bridge it reports the deck, and on a ladder's columns it reports the
+        ramp.  That is deliberate and is the whole mechanism - movement, cliff
+        avoidance, prop placement and build siting all come through here, so
+        they all start honouring a crossing the moment one is stamped.
+        """
         try:
             xf = float(x)
         except (TypeError, ValueError):
             return float(self.height[0])
         if not np.isfinite(xf):
             return float(self.height[0])
+        h = self.surface()
         if xf <= 0.0:
-            return float(self.height[0])
+            return float(h[0])
         last = self.W - 1
         if xf >= last:
-            return float(self.height[last])
+            return float(h[last])
         i = int(xf)
         t = xf - i
-        h = self.height
         return float(h[i]) * (1.0 - t) + float(h[i + 1]) * t
 
     def slope(self, x: float) -> float:
         """``dy/dx`` at ``x``, central difference smoothed over ~5 px."""
-        return (self.ground_y(x + _SLOPE_HALF) - self.ground_y(x - _SLOPE_HALF)) / SLOPE_SPAN
+        s = (self.ground_y(x + _SLOPE_HALF) - self.ground_y(x - _SLOPE_HALF)) / SLOPE_SPAN
+        # Identity check first: this runs several times per agent per tick and
+        # in almost every world there is no ladder to ask about.
+        if self.climb is not None and self.climb_aided(x):
+            if s > MAX_SLOPE_CLIMB:
+                return MAX_SLOPE_CLIMB
+            if s < -MAX_SLOPE_CLIMB:
+                return -MAX_SLOPE_CLIMB
+        return s
 
     def is_walkable(self, x: float) -> bool:
         """Gentle enough to simply walk across."""
@@ -502,7 +713,13 @@ class Terrain:
         return abs(self.slope(x)) <= MAX_SLOPE_CLIMB
 
     def is_cliff(self, x: float) -> bool:
-        """Beyond climbing: agents here can slip and fall."""
+        """Beyond climbing: agents here can slip and fall.
+
+        A finished ladder is exactly the thing that makes a face not a cliff, so
+        its columns answer False however steep the rock behind them is.
+        """
+        if self.climb is not None and self.climb_aided(x):
+            return False
         return abs(self.slope(x)) > MAX_SLOPE_CLIMB
 
     def material_at(self, x: float) -> int:
@@ -546,11 +763,16 @@ class Terrain:
         if need >= self.W:
             return None
 
-        sl = np.abs(self.column_slope())
+        sl = np.abs(self.column_slope(raw=True))
         blocked = np.zeros(self.W, dtype=bool)
         if self.chasm is not None:
             c0, c1 = self.chasm
             blocked[max(0, c0 - 16) : min(self.W, c1 + 16)] = True
+        # A deck is perfectly flat and would otherwise score as the best
+        # building site on the map.  Nobody puts a hut on the bridge.
+        for ov in (self.deck, self.climb):
+            if ov is not None and ov.size == self.W:
+                blocked |= np.isfinite(ov)
 
         for thresh in (FLAT_SLOPE, 0.45, 0.7):
             ok = (sl <= thresh) & ~blocked
@@ -596,6 +818,405 @@ class Terrain:
             return out
         except Exception:
             return []
+
+    def find_climb_face(
+        self,
+        near: float | None = None,
+        min_rise: float = LADDER_MIN_RISE,
+    ) -> tuple[int, int, float, float] | None:
+        """Where a ladder would earn its keep.
+
+        Finds a face too steep to climb (``|slope| > MAX_SLOPE_CLIMB``) and
+        returns the footprint of a ramp that would defeat it, as
+        ``(x0, x1, y0, y1)`` with ``x0 < x1``, ``y0`` the surface y at ``x0``
+        and ``y1`` the surface y at ``x1`` - exactly the arguments
+        :meth:`stamp_climb` takes.
+
+        The ramp always lies on the **low** side of the face: a straight line
+        back from the lip, down to where it meets the low ground.  Putting it
+        anywhere else would bury it - the overlay only wins where it is above
+        the rock, so a ramp running out over the high side is simply ignored and
+        leaves the face exactly as impassable as it was.
+
+        Every candidate is *verified* before it is returned, by merging the
+        proposed ramp onto the real heightmap and measuring the worst gradient
+        an agent would actually meet.  Sizing the run from the face's height
+        alone is not enough and was measured failing: where the low ground keeps
+        falling away past the lip, the foot lands far below where it was aimed
+        and the "ramp" comes out steeper than the face it was meant to replace
+        (3.5 and 4.6 against a 2.6 limit on cliffs/1 and cliffs/3).
+
+        ``near`` biases the choice toward an x (the colony centre, typically);
+        without it the tallest qualifying face wins.  Returns ``None`` when
+        nothing qualifies, which is the normal answer on gentle terrain.
+        """
+        try:
+            return self._find_climb_face_impl(near, float(min_rise))
+        except Exception:
+            return None
+
+    def _ramp_gradient(self, a: int, b: int, ya: float, yb: float) -> float:
+        """Worst ``|dy/dx|`` on a ramp once merged onto the real ground.
+
+        Probed over 3 px because that is ``entities.STEP_PROBE`` - the span the
+        physics itself judges a step over.  Measuring the ramp in isolation
+        would miss the only thing that can go wrong, which is the ground poking
+        back up through it.
+        """
+        lo = max(0, a - 4)
+        hi = min(self.W - 1, b + 4)
+        prof = self.height[lo : hi + 1].astype(np.float64)
+        n = b - a + 1
+        i = a - lo
+        prof[i : i + n] = np.fmin(prof[i : i + n], np.linspace(ya, yb, n))
+        if prof.size <= 3:
+            return 0.0
+        return float(np.max(np.abs(prof[3:] - prof[:-3]))) / 3.0
+
+    def _find_climb_face_impl(
+        self, near: float | None, min_rise: float
+    ) -> tuple[int, int, float, float] | None:
+        w = self.W
+        h = self.height.astype(np.float64)
+        steep = np.abs(self.column_slope(raw=True)) > MAX_SLOPE_CLIMB
+
+        # A ladder into the chasm is not the crossing the colony needs, and the
+        # bridge already owns that span.  Keep the two structures off each other.
+        if self.chasm is not None:
+            c0, c1 = self.chasm
+            steep[max(0, int(c0) - 20) : min(w, int(c1) + 20)] = False
+        # Nor onto something already bridged or laddered.
+        for ov in (self.deck, self.climb):
+            if ov is not None and ov.size == w:
+                steep &= ~np.isfinite(ov)
+
+        # Verify against a little under the limit: the physics also samples the
+        # slope helper at fractional x, and landing exactly on 2.6 leaves no
+        # room for the interpolation between two columns to round the wrong way.
+        limit = MAX_SLOPE_CLIMB * 0.92
+
+        best: tuple[int, int, float, float] | None = None
+        best_score = -1e18
+        for a, b in _runs(steep):
+            lo_i = max(0, a - 2)
+            hi_i = min(w - 1, b + 1)
+            rise = abs(float(h[lo_i]) - float(h[hi_i]))
+            if rise < min_rise:
+                continue
+
+            # Which end is the top (smaller y is higher ground)?
+            if float(h[hi_i]) < float(h[lo_i]):
+                x_top, direction = hi_i, -1
+            else:
+                x_top, direction = lo_i, +1
+            y_top = float(h[x_top])
+
+            # A run shorter than rise/LADDER_SLOPE cannot possibly come out
+            # gentle enough - its average gradient is already over the design
+            # slope before the ground under it is taken into account - so the
+            # search starts there rather than crawling up from the minimum.
+            first = int(max(LADDER_MIN_W, round(rise / max(0.5, LADDER_SLOPE))))
+            found: tuple[int, int, float, float] | None = None
+            for run in range(min(first, LADDER_MAX_W), LADDER_MAX_W + 1, 2):
+                x_foot = x_top + direction * run
+                if not (0 <= x_foot < w):
+                    break                      # ran off the screen edge
+                y_foot = float(h[x_foot])
+                if abs(y_foot - y_top) < min_rise * 0.8:
+                    continue                   # has not cleared the face yet
+                lo_x, hi_x = (x_foot, x_top) if x_foot < x_top else (x_top, x_foot)
+                y_a, y_b = (y_foot, y_top) if x_foot < x_top else (y_top, y_foot)
+                if self._ramp_gradient(lo_x, hi_x, y_a, y_b) <= limit:
+                    found = (lo_x, hi_x, y_a, y_b)
+                    break
+            if found is None:
+                continue
+
+            score = rise
+            if near is not None:
+                try:
+                    score -= abs(0.5 * (found[0] + found[1]) - float(near)) * 0.35
+                except (TypeError, ValueError):
+                    pass
+            if score > best_score:
+                best_score = score
+                best = found
+        return best
+
+    # --------------------------------------------------------- reachability --
+
+    def _build_reach(self) -> tuple[np.ndarray, tuple[tuple[int, int, float], ...]]:
+        """Label every column with the stretch of map it belongs to.
+
+        One vectorised sweep of the *effective* surface, so a finished bridge or
+        ladder rejoins the two sides it spans the moment it is stamped.
+
+        **What counts as a barrier.**  Connectivity here is *mutual*: two
+        columns are in the same region when an agent can get from either to the
+        other.  In one dimension that collapses the asymmetry the physics
+        genuinely has - ``entities._ground_step`` refuses a face steeper than
+        ``MAX_SLOPE_CLIMB`` going *up* but lets you walk off any drop going
+        *down* - into a single undirected test, because a one-way drop into a
+        hole is not a route a colony can use.  Modelling the descent as
+        connectivity would report the chasm floor as "reachable" (it is, once)
+        and so hide the exact problem the crossing exists to solve.  So the
+        first half of the test is ``|dy/dx| > MAX_SLOPE_CLIMB``, measured over
+        ``BARRIER_PROBE`` px, in whichever direction is uphill.
+
+        The second half is ``BARRIER_MIN_RELIEF`` - see the constant for the
+        measurements.  Slope alone is not a barrier: generation guarantees a
+        cliff on every map and agents climb the small ones routinely, so the
+        slope test on its own splits an ordinary hills map into 150 pieces.
+        Only a face that is both unclimbable *and* tall enough for the descent
+        to kill is something the colony has to build its way past.
+
+        Returns ``(labels, barriers)``:  ``labels[i]`` is the region id of
+        column ``i`` (ids increase left to right, regions are contiguous), and
+        ``barriers`` is ``(rim_left, rim_right, relief)`` per wall, where the
+        two rims are the last walkable column on each side.
+        """
+        w = self.W
+        h = self.surface().astype(np.float64)
+        p = int(BARRIER_PROBE)
+        if w <= p + 2:
+            return np.zeros(w, dtype=np.int32), ()
+
+        # g[j] > 0: the ground p px right of column j is *higher* (y smaller),
+        # so travelling right out of j is a climb; g[j] < 0 is a climb going
+        # left out of column j+p.  Either way |g| over the limit is a wall.
+        g = (h[: w - p] - h[p:]) / float(p)
+        bad = np.abs(g) > MAX_SLOPE_CLIMB
+
+        # A finished ladder is precisely the thing that makes a face passable,
+        # so a window touching its ramp is not a wall however steep the rock
+        # under it is.  Same exemption is_cliff() makes, in bulk.
+        if self.climb is not None and self.climb.size == w:
+            aided = np.isfinite(self.climb)
+            bad &= ~(aided[: w - p] | aided[p:])
+
+        # A window spanning columns j..j+p blocks every boundary inside it.
+        cut = np.zeros(w - 1, dtype=bool)
+        for k in range(p):
+            cut[k : k + bad.size] |= bad
+
+        barriers: list[tuple[int, int, float]] = []
+        # One label step per *wall*, placed at the wall's midpoint - not one per
+        # cut boundary.  A wall is 20-60 columns wide and none of it is ground
+        # anybody stands on, so counting each of those columns as its own region
+        # would bury the two regions that matter (seed 5: 62 "regions" for what
+        # is plainly three pieces of map).  Splitting the face down the middle
+        # keeps regions contiguous and leaves each rim in the region it
+        # overlooks, which is all any caller asks of the face itself.
+        step = np.zeros(w - 1, dtype=np.int32)
+        for a, b in _runs(cut):
+            # Boundaries a..b-1 are cut, so columns a..b are the wall and the
+            # rims are a (left) and b (right) - the last standable column on
+            # each side.
+            face = h[a : b + 1]
+            relief = float(face.max() - face.min())
+            if relief < BARRIER_MIN_RELIEF:
+                continue                  # rough ground, not a wall
+            barriers.append((int(a), int(b), relief))
+            step[(a + b) // 2] = 1
+
+        labels = np.concatenate(([0], np.cumsum(step))).astype(np.int32)
+        return labels, tuple(barriers)
+
+    def _reach_cache(self) -> tuple[np.ndarray, tuple[tuple[int, int, float], ...]]:
+        """The memoised reachability sweep.  Rebuilt only when ``epoch`` moves."""
+        if self._reach is None or self._reach_epoch != self._epoch:
+            try:
+                self._reach = self._build_reach()
+            except Exception:
+                # Fail soft: one region, no barriers, i.e. "nothing is cut off".
+                # A wrong answer here must never be an exception on a director
+                # pass that also has a colony to run.
+                self._reach = (np.zeros(self.W, dtype=np.int32), ())
+            self._reach_epoch = self._epoch
+        return self._reach
+
+    def regions(self) -> np.ndarray:
+        """Per-column region id.  Do not write to the result - it is cached."""
+        return self._reach_cache()[0]
+
+    def barriers(self) -> tuple[tuple[int, int, float], ...]:
+        """``(rim_left, rim_right, relief)`` for every wall, left to right."""
+        return self._reach_cache()[1]
+
+    def region_at(self, x: float) -> int:
+        """Region id of the column under ``x``.  ``0`` for a nonsense ``x``."""
+        lab = self._reach_cache()[0]
+        try:
+            xf = float(x)
+        except (TypeError, ValueError):
+            return 0
+        if xf != xf:                       # NaN; see climb_aided for the idiom
+            return 0
+        last = self.W - 1
+        i = 0 if xf < 0.0 else (last if xf >= last else int(xf))
+        return int(lab[i])
+
+    def region_bounds(self, region: int) -> tuple[int, int] | None:
+        """``(first_column, last_column)`` of a region, or ``None`` if unknown.
+
+        Regions are contiguous by construction, so this is two searches rather
+        than a scan.
+        """
+        lab = self._reach_cache()[0]
+        try:
+            r = int(region)
+        except (TypeError, ValueError):
+            return None
+        a = int(np.searchsorted(lab, r, side="left"))
+        b = int(np.searchsorted(lab, r, side="right")) - 1
+        if a > b or a < 0 or b >= self.W:
+            return None
+        return a, b
+
+    # ------------------------------------------------ crossings (overlays) --
+
+    def _blank_overlay(self) -> np.ndarray:
+        return np.full(self.W, np.nan, dtype=np.float32)
+
+    def _span_indices(self, x0: float, x1: float) -> tuple[int, int] | None:
+        """``(a, b)`` inclusive column range for a crossing, or ``None``."""
+        try:
+            a = int(np.floor(float(x0)))
+            b = int(np.ceil(float(x1)))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if a > b:
+            a, b = b, a
+        a = max(0, min(a, self.W - 1))
+        b = max(0, min(b, self.W - 1))
+        # Two columns is not a crossing, and something claiming to span most of
+        # the map is a bug upstream rather than an unusually ambitious bridge.
+        if (b - a) < 3 or (b - a) > int(self.W * 0.6):
+            return None
+        return a, b
+
+    def stamp_deck(
+        self, x0: float, x1: float, y: float, ramp: float = CROSSING_RAMP_PX
+    ) -> bool:
+        """Lay a bridge deck across ``[x0, x1]`` at height ``y``.  Fails soft.
+
+        The deck is flat at ``y`` across the middle and eases onto the raw
+        ground over a ramp at each end, so the join is continuous wherever the
+        rim actually is - a hard step there reads to the walk code as a ledge
+        and gets refused, which is precisely the bug this whole overlay exists
+        to fix.  Returns True if anything was stamped.
+
+        ``ramp`` is a *floor*, not the length: the ramp is sized to whatever
+        height it actually has to shed.  A fixed 10 px ramp measured 2.89 on
+        seed 5, where the two rims of the chasm differ by 21 px - over
+        MAX_SLOPE_CLIMB, so the finished bridge still ended in a cliff and
+        agents still refused the last five columns of it.
+        """
+        try:
+            span = self._span_indices(x0, x1)
+            if span is None:
+                return False
+            a, b = span
+            level = float(y)
+            if not np.isfinite(level):
+                return False
+            level = float(np.clip(level, HARD_MIN, HARD_MAX))
+
+            n = b - a + 1
+            # Cap how far the deck may sit off the ground it has to come down
+            # onto. Each end ramp gets at most half the span, and a smoothstep's
+            # gradient peaks at 1.5x its average, so a ramp r px long can shed
+            # MAX_SLOPE_WALK * r / 1.5 and no more. Asking for more than that
+            # does not produce a higher bridge, it produces a bridge that ends
+            # in a cliff: on seeds 25 and 36 behaviour surveyed a rim 150 px
+            # above the ends of the span it handed over, and the resulting deck
+            # joined the ground at 3.94 against a 2.6 limit - a fresh fall
+            # hazard created by the very structure meant to remove one.
+            ha, hb = float(self.height[a]), float(self.height[b])
+            shed = MAX_SLOPE_WALK * max(1, n // 2) / 1.5
+            lo, hi = max(ha, hb) - shed, min(ha, hb) + shed
+            # lo > hi means the two ends differ by more than two ramps can
+            # reconcile - the span is simply too short for the step across it.
+            level = float(np.clip(level, lo, hi)) if lo <= hi else 0.5 * (ha + hb)
+
+            prof = np.full(n, level, dtype=np.float64)
+            # Same peak-vs-average reasoning sizes the ramp actually used:
+            # averaging leaves the steepest 3 px of the join over the limit,
+            # which is the only part that matters.
+            drop = max(abs(ha - level), abs(hb - level))
+            need = 1.5 * drop / max(0.05, MAX_SLOPE_WALK)
+            r = int(min(max(1.0, float(ramp), need), n // 2))
+            if r >= 1:
+                t = _smoothstep((np.arange(r, dtype=np.float64) + 0.5) / float(r))
+                prof[:r] = float(self.height[a]) * (1.0 - t) + level * t
+                prof[n - r :] = (float(self.height[b]) * (1.0 - t) + level * t)[::-1]
+
+            if self.deck is None:
+                self.deck = self._blank_overlay()
+            self.deck[a : b + 1] = prof.astype(np.float32)
+            self.touch()
+            return True
+        except Exception:
+            return False
+
+    def stamp_climb(self, x0: float, x1: float, y0: float, y1: float) -> bool:
+        """Put a ladder ramp from ``(x0, y0)`` to ``(x1, y1)``.  Fails soft.
+
+        A straight line between the two anchors.  Both ends are meant to sit on
+        the raw ground, so the "higher surface wins" merge joins them without a
+        step and the ramp only shows where it is genuinely above the rock.
+        Returns True if anything was stamped.
+        """
+        try:
+            span = self._span_indices(x0, x1)
+            if span is None:
+                return False
+            a, b = span
+            ya, yb = float(y0), float(y1)
+            if not (np.isfinite(ya) and np.isfinite(yb)):
+                return False
+            if float(x1) < float(x0):
+                ya, yb = yb, ya
+            ya = float(np.clip(ya, HARD_MIN, HARD_MAX))
+            yb = float(np.clip(yb, HARD_MIN, HARD_MAX))
+
+            n = b - a + 1
+            prof = np.linspace(ya, yb, n, dtype=np.float64)
+            if self.climb is None:
+                self.climb = self._blank_overlay()
+            self.climb[a : b + 1] = prof.astype(np.float32)
+            self.touch()
+            return True
+        except Exception:
+            return False
+
+    def clear_crossing(self, x0: float, x1: float) -> bool:
+        """Remove any deck or climb aid over ``[x0, x1]``.  Fails soft.
+
+        An overlay left holding nothing but NaN is dropped entirely, which puts
+        ``ground_y`` back on its no-overlay fast path once the last bridge in
+        the world falls down.
+        """
+        try:
+            span = self._span_indices(x0, x1)
+            if span is None:
+                return False
+            a, b = span
+            hit = False
+            for name in ("deck", "climb"):
+                ov = getattr(self, name)
+                if ov is None or ov.size != self.W:
+                    continue
+                if bool(np.isfinite(ov[a : b + 1]).any()):
+                    hit = True
+                ov[a : b + 1] = np.nan
+                if not bool(np.isfinite(ov).any()):
+                    setattr(self, name, None)
+            if hit:
+                self.touch()
+            return hit
+        except Exception:
+            return False
 
     # ------------------------------------------------------------ mutators --
 
@@ -645,6 +1266,7 @@ class Terrain:
 
         self.height[a : b + 1] += (amount * prof).astype(np.float32)
         np.clip(self.height, HARD_MIN, HARD_MAX, out=self.height)
+        self.touch()
 
     def crater(self, cx: int, radius: int, depth: float) -> None:
         """Punch a meteor crater: parabolic bowl, raised rim, scorched floor."""
@@ -670,6 +1292,7 @@ class Terrain:
         delta = d * bowl - 0.22 * d * rim
         self.height[a:b] += delta.astype(np.float32)
         np.clip(self.height, HARD_MIN, HARD_MAX, out=self.height)
+        self.touch()
 
         inner_a = max(0, c - int(r * 0.9))
         inner_b = min(self.W - 1, c + int(r * 0.9))
@@ -716,12 +1339,13 @@ class Terrain:
         b = self.W - 1 if x1 is None else max(0, min(int(x1), self.W - 1))
         if a > b:
             a, b = b, a
-        sl = np.abs(self.column_slope()[a : b + 1])
+        sl = np.abs(self.column_slope(raw=True)[a : b + 1])
         keep = np.clip(1.0 - sl / 2.0, 0.0, 1.0)
         eff = th * keep
 
         self.height[a : b + 1] -= eff.astype(np.float32)
         np.clip(self.height, HARD_MIN, HARD_MAX, out=self.height)
+        self.touch()
 
         paint = eff >= max(0.12, th * 0.35)
         if paint.any():
@@ -736,7 +1360,7 @@ class Terrain:
         reshaping event, but note it erases painted ash/snow.
         """
         try:
-            sl = np.abs(self.column_slope())
+            sl = np.abs(self.column_slope(raw=True))
             h = self.height.astype(np.float64)
             rng = np.random.default_rng((int(self.seed) ^ 0x5EED) & 0xFFFFFFFF)
             patch = _value_noise(rng, self.W, 11.0)
@@ -758,8 +1382,13 @@ class Terrain:
     # ------------------------------------------------------------ persistence --
 
     def to_dict(self) -> dict:
-        """Exact landscape snapshot - raw numpy bytes, base64'd."""
-        return {
+        """Exact landscape snapshot - raw numpy bytes, base64'd.
+
+        The crossing overlays are written only when they hold something, so a
+        world that never built a bridge saves exactly the bytes it always did
+        and an older loader that has never heard of them is unaffected.
+        """
+        d: dict = {
             "w": int(self.W),
             "seed": int(self.seed),
             "style": str(self.style),
@@ -767,6 +1396,11 @@ class Terrain:
             "height": _b64_array(self.height.astype(np.float32)),
             "material": _b64_array(self.material.astype(np.uint8)),
         }
+        if self.deck is not None:
+            d["deck"] = _b64_array(self.deck.astype(np.float32))
+        if self.climb is not None:
+            d["climb"] = _b64_array(self.climb.astype(np.float32))
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "Terrain":
@@ -808,6 +1442,13 @@ class Terrain:
             except (TypeError, ValueError):
                 chasm = None
 
+        # A crossing overlay is pure convenience: it can always be re-stamped by
+        # the structure that owns it on its next tick.  So anything unreadable
+        # here loads as "no crossing" rather than failing the whole terrain -
+        # __post_init__ then throws out anything the wrong length or all-NaN.
+        deck = _unb64_array(d.get("deck"), "float32", w) if "deck" in d else None
+        climb = _unb64_array(d.get("climb"), "float32", w) if "climb" in d else None
+
         try:
             return cls(
                 W=w,
@@ -816,6 +1457,8 @@ class Terrain:
                 seed=seed,
                 style=style,
                 chasm=chasm,
+                deck=deck,
+                climb=climb,
             )
         except Exception:
             return cls.generate(seed, style)

@@ -49,10 +49,16 @@ __all__ = [
     "StructureSpec",
     "STRUCTURE_SPECS",
     "STRUCTURE_KINDS",
+    "CROSSING_KINDS",
     "structure_spec",
+    "plan_ladder",
     "FIRE_LIGHT_COLOR",
     "BURN_LIGHT_COLOR",
 ]
+
+#: Kinds that write themselves into Terrain's effective-surface overlay when
+#: they finish, and take themselves back out when they fall down.
+CROSSING_KINDS: tuple[str, ...] = ("bridge", "ladder")
 
 # ------------------------------------------------------------------ tuning --
 FIRE_LIGHT_COLOR: tuple[int, int, int] = (255, 168, 82)
@@ -123,10 +129,25 @@ STRUCTURE_SPECS: dict[str, StructureSpec] = {
         width=40.0, height=34.0, capacity=0, flammable=False,
         build_time=8.0, spacing=120.0, variants=2,
     ),
+    # A bridge is not decoration: when it completes it stamps a deck into
+    # Terrain's effective-surface overlay across `state["span"]`, and from that
+    # moment ground_y() over the gap reports planking instead of the floor 300
+    # px down. See Structure._tick_crossing.
     "bridge": StructureSpec(
         "bridge", 3, 120.0, {RES_WOOD: 20, RES_FIBRE: 4},
         width=90.0, height=10.0, capacity=0, flammable=True,
         build_time=10.0, spacing=80.0, variants=2,
+    ),
+    # The cheap crossing: a ladder against a vertical face. Half a bridge's
+    # wood, two stages instead of three and a shorter stage, because it solves
+    # a much smaller problem - one face rather than a whole chasm - and the
+    # colony should be able to answer a cliff without a full build project.
+    # On completion it stamps the *climb* overlay, which is what makes a face
+    # steeper than MAX_SLOPE_CLIMB passable at all.
+    "ladder": StructureSpec(
+        "ladder", 2, 70.0, {RES_WOOD: 8, RES_FIBRE: 2},
+        width=40.0, height=60.0, capacity=0, flammable=True,
+        build_time=6.0, spacing=60.0, variants=2,
     ),
     "watchtower": StructureSpec(
         "watchtower", 3, 120.0, {RES_WOOD: 22, RES_STONE: 8},
@@ -158,6 +179,45 @@ _DEFAULT_SPEC = StructureSpec("unknown", 1, 80.0, {RES_WOOD: 4}, 24.0, 24.0)
 def structure_spec(kind: str) -> StructureSpec:
     """Spec for `kind`, or a bland fallback so unknown kinds never crash."""
     return STRUCTURE_SPECS.get(kind, _DEFAULT_SPEC)
+
+
+def plan_ladder(
+    terrain: Any, near: float | None = None
+) -> tuple[float, float, dict[str, Any]] | None:
+    """Site a ladder against a cliff face: ``(x, y, extra_state)`` or ``None``.
+
+    The same shape ``behaviour.pick_site`` returns for every other kind, so
+    wiring the ladder into the build order is a two-line change there rather
+    than a new code path. ``terrain.find_climb_face`` does the survey; this only
+    turns its answer into the state dict a Structure carries -
+    ``span``/``rise``, which :meth:`Structure._tick_crossing` later stamps.
+
+    Returns ``None`` on gentle terrain with no face worth laddering, which is
+    the common case and is not an error.
+    """
+    finder = getattr(terrain, "find_climb_face", None)
+    if not callable(finder):
+        return None
+    try:
+        face = finder(near)
+    except Exception:
+        return None
+    if not face or len(face) != 4:
+        return None
+    try:
+        x0, x1, y0, y1 = (float(v) for v in face)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (x0, x1, y0, y1)) or x1 <= x0:
+        return None
+    # Anchor the structure at the foot: that is where a builder has to stand,
+    # and where a ladder visibly rests. `y` is the ground there.
+    foot_x, foot_y = (x0, y0) if y0 > y1 else (x1, y1)
+    return (
+        foot_x,
+        foot_y,
+        {"w": (x1 - x0) + 6.0, "span": [x0, x1], "rise": [y0, y1]},
+    )
 
 
 # ------------------------------------------------------------- dict helpers --
@@ -684,6 +744,112 @@ class Structure:
         else:
             self.growth = _clamp01(self.growth + (target - self.growth) * k)
 
+    # ------------------------------------------------------------ crossings --
+    def crossing_span(self) -> tuple[float, float] | None:
+        """``(x0, x1)`` this crossing covers, or ``None`` if it is not one.
+
+        ``behaviour.pick_site`` already records the surveyed span in
+        ``state["span"]``; the width fallback is for a crossing placed by hand
+        (a test, a debug key) that never went through the director.
+        """
+        if self.kind not in CROSSING_KINDS:
+            return None
+        raw = self.state.get("span")
+        if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+            try:
+                x0, x1 = float(raw[0]), float(raw[1])
+                if math.isfinite(x0) and math.isfinite(x1) and abs(x1 - x0) >= 4.0:
+                    return (min(x0, x1), max(x0, x1))
+            except (TypeError, ValueError):
+                pass
+        hw = max(8.0, float(self.spec.width) * 0.5)
+        return (self.x - hw, self.x + hw)
+
+    def _crossing_stamped(self, terrain: Any, x0: float, x1: float) -> bool:
+        """Does the terrain *actually* carry this crossing right now?
+
+        Asked of the terrain rather than of a flag in `state` on purpose. The
+        two can disagree - a save whose overlay failed to load, a terrain
+        replaced under a surviving registry - and when they do it is the
+        terrain that is true. Reconciling against it makes the stamp
+        self-healing instead of permanently wrong.
+        """
+        mid = 0.5 * (x0 + x1)
+        probe = "climb_aided" if self.kind == "ladder" else "has_deck"
+        fn = getattr(terrain, probe, None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn(mid))
+        except Exception:
+            return False
+
+    def _stamp_crossing(self, terrain: Any, x0: float, x1: float) -> bool:
+        if self.kind == "ladder":
+            rise = self.state.get("rise")
+            y0 = y1 = None
+            if isinstance(rise, (list, tuple)) and len(rise) >= 2:
+                try:
+                    y0, y1 = float(rise[0]), float(rise[1])
+                except (TypeError, ValueError):
+                    y0 = y1 = None
+            if y0 is None or y1 is None or not (math.isfinite(y0) and math.isfinite(y1)):
+                # No surveyed rise: read the ground at the two anchors. Nothing
+                # is stamped there yet, so this is still the bare rock.
+                gy = getattr(terrain, "ground_y", None)
+                if not callable(gy):
+                    return False
+                y0, y1 = float(gy(x0)), float(gy(x1))
+            fn = getattr(terrain, "stamp_climb", None)
+            return bool(fn(x0, x1, y0, y1)) if callable(fn) else False
+
+        fn = getattr(terrain, "stamp_deck", None)
+        if not callable(fn):
+            return False
+        # `y` is the rim behaviour surveyed when it staked the site out, and is
+        # also where the renderer draws the deck - so the planking, the sprite
+        # and the walkable surface are all the same line by construction.
+        return bool(fn(x0, x1, float(self.y)))
+
+    def _tick_crossing(self, world: Any | None) -> None:
+        """Keep the terrain overlay in step with whether this crossing stands.
+
+        This is the hook that makes a finished bridge something agents can walk
+        on. It is edge-triggered off a comparison with the terrain's real state,
+        so it costs two array lookups a tick and fires only on the transitions:
+        completed (stamp), collapsed or burned down (clear), rebuilt from rubble
+        (stamp again), reloaded from a save with a lost overlay (stamp again).
+
+        Deliberately outside `_tick_upkeep`, which returns early for rubble -
+        the collapse of a bridge is exactly when the deck has to come out.
+        """
+        if self.kind not in CROSSING_KINDS or world is None:
+            return
+        terrain = getattr(world, "terrain", None)
+        if terrain is None:
+            return
+        span = self.crossing_span()
+        if span is None:
+            return
+        x0, x1 = span
+        want = bool(self.built) and not self.is_ruined
+        if want == self._crossing_stamped(terrain, x0, x1):
+            return
+        if want:
+            if self._stamp_crossing(terrain, x0, x1):
+                self.state["crossing_on"] = True
+                self._chronicle(
+                    world,
+                    f"The {self.kind} is open - the far side can be reached."
+                    if self.kind == "bridge"
+                    else "The ladder is up; the cliff can be climbed.",
+                )
+            return
+        clear = getattr(terrain, "clear_crossing", None)
+        if callable(clear) and clear(x0, x1):
+            self.state.pop("crossing_on", None)
+            self._chronicle(world, f"The {self.kind} is gone; the way is cut off again.")
+
     # ----------------------------------------------------------------- tick --
     def update(self, dt: float, world: Any | None = None) -> None:
         """Per-tick upkeep: fire fuel, burning damage, ruin ageing, hut growth.
@@ -701,6 +867,10 @@ class Structure:
                 self._tick_growth(dt, world)
         except Exception:  # pragma: no cover
             log.debug("structure growth failed %s#%s", self.kind, self.id, exc_info=True)
+        try:
+            self._tick_crossing(world)
+        except Exception:  # pragma: no cover
+            log.debug("crossing sync failed %s#%s", self.kind, self.id, exc_info=True)
 
     def _tick_upkeep(self, dt: float, world: Any | None = None) -> None:
         if dt <= 0.0:
