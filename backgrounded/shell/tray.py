@@ -32,7 +32,7 @@ import uuid
 from ctypes import wintypes
 from typing import Any, Callable
 
-from ..constants import SCENES, SCENE_LABELS
+from ..constants import SCENES, SCENE_LABELS, SCENE_ROTATE_SEC
 
 log = logging.getLogger(__name__)
 
@@ -99,6 +99,7 @@ ID_NEW_TERRAIN = 1044
 ID_CLEAR_GRAVES = 1045
 ID_NAMES = 1046
 ID_LOG = 1047
+ID_AUTO_SCENE = 1048
 ID_SAVE = 1005
 ID_EXIT = 1006
 ID_SCENE_BASE = 2000
@@ -704,6 +705,16 @@ class Tray:
                     scene_menu, ID_SCENE_BASE,
                     ID_SCENE_BASE + len(SCENES) - 1,
                     ID_SCENE_BASE + active, MF_BYCOMMAND)
+            # The rotation toggle lives inside the Scene submenu because that is
+            # what it is about, and because picking a scene by hand and then
+            # having the weather move on by itself in ten minutes is exactly the
+            # surprise this switch exists to prevent. The interval is in the
+            # label so the menu answers "how often?" without needing a manual.
+            mins = max(1, int(round(SCENE_ROTATE_SEC / 60.0)))
+            user32.AppendMenuW(scene_menu, MF_SEPARATOR, 0, None)
+            user32.AppendMenuW(
+                scene_menu, flag(bool(state.get("auto_scene_change", True))),
+                ID_AUTO_SCENE, f"Change scene every {mins} min")
             user32.AppendMenuW(menu, MF_STRING | MF_POPUP, scene_menu, "Scene")
 
         # --- Speed submenu, radio-checked on the active multiplier
@@ -794,6 +805,8 @@ class Tray:
             self._emit("toggle_names", None)
         elif cmd == ID_LOG:
             self._emit("toggle_log", None)
+        elif cmd == ID_AUTO_SCENE:
+            self._emit("toggle_auto_scene", None)
         elif cmd == ID_SAVE:
             self._emit("save", None)
         elif cmd == ID_EXIT:

@@ -157,6 +157,7 @@ class App:
             "show_stats": getattr(self.cfg, "show_stats", True),
             "show_names": getattr(self.cfg, "show_names", True),
             "show_log": getattr(self.cfg, "show_log", True),
+            "auto_scene_change": getattr(self.cfg, "auto_scene_change", True),
         }
 
     def _drain_commands(self) -> None:
@@ -245,6 +246,16 @@ class App:
             self.renderer.show_log = not self.renderer.show_log
             cfg.show_log = self.renderer.show_log
             self._save_config("show_log")
+        elif kind == "toggle_auto_scene":
+            # The setting lives on the config; the world holds the live copy the
+            # tick actually reads, so both move together or the menu would show
+            # one thing while the weather did another.
+            cfg.auto_scene_change = not getattr(cfg, "auto_scene_change", True)
+            if self.world is not None:
+                self.world.auto_scene_rotate = cfg.auto_scene_change
+            self._save_config("auto_scene_change")
+            log.info("auto scene rotation %s",
+                     "on" if cfg.auto_scene_change else "off")
         elif kind == "new_terrain":
             self.world.randomise_terrain()
             persist.save_world(self.world)
