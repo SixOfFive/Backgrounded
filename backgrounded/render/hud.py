@@ -430,6 +430,8 @@ def _content_key(world, show_roster: bool) -> tuple:
         world.population.generation,
         world.structures.count(),
         world.stats.get("died", 0),
+        world.stats.get("abducted", 0),
+        world.stats.get("returned", 0),
         tuple(sorted(world.stockpile.items())),
         show_roster,
     )
@@ -477,10 +479,23 @@ def _build(world, show_roster: bool) -> pygame.Surface:
     agents.sort(key=lambda a: a.id)
 
     rows = len(agents) if show_roster else 0
+
+    # The ufo's books, kept apart from "lost": an abduction takes somebody off
+    # the roster alive and leaves no grave, so counting it as a death would be
+    # a lie, and leaving it out entirely means the headcount just drops with
+    # nothing on the panel to explain it. .get() with defaults so a save from
+    # before these counters existed still renders.
+    taken = int(world.stats.get("abducted", 0) or 0)
+    back = int(world.stats.get("returned", 0) or 0)
+    # Only once the ufo has actually taken someone - most colonies never meet
+    # it, and a permanently-zero row is pure noise. It needs its own line
+    # because appended to "pop/gen/built/lost" it runs off the panel edge.
+    ufo_line = taken > 0
+
     # Footer now wraps to two lines, so reserve LINE * 3 for it (divider +
     # two text lines) instead of LINE * 2.
     height = (PAD * 2 + LINE * 3 + 6 + (rows * (LINE + 9)) + LINE * 3 + 8
-              + (LINE - 2 if show_roster else 0))
+              + (LINE - 2 if show_roster else 0) + (LINE if ufo_line else 0))
     panel = pygame.Surface((PANEL_W, height), pygame.SRCALPHA)
     panel.fill((*BG, BG_ALPHA))
     pygame.draw.rect(panel, EDGE, panel.get_rect(), 1)
@@ -501,6 +516,11 @@ def _build(world, show_roster: bool) -> pygame.Surface:
     panel.blit(_text(f"pop {pop}   gen {gen}   built {world.structures.count()}"
                      f"   lost {world.stats.get('died', 0)}", DIM, 11), (PAD, y))
     y += LINE
+
+    if ufo_line:
+        panel.blit(_text(f"taken {taken}" + (f", back {back}" if back else ""),
+                         DIM, 11), (PAD, y))
+        y += LINE
 
     sp = world.stockpile
     panel.blit(_text(
