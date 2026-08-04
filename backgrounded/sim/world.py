@@ -763,8 +763,18 @@ class World:
                             StructureRegistry)
         w.population = _sub("population", Population.from_dict, Population)
         w.lighting = _sub("lighting", Lighting.from_dict, Lighting)
-        w.events = _sub("events", EventSystem.from_dict, EventSystem)
-        w.animals = _sub("animals", AnimalRegistry.from_dict, AnimalRegistry)
+        # Regenerated subsystems are seeded from the loaded world, with the same
+        # offsets __init__ uses, so a section that had to be rebuilt behaves like
+        # a fresh one instead of like an unseeded one. A bare EventSystem() or
+        # AnimalRegistry() draws its seed from the *global* random module, so a
+        # reload whose section was missing or corrupt came back permanently
+        # non-reproducible - and silently, because _sub logs the regeneration but
+        # nothing downstream can tell a seeded stream from an unseeded one. The
+        # ufo already had this; events and animals did not.
+        w.events = _sub("events", EventSystem.from_dict,
+                        lambda: EventSystem(seed=w.seed ^ 0x513))
+        w.animals = _sub("animals", AnimalRegistry.from_dict,
+                         lambda: AnimalRegistry(seed=w.seed ^ 0xA17))
         w.ufo = _sub("ufo", Ufo.from_dict, lambda: Ufo(seed=w.seed ^ 0x71F))
 
         w.stockpile = {r: 0 for r in ALL_RESOURCES}
