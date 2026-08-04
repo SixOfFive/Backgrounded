@@ -47,13 +47,26 @@ def section(name: str) -> None:
 # --------------------------------------------------------------- imports --
 def test_imports() -> bool:
     section("imports")
+    # This list was a coverage hole and the hole had consequences. It named no
+    # module under render/ at all, and lagged sim/ by whatever was added last -
+    # so a render module that did not exist (thrown spears were modelled and
+    # never drawn, for 230 throws across 16 colonies) and a sim module nobody
+    # imported both sat behind a green 26/26. An import test is the cheapest
+    # check here and the only one that catches "the file is not there yet".
+    #
+    # sim/ first and alone, because test_sim_is_headless asserts below that
+    # nothing imported so far has pulled in pygame - importing render/ before
+    # that would be importing pygame and the assertion would be meaningless.
     mods = [
         "backgrounded.constants", "backgrounded.paths", "backgrounded.config",
         "backgrounded.sim.terrain", "backgrounded.sim.props",
         "backgrounded.sim.entities", "backgrounded.sim.names",
         "backgrounded.sim.lighting", "backgrounded.sim.events",
         "backgrounded.sim.structures", "backgrounded.sim.actions",
-        "backgrounded.sim.behavior", "backgrounded.sim.world",
+        "backgrounded.sim.behavior", "backgrounded.sim.animals",
+        "backgrounded.sim.combat_actions", "backgrounded.sim.dragons",
+        "backgrounded.sim.throwing", "backgrounded.sim.ufo",
+        "backgrounded.sim.interact", "backgrounded.sim.world",
         "backgrounded.persist",
     ]
     ok = True
@@ -79,6 +92,34 @@ def test_sim_is_headless() -> None:
     offenders = [p.name for p in root.glob("*.py")
                  if "import pygame" in p.read_text("utf-8", errors="ignore")]
     check(not offenders, "no 'import pygame' in sim/", str(offenders))
+
+
+def test_render_imports() -> None:
+    """Every render module imports, under a dummy video driver.
+
+    Runs strictly AFTER test_sim_is_headless, which asserts pygame has not been
+    loaded yet - importing render/ is importing pygame, so doing it any earlier
+    would make that assertion vacuous.
+
+    This exists because a render module that was never written stayed invisible
+    behind a green suite: spears were modelled and thrown 230 times across 16
+    colonies with nothing on screen, because render/throwing.py did not exist and
+    nothing here would have noticed. Discovering every module on disk rather than
+    listing them means the next one is covered without anyone remembering.
+    """
+    section("render/ imports")
+    import os
+    os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+    root = Path(__file__).resolve().parent.parent / "backgrounded" / "render"
+    names = sorted(p.stem for p in root.glob("*.py") if p.stem != "__init__")
+    check(bool(names), "found render modules to import", str(names))
+    for name in names:
+        mod = f"backgrounded.render.{name}"
+        try:
+            __import__(mod)
+            check(True, f"import {mod}")
+        except Exception as exc:
+            check(False, f"import {mod}", f"{type(exc).__name__}: {exc}")
 
 
 # ------------------------------------------------------------------- run --
@@ -243,6 +284,7 @@ def main() -> int:
         print("\nimports failed; stopping here")
         return 1
     test_sim_is_headless()
+    test_render_imports()          # after the headless check - it loads pygame
     world = test_long_run(args.ticks, args.scene)
     test_roundtrip(world)
     test_defensive_load()

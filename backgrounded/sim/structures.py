@@ -28,6 +28,7 @@ from typing import Any, Iterator
 from ..constants import (
     BARRICADE_DAMAGE,
     BARRICADE_RANGE,
+    BARRICADE_SPIKE_H,
     BONFIRE_GARBAGE_CAP,
     BONFIRE_LIGHT_COLOR,
     BONFIRE_LIGHT_INTENSITY,
@@ -47,6 +48,49 @@ from ..constants import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _ground_clearance(world: Any, obj: Any) -> float:
+    """Px between *obj* and the ground under it; 0.0 for anything without one.
+
+    The fallback used when :mod:`.throwing` cannot be imported. Answering 0.0 -
+    "it is on the ground" - is the answer this package gave before altitude
+    existed, so a failure here restores the OLD behaviour rather than inventing
+    a new one, and the only thing that changes is that flyers become reachable.
+    """
+    alt = getattr(obj, "alt", None)
+    if not isinstance(alt, (int, float)) or isinstance(alt, bool):
+        return 0.0
+    f = float(alt)
+    return 0.0 if f != f or f in (float("inf"), float("-inf")) else f
+
+
+_CLEARANCE = None
+
+
+def _clearance():
+    """Resolve ``throwing.clearance`` once, lazily, and cache it.
+
+    NOT a module-level import, and that is load-bearing rather than style:
+    ``structures -> throwing -> entities -> actions -> structures`` is a real
+    cycle (actions.py imports this module at its top level), so importing
+    throwing here at import time is an ImportError on a cold start, not a
+    subtle problem. Resolved on first use instead, when every module is built.
+
+    Cached in a module global because ``_tick_barricade`` is a per-frame path
+    walked once per barricade per tick; re-importing there would be a
+    ``sys.modules`` lookup every frame for a function that never changes.
+    Falls back to :func:`_ground_clearance`, which is semantically identical
+    for everything that does not fly.
+    """
+    global _CLEARANCE
+    if _CLEARANCE is None:
+        try:
+            from .throwing import clearance      # noqa: PLC0415 - see above
+            _CLEARANCE = clearance
+        except Exception:
+            _CLEARANCE = _ground_clearance
+    return _CLEARANCE
 
 __all__ = [
     "Structure",
@@ -1262,6 +1306,34 @@ class Structure:
         else:
             self.state["fuel"] = fuel
 
+    def _spiked_targets(self, world: Any | None) -> list[Any]:
+        """Everything the spikes are allowed to bite: wild animals AND dragons.
+
+        Two registries rather than one, because a dragon is deliberately NOT in
+        ``world.animals``: ``AnimalRegistry._walk`` re-welds ``y =
+        ground_y(x)`` after every move, which would destroy a flyer's altitude
+        every tick, and ``ANIMAL_MAX_ALIVE`` is 4, so a dragon would crowd out
+        a whole wolf incursion. They are unified here, at the one predicate
+        that genuinely wants both.
+
+        Each side is read behind ``getattr`` and degrades to ``[]`` on its own.
+        ``world.animals`` may be absent on a bare test world - the existing
+        method already documented that - and ``world.dragons`` is absent on
+        every world loaded from a save written before dragons existed, which is
+        the far more common case and must not cost the barricade its teeth.
+        """
+        out: list[Any] = []
+        for attr in ("animals", "dragons"):
+            reg = getattr(world, attr, None)
+            alive = getattr(reg, "alive", None)
+            if not callable(alive):
+                continue
+            try:
+                out.extend(alive())
+            except Exception:
+                continue
+        return out
+
     def _tick_barricade(self, dt: float, world: Any | None) -> None:
         """A built barricade wounds wild animals lingering within its spikes.
 
@@ -1269,28 +1341,38 @@ class Structure:
         never a stickman - stickmen are simply not in ``world.animals``. On the
         edge that kills an animal it names the beast in the chronicle.
 
+        The test is x AND height. It used to be x alone, which was correct for
+        every entity that had ever existed here - animals.py's own header says
+        "Nothing here flies or falls" - and became a real bug the moment
+        something could fly. MEASURED BEFORE THE FIX, against this exact method
+        with a duck-typed flying stub: a dragon 400 px above the fence took the
+        full BARRICADE_DAMAGE of 22.0 hp/s, byte-for-byte identical to a wolf
+        standing in the spikes. A colony's barricades would have shredded a
+        flyover cruising at alt 360 that the player cannot even reach with a
+        spear. ``clearance`` answers 0.0 for anything with no ``alt``, so every
+        wolf, bear and boar takes exactly the damage it took before.
+
         Runs on the per-frame path, so it must never raise: ``world.animals``
         may be absent (a bare test world) or malformed, and an individual
         animal's ``.x``/``.hurt`` might misbehave. Every one of those degrades
         to "no damage this tick" rather than disabling the structures subsystem.
+        That is also why ``clearance`` is specified total - a clearance() that
+        raises would not merely break barricades, it would disable the entire
+        structures subsystem for the session via ``World._guarded``, silently,
+        and the colony would simply stop building.
         """
         if world is None or dt <= 0.0:
             return
         dmg = BARRICADE_DAMAGE * float(dt)
         if dmg <= 0.0:
             return
-        reg = getattr(world, "animals", None)
-        alive = getattr(reg, "alive", None)
-        if not callable(alive):
-            return
-        try:
-            animals = list(alive())
-        except Exception:
-            return
-        for a in animals:
+        clearance = _clearance()
+        for a in self._spiked_targets(world):
             try:
                 if abs(float(a.x) - self.x) > BARRICADE_RANGE:
                     continue
+                if clearance(world, a) > BARRICADE_SPIKE_H:
+                    continue          # it is flying OVER the spikes
                 if a.hurt(dmg):
                     kind = str(getattr(a, "kind", "") or "beast").strip().lower()
                     self._chronicle(world, f"The spikes take a {kind or 'beast'}.")
@@ -1874,6 +1956,56 @@ if __name__ == "__main__":  # pragma: no cover - smoke test
     before = bw.animals.items[1].health
     unbuilt_bar.update(1.0 / 30.0, bw)
     print("  unbuilt barricade harmless:", bw.animals.items[1].health == before)
+
+    # ------------------------------------------- barricade vs a FLYING thing --
+    # The altitude bug, as a regression test. Before the height gate a stub at
+    # alt 200 took the full 22.0 hp/s at the barricade's own x - identical to a
+    # wolf standing in the spikes - because the predicate tested x alone.
+    class _StubFlyer(_StubAnimal):
+        def __init__(self, x: float, hp: float, alt: float, kind: str = "wyvern") -> None:
+            super().__init__(x, hp, kind)
+            self.alt = alt
+
+    class _AltWorld(_BarWorld):
+        def __init__(self, flyer: "_StubFlyer") -> None:
+            self.lines = []
+            self.animals = _StubAnimals([flyer])
+
+    high = _StubFlyer(200.0, 400.0, 200.0)
+    bar_hi = StructureRegistry().create("barricade", 200.0, 600.0, built=True)
+    aw = _AltWorld(high)
+    for _ in range(30):
+        bar_hi.update(1.0 / 30.0, aw)
+    assert high.health == 400.0, f"spikes hit a flyer 200 px up ({high.health})"
+    print("  flyer at alt 200 untouched over 30 ticks:", high.health == 400.0)
+
+    low = _StubFlyer(200.0, 400.0, 0.0)
+    bar_lo = StructureRegistry().create("barricade", 200.0, 600.0, built=True)
+    aw2 = _AltWorld(low)
+    ticks = 0
+    while low.health > 0.0 and ticks < 2000:
+        ticks += 1
+        bar_lo.update(1.0 / 30.0, aw2)
+    assert low.health <= 0.0, "a grounded dragon walked out of the spikes alive"
+    print(f"  same stub at alt 0 dies in {ticks} ticks:", low.health <= 0.0)
+
+    # ...and the spikes must reach world.dragons, not only world.animals.
+    class _DragonOnlyWorld:
+        def __init__(self, d) -> None:
+            self.lines = []
+            self.dragons = _StubAnimals([d])
+
+        def log_event(self, text: str) -> None:
+            self.lines.append(text)
+
+    ground_drake = _StubFlyer(200.0, 66.0, 0.0, "quadruped")
+    dw = _DragonOnlyWorld(ground_drake)
+    bar_dr = StructureRegistry().create("barricade", 200.0, 600.0, built=True)
+    for _ in range(120):
+        bar_dr.update(1.0 / 30.0, dw)
+    assert ground_drake.health <= 0.0, "the spikes cannot see world.dragons"
+    print("  grounded dragon reached via world.dragons:",
+          [ln for ln in dw.lines if "spikes" in ln][:1])
 
     # ---------------------------------------------- hut growth, real World --
     from .world import World  # noqa: PLC0415 - smoke test only

@@ -822,8 +822,37 @@ class AnimalRegistry:
                     self.remove(a)
             self._reap(world)
             self._wave_end(world)
+            self._tick_spears(world, step)
         except Exception:
             log.exception("animal tick failed")
+
+    def _tick_spears(self, world: Any, dt: float) -> None:
+        """Drive the thrown-spear registry, if this world has one.
+
+        A spear is a projectile the combat loop fires at the things in *this*
+        registry, and it has to be integrated every frame or it hangs in the
+        air. World.tick is the natural owner and declares its own ``spears``
+        guard - but a spear that is only ticked from there is silently inert on
+        any world built before that line existed (an old save, a test stub, a
+        checkout where the two halves have not met yet), and "inert" here means
+        agents throw spears that never land and never come back. Driving it from
+        the one subsystem that is already ticked, and that a spear is always
+        aimed at, closes that hole.
+
+        ``SpearRegistry.tick`` deduplicates on ``world.tick_count``, so when
+        World.tick *does* also drive it the second call in the frame is a no-op
+        rather than a second helping of gravity. Wrapped in its own try/except
+        as well: this runs inside World._guarded("animals"), and a raise here
+        would disable the wildlife for the rest of the session.
+        """
+        reg = getattr(world, "spears", None)
+        fn = getattr(reg, "tick", None)
+        if not callable(fn):
+            return
+        try:
+            fn(world, dt)
+        except Exception:
+            log.exception("spear tick failed")
 
     def _tick_animal(self, world: Any, a: Animal, dt: float) -> None:
         a.age += dt

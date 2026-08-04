@@ -20,7 +20,8 @@ from ..constants import (
 from ..sim.structures import (
     BONFIRE_FADE_UNITS, BONFIRE_RAMP_SEC, CROSSING_KINDS,
 )
-from . import creatures, fx, hud, sky
+from . import creatures, dragons as dragon_art, fx, hud, sky
+from . import throwing as spear_art
 from .atlas import Atlas
 from .particles import ParticleSystem
 from .stickfigure import draw_stickman
@@ -146,12 +147,34 @@ class Renderer:
         self._draw_props(s, world)
         self._draw_structures(s, world)
 
+        # 6b. the one dragon that stands in the colony rather than over it.
+        # Inside the light composite, and before the agents - see
+        # _draw_dragons for both halves of why.
+        self._draw_dragons(s, world, grounded=True)
+
         # 7. agents, then the wildlife among them
         self._draw_agents(s, world)
         try:
             creatures.draw_animals(s, world, world.world_time)
         except Exception:
             log.exception("animal draw failed")
+        # Thrown spears, immediately after the bodies. sim/throwing.py has
+        # modelled a real projectile since it landed and there was no call here
+        # at all, so a hostile proof measured 230 throws that drew literally
+        # nothing - no shaft in the air, none in the dirt. This line is the
+        # whole of that fix; the art is render/throwing.py.
+        #
+        # At this layer and not with the dragons: a spear lives in the same
+        # 0-140 px band as the wolves it is thrown at, so the composite below
+        # must light it off the same torches, or it becomes the one object in
+        # the colony that glows at 3am - the very thing _draw_dragons had to
+        # unpick for the quadruped. After the agents and the animals rather
+        # than before, because a shaft is 25 px long and 2 px wide and any body
+        # it were drawn behind would simply eat it.
+        try:
+            spear_art.draw_spears(s, world, world.world_time)
+        except Exception:
+            log.exception("spear draw failed")
         try:
             creatures.draw_mining_dust(s, world, world.world_time)
         except Exception:
@@ -190,6 +213,25 @@ class Renderer:
             creatures.draw_ufo(s, world, world.world_time)
         except Exception:
             log.exception("ufo draw failed")
+
+        # The four dragons that fly, at the same layer and for the same reason.
+        # A dragon at cruise altitude (150-420 px) is above every light source
+        # in the world, so putting it INSIDE the composite would multiply it
+        # down by the scene's ambient and leave a black smear on black - it
+        # would not merely be dark, it would be gone. Drawing it here instead
+        # means the module does its own silhouette handling: render/dragons.py
+        # applies exactly creatures._draw_animal's rule (light_at below
+        # _SIL_CUTOFF -> draw the whole creature in _SIL_COLOR), so a dragon
+        # low enough to be in torchlight is lit like a wolf and one at altitude
+        # is a flat cut-out against the sky, which is what the high-altitude
+        # art was designed around.
+        #
+        # The one accepted cost of drawing after the composite: a serpent
+        # cresting a chasm mouth overdraws a few px of the far wall. The module
+        # skips a serpent entirely below alt -6 rather than clipping, because
+        # clipping wants a scratch surface every frame; if it ever reads badly
+        # on a real chasm map the fix is a clip rect here, not in the art.
+        self._draw_dragons(s, world, grounded=False)
 
         # 11. lightning geometry, then vignette
         self._draw_lightning(s, world)
@@ -620,6 +662,95 @@ class Renderer:
                 s.blit(mark, (zx, zy))
         except Exception:
             pass
+
+    # ------------------------------------------------------------ dragons --
+    def _draw_dragons(self, s: pygame.Surface, world, *, grounded: bool) -> None:
+        """Draw the dragons that belong at this layer, and only those.
+
+        render/dragons.py ships one entry point and documents it as "call after
+        the light composite". That is right for the four kinds that fly and
+        wrong for the fifth, and the module's own reasoning says why without
+        quite noticing: it argues from *cruise altitude*, and the quadruped
+        never has one. The quadruped is the siege dragon, and ``draw_one`` pins
+        it to ``ground_y`` for its whole visit precisely because it has no
+        flight pose - so drawing it after the composite made it the one object
+        in the colony that glows at 3am.
+
+        Measured, seed 4242, scene clear, deep night (ambient 0.34), mean
+        luminance of the body's own ink against the world in the same box:
+
+        ==================== ======= ============= =============
+        where it stands      world   after (was)   inside (now)
+        ==================== ======= ============= =============
+        240 px from any fire    10.1   17.3 (1.7x)     7.3 (0.7x)
+        in a firepit's pool     33.2   96.7 (2.9x)    64.6 (1.9x)
+        ==================== ======= ============= =============
+
+        Unlit it was brighter than the ground it stood on; by a fire it was
+        three times the scene. Inside the composite it tracks the world in both
+        - still the brightest thing near the fire, which is correct, because it
+        is standing in firelight. render/throwing.py names the identical
+        failure as its reason for putting thrown spears at step 7; same call.
+
+        Split by KIND and not by altitude, which is the tempting version and is
+        wrong: a wyvern stooping to seize somebody crosses the ground band
+        twice a visit, so an altitude threshold would carry it across the
+        composite mid-dive and pop its brightness on the way through. That is a
+        worse artefact than the bug being fixed. The quadruped never leaves the
+        ground and nothing else ever settles on it, so this partition never
+        moves a dragon between layers while it is on screen. An unrecognised
+        kind draws as a wyvern (``dragon_kind_of``) and so lands in the flying
+        half, which is exactly where every dragon used to be - a sim that grows
+        a sixth kind degrades to the old behaviour rather than to a new one.
+
+        What this deliberately does *not* buy is occlusion by buildings. The
+        grounded pass runs after the structures, so a dragon standing behind a
+        roof still overdraws it, the same way a villager does. A 268 px siege
+        dragon half-hidden by a 92 px hut would read as a clipping bug rather
+        than as depth. It runs *before* the agents for the opposite reason:
+        that body is wide enough to swallow a dozen people, and the villagers
+        it is hunting have to stay visible in front of it.
+
+        Fails soft, like every other pass in here: no dragons, an unreadable
+        registry or a raise inside the art costs this frame's dragon, not the
+        frame.
+        """
+        reg = getattr(world, "dragons", None)
+        if reg is None:
+            return
+        try:
+            if len(reg) == 0:
+                return                  # the case ~every frame of every run
+        except TypeError:
+            pass                        # no __len__; fall through and walk it
+        try:
+            # ``alive()`` is the first name render/dragons._iter_dragons probes
+            # for, so this and the module's own walk select the same set.
+            fn = getattr(reg, "alive", None)
+            dragons = fn() if callable(fn) else list(reg)
+        except Exception:
+            log.debug("could not read the dragon list", exc_info=True)
+            return
+        # Coerced here rather than five times inside the art, and separately
+        # from the list read: a world reloaded from a junk save can hand over
+        # anything at all as a clock, and losing the animation phase is not a
+        # reason to lose the dragon.
+        try:
+            t = float(world.world_time)
+        except (AttributeError, TypeError, ValueError):
+            t = 0.0
+        if not math.isfinite(t):
+            t = 0.0
+        want = dragon_art.KIND_QUADRUPED
+        for d in dragons:
+            if d is None:
+                continue
+            try:
+                if (dragon_art.dragon_kind_of(d) == want) is not grounded:
+                    continue
+                dragon_art.draw_one(s, world, d, t)
+            except Exception:
+                log.debug("dragon draw failed", exc_info=True)
 
     # ------------------------------------------------------------- agents --
     def _draw_agents(self, s: pygame.Surface, world) -> None:

@@ -521,3 +521,215 @@ MORPH_LABELS: dict[str, str] = {
     MORPH_STOUT: "broad as a boulder",
     MORPH_LANKY: "all elbows and shins",
 }
+
+# ---------------------------------------------------------------- altitude --
+# Two numbers the SIM reads that describe things RENDER draws. Nothing in this
+# world had an altitude until dragons, so every reach test in the package is
+# one-dimensional (x only) and was *correct* while that was true - animals.py's
+# own header says "Nothing here flies or falls". These are the ceilings that
+# make those tests two-dimensional for the handful of callers that must care.
+
+#: Px. How tall a barricade's spikes are, i.e. the highest thing they can bite.
+#:
+#: This is not a taste number: it is the atlas canvas height for the "barricade"
+#: sprite, ``(60, 58)`` at render/atlas.py:220. Sim and render MUST agree on how
+#: tall the spikes are or the hitbox stops matching the picture - and nothing
+#: would fail if they drifted, which is exactly why it is written down here with
+#: its source. **If that canvas changes, THIS CHANGES TOO.**
+#:
+#: The bug this exists to close was measured before it was fixed
+#: (scratchpad/barricade_altitude_probe.py, driven against the real
+#: Structure.update with a duck-typed flying stub): a dragon 400 px above a
+#: barricade took the full BARRICADE_DAMAGE of 22.0 hp/s, byte-for-byte
+#: identical to a wolf standing in the spikes, because the predicate at
+#: structures.py:1292 tests ``abs(a.x - self.x)`` and nothing else.
+BARRICADE_SPIKE_H = 58.0
+
+#: Px. How high a stickman on the ground can reach with a spear held overhead -
+#: AGENT_HEIGHT (26) plus the thrust. Above this a melee attacker is swinging at
+#: air and must throw instead; combat_actions breaks off rather than standing
+#: underneath something 200 px up jabbing at it.
+MELEE_CEILING = 44.0
+
+# ----------------------------------------------------------------- dragons --
+#: The rarest thing in the world, and the only one that has to be *earned*.
+#:
+#: THE GATE is two standing stone huts - ``kind == "hut"``, built, not ruined,
+#: ``state["material"] == "stone"`` - latched the first tick it is true, and
+#: never unlatched (a fire that ruins a stone hut does not un-notice the
+#: colony), exactly like ``hut_tier_unlocked``.
+#:
+#: Chosen by measurement, 20 seeds x 75 sim-min sampled once per sim-second
+#: (scratchpad/gate_measure.py). Every cheaper candidate fires on a colony that
+#: merely *started* rather than one that prospered: built>=4 fired on 20/20 at a
+#: median of 7.8 min, pop>=6 on 20/20 at 19.1 min, and hut_tier_unlocked alone
+#: is a latch on a MORALE dwell, so it fires on a happy colony that has built
+#: nothing (earliest 9.6 min). GENERATION was disqualified outright: it counts
+#: ARRIVALS, not lineage depth - end-of-run generation was 15-33 on every seed -
+#: so it is a churn counter wearing a tech counter's name.
+#:
+#: stone_hut>=2 is the only candidate that requires all three of the masonry
+#: TECH (hut_tier_unlocked is a hard prerequisite: tier+stone>=1 measured
+#: identically to stone>=1, proving stone huts cannot precede the tier), a real
+#: stone SURPLUS hauled and applied twice, and enough SHELTER that a second hut
+#: was worth upgrading. 16/20 colonies reach it inside 75 min - earliest 21.9,
+#: median 45.3, latest 67.8 - and four never do (two failed colonies, two merely
+#: slow). Rare, late, and some colonies never see a dragon at all.
+#:
+#: A DWELL WAS MEASURED AND REJECTED, not skipped: requiring 60/120/240 s of
+#: sustained >=2 stone huts (scratchpad/gate_measure2.py) found ZERO drops back
+#: below 2 across all 16 seeds that reach the gate, over 430-3184 s of post-gate
+#: time each. A dwell buys nothing measurable and costs 1.0-2.3 min of median
+#: delay, so the latch alone is the mechanism.
+DRAGON_GATE_STONE_HUTS = 2
+
+#: Seconds of quiet after the latch before the first dragon. The gate says the
+#: colony is ready; this says the world is not going to say so in the same
+#: breath.
+DRAGON_FIRST_DELAY = 480.0
+#: Seconds between visits thereafter. Compare UFO_INTERVAL_MIN/MAX (420/1500):
+#: dragons are deliberately rarer than the saucer. The measured post-gate window
+#: is a median of 29.4 sim-min in a 75-min run; minus the 8-minute grace that
+#: leaves ~21 min against a mean interval of 27.5 min, so roughly half of
+#: unlocked colonies see one dragon and the rest see none - about 40% of all
+#: colonies meet a dragon in 75 sim-min.
+DRAGON_INTERVAL_MIN = 900.0
+DRAGON_INTERVAL_MAX = 2400.0
+
+#: A dragon cannot be hurt until it has fed (see dragons.Dragon.hurt). That rule
+#: creates one failure - an unsated dragon with nobody reachable is an immortal
+#: monster parked on the map forever - and this is the hatch that closes it.
+#: After this many seconds with NO eligible victim (everyone indoors, everyone
+#: dead but the last one, everyone already taken) it latches sated anyway and
+#: becomes killable on ordinary terms. Hiding indoors stays a real defence; it
+#: just costs ninety seconds and turns the monster mortal.
+DRAGON_STARVE_SEC = 90.0
+
+#: Seconds a wyvern holds a colonist before the lift completes, and the same
+#: window the serpent needs for a take. This is the ONE stretch of a wyvern's
+#: visit spent under BARRICADE_SPIKE_H and MELEE_CEILING - it flies over the
+#: traps for everything else - so this number is how long the fight lasts.
+DRAGON_SEIZE_SEC = 3.0
+
+#: Seconds a fed dragon spends GORGING - low, heavy and killable - before it
+#: starts the climb out. This is the payoff half of the feeding rule, and it
+#: exists because the rule shipped with only its first half working.
+#:
+#: MEASURED, and this is the defect it closes: the chronicle wrote "The wyrm has
+#: fed. It can be hurt now." and then took the dragon out of reach on the very
+#: next state transition. Over 16 seeds x 90 sim-min a fed dragon was under a
+#: thrower for a median of 1.2 s and inside melee for 0.3 s, and every wyvern
+#: that ever fed left with its health bar untouched - 0 of 3, not one point of
+#: damage. Two independent reasons, both of them the same mistake:
+#:
+#:  1. ``_devour`` set ``sated`` and moved straight to PHASE_LEAVE, whose first
+#:     act is a 96 px/s climb. A wyvern was inside MELEE_CEILING (44) for about
+#:     0.35 s after the sentence promising it could be hurt.
+#:  2. ``combat_actions.animal_leaving`` treats ANY target whose ``state``
+#:     reads "leave" as walking off the map and refuses to spend a spear on it.
+#:     So the instant a dragon fed, every thrower in the colony stopped
+#:     considering it - for the whole rest of its life, at any altitude.
+#:
+#: The gorge is therefore a phase of its own and not a slower leave: the name
+#: is load-bearing, because "leave" is a word another module reads.
+#:
+#: MEASURED after: 17.7 s inside a thrower's ceiling and 13.4 s inside melee per
+#: fed wyvern (median over six seeds), against its 180 hp - one armed adult who
+#: commits, or five spears. A serpent gets 17.2 s of both, because it crawls
+#: home along the surface instead of climbing, and 200 hp to spend it on.
+#:
+#: What that buys, end to end: over 24 seeds an ARMED colony brought down 6 of
+#: the 24 wyverns that fed on it, and 6 of the 18 that got away left at 24 hp of
+#: 180 - one more spear. Over 18 seeds of a forced regime (203 visits, 168 of
+#: them killable) colonies killed 93, about half - quadruped 24 of 31, skeletal
+#: 38 of 69, wyvern 23 of 49, serpent 8 of 19. On the unforced 16 x 90 the
+#: window went from 1.2 s to 17.7 s and the kills from 2 of 7 to 4 of 6.
+#: See sim/dragons.py for the two legs.
+DRAGON_GORGE_SEC = 12.0
+
+#: Seconds a quadruped stays on the ground once it has landed. It is grounded
+#: for its entire dangerous phase, which is the payoff for having an altitude at
+#: all: barricades, melee and thrown spears all reach it, so a colony that built
+#: defences finally has a trap that does what the player asked it to do.
+DRAGON_SIEGE_SEC = 150.0
+#: Seconds between headstones a skeletal takes, and how many it takes before it
+#: goes. MAX_GRAVES is 10 (world.py), so four is a visible bite out of a
+#: resource the player has watched accumulate all run - and it costs no lives
+#: and no buildings, which is the whole point of that kind.
+DRAGON_SCOUR_SEC = 12.0
+DRAGON_SCOUR_MAX = 4
+
+#: Px. Anything a grounded quadruped comes this close to is eaten.
+DRAGON_MAW_REACH = 30.0
+#: Hp/s a roosting quadruped does to the nearest built structure in reach. Over
+#: a full DRAGON_SIEGE_SEC that is 900 hp of damage if it is never interrupted -
+#: real structural loss, and the reason this is the expensive dragon.
+DRAGON_RAZE_DPS = 6.0
+
+#: One at a time, ever. Two dragons is not twice the event, it is a different
+#: game - and MAX_DRAGONS_ALIVE is also what keeps the visit rare rather than
+#: the interval, which only spaces the *starts*.
+MAX_DRAGONS_ALIVE = 1
+
+DRAGON_FLYOVER = "flyover"
+DRAGON_WYVERN = "wyvern"
+DRAGON_QUADRUPED = "quadruped"
+DRAGON_SERPENT = "serpent"
+DRAGON_SKELETAL = "skeletal"
+#: Five genuinely different machines, not one body with five skins. See
+#: sim/dragons.py for what each one actually does.
+DRAGON_KINDS: tuple[str, ...] = (
+    DRAGON_FLYOVER, DRAGON_WYVERN, DRAGON_QUADRUPED, DRAGON_SERPENT,
+    DRAGON_SKELETAL,
+)
+
+#: ``(max_health, speed px/s, cruise altitude px)``.
+#:
+#: The altitudes are the load-bearing column, not the health: they are what
+#: decides which weapon can reach which dragon, and they were chosen against
+#: MELEE_CEILING (44), BARRICADE_SPIKE_H (58) and throwing.THROW_MAX_RANGE
+#: (240) rather than by eye:
+#:
+#:   flyover    360  - above THROW_MAX_RANGE. Unreachable BY DESIGN; the only
+#:                     one that is. It is atmosphere, not an event.
+#:   wyvern     180  - out of reach on the cruise, inside every reach during
+#:                     the seize (alt 6-14). That window is the fight.
+#:   quadruped  110  - only while off-screen. It spends its whole visit at
+#:                     alt 0, where everything reaches it.
+#:   serpent      9  - inside BARRICADE_SPIKE_H and MELEE_CEILING for its
+#:                     entire surfaced phase, but barricades are sited within
+#:                     BARRICADE_EDGE_FRAC of a screen EDGE and a chasm is not
+#:                     an edge, so the traps are in the wrong place for it by
+#:                     construction.
+#:   skeletal    85  - ABOVE melee and spikes, well inside throwing range. The
+#:                     throw-only dragon, killable from the first second
+#:                     (sated at birth), which makes it the throw's tutorial.
+#:
+#: Health is a first pass and is NOT measured. It cannot honestly be: adding a
+#: scored action re-phases world.pyrng hard enough to move mean deaths by 16%
+#: over 24 seeds, so any balance number diffed against a pre-change baseline is
+#: inside the noise floor before the mechanic does anything. These are set so
+#: the arithmetic is legible - a wyvern is 6 thrown spears (THROW_DAMAGE 34), a
+#: quadruped is 15 s of barricade (BARRICADE_DAMAGE 22 hp/s) - and are to be
+#: retuned only behind the phase-locked A/B protocol.
+DRAGON_STATS: dict[str, tuple[float, float, float]] = {
+    DRAGON_FLYOVER:   (120.0, 44.0, 360.0),
+    DRAGON_WYVERN:    (180.0, 96.0, 180.0),
+    DRAGON_QUADRUPED: (320.0, 54.0, 110.0),
+    DRAGON_SERPENT:   (200.0, 62.0,   9.0),
+    DRAGON_SKELETAL:  (150.0, 70.0,  85.0),
+}
+
+#: How many colonists one visit may eat, per kind. Lifted from animals.py's "one
+#: kill each, then they go" rule, which was measured: without a cap a wolf pack
+#: that could not be fought took 15 people in 300 s, because the replacement
+#: path kept feeding it new arrivals. A dragon has the same failure available to
+#: it and the same answer. The quadruped's 3 is deliberately the exception - it
+#: STAYS, so a colony that throws bodies at it loses three and no more.
+DRAGON_MAX_FED: dict[str, int] = {
+    DRAGON_FLYOVER: 0,
+    DRAGON_WYVERN: 1,
+    DRAGON_QUADRUPED: 3,
+    DRAGON_SERPENT: 1,
+    DRAGON_SKELETAL: 0,
+}

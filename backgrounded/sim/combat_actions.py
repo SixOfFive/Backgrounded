@@ -1,6 +1,6 @@
 """Combat and crafting - the *agent* half of the animal threat.
 
-Four new :class:`~.actions.Action` kinds, registered into ``actions._HANDLERS``
+Six :class:`~.actions.Action` kinds, registered into ``actions._HANDLERS``
 at import so a save taken mid-fight or mid-craft rehydrates correctly:
 
 ==============  ===========================================================
@@ -8,6 +8,8 @@ CraftSpear      6 s at the stockpile, spends ``SPEAR_COST``, arms the agent
 CraftArmour     8 s at the stockpile, spends ``ARMOUR_COST`` (needs hides)
 FightAnimal     close, then swing on ``SPEAR_COOLDOWN``. Armed agents only.
 FleeAnimal      run to a safe distance. What an *unarmed* agent does.
+ThrowSpear      aim, release, and you are now unarmed. See :mod:`.throwing`.
+RetrieveSpear   walk to a spear lying in the dirt and pick it up.
 ==============  ===========================================================
 
 No pygame. Everything an action touches on ``world`` goes through the accessor
@@ -63,13 +65,39 @@ Why the numbers land there:
   this is the single knob that turns "a real event you can lose someone to"
   into "usually survivable".
 
+Throwing
+--------
+:mod:`.throwing` owns the projectile; this file owns the *decision*, and the
+decision is narrow on purpose. Melee is still the doctrine at contact range,
+because a throw costs you the spear:
+
+* An **adult** throws only when melee is not the better answer - the target is
+  further than ``FIGHT_RADIUS`` (so the alternative is a 200 px sprint into a
+  wolf that is already eating somebody, which is what the RESCUE_RADIUS comment
+  below records going wrong), or the target is above ``MELEE_CEILING`` and
+  cannot be reached with a spear in the hand at all. And never while something
+  is inside ``FLEE_RADIUS`` of the thrower: disarming yourself with a wolf on
+  top of you is not a trade, it is a mistake.
+* A **child** throws, and it is the only thing a child can do in a fight -
+  :func:`score_combat` hard-excludes ``role == "child"`` from FightAnimal, so
+  before this a child was purely a liability. They get a wider aim error and
+  0.6x the range, and they still run once anything is closer than
+  ``CHILD_THROW_MIN_GAP``; the window between that and their range limit is the
+  contribution.
+* Whoever threw it can walk over and pick it up again (RetrieveSpear), which is
+  why a miss is a setback rather than a loss, and why the retrieval score sits
+  next to CraftSpear's rather than under it.
+
 Wiring (the two things this module cannot do for itself, since it may only
 write this file):
 
-* ``behavior.score_actions`` should merge :func:`score_combat` into its score
-  dict, and ``behavior._MAKERS`` should route the four kinds through
-  :func:`make_combat_action` - :func:`install_makers` does the second half if
-  the caller passes it the behavior module.
+* ``behavior.score_actions`` already merges :func:`score_combat` into its score
+  dict with ``dict.update``, and :func:`score_combat` merges :func:`score_throw`
+  into its own result, so the two new kinds arrive with no edit to behavior.py.
+  ``behavior.choose_action`` likewise already falls back to
+  :func:`make_combat_action` for any kind absent from ``_MAKERS``.
+  :func:`install_makers` still splices all six in for a caller that would rather
+  be explicit.
 * ``behavior.emergency_override`` should return True when an animal is inside
   ``FLEE_RADIUS``, or an agent will finish chopping its tree while a wolf eats
   it. :func:`under_attack` is the predicate to use.
@@ -116,24 +144,49 @@ from .actions import (
     stock_take,
     world_now,
 )
+from .throwing import (
+    RETRIEVE_RADIUS,
+    THROW_MAX_RANGE,
+    THROW_MIN_RANGE,
+    can_throw,
+    clearance,
+    ensure_registry,
+    flight_clear,
+    launch_point,
+    registry_of as spear_registry_of,
+    throw_targets,
+)
+
+#: px. AGENT_HEIGHT (26) plus a spear held overhead - above this a stickman
+#: cannot reach and must throw. Declared in constants.py by the workstream that
+#: owns that file; the fallback is here so this module still imports (and this
+#: gate still holds) in a checkout where that append has not landed. Same number
+#: either way, and constants.py wins the moment it exists.
+try:                                    # pragma: no cover - trivial
+    from ..constants import MELEE_CEILING
+except ImportError:                     # pragma: no cover - trivial
+    MELEE_CEILING = 44.0
 
 log = logging.getLogger(__name__)
 
 __all__ = [
     "COMBAT_ACTION_KINDS",
     "score_combat",
+    "score_throw",
     "make_combat_action",
+    "make_throw_action",
     "install_makers",
     "under_attack",
     # animal accessor layer, reusable by behavior.py / events.py
     "animals_of", "living_animals", "animal_alive", "animal_by_id",
     "animal_id", "animal_kind", "animal_x", "animal_leaving",
     "nearest_animal", "hurt_animal", "claim_hides", "note_animal_seen",
-    "sighting_freshness",
+    "sighting_freshness", "melee_foes",
 ]
 
 COMBAT_ACTION_KINDS: tuple[str, ...] = (
     "CraftSpear", "CraftArmour", "FightAnimal", "FleeAnimal",
+    "ThrowSpear", "RetrieveSpear",
 )
 
 # ------------------------------------------------------------------ tuning --
@@ -182,6 +235,25 @@ CHASE_GIVE_UP = 45.0        # s spent closing without landing a swing
 FIGHT_TIMEOUT = 75.0        # s of one continuous engagement
 CRAFT_WALK_TIMEOUT = 75.0   # s walking to the stockpile before giving up
 FLEE_TIMEOUT = 20.0
+
+# ------------------------------------------------------------- throwing --
+#: Seconds spent lining a throw up before the spear leaves the hand. Long
+#: enough that a throw is a visible act with a pose rather than a teleporting
+#: number, short enough that a wolf at CHILD_THROW_MIN_GAP (72 px, ~1.6 s of
+#: wolf) does not arrive mid-wind-up.
+THROW_WINDUP = 0.45
+#: How far an unarmed colonist will walk to fetch a spear off the ground.
+#: Deliberately RESCUE_RADIUS and not further: the reason rescues were cut from
+#: 640 px is that a long cross-map walk goes over cliff faces and every ledge
+#: step carries a slip chance. Fetching a spear is worth exactly as much risk.
+RETRIEVE_SEEK = RESCUE_RADIUS
+RETRIEVE_TIMEOUT = 45.0
+#: A child throws only while the nearest hostile is at least this far off. A
+#: wolf makes ~44 px/s, so 72 px is about 1.6 s - the wind-up plus a head start.
+#: Closer than this and a child runs, which is still the right answer.
+CHILD_THROW_MIN_GAP = 72.0
+#: Child range multiplier, and the reason a child stands behind the adults.
+CHILD_RANGE_FRAC = 0.6
 
 CHASE_SPEED = WALK_SPEED * 1.45
 FLEE_SPEED = WALK_SPEED * 2.2
@@ -336,6 +408,60 @@ def nearest_animal(
     return None
 
 
+def dragons_of(world: Any) -> list[Any]:
+    """Living dragons, or [] on a world that has no dragon subsystem.
+
+    Kept separate from :func:`animals_of` on purpose. Dragons must NOT flow into
+    ``nearest_animal``, because that is what ``score_combat`` flees from and
+    what blocks the workbench: a dragon cruising overhead would put the whole
+    colony into permanent flight and stop it ever making another spear. The one
+    place they join the animals is :func:`melee_foes` - the armed agent's quarry
+    list - and :func:`throwing.throw_targets`.
+    """
+    src = getattr(world, "dragons", None)
+    if src is None:
+        return []
+    if isinstance(src, (list, tuple)):
+        return [d for d in src if animal_alive(d)]
+    fn = getattr(src, "alive", None)
+    if callable(fn):
+        try:
+            return [d for d in fn() if animal_alive(d)]
+        except Exception:
+            return []
+    return []
+
+
+def melee_foes(world: Any) -> list[Any]:
+    """Everything an agent with a spear in hand could actually hit.
+
+    Animals (always on the ground - animals.py's header says "nothing here flies
+    or falls") plus any dragon low enough to reach. ``MELEE_CEILING`` is the
+    whole test: a spearman must not stand under something 200 px up swinging at
+    the air, and a grounded siege dragon must be a fair fight.
+    """
+    out = [a for a in animals_of(world) if animal_alive(a)]
+    for d in dragons_of(world):
+        try:
+            if clearance(world, d) <= MELEE_CEILING:
+                out.append(d)
+        except Exception:
+            continue
+    return out
+
+
+def _is_dragon(world: Any, foe: Any) -> bool:
+    """True when *foe* came from the dragon registry rather than the animals.
+
+    Ids are per-registry, so a dragon and a wolf can both be #3 - which means
+    an action that remembers a bare target id cannot resolve it without knowing
+    which side it came from. That is the whole reason this exists.
+    """
+    if foe is None:
+        return False
+    return any(d is foe for d in dragons_of(world))
+
+
 def _mark_animal_dead(world: Any, animal: Any) -> None:
     """Best-effort "this one is finished" so it stops being a threat.
 
@@ -450,7 +576,13 @@ def claim_hides(world: Any, animal: Any) -> int:
     n = getattr(animal, "hides", None)
     if not isinstance(n, (int, float)):
         stats = ANIMAL_STATS.get(animal_kind(animal))
-        n = stats[3] if isinstance(stats, (list, tuple)) and len(stats) > 3 else 1
+        if not isinstance(stats, (list, tuple)) or len(stats) <= 3:
+            # Not a kind this game skins. A dragon has no `hides` field and no
+            # ANIMAL_STATS row, and the old fallback of 1 would have paid the
+            # colony a leather hide for killing a wyvern on a world whose
+            # animals are a bare list. Nothing to take.
+            return 0
+        n = stats[3]
     try:
         count = max(0, int(n))
     except (TypeError, ValueError):
@@ -527,6 +659,21 @@ def _is_mauling(world: Any, animal: Any, exclude: Any = None) -> bool:
     return False
 
 
+def _reachable(world: Any, foe: Any) -> bool:
+    """True when a spear held in the hand could touch *foe*.
+
+    Every animal answers True - none of them fly. This only ever says no to a
+    dragon at altitude, and it says it here, in the quarry chooser, so that
+    FightAnimal is never even *scored* against something 200 px up. The same
+    test runs again inside :func:`_h_fight`, because a target can climb after
+    the fight has started.
+    """
+    try:
+        return clearance(world, foe) <= MELEE_CEILING
+    except Exception:
+        return True
+
+
 def pick_quarry(agent: Any, world: Any) -> Any | None:
     """The animal an armed agent should go for, or None.
 
@@ -545,6 +692,18 @@ def pick_quarry(agent: Any, world: Any) -> Any | None:
     parting = nearest_animal(world, ax, max_dist=PARTING_REACH)
     if parting is not None:
         return parting
+    # A dragon standing in the colony is a fight; one in the sky is not. It is
+    # checked after the animals because a wolf chewing on somebody is always
+    # the more urgent problem, and before the rescue sweep because a landed
+    # dragon is closer to hand than a mauling across the camp.
+    for d in dragons_of(world):
+        if not _reachable(world, d):
+            continue
+        try:
+            if abs(float(getattr(d, "x", ax)) - ax) <= FIGHT_RADIUS:
+                return d
+        except (TypeError, ValueError):
+            continue
     best, best_d = None, float("inf")
     for a in animals_of(world):
         if not animal_alive(a) or animal_leaving(a):
@@ -817,13 +976,35 @@ def _c_craft(a: Action, ag: Any, w: Any) -> None:
 # ===========================================================================
 #  FightAnimal
 # ===========================================================================
-def _acquire(a: Action, ag: Any, animal: Any) -> None:
+def _acquire(a: Action, ag: Any, animal: Any, world: Any = None) -> None:
     a.target = animal_id(animal)
     a.data["ax"] = animal_x(animal, float(getattr(ag, "x", 0.0)))
+    # Which registry the id belongs to. Without it a saved fight against
+    # dragon #3 resolves to wolf #3 on reload - see :func:`_is_dragon`.
+    if world is not None and _is_dragon(world, animal):
+        a.data["foe"] = "dragon"
+    else:
+        a.data.pop("foe", None)
     _set_target(ag, animal)
 
 
+def _dragon_by_id(world: Any, did: Any) -> Any | None:
+    if did is None:
+        return None
+    try:
+        want = int(did)
+    except (TypeError, ValueError):
+        return None
+    for d in dragons_of(world):
+        if animal_id(d) == want:
+            return d
+    return None
+
+
 def _current_target(a: Action, w: Any) -> Any | None:
+    if a.data.get("foe") == "dragon":
+        d = _dragon_by_id(w, a.target)
+        return d if d is not None and animal_alive(d) else None
     animal = animal_by_id(w, a.target) if a.target is not None else None
     if animal is not None and animal_alive(animal):
         return animal
@@ -877,7 +1058,15 @@ def _h_fight(a: Action, ag: Any, w: Any, dt: float) -> None:
         if animal is None:
             _fight_finish(a, ag)
             return
-        _acquire(a, ag, animal)
+        _acquire(a, ag, animal, w)
+
+    # It went up. A stickman cannot swing at something above head height plus a
+    # spear, and standing underneath one waiting is how an agent spends its
+    # whole life in a fight it is not having. Break off; ThrowSpear is scored
+    # the same tick and is the answer to a flyer.
+    if not _reachable(w, animal):
+        _fight_finish(a, ag)
+        return
 
     if _health_frac(ag) < BREAK_OFF_HEALTH:
         # Bleeding out. Break off and let FleeAnimal take over next re-score;
@@ -938,7 +1127,7 @@ def _h_fight(a: Action, ag: Any, w: Any, dt: float) -> None:
 
     nxt = pick_quarry(ag, w)
     if nxt is not None and _health_frac(ag) >= BREAK_OFF_HEALTH:
-        _acquire(a, ag, nxt)
+        _acquire(a, ag, nxt, w)
         a.phase = "approach"
         return
     _fight_finish(a, ag)
@@ -996,8 +1185,334 @@ def _h_flee_animal(a: Action, ag: Any, w: Any, dt: float) -> None:
 
 
 # ===========================================================================
+#  ThrowSpear / RetrieveSpear
+#
+#  The projectile itself lives in throwing.py. Everything here is about who
+#  decides to throw, at what, and what they do about the spear afterwards.
+# ===========================================================================
+def _throw_range(agent: Any) -> float:
+    return THROW_MAX_RANGE * (CHILD_RANGE_FRAC if _role(agent) == "child" else 1.0)
+
+
+def _throw_target(agent: Any, world: Any) -> Any | None:
+    """What this agent should throw at, or None. The scorer and the action's
+    start phase both go through here, so an agent never commits to a throw it
+    would not have scored.
+
+    The rules, in the order they matter:
+
+    * Nothing inside ``THROW_MIN_RANGE`` - that is thrusting distance, and a
+      thrust does not cost you the spear.
+    * Nothing that is already leaving. Spending a spear on a wolf walking off
+      the map is how a colony ends up unarmed for the next wave.
+    * A **child** throws at anything hostile from ``CHILD_THROW_MIN_GAP`` out.
+    * An **adult** throws only while **nothing at all is inside**
+      ``FLEE_RADIUS`` of them. That single gate is the whole doctrine: you
+      throw at what is still far enough away that you are not yet in danger,
+      and you keep the point in your hand for anything that has closed. It also
+      makes the throw the *opener* and the thrust the *finisher*, which is the
+      order the two damage numbers were tuned for.
+
+    The first version of this rule was narrower - adults threw only past
+    ``FIGHT_RADIUS`` (180), leaving a 60 px band between that and
+    ``THROW_MAX_RANGE``. Measured over seed 2001 x 900 sim-s: 9800
+    choose_action calls, 63 of them with an animal inside 240 px, and only 11
+    that scored a throw above zero. Two throws in fifteen minutes is not a
+    mechanic, it is a rumour. The band is now 110-240 px.
+    """
+    try:
+        ax = float(getattr(agent, "x", 0.0))
+    except (TypeError, ValueError):
+        return None
+    child = _role(agent) == "child"
+    reach = _throw_range(agent)
+
+    if not child:
+        # Under personal attack: keep the spear in your hand. Note this also
+        # implies every candidate below is at least FLEE_RADIUS away, which is
+        # why there is no second distance test for adults.
+        if nearest_animal(world, ax, max_dist=FLEE_RADIUS) is not None:
+            return None
+
+    for foe in throw_targets(world, ax, reach):
+        try:
+            fx = float(getattr(foe, "x", ax))
+        except (TypeError, ValueError):
+            continue
+        gap = abs(fx - ax)
+        if gap < THROW_MIN_RANGE:
+            continue
+        if animal_leaving(foe):
+            continue
+        if getattr(foe, "hostile", True) is False:
+            continue
+        if child:
+            if gap < CHILD_THROW_MIN_GAP:
+                # Too close to spend the wind-up on. Run instead.
+                continue
+            return foe
+        # Dragons are not in nearest_animal (deliberately - see dragons_of), so
+        # the FLEE_RADIUS pre-check above did not see this one. Apply it here.
+        if _reachable(world, foe) and gap < FLEE_RADIUS:
+            continue
+        # Last, because it is the expensive one: is there actually an arc from
+        # here to there that misses the hillside? See throwing.flight_clear -
+        # without this, terrain ate four throws in five.
+        x0, y0 = launch_point(agent, fx)
+        if not flight_clear(world, x0, y0, foe):
+            continue
+        return foe
+    return None
+
+
+def _h_throw(a: Action, ag: Any, w: Any, dt: float) -> None:
+    if a.phase == "start":
+        if not can_throw(ag, w):
+            a.failed = True
+            return
+        foe = _throw_target(ag, w)
+        if foe is None:
+            a.failed = True
+            return
+        a.target = animal_id(foe)
+        if _is_dragon(w, foe):
+            a.data["foe"] = "dragon"
+        a.data["ax"] = animal_x(foe, float(getattr(ag, "x", 0.0)))
+        a.phase = "aim"
+        a.data["wt"] = 0.0
+
+    if a.phase == "aim":
+        # "chop" is the overhead swing pose. There is no throw pose in
+        # actions.POSES yet and POSES is a closed tuple that render/ switches
+        # on, so inventing a name here would draw nothing at all. The nearest
+        # true thing is better than a silent blank.
+        a.pose = "chop"
+        _halt(ag)
+        foe = _current_target(a, w)
+        if foe is None or not animal_alive(foe):
+            foe = _throw_target(ag, w)
+            if foe is None:
+                a.failed = True
+                return
+            a.target = animal_id(foe)
+            a.data["foe"] = "dragon" if _is_dragon(w, foe) else None
+            if a.data.get("foe") is None:
+                a.data.pop("foe", None)
+        fx = animal_x(foe, float(getattr(ag, "x", 0.0)))
+        a.data["ax"] = fx
+        _face(ag, fx - float(getattr(ag, "x", 0.0)))
+        a.data["wt"] = float(a.data.get("wt", 0.0)) + dt
+        if float(a.data["wt"]) < THROW_WINDUP:
+            return
+        a.phase = "release"
+
+    if a.phase == "release":
+        reg = ensure_registry(w)
+        foe = _current_target(a, w)
+        if reg is None or foe is None:
+            a.failed = True
+            return
+        sp = reg.throw(w, ag, foe)
+        if sp is None:
+            # Out of range now, or the solve had no answer. Not an error - it
+            # is a shot not taken, and the agent still has the spear.
+            a.failed = True
+            return
+        _adjust(ag, "fatigue", 0.010)
+        a.data["thrown"] = 1
+        _clear_target(ag)
+        a.done = True
+        return
+
+    a.phase = "start"
+
+
+def _c_throw(a: Action, ag: Any, w: Any) -> None:
+    _clear_target(ag)
+
+
+def _retrievable_spear(agent: Any, world: Any) -> Any | None:
+    """The spear this agent should go and fetch, or None.
+
+    Shared by the scorer and the maker so the two cannot disagree. Two gates
+    beyond "there is one": the walk has to be short (see RETRIEVE_SEEK), and
+    nothing may be standing over it. Fetching a spear from under a wolf is how
+    an unarmed colonist walks into the one place on the map they must not be.
+    """
+    try:
+        if _armed(agent):
+            return None
+        ax = float(getattr(agent, "x", 0.0))
+        if nearest_animal(world, ax, max_dist=FLEE_RADIUS) is not None:
+            return None
+        reg = spear_registry_of(world)
+        if reg is None:
+            return None
+        sp = reg.nearest_on_ground(ax)
+        if sp is None:
+            return None
+        if abs(float(sp.x) - ax) > RETRIEVE_SEEK:
+            return None
+        if nearest_animal(world, float(sp.x), max_dist=FLEE_RADIUS) is not None:
+            return None
+        return sp
+    except Exception:
+        return None
+
+
+def _h_retrieve(a: Action, ag: Any, w: Any, dt: float) -> None:
+    reg = spear_registry_of(w)
+    if reg is None:
+        a.failed = True
+        return
+
+    if a.phase == "start":
+        if _armed(ag):
+            a.done = True                   # somebody handed them one
+            return
+        sp = reg.nearest_on_ground(float(getattr(ag, "x", 0.0)))
+        if sp is None:
+            a.failed = True
+            return
+        a.target = int(sp.id)
+        a.phase = "walk"
+
+    if a.phase == "walk":
+        a.pose = "walk"
+        sp = reg.get(a.target)
+        if sp is None or sp.in_flight:
+            # Somebody else got there first, or it was never really down.
+            sp = reg.nearest_on_ground(float(getattr(ag, "x", 0.0)))
+            if sp is None:
+                _halt(ag)
+                a.failed = True
+                return
+            a.target = int(sp.id)
+        rem = step_toward(ag, w, float(sp.x), dt, arrive=RETRIEVE_RADIUS)
+        if rem <= RETRIEVE_RADIUS:
+            a.phase = "take"
+        elif a.t > RETRIEVE_TIMEOUT:
+            _halt(ag)
+            a.failed = True
+        return
+
+    if a.phase == "take":
+        _halt(ag)
+        sp = reg.get(a.target)
+        if sp is None or not reg.take(sp):
+            a.failed = True
+            return
+        try:
+            ag.weapon = WEAPON_SPEAR
+        except Exception:
+            # Arming failed after the spear was lifted. Put it back rather than
+            # deleting it: a spear that vanishes out of the world costs the
+            # colony wood and stone it has no way of knowing it lost.
+            reg.add(sp)
+            a.failed = True
+            return
+        _bump_stat(w, "spears_recovered")
+        emit_speech(w, ag, "^")
+        a.done = True
+        return
+
+    a.phase = "start"
+
+
+# ===========================================================================
 #  Scoring + construction
 # ===========================================================================
+def score_throw(agent: Any, world: Any) -> dict[str, float]:
+    """Utility 0..1 for the two throwing behaviours. Never raises.
+
+    Always returns both keys, so the score dict is the same *shape* whether or
+    not anything can be thrown. That is not tidiness: ``behavior.choose_action``
+    draws ``rng.uniform(0, TIEBREAK)`` once per candidate whose score is > 0,
+    off ``world.pyrng`` - the same stream ``animals._rng`` spawns wolves from.
+    Two builds that score a different NUMBER of candidates diverge in what
+    wildlife they get, so any A/B of this mechanic has to keep both arms
+    scoring both keys and toggle only whether :func:`make_throw_action` returns
+    an action. See the module head of this file for the measured size of that
+    effect.
+    """
+    out: dict[str, float] = {"ThrowSpear": 0.0, "RetrieveSpear": 0.0}
+    try:
+        if not getattr(agent, "alive", True) or getattr(agent, "taken", False):
+            return out
+        if getattr(agent, "inside", None) is not None:
+            return out
+        ax = float(getattr(agent, "x", 0.0))
+        child = _role(agent) == "child"
+
+        # ---------------------------------------------------------- throw ---
+        if can_throw(agent, world) and (child or _health_frac(agent) >= BREAK_OFF_HEALTH):
+            foe = _throw_target(agent, world)
+            if foe is not None:
+                # Above OVERRIDE_FLOOR (0.95) on purpose. Below it the running
+                # action collects HYSTERESIS_BONUS (0.35), so a committed
+                # builder effectively outscores anything under the floor and
+                # nobody ever turns round - the same trap FightAnimal's comment
+                # records falling into.
+                #
+                # 0.985 for an adult is deliberately ABOVE anything FightAnimal
+                # can score at this distance (0.95 + 0.04 * near + 0.01
+                # armoured, so 0.983 at the FLEE_RADIUS crossover and falling
+                # from there). Throw first, close after: the alternative is the
+                # long sprint that RESCUE_RADIUS's comment records turning 0
+                # fall deaths into 12. A child sits lower, at 0.965, because
+                # their FleeAnimal is 0.92-1.0 and running must still win once
+                # anything is actually on top of them.
+                out["ThrowSpear"] = 0.965 if child else 0.985
+
+        # ------------------------------------------------------- retrieve ---
+        sp = _retrievable_spear(agent, world)
+        if sp is not None:
+            # Sits alongside CraftSpear (0.55 + 0.32 * fresh) rather than under
+            # it: fetching a spear that already exists should beat felling a
+            # tree to make another one, but only while it is close enough to be
+            # worth the walk.
+            near = 1.0 - _clamp01(abs(float(sp.x) - ax) / RETRIEVE_SEEK)
+            fresh = sighting_freshness(world)
+            out["RetrieveSpear"] = _clamp01(
+                0.58 + 0.30 * fresh) * (0.65 + 0.35 * near)
+    except Exception:
+        log.debug("score_throw failed", exc_info=True)
+    return out
+
+
+def make_throw_action(kind: str, agent: Any, world: Any) -> Action | None:
+    """Build ThrowSpear / RetrieveSpear, or None if it is not available now.
+
+    Split out of :func:`make_combat_action` and called through the module global
+    so an A/B can replace exactly this function - which is the only honest way
+    to measure the mechanic. See :func:`score_throw`.
+    """
+    try:
+        if kind == "ThrowSpear":
+            if not can_throw(agent, world):
+                return None
+            foe = _throw_target(agent, world)
+            if foe is None:
+                return None
+            a = make_action("ThrowSpear", target=animal_id(foe), phase="aim",
+                            pose="chop",
+                            ax=animal_x(foe, float(getattr(agent, "x", 0.0))),
+                            wt=0.0)
+            if _is_dragon(world, foe):
+                a.data["foe"] = "dragon"
+            return a
+
+        if kind == "RetrieveSpear":
+            sp = _retrievable_spear(agent, world)
+            if sp is None:
+                return None
+            return make_action("RetrieveSpear", target=int(sp.id),
+                               phase="walk", pose="walk")
+    except Exception:
+        log.debug("make_throw_action(%r) failed", kind, exc_info=True)
+    return None
+
+
 def score_combat(agent: Any, world: Any) -> dict[str, float]:
     """Utility 0..1 for the four combat/crafting behaviours.
 
@@ -1008,7 +1523,17 @@ def score_combat(agent: Any, world: Any) -> dict[str, float]:
     out: dict[str, float] = {
         "FleeAnimal": 0.0, "FightAnimal": 0.0,
         "CraftSpear": 0.0, "CraftArmour": 0.0,
+        "ThrowSpear": 0.0, "RetrieveSpear": 0.0,
     }
+    # Merged here rather than in behavior.py because behavior.score_actions
+    # already does `s.update(score_combat(...))`, so folding the throwing keys
+    # in at this level makes them arrive with no edit to that file at all -
+    # which matters when behavior.py belongs to somebody else. The two are kept
+    # as separate functions so either can be scored, tested or A/B'd alone.
+    try:
+        out.update(score_throw(agent, world))
+    except Exception:
+        log.debug("score_throw failed", exc_info=True)
     try:
         if not getattr(agent, "alive", True) or getattr(agent, "taken", False):
             return out
@@ -1080,6 +1605,13 @@ def make_combat_action(kind: str, agent: Any, world: Any) -> Action | None:
     try:
         if kind not in COMBAT_ACTION_KINDS:
             return None
+        if kind in ("ThrowSpear", "RetrieveSpear"):
+            # Module-global lookup, not a direct call: an A/B rig replaces
+            # combat_actions.make_throw_action with one that returns None and
+            # gets an arm that scores identically and therefore draws the same
+            # random numbers at the same points. A local call would bind at
+            # import and defeat that.
+            return make_throw_action(kind, agent, world)
         ax = float(getattr(agent, "x", 0.0))
 
         if kind == "FightAnimal":
@@ -1093,6 +1625,8 @@ def make_combat_action(kind: str, agent: Any, world: Any) -> Action | None:
             a = make_action("FightAnimal", target=animal_id(animal),
                             phase="approach", pose="run",
                             ax=animal_x(animal, ax))
+            if _is_dragon(world, animal):
+                a.data["foe"] = "dragon"
             _set_target(agent, animal)
             return a
 
@@ -1154,12 +1688,15 @@ _COMBAT_HANDLERS: dict[str, Callable[[Action, Any, Any, float], None]] = {
     "CraftArmour": _h_craft,
     "FightAnimal": _h_fight,
     "FleeAnimal": _h_flee_animal,
+    "ThrowSpear": _h_throw,
+    "RetrieveSpear": _h_retrieve,
 }
 
 _COMBAT_CLEANUP: dict[str, Callable[[Action, Any, Any], None]] = {
     "CraftSpear": _c_craft,
     "CraftArmour": _c_craft,
     "FightAnimal": _c_fight,
+    "ThrowSpear": _c_throw,
 }
 
 
@@ -1345,6 +1882,142 @@ if __name__ == "__main__":  # pragma: no cover - headless
     sc = score_combat(hunter, w)
     assert sc["FightAnimal"] == 0.0 and sc["FleeAnimal"] > 0.9, sc
     print("wounded scores:", {k: round(v, 2) for k, v in sc.items()})
+
+    # --- throwing ----------------------------------------------------------
+    from .throwing import SpearRegistry, Spear, STATE_GROUND
+
+    w2 = _World()
+    w2.structures.create("stockpile", 600.0, 600.0, built=True)
+    w2.spears = SpearRegistry(seed=17)
+    thrower = Stickman(id=10, name="Cal", x=400.0, y=600.0)
+    thrower.weapon = WEAPON_SPEAR
+    w2.agents.append(thrower)
+    far = _Animal("wolf", 600.0)          # 200 px: past FIGHT_RADIUS
+    w2.animals.append(far)
+
+    sc = score_throw(thrower, w2)
+    print("adult, wolf at 200px:", {k: round(v, 2) for k, v in sc.items()})
+    assert sc["ThrowSpear"] > 0.95, sc
+    far.x = 460.0                          # 60 px: inside FLEE_RADIUS
+    assert score_throw(thrower, w2)["ThrowSpear"] == 0.0, "threw at melee range"
+    far.x = 600.0
+
+    act = make_combat_action("ThrowSpear", thrower, w2)
+    assert act is not None and act.kind == "ThrowSpear"
+    for _ in range(int(30 * 6)):
+        act.update(thrower, w2, dt)
+        w2.spears.tick(w2, dt)
+        if act.finished:
+            break
+    print("throw:", act, "weapon now", repr(thrower.weapon),
+          "| spears", [s.summary() for s in w2.spears.all()])
+    assert act.done, act
+    assert thrower.weapon == WEAPON_NONE, "the thrower kept the spear"
+    assert len(w2.spears.all()) == 1, w2.spears.all()
+
+    # the spear comes down somewhere, and it can be fetched
+    for _ in range(int(30 * 8)):
+        w2.spears.tick(w2, dt)
+        if not w2.spears.in_flight():
+            break
+    assert w2.spears.on_ground(), "the spear never landed"
+    lying = w2.spears.on_ground()[0]
+    far.x = 1400.0                         # get the wolf away from the spear
+    sc = score_throw(thrower, w2)
+    print("unarmed, a spear on the ground:", {k: round(v, 2) for k, v in sc.items()})
+    assert sc["RetrieveSpear"] > 0.4, sc
+    fetch = make_combat_action("RetrieveSpear", thrower, w2)
+    assert fetch is not None
+    for _ in range(int(30 * 60)):
+        fetch.update(thrower, w2, dt)
+        w2.spears.tick(w2, dt)      # also what runs the per-thrower cooldown
+        thrower.apply_physics(dt, w2.terrain)
+        if fetch.finished:
+            break
+    print("retrieve:", fetch, "weapon", repr(thrower.weapon),
+          f"walked to {thrower.x:.0f} for a spear at {lying.x:.0f}")
+    assert fetch.done and thrower.weapon == WEAPON_SPEAR, fetch
+    assert not w2.spears.on_ground(), "the spear was picked up twice"
+    assert w2.stats.get("spears_recovered") == 1, w2.stats
+
+    # a child throws, and only from far enough out to survive doing it
+    kid = Stickman(id=11, name="Wren", x=400.0, y=600.0)
+    kid.role = "child"
+    kid.weapon = WEAPON_SPEAR
+    w2.agents.append(kid)
+    far.x = 400.0 + CHILD_THROW_MIN_GAP + 20.0
+    sck = score_throw(kid, w2)
+    print("child, wolf at 92px:", {k: round(v, 2) for k, v in sck.items()})
+    assert sck["ThrowSpear"] > 0.95, sck
+    assert score_combat(kid, w2)["FightAnimal"] == 0.0, "a child in melee"
+    far.x = 400.0 + CHILD_THROW_MIN_GAP - 20.0
+    assert score_throw(kid, w2)["ThrowSpear"] == 0.0, "child threw at 52 px"
+    far.x = 400.0 + THROW_MAX_RANGE - 10.0     # inside adult range, past 0.6x
+    assert score_throw(kid, w2)["ThrowSpear"] == 0.0, "child out-threw an adult"
+
+    # an adult with a wolf on top of them keeps the spear
+    far.x = 600.0
+    close = _Animal("wolf", thrower.x + 30.0)
+    w2.animals.append(close)
+    assert score_throw(thrower, w2)["ThrowSpear"] == 0.0, "disarmed under attack"
+    w2.animals.remove(close)
+
+    # --- the melee ceiling --------------------------------------------------
+    class _Flyer:
+        def __init__(self, x, alt):
+            self.id, self.kind = 1, "wyvern"
+            self.x, self.alt = float(x), float(alt)
+            self.y = 600.0 - float(alt)
+            self.health = self.max_health = 200.0
+            self.alive, self.hostile = True, True
+
+        def hurt(self, amount):
+            self.health = max(0.0, self.health - float(amount))
+            if self.health <= 0.0:
+                self.alive = False
+                return True
+            return False
+
+    thrower.x = 400.0
+    thrower.weapon = WEAPON_SPEAR
+    w2.animals.clear()
+    w2.dragons = [_Flyer(500.0, 70.0)]          # above MELEE_CEILING, in reach
+    assert pick_quarry(thrower, w2) is None, "melee against something 70 px up"
+    assert score_combat(thrower, w2)["FightAnimal"] == 0.0
+    assert score_throw(thrower, w2)["ThrowSpear"] > 0.95, "no answer to a flyer"
+    # ... and something high enough is out of the ballistic envelope entirely,
+    # which is what makes "that one is untouchable" a fact rather than a rule.
+    # See the reachability table in throwing.py's docstring.
+    w2.dragons = [_Flyer(500.0, 350.0)]
+    assert score_throw(thrower, w2)["ThrowSpear"] == 0.0, "speared a thing 350 px up"
+    w2.dragons = [_Flyer(500.0, 70.0)]
+    w2.dragons = [_Flyer(430.0, 0.0)]           # landed: a fair fight
+    # Too much health to kill inside the test, so the take-off branch below is
+    # actually reached instead of the fight simply ending in a win.
+    w2.dragons[0].health = w2.dragons[0].max_health = 2000.0
+    q = pick_quarry(thrower, w2)
+    assert q is not None and q.kind == "wyvern", q
+    assert score_combat(thrower, w2)["FightAnimal"] > 0.85
+    duel = make_combat_action("FightAnimal", thrower, w2)
+    assert duel is not None and duel.data.get("foe") == "dragon", duel.data
+    for _ in range(int(30 * 20)):
+        duel.update(thrower, w2, dt)
+        if duel.finished or not w2.dragons[0].alive:
+            break
+    print(f"melee vs a landed dragon: {duel} dragon hp "
+          f"{w2.dragons[0].health:.0f}/2000")
+    assert w2.dragons[0].health < 2000.0, "never landed a blow on a grounded dragon"
+    assert not duel.finished, "the fight ended before the dragon took off"
+    # ... and it walks away rather than standing under it when it takes off
+    w2.dragons[0].alt = 300.0
+    w2.dragons[0].y = 300.0
+    for _ in range(int(30 * 4)):
+        duel.update(thrower, w2, dt)
+        if duel.finished:
+            break
+    assert duel.finished, "stood under a flying dragon swinging"
+    assert claim_hides(w2, w2.dragons[0]) == 0, "took a hide off a dragon"
+    w2.dragons = []
 
     # --- registration / round-trip -----------------------------------------
     for kind in COMBAT_ACTION_KINDS:

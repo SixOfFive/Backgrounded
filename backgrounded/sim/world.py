@@ -18,7 +18,8 @@ from typing import Any
 import numpy as np
 
 from ..constants import (
-    AI_TICKS, ALL_RESOURCES, DAY_LENGTH_SEC, FOOD_PER_HEAD_TO_GROW,
+    AI_TICKS, ALL_RESOURCES, DAY_LENGTH_SEC, DRAGON_GATE_STONE_HUTS,
+    FOOD_PER_HEAD_TO_GROW,
     HUT_TIER_DWELL_SEC, HUT_TIER_MORALE,
     MAX_POP, MIN_POP, MORALE_TO_GROW, MORPH_LABELS,
     POP_BIRTH_COOLDOWN, POP_PER_HUT,
@@ -30,6 +31,8 @@ from ..constants import (
 from . import behavior, names
 from .actions import sweep_claims
 from .animals import AnimalRegistry
+from .dragons import DragonRegistry
+from .throwing import SpearRegistry
 from .ufo import Ufo
 from .entities import GRAVE_DELAY, Population, Stickman
 from .events import EventSystem
@@ -123,6 +126,14 @@ class World:
         # landed at a different minute each time and no seeded comparison of a
         # long run could be trusted. Same offset trick as above.
         self.ufo: Ufo = Ufo(seed=self.seed ^ 0x71F)
+        # Dragons and thrown spears, each on its own seeded stream and each
+        # offset like every registry above it. Two separate streams rather than
+        # one shared with pyrng, deliberately: behavior.choose_action draws from
+        # pyrng once per scored candidate, so a dragon scheduler sharing it
+        # would re-phase the stream wolves spawn from every time it rolled - the
+        # measured re-phase confound that moved mean deaths 16% on its own.
+        self.dragons: DragonRegistry = DragonRegistry(seed=self.seed ^ 0xD4A)
+        self.spears: SpearRegistry = SpearRegistry(seed=self.seed ^ 0x59EA)
 
         self._init_colony_state()
         self._seed_population()
@@ -171,6 +182,25 @@ class World:
         # them and re-earns the tier, which costs at most HUT_TIER_DWELL_SEC.
         self.hut_tier_unlocked: bool = False
         self.hut_tier_dwell: float = 0.0
+
+        # The dragon gate: a latch, set the first tick DRAGON_GATE_STONE_HUTS
+        # stone huts are standing. Declared HERE and not in __init__ for exactly
+        # the reason above - _tick_dragon_gate rides inside _guarded("colony"),
+        # so on a loaded world a missing attribute would not crash, it would
+        # disable the colony subsystem for the session and quietly take
+        # update_director and assign_roles with it.
+        #
+        # Chosen over built>=4 / pop>=6 / generation counts because it is the
+        # only candidate that requires all three of the masonry TECH, a real
+        # stone SURPLUS hauled and applied twice, and enough SHELTER that a
+        # second hut was worth upgrading - it is a thing standing in the world
+        # rather than a flag. Measured over 20 seeds x 75 sim-min: 16/20 reach
+        # it, earliest 21.9 min, median 45.3, and four colonies never do. A
+        # sustained DWELL was measured and REJECTED: across all 16 seeds that
+        # reach the gate there were ZERO drops back below two stone huts for the
+        # entire remainder of the run, so a dwell buys nothing and costs 1-2 min
+        # of delay. The latch alone is the mechanism.
+        self.dragons_unlocked: bool = False
         # Republished every director pass from the chosen hut's own
         # state["upgrade"], and deliberately NOT persisted: it is derived, and a
         # saved copy is a second source of truth that can disagree with the
@@ -239,6 +269,13 @@ class World:
         self._guarded("structures", lambda: self.structures.update(dt, self))
         self._guarded("agents", lambda: self._tick_agents(dt))
         self._guarded("animals", lambda: self.animals.tick(self, dt))
+        # After "animals" and before "ufo". The spear registry is ALSO driven
+        # from AnimalRegistry.tick, so that the mechanic is not silently inert
+        # on a world built before this line existed; its tick is
+        # frame-deduplicated on world.tick_count, so whichever of the two runs
+        # second this frame is a no-op rather than a second helping of gravity.
+        self._guarded("spears", lambda: self.spears.tick(self, dt))
+        self._guarded("dragons", lambda: self.dragons.tick(self, dt))
         self._guarded("ufo", lambda: self.ufo.tick(self, dt))
         self._guarded("lights", self._rebuild_lights)
         self._guarded("lighting", lambda: self.lighting.tick(dt))
@@ -702,6 +739,68 @@ class World:
         # itself off for the session on one bad tick, and this is two floats and
         # a comparison - it does not earn its own failure mode.
         self._tick_hut_tier(dt)
+        # Same reasoning as _tick_hut_tier: rides inside the existing "colony"
+        # guard rather than taking a _guarded name of its own. It is a counter
+        # and a comparison; it does not earn its own failure mode.
+        self._tick_dragon_gate(dt)
+
+    def _stone_huts_standing(self) -> int:
+        """How many built, unruined STONE huts are up right now.
+
+        ``Structure.material()`` rather than reading ``state["material"]``
+        directly: that accessor already strips and lower-cases, so ``"STONE "``
+        from a hand-edited save reads as stone here exactly as it does in
+        render, and an unknown material falls back to the default in one place
+        instead of two. Never raises - it is called from a per-tick path and a
+        malformed structure must cost its own row, not the gate.
+        """
+        n = 0
+        for st in self.structures.all():
+            try:
+                if st.kind != "hut" or not st.built or st.is_ruined:
+                    continue
+                if st.material() == "stone":
+                    n += 1
+            except Exception:
+                continue
+        return n
+
+    def _tick_dragon_gate(self, dt: float) -> None:
+        """Latch the dragon gate once two stone huts are standing.
+
+        LATCHED, like ``hut_tier_unlocked`` and for the same reason: a fire that
+        ruins a stone hut does not un-notice the colony. An unlatched gate would
+        also make the schedule flicker - the registry's own next-visit timer is
+        armed on the latching edge, so a gate that closed again would keep
+        re-arming DRAGON_FIRST_DELAY and no dragon would ever actually arrive.
+        See ``_init_colony_state`` for why this signal and not another, and for
+        the dwell that was measured and rejected.
+
+        The registry ALSO counts stone huts for itself and prefers this flag
+        when it is present, so the world-side latch is a mirror rather than a
+        prerequisite - the feature is whole either way. What this adds is
+        persistence: the registry's own count is recomputed from the standing
+        structures, so a colony whose stone huts later burn down would look
+        un-gated again to the registry alone. Once this is True it stays True
+        across the fire and across the save.
+
+        ``dt`` is unused - the gate is a comparison, not a dwell - and is taken
+        anyway so the signature matches every other ``_tick_*`` here and a dwell
+        could be reinstated without touching the call site.
+        """
+        if self.dragons_unlocked:
+            return
+        standing = self._stone_huts_standing()
+        if standing >= DRAGON_GATE_STONE_HUTS:
+            self.dragons_unlocked = True
+            # No chronicle line here on purpose. The gate is not the event - the
+            # HERALD is, and the registry announces that itself
+            # DRAGON_FIRST_DELAY later with "Something crosses the sky, high
+            # up." Announcing the unlock too would tell the player about a
+            # mechanic before anything has happened, and turn a thing they
+            # notice in the sky into a reward popping in a log.
+            log.info("dragon gate latched at t=%.1fs (%d stone huts)",
+                     self.world_time, self._stone_huts_standing())
 
     def _tick_hut_tier(self, dt: float) -> None:
         """Unlock stone huts once the colony has been content for long enough.
@@ -848,6 +947,8 @@ class World:
             "lighting": self.lighting.to_dict(),
             "events": self.events.to_dict(),
             "animals": self.animals.to_dict(),
+            "dragons": self.dragons.to_dict(),
+            "spears": self.spears.to_dict(),
             "ufo": self.ufo.to_dict(),
             "auto_scene_rotate": bool(getattr(self, "auto_scene_rotate", True)),
             "stockpile": dict(self.stockpile),
@@ -862,6 +963,10 @@ class World:
             # colony 179 seconds into earning it, every single save.
             "hut_tier_unlocked": bool(self.hut_tier_unlocked),
             "hut_tier_dwell": float(self.hut_tier_dwell),
+            # Additive for the same reason, and with no partner field: the
+            # dragon gate is a pure latch with no dwell to lose, so there is
+            # nothing here that a reload could reset half-way through earning.
+            "dragons_unlocked": bool(self.dragons_unlocked),
             # upgrade_job is NOT here. It is derived from the chosen hut's
             # state["upgrade"] and republished on the first director pass after
             # a load; persisting it would create a second copy that can disagree
@@ -901,11 +1006,30 @@ class World:
         w.hut_tier_unlocked = bool(d.get("hut_tier_unlocked", False))
         w.hut_tier_dwell = _finite(d.get("hut_tier_dwell"), 0.0,
                                    lo=0.0, hi=HUT_TIER_DWELL_SEC)
+        # The dragon gate, on the same terms. A save written before dragons
+        # existed carries no key at all and simply loads locked - and then
+        # re-latches on the first tick if its stone huts are already up, which
+        # costs nothing because the registry's own DRAGON_FIRST_DELAY starts
+        # from that moment. bool() rather than a truthiness test on the raw
+        # value so "false", 0 and [] all coerce the way a hand-edited file would
+        # be read anywhere else in this method.
+        w.dragons_unlocked = bool(d.get("dragons_unlocked", False))
         # Persisted so a user who turns rotation off keeps it off across a
         # restart; the default above is what an older save falls back to.
         w.auto_scene_rotate = bool(d.get("auto_scene_rotate", True))
 
         def _sub(key, loader, fallback):
+            # An ABSENT section and an UNUSABLE one are different events and used
+            # to log the same alarming line. Every save written before dragons
+            # existed lacks "dragons" and "spears", so loading a perfectly good
+            # older colony printed "save section 'dragons' unusable" - which
+            # reads as corruption, is the first thing anyone would investigate
+            # after a crash, and is wrong. Missing is the ordinary case for any
+            # subsystem added after a save was written; only a section that is
+            # PRESENT and unreadable deserves a warning.
+            if key not in d:
+                log.debug("save section %r absent; regenerating", key)
+                return fallback()
             try:
                 return loader(d[key])
             except Exception:
@@ -932,6 +1056,23 @@ class World:
         w.animals = _sub("animals", AnimalRegistry.from_dict,
                          lambda: AnimalRegistry(seed=w.seed ^ 0xA17))
         w.ufo = _sub("ufo", Ufo.from_dict, lambda: Ufo(seed=w.seed ^ 0x71F))
+        # Both new registries go through _sub with a SEEDED fallback, and the
+        # seeding is load-bearing rather than tidy: a bare DragonRegistry() or
+        # SpearRegistry() draws its seed from the global random module, so a
+        # reload whose section was missing or corrupt would come back
+        # permanently non-reproducible - silently, because _sub logs the
+        # regeneration but nothing downstream can tell a seeded stream from an
+        # unseeded one. That is the exact bug already fixed here for events and
+        # animals; this is the same shape, so it gets the same treatment on the
+        # way in rather than after somebody spends a day on it.
+        #
+        # A save written before either existed has neither key, so _sub's
+        # KeyError sends both down the fallback and the world loads with no
+        # dragons and no spears in flight - which is precisely right.
+        w.dragons = _sub("dragons", DragonRegistry.from_dict,
+                         lambda: DragonRegistry(seed=w.seed ^ 0xD4A))
+        w.spears = _sub("spears", SpearRegistry.from_dict,
+                        lambda: SpearRegistry(seed=w.seed ^ 0x59EA))
 
         w.stockpile = {r: 0 for r in ALL_RESOURCES}
         w.stockpile.update({k: int(v) for k, v in
