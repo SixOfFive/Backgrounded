@@ -21,13 +21,15 @@ of the world, so it must stay legible when the scene is nearly black.
 from __future__ import annotations
 
 import logging
+from collections import Counter
 
 import pygame
 
 from ..constants import (
     DAY_LENGTH_SEC, RES_COOKED, RES_FIBRE, RES_FOOD, RES_STONE,
-    RES_WOOD, SCENE_LABELS,
+    RES_WOOD, SCENE_LABELS, SCENE_ROTATE_SEC,
 )
+from ..sim.names import role_label
 
 log = logging.getLogger(__name__)
 
@@ -412,6 +414,123 @@ def _doing(agent) -> str:
 _panel_cache: pygame.Surface | None = None
 _panel_key: tuple | None = None
 
+# ================================================================== tooltips ==
+# Hover detail for the stats panel: "wd 12" is compact enough to read at a
+# glance and opaque enough to be useless until you know what it means, so the
+# panel now explains itself under the pointer.
+#
+# The hit regions are built *with* the panel, in the panel's own unscaled
+# coordinates, and transformed at draw time by the blit origin and HUD_SCALE.
+# Two things fall out of that which matter: a window resize moves the panel and
+# needs no cache invalidation (only the origin changes), and a [ / ] resize
+# needs none either (only the divisor changes). Storing them in window
+# coordinates instead would silently rot on both.
+#
+# Tooltip text is captured when the panel is rebuilt, so it is at most one
+# _REBUILD_HZ period (~0.17 s) stale. Rebuilding zones per frame to close that
+# would cost a font-metrics pass at 60 Hz for a number nobody can read moving
+# that fast.
+
+#: (rect in panel-local unscaled px, title, body lines).
+_panel_zones: list[tuple[pygame.Rect, str, tuple[str, ...]]] = []
+
+TIP_BG = (16, 19, 26)
+TIP_BG_ALPHA = 242
+TIP_EDGE = (98, 110, 132)
+#: Wrap width for tooltip body text, in authored px before HUD_SCALE.
+TIP_W_MAX = 262
+
+
+def _span(font: pygame.font.Font, text: str, i: int, j: int,
+          x: int, y: int, h: int) -> pygame.Rect:
+    """Rect covering ``text[i:j]`` of *text* rendered at (*x*, *y*).
+
+    Measured with the same font the line is rendered with rather than assumed
+    monospace: the panel asks for consolas and takes whatever the system has,
+    and on a machine with none of the three the fallback is proportional.
+    """
+    x0 = font.size(text[:i])[0]
+    x1 = font.size(text[:j])[0]
+    return pygame.Rect(int(x + x0), int(y), max(2, int(x1 - x0)), int(h))
+
+
+def _tip_surface(title: str, body: tuple[str, ...],
+                 avail: int = 1 << 20) -> pygame.Surface:
+    """The tooltip plate, cached by content, scale and the width available.
+
+    Rendered at scaled font sizes rather than built small and enlarged: this
+    is the one thing on screen the user is actively squinting at, and a
+    smoothscaled 10 px glyph is exactly what they were complaining about.
+
+    ``avail`` is how much room the target surface has. It has to be a factor
+    because the wrap width is scaled by :data:`HUD_SCALE`, and scale is a user
+    dial while window size is a separate one: at 3.5x the authored 262 px wraps
+    at ~917 px, which is wider than a 640 px window, and no amount of clamping
+    the *position* rescues a plate that does not fit. It is quantised to 32 px
+    so that dragging a resize does not mint a fresh plate per pixel.
+    """
+    s = max(1.0, float(HUD_SCALE))
+    pad = max(4, int(round(6 * s)))
+    cap = max(120, int(avail) // 32 * 32)
+    key = ("__tip__", title, body, round(s, 3), cap)
+    surf = _text_cache.get(key)
+    if surf is not None:
+        return surf
+    if len(_text_cache) > _TEXT_CACHE_MAX:
+        _text_cache.clear()
+
+    ts = max(9, int(round(12 * s)))
+    bs = max(8, int(round(10 * s)))
+    maxw = max(60, min(int(TIP_W_MAX * s), cap - pad * 2))
+    rows: list[pygame.Surface] = []
+    if title:
+        rows.append(_font(ts, True).render(title, True, TITLE))
+    for entry in body:
+        text = str(entry)
+        if not text:                      # deliberate blank spacer row
+            rows.append(_font(bs).render(" ", True, DIM))
+            continue
+        for line in _wrap(text, maxw, bs):
+            rows.append(_font(bs).render(line, True, DIM))
+
+    # A single unbreakable word longer than the wrap width still comes back at
+    # full length from _wrap, so the plate is capped here as well and that row
+    # is clipped by the blit. Losing the tail of one long word beats a plate
+    # hanging off the side of the window.
+    w = min(cap, max((r.get_width() for r in rows), default=1) + pad * 2)
+    h = sum(r.get_height() for r in rows) + pad * 2
+    surf = pygame.Surface((w, h), pygame.SRCALPHA)
+    surf.fill((*TIP_BG, TIP_BG_ALPHA))
+    pygame.draw.rect(surf, TIP_EDGE, surf.get_rect(), 1)
+    y = pad
+    for r in rows:
+        surf.blit(r, (pad, y))
+        y += r.get_height()
+    _text_cache[key] = surf
+    return surf
+
+
+def _draw_tip(surf: pygame.Surface, mouse: tuple[int, int],
+              title: str, body: tuple[str, ...]) -> None:
+    """Place the tooltip beside the pointer, kept inside *surf*.
+
+    Left of the cursor by preference. The panel hugs the right edge of the
+    window, so anything hovering it is already near that edge and a tooltip
+    opening rightwards would be clamped against the frame on every single
+    hover - which reads as the tooltip being stuck rather than as placement.
+    """
+    tip = _tip_surface(title, body, max(160, surf.get_width() - MARGIN * 2))
+    s = max(1.0, float(HUD_SCALE))
+    gap = int(12 * s)
+    x = mouse[0] - tip.get_width() - gap
+    if x < MARGIN:
+        x = mouse[0] + gap
+    y = mouse[1] + int(8 * s)
+    x = max(0, min(x, surf.get_width() - tip.get_width()))
+    y = max(0, min(y, surf.get_height() - tip.get_height()))
+    surf.blit(tip, (x, y))
+
+
 #: The panel is rebuilt at most this often. Everything on it - needs, counts,
 #: the chronicle - moves on a human timescale, so redrawing it at 60 fps is
 #: pure waste: building it costs ~5 ms against a ~5 ms scene, i.e. it doubled
@@ -436,7 +555,8 @@ def _content_key(world, show_roster: bool) -> tuple:
 
 
 def draw_stats(surf: pygame.Surface, world, show_roster: bool = True,
-               offset: tuple[int, int] = (0, 0)) -> None:
+               offset: tuple[int, int] = (0, 0),
+               mouse: "tuple[int, int] | None" = None) -> None:
     """Draw the panel in *surf*'s own top-right corner. Never raises.
 
     The anchor is measured off the target surface rather than off ``RENDER_W``,
@@ -454,12 +574,19 @@ def draw_stats(surf: pygame.Surface, world, show_roster: bool = True,
     ``offset`` shifts the whole panel, and exists for one caller: the wallpaper
     path re-applies the screen shake that :meth:`Renderer.draw` baked into the
     frame, so the panel keeps riding the earthquake there exactly as before.
+
+    ``mouse`` is the pointer in *surf*'s coordinates, and is what turns the
+    hover tooltips on. It is a parameter rather than something read off
+    ``pygame.mouse`` here because this function is called twice per frame - once
+    onto the window and once into the wallpaper image - and only one of those
+    has a pointer over it. Reading the mouse internally would bake a tooltip
+    into the desktop wallpaper, anchored to a window the wallpaper cannot see.
     """
-    global _panel_cache, _panel_key
+    global _panel_cache, _panel_key, _panel_zones
     try:
         key = _content_key(world, show_roster)
         if _panel_cache is None or key != _panel_key:
-            _panel_cache = _build(world, show_roster)
+            _panel_cache, _panel_zones = _build(world, show_roster)
             _panel_key = key
         if _panel_cache is not None:
             panel = _scaled(_panel_cache, "stats")
@@ -467,14 +594,160 @@ def draw_stats(surf: pygame.Surface, world, show_roster: bool = True,
             # left edge rather than pushing it off screen entirely. Measured off
             # the *scaled* width, or the anchor would drift by the scale factor.
             x = max(0, surf.get_width() - panel.get_width() - MARGIN)
-            surf.blit(panel, (x + int(offset[0]), MARGIN + int(offset[1])))
+            ox = x + int(offset[0])
+            oy = MARGIN + int(offset[1])
+            surf.blit(panel, (ox, oy))
+            if mouse is not None and _panel_zones:
+                _hover(surf, mouse, ox, oy)
     except Exception:
         log.exception("hud draw failed")
 
 
-def _build(world, show_roster: bool) -> pygame.Surface:
+def _hover(surf: pygame.Surface, mouse: tuple[int, int],
+           ox: int, oy: int) -> None:
+    """Draw the tooltip for whatever zone the pointer is inside, if any."""
+    s = max(0.01, float(HUD_SCALE))
+    lx = (mouse[0] - ox) / s
+    ly = (mouse[1] - oy) / s
+    for rect, title, body in _panel_zones:
+        if rect.collidepoint(lx, ly):
+            _draw_tip(surf, mouse, title, body)
+            return
+
+
+def _is_mutant(a) -> bool:
+    try:
+        fn = getattr(a, "is_mutant", None)
+        return bool(fn()) if callable(fn) else False
+    except Exception:
+        return False
+
+
+def _dur(sec: float) -> str:
+    """Coarse elapsed time - "2h 05m", or "7m 30s" under the hour."""
+    total = max(0, int(sec))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m {s:02d}s"
+
+
+def _scene_tip(world) -> tuple[str, ...]:
+    try:
+        if getattr(world, "auto_scene_rotate", True):
+            left = max(0.0, SCENE_ROTATE_SEC
+                       - float(getattr(world.events, "scene_t", 0.0) or 0.0))
+            return (f"changes by itself in {_dur(left)}",
+                    "turn that off in Tray > Scene")
+        return ("automatic scene changes are off",
+                "pick another in Tray > Scene")
+    except Exception:
+        return ()
+
+
+def _pop_tip(world, agents) -> tuple[str, ...]:
+    try:
+        tally = Counter(role_label(getattr(a, "role", "")) for a in agents)
+        lines = [f"{len(agents)} alive right now"]
+        lines += [f"   {n} x {role}" for role, n in sorted(tally.items())]
+        mutants = sum(1 for a in agents if _is_mutant(a))
+        if mutants:
+            lines.append(f"{mutants} of them came out strange")
+        return tuple(lines)
+    except Exception:
+        return ()
+
+
+def _built_tip(world, finished: int) -> tuple[str, ...]:
+    try:
+        total = world.structures.count(built_only=False)
+        wip = max(0, int(total) - int(finished))
+        lines = [f"{finished} finished and standing"]
+        if wip:
+            lines.append(f"{wip} still going up")
+        return tuple(lines)
+    except Exception:
+        return ()
+
+
+def _lost_tip(world) -> tuple[str, ...]:
+    try:
+        st = world.stats
+        lines = [f"{int(st.get('died', 0) or 0)} have died here"]
+        taken = int(st.get("abducted", 0) or 0)
+        if taken:
+            back = int(st.get("returned", 0) or 0)
+            # Kept apart from the death toll on purpose: an abduction takes
+            # somebody off the roster alive and leaves no grave.
+            lines.append(f"{taken} taken by the lights, {back} put back")
+        born = int(st.get("born", 0) or 0)
+        lines.append(f"{born} born here since the colony started")
+        return tuple(lines)
+    except Exception:
+        return ()
+
+
+def _plural(n: int, one: str, many: str) -> str:
+    return one if n == 1 else many
+
+
+def _agent_tip(a) -> tuple[str, tuple[str, ...]]:
+    """Title and body for one roster row."""
+    try:
+        title = str(getattr(a, "name", "?"))
+        body = [f"{role_label(getattr(a, 'role', ''))}, "
+                f"generation {int(getattr(a, 'generation', 0) or 0)}"]
+        if _is_mutant(a):
+            morph = str(getattr(a, "morph", "") or "").replace("_", " ")
+            if morph:
+                body.append(f"and {morph}")
+        body.append("")
+        # The roster column truncates this to fit; the whole point of the
+        # tooltip is that here it does not.
+        body.append(activity_of(a) or "idle")
+        carrying = getattr(a, "carrying", None)
+        qty = int(getattr(a, "carry_qty", 0) or 0)
+        if carrying and qty > 0:
+            body.append(f"carrying {qty} x {carrying}")
+        if getattr(a, "holds_candle", False):
+            body.append("holding a candle")
+        body.append("")
+        for label, val in (("hungry", getattr(a, "hunger", 0.0)),
+                           ("tired", getattr(a, "fatigue", 0.0)),
+                           ("cold", getattr(a, "warmth", 0.0))):
+            body.append(f"{label + ':':<8}{int(round(float(val) * 100)):3d}%")
+        return title, tuple(body)
+    except Exception:
+        return str(getattr(a, "name", "?")), ()
+
+
+#: (key, resource, title, why it matters). The second line of each is the part
+#: the panel cannot say: "wd 12" tells you the number and nothing about what
+#: spends it.
+_RES_FIELDS = (
+    ("wd", RES_WOOD, "Wood",
+     ("chopped from trees", "every build needs it, and the firepit burns it")),
+    ("st", RES_STONE, "Stone",
+     ("broken off the rock face", "walls, hearths and the heavier builds")),
+    ("fd", RES_FOOD, "Food",
+     ("raw - foraged berries and harvested crops",
+      "edible as it is, but worth cooking first")),
+    ("ck", RES_COOKED, "Cooked food",
+     ("meals made at the fire", "eaten before anyone touches the raw food")),
+    ("fb", RES_FIBRE, "Fibre",
+     ("stripped while gathering",
+      "huts, bridges, ladders and totems all want it")),
+)
+
+
+def _build(world, show_roster: bool) -> tuple[pygame.Surface, list]:
     agents = [a for a in world.population.alive_agents()]
     agents.sort(key=lambda a: a.id)
+
+    # Hit regions for the hover tooltips, in this panel's own coordinates. Built
+    # here rather than in a second pass so a zone cannot drift from the text it
+    # names: every rect below is measured from the same y the blit above it used.
+    zones: list[tuple[pygame.Rect, str, tuple[str, ...]]] = []
+    f11 = _font(11)
 
     rows = len(agents) if show_roster else 0
     # Footer now wraps to two lines, so reserve LINE * 3 for it (divider +
@@ -489,24 +762,62 @@ def _build(world, show_roster: bool) -> pygame.Surface:
 
     # ---- header -----------------------------------------------------------
     scene = SCENE_LABELS.get(world.events.scene, world.events.scene)
-    panel.blit(_text(scene, TITLE, 13, True), (PAD, y))
+    st = _text(scene, TITLE, 13, True)
+    panel.blit(st, (PAD, y))
+    zones.append((pygame.Rect(PAD, y, st.get_width(), LINE),
+                  f"Scene: {scene}", _scene_tip(world)))
     day = int(world.world_time // DAY_LENGTH_SEC) + 1
     stamp = f"day {day}  {_clock(world)}"
     ts = _text(stamp, DIM, 11)
-    panel.blit(ts, (PANEL_W - PAD - ts.get_width(), y + 2))
+    tx = PANEL_W - PAD - ts.get_width()
+    panel.blit(ts, (tx, y + 2))
+    zones.append((pygame.Rect(tx, y, ts.get_width(), LINE),
+                  f"Day {day}, {_clock(world)}",
+                  (f"a full day and night is {int(DAY_LENGTH_SEC)}s of sim time",
+                   f"this world has been running {_dur(world.world_time)}")))
     y += LINE + 3
 
     pop = len(agents)
     gen = world.population.generation
-    panel.blit(_text(f"pop {pop}   gen {gen}   built {world.structures.count()}"
-                     f"   lost {world.stats.get('died', 0)}", DIM, 11), (PAD, y))
+    finished = world.structures.count()
+    # Built as segments rather than one f-string so each field's character span
+    # is known, which is what the hover zones are measured from. The joined
+    # result is byte-identical to the single string this replaced.
+    counters = (
+        (f"pop {pop}", "Population", _pop_tip(world, agents)),
+        (f"gen {gen}", "Generation",
+         (f"{gen} {_plural(gen, 'generation has', 'generations have')} lived here",
+          "it goes up when a child of this colony has a child")),
+        (f"built {finished}", "Structures", _built_tip(world, finished)),
+        (f"lost {int(world.stats.get('died', 0) or 0)}", "Lost", _lost_tip(world)),
+    )
+    line = "   ".join(text for text, _, _ in counters)
+    panel.blit(_text(line, DIM, 11), (PAD, y))
+    at = 0
+    for text, title, body in counters:
+        zones.append((_span(f11, line, at, at + len(text), PAD, y, LINE),
+                      title, body))
+        at += len(text) + 3                      # the three-space separator
     y += LINE
 
     sp = world.stockpile
-    panel.blit(_text(
-        f"wd {sp.get(RES_WOOD,0):<3} st {sp.get(RES_STONE,0):<3} "
-        f"fd {sp.get(RES_FOOD,0):<3} ck {sp.get(RES_COOKED,0):<3} "
-        f"fb {sp.get(RES_FIBRE,0)}", DIM, 11), (PAD, y))
+    parts: list[str] = []
+    tips: list[tuple[str, tuple[str, ...]]] = []
+    last = len(_RES_FIELDS) - 1
+    for i, (key, res, title, why) in enumerate(_RES_FIELDS):
+        qty = int(sp.get(res, 0) or 0)
+        # The final field carries no padding, exactly as the original did -
+        # trailing spaces on the last column would widen the panel's text for
+        # no reason and shift nothing else.
+        parts.append(f"{key} {qty}" if i == last else f"{key} {qty:<3}")
+        tips.append((f"{title} - {qty}", why))
+    line = " ".join(parts)
+    panel.blit(_text(line, DIM, 11), (PAD, y))
+    at = 0
+    for part, (title, body) in zip(parts, tips):
+        zones.append((_span(f11, line, at, at + len(part), PAD, y, LINE),
+                      title, body))
+        at += len(part) + 1
     y += LINE
     if show_roster:
         panel.blit(_text("needs: hun=hungry tir=tired cld=cold (full=bad)",
@@ -519,6 +830,7 @@ def _build(world, show_roster: bool) -> pygame.Surface:
     # ---- roster -----------------------------------------------------------
     if show_roster:
         for a in agents:
+            row_top = y
             col = tuple(a.color)
             pygame.draw.circle(panel, col, (PAD + 4, y + 5), 4)
             if getattr(a, "holds_candle", False):
@@ -553,19 +865,36 @@ def _build(world, show_roster: bool) -> pygame.Surface:
             panel.blit(rs, (PANEL_W - PAD - rs.get_width(), y - 2))
             y += 11
 
+            # One zone for the whole two-line block rather than four small ones
+            # per agent. Splitting it would mean the tooltip changed under the
+            # pointer as it drifted a few pixels between a name and the bar
+            # beside it, and everything it would say is on the one plate anyway.
+            title, body = _agent_tip(a)
+            zones.append((pygame.Rect(PAD, row_top, PANEL_W - PAD * 2,
+                                      max(1, y - row_top)), title, body))
+
     # ---- footer: most recent chronicle line -------------------------------
     pygame.draw.line(panel, EDGE, (PAD, y), (PANEL_W - PAD, y))
     y += 5
-    last = world.chronicle[-1] if world.chronicle else ""
-    if "] " in last:
-        last = last.split("] ", 1)[1]
+    foot_top = y
+    raw = str(world.chronicle[-1] if world.chronicle else "")
+    last = raw.split("] ", 1)[1] if "] " in raw else raw
+    stamp = raw.split("] ", 1)[0].lstrip("[") if "] " in raw else ""
     # Wrap onto up to two lines rather than clipping mid-word. The height
     # calc below reserves two footer lines, so this never overruns the panel.
-    for line in _wrap(str(last), PANEL_W - PAD * 2, 10)[:2]:
+    wrapped = _wrap(last, PANEL_W - PAD * 2, 10)
+    for line in wrapped[:2]:
         panel.blit(_text(line, DIM, 10), (PAD, y))
         y += LINE - 3
+    if last:
+        # Worth a tooltip even though the text is right there: a long event is
+        # cut at two lines, and the day stamp is stripped to save width.
+        zones.append((pygame.Rect(PAD, foot_top, PANEL_W - PAD * 2,
+                                  max(LINE, y - foot_top)),
+                      "Latest event",
+                      ((last,) if not stamp else (last, "", stamp))))
 
-    return panel
+    return panel, zones
 
 
 def _wrap(text: str, max_w: int, size: int) -> list[str]:

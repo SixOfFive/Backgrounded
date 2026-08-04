@@ -237,7 +237,8 @@ class Renderer:
         return s
 
     def draw_hud(self, surf: "pygame.Surface | None", world,
-                 shake: bool = False) -> None:
+                 shake: bool = False,
+                 mouse: "tuple[int, int] | None" = None) -> None:
         """Paint the stats panel and the chronicle log onto *surf*.
 
         Both anchor to *surf*'s own corners, so this lands top-right /
@@ -251,6 +252,11 @@ class Renderer:
         with the world there); the window overlay must not, because the window
         itself is not what is shaking.
 
+        ``mouse`` is the pointer in *surf*'s coordinates, and enables the stats
+        panel's hover tooltips. Only the window path passes it - the wallpaper
+        is an image with no pointer over it, and a tooltip baked into it would
+        be a permanent grey box on the desktop.
+
         Never raises: both hud functions already swallow their own errors, and
         the flags are read defensively because this sits on the frame loop.
         """
@@ -260,7 +266,7 @@ class Renderer:
             off = self._shake if shake else (0, 0)
             if self.show_stats:
                 hud.draw_stats(surf, world, show_roster=self.show_roster,
-                               offset=off)
+                               offset=off, mouse=mouse)
             if self.show_log:
                 hud.draw_log(surf, world, offset=off)
         except Exception:

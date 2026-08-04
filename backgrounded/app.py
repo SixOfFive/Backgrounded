@@ -359,9 +359,21 @@ class App:
         The HUD goes down first and the tool palette on top, so a tooltip is
         never buried under the stats panel. Both halves fail soft - an overlay
         that raises must not cost the frame.
+
+        The pointer is handed to the HUD here and nowhere else. It is in window
+        pixels, which is the space the panels are drawn in, and it is passed
+        only on this path: the same draw_hud runs again against the 1600x1000
+        wallpaper frame, where a pointer position would be meaningless and a
+        tooltip would be baked into the desktop permanently.
+
+        ``get_focused`` is what stops a tooltip appearing under a pointer that
+        is somewhere else entirely - pygame keeps reporting the last position it
+        saw once the mouse leaves the window, so without it the panel would show
+        detail for whatever the cursor was over when it left.
         """
         try:
-            self.renderer.draw_hud(screen, self.world)
+            mouse = pygame.mouse.get_pos() if pygame.mouse.get_focused() else None
+            self.renderer.draw_hud(screen, self.world, mouse=mouse)
         except Exception:
             log.debug("window hud draw failed", exc_info=True)
         self.tools.draw_overlay(screen)
