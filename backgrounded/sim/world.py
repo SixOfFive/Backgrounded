@@ -402,6 +402,10 @@ class World:
                 a.y = self.terrain.ground_y(a.x)
                 a.vx = a.vy = 0.0
                 a.on_ground = True
+                # Every structure went with the old landscape, including the
+                # watchtower somebody was standing on: leaving the perch set
+                # would hold him at the height of a tower that no longer exists.
+                a.perch_y = None
                 a.action = None
             self.log_event("The land changes shape beneath them.")
             log.info("terrain randomised (seed=%d)", self.seed)

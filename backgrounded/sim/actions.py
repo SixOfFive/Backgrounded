@@ -994,8 +994,33 @@ def _plant(agent: Any, gy: float) -> None:
     780 px/s over 0.87s of "falling" that covered 0.3px. The landing check then
     read that as a fatal impact, which is why every agent died of a fall while
     standing still on flat ground. Position and state must be asserted together.
+
+    Standing on the ground also means standing on nothing else, so this drops
+    any platform perch too - see :meth:`entities.Stickman.perch`.
     """
     agent.y = float(gy)
+    agent.vy = 0.0
+    agent.on_ground = True
+    agent.fall_t = 0.0
+    agent.perch_y = None
+
+
+def _perch(agent: Any, y: float) -> None:
+    """Stand the agent on a platform at *y*, off the ground, for this tick.
+
+    The other half of _plant, for the handful of places that legitimately hold
+    somebody above the terrain (a watchtower deck). entities owns y whenever
+    the agent is off the ground, so an action that writes y up there without
+    saying why is one entities reads as a body in free fall - which is exactly
+    how manning a watchtower became a way to die. Must be re-asserted every
+    tick: the perch is a lease (entities.PERCH_LEASE).
+    """
+    fn = getattr(agent, "perch", None)
+    if callable(fn):
+        fn(float(y))
+        return
+    # A stub agent from a test: assert the same state by hand, minus the lease.
+    agent.y = float(y)
     agent.vy = 0.0
     agent.on_ground = True
     agent.fall_t = 0.0
@@ -1899,8 +1924,13 @@ def _c_sleep(a: Action, ag: Any, w: Any) -> None:
     if hut is not None:
         hut.leave(int(getattr(ag, "id", 0)))
     if a.data.get("in"):
+        # _plant, not a bare y write, for the same reason the lookout uses it:
+        # a sleeper parked at the hut floor sits a couple of px above the
+        # ground line, so entities has been reading them as airborne all night.
+        # Waking them without asserting vy hands whatever gravity accrued in
+        # there to the landing check.
         try:
-            ag.y = ground_y(w, ag.x)
+            _plant(ag, ground_y(w, ag.x))
         except Exception:
             pass
     # Always clear this, even if the hut is gone: an agent left flagged as
@@ -2283,7 +2313,7 @@ def _h_climb(a: Action, ag: Any, w: Any, dt: float) -> None:
 def _h_lookout(a: Action, ag: Any, w: Any, dt: float) -> None:
     tower = structure_by_id(w, a.target)
     if tower is None or tower.kind != "watchtower" or getattr(tower, "is_ruined", False):
-        if a.phase in ("ascend", "watch"):
+        if a.phase in ("ascend", "watch", "descend"):
             # The tower went out from under them - put them back on the ground
             # rather than leaving a stickman hanging in mid-air.
             _c_lookout(a, ag, w)
@@ -2325,7 +2355,7 @@ def _h_lookout(a: Action, ag: Any, w: Any, dt: float) -> None:
         y0 = float(a.data.get("y0", ag.y))
         try:
             ag.x = float(tower.x)
-            ag.y = y0 + (top - y0) * k
+            _perch(ag, y0 + (top - y0) * k)
         except Exception:
             pass
         _adjust(ag, "fatigue", 0.02 * dt)
@@ -2334,11 +2364,34 @@ def _h_lookout(a: Action, ag: Any, w: Any, dt: float) -> None:
             a.data["wt"] = 0.0
         return
 
+    if a.phase == "descend":
+        # The way down is a climb, not a step off the edge. 68 px of watchtower
+        # is past STEP_FALL_MAX, so letting go at the top lands at ~350 px/s -
+        # over FALL_LETHAL_SPEED - and the ladder they walked up would have
+        # killed them on the way home.
+        a.pose = "climb"
+        _halt(ag)
+        gy = ground_y(w, ag.x)
+        a.data["dsc"] = float(a.data.get("dsc", 0.0)) + dt
+        k = _clamp01(a.data["dsc"] / CLIMB_TIME)
+        y1 = float(a.data.get("y1", top))
+        _adjust(ag, "fatigue", 0.012 * dt)
+        if k >= 1.0 or gy <= y1:
+            _c_lookout(a, ag, w)
+            a.done = True
+            return
+        try:
+            ag.x = float(tower.x)
+            _perch(ag, y1 + (gy - y1) * k)
+        except Exception:
+            pass
+        return
+
     a.pose = "lookout"
     _halt(ag)
     try:
         ag.x = float(tower.x)
-        ag.y = top
+        _perch(ag, top)
     except Exception:
         pass
     a.data["wt"] = float(a.data.get("wt", 0.0)) + dt
@@ -2358,12 +2411,24 @@ def _h_lookout(a: Action, ag: Any, w: Any, dt: float) -> None:
             pass
         emit_speech(w, ag, "!")
         chronicle(w, f"{getattr(ag, 'name', 'The lookout')} spotted danger.")
-        _c_lookout(a, ag, w)
-        a.done = True
+        _start_climb_down(a, top)
         return
     if a.data["wt"] >= float(a.data.get("dur", 120.0)):
-        _c_lookout(a, ag, w)
-        a.done = True
+        _start_climb_down(a, top)
+
+
+def _start_climb_down(a: Action, top: float) -> None:
+    """End the watch by climbing down. The alarm, if any, is already raised.
+
+    Shout first, then come down: the hazard branch has already set world.alarm
+    and chronicled it, so the colony reacts on the same tick either way. If
+    something more urgent than a ladder happens on the way, behaviour's
+    override replaces the action and the cleanup hook puts him on the ground.
+    """
+    a.phase = "descend"
+    a.pose = "climb"
+    a.data["dsc"] = 0.0
+    a.data["y1"] = float(top)
 
 
 def _c_lookout(a: Action, ag: Any, w: Any) -> None:
@@ -2371,11 +2436,16 @@ def _c_lookout(a: Action, ag: Any, w: Any) -> None:
     if tower is not None:
         tower.leave(int(getattr(ag, "id", 0)))
     if a.data.get("in"):
+        # Off the tower and onto the ground in one step. This is the abrupt
+        # path - an interrupted watch, a tower that burned down under him -
+        # so it must assert the whole landing, not just y: dropping the perch
+        # while leaving him above the ground would hand a man 68 px up to
+        # gravity, and that lands at ~350 px/s, which is fatal.
         try:
-            ag.y = ground_y(w, ag.x)
+            _plant(ag, ground_y(w, ag.x))
         except Exception:
             pass
-    # Always clear this, even if the hut is gone: an agent left flagged as
+    # Always clear this, even if the tower is gone: an agent left flagged as
     # inside a building that no longer exists would be invisible forever.
     try:
         ag.inside = None
