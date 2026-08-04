@@ -19,6 +19,7 @@ import numpy as np
 
 from ..constants import (
     AI_TICKS, ALL_RESOURCES, DAY_LENGTH_SEC, FOOD_PER_HEAD_TO_GROW,
+    HUT_TIER_DWELL_SEC, HUT_TIER_MORALE,
     MAX_POP, MIN_POP, MORALE_TO_GROW, MORPH_LABELS,
     POP_BIRTH_COOLDOWN, POP_PER_HUT,
     REGROW_MAX, REGROW_PER_HEAD, RENDER_H, RENDER_W,
@@ -71,6 +72,23 @@ STAT_DEFAULTS: dict[str, int] = {
     "lightning_strikes": 0, "generations": 1,
     "abducted": 0, "returned": 0,
 }
+
+
+def _finite(value: Any, default: float, lo: float, hi: float) -> float:
+    """A real number in [lo, hi] from anything at all, never raising.
+
+    For fields read by :meth:`World.from_dict`, which is the one function here
+    that must not raise: persist.load_world reads an exception as a corrupt save
+    and quarantines it, so a junk value in a hand-edited file would cost the
+    whole colony rather than the one field.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if f != f or f in (float("inf"), float("-inf")):   # nan / +-inf
+        return default
+    return lo if f < lo else (hi if f > hi else f)
 
 
 class World:
@@ -140,6 +158,24 @@ class World:
         # carried across a load: a subsystem that died in a previous session
         # deserves a fresh start in this one.
         self._disabled: set[str] = set()
+
+        # The stone-hut tier: a latch, and the dwell timer that earns it.
+        # Declared here rather than in __init__ for exactly the reason this
+        # method exists. _tick_hut_tier runs inside _guarded("colony"), so on a
+        # loaded world a missing hut_tier_unlocked would not crash - it would
+        # raise once, disable the "colony" subsystem for the session, and take
+        # update_director and assign_roles down with it. Nothing visible would
+        # say why; the colony would simply stop building and stop assigning
+        # roles. from_dict writes the saved values over these defaults right
+        # after calling this, and a save written before the tier existed keeps
+        # them and re-earns the tier, which costs at most HUT_TIER_DWELL_SEC.
+        self.hut_tier_unlocked: bool = False
+        self.hut_tier_dwell: float = 0.0
+        # Republished every director pass from the chosen hut's own
+        # state["upgrade"], and deliberately NOT persisted: it is derived, and a
+        # saved copy is a second source of truth that can disagree with the
+        # structure it claims to describe. The truth lives on the Structure.
+        self.upgrade_job: dict[str, Any] | None = None
 
         # Things the player's Hand tool is currently carrying, by id. Transient
         # by design: never serialised, so a save mid-drag reloads with nothing
@@ -598,6 +634,30 @@ class World:
         n = len(self.population.alive_agents())
         return float(min(REGROW_MAX, 1.0 + max(0, n - MIN_POP) * REGROW_PER_HEAD))
 
+    def colony_morale(self) -> float:
+        """Mean morale over the living - the colony's one definition of "happy".
+
+        Two gates read this: the birth gate below (MORALE_TO_GROW) and the
+        stone-hut tier gate (HUT_TIER_MORALE). One helper, so "how is the colony
+        doing" cannot come to mean two slightly different numbers depending on
+        who is asking.
+
+        The body is the expression that was inlined in ``_tick_population``,
+        moved here verbatim. It is deliberately NOT ``Population.stats()
+        ["morale"]``, which computes the same mean in numpy float32 and so
+        differs in the last bits: swapping that in here would silently shift the
+        already-shipped birth gate, and nobody would ever trace a colony that
+        grew one birth differently back to a change of dtype.
+
+        Never raises. An empty colony reads 0.0, and so does any failure - a
+        gate that cannot measure morale has to stay shut, not fall open.
+        """
+        try:
+            alive = self.population.alive_agents()
+            return sum(float(a.morale) for a in alive) / max(1, len(alive))
+        except Exception:
+            return 0.0
+
     def _tick_population(self, dt: float) -> None:
         """Let the colony grow when it is genuinely thriving."""
         self._birth_cd = getattr(self, "_birth_cd", POP_BIRTH_COOLDOWN) - dt
@@ -616,11 +676,10 @@ class World:
         food = self.stockpile.get(RES_FOOD, 0) + self.stockpile.get(RES_COOKED, 0)
         if food < FOOD_PER_HEAD_TO_GROW * n:
             return
-        try:
-            morale = sum(float(a.morale) for a in alive) / max(1, n)
-        except Exception:
-            morale = 0.0
-        if morale < MORALE_TO_GROW:
+        # Shared with the stone-hut tier gate. The try/except that used to wrap
+        # this sum now lives inside colony_morale(), which returns 0.0 on any
+        # failure - the same "no birth" answer this code took before.
+        if self.colony_morale() < MORALE_TO_GROW:
             return
         # Somewhere to sleep, or nobody wants to bring anyone into it.
         huts = self.structures.count("hut")
@@ -638,6 +697,49 @@ class World:
                                   if getattr(st, "built", False))
         behavior.update_director(self, dt)
         behavior.assign_roles(self, dt)
+        # Rides inside the existing "colony" guard rather than taking a
+        # _guarded name of its own. A new name is a new thing that can switch
+        # itself off for the session on one bad tick, and this is two floats and
+        # a comparison - it does not earn its own failure mode.
+        self._tick_hut_tier(dt)
+
+    def _tick_hut_tier(self, dt: float) -> None:
+        """Unlock stone huts once the colony has been content for long enough.
+
+        The comparison is ``>=`` and that is load-bearing. morale is 1 = good,
+        while hunger, fatigue and warmth are 1 = bad (entities.py:429-432), and
+        both conventions live in this package. A ``<=`` here produces a gate
+        that opens on a miserable colony and never on a happy one - and it would
+        still fire, still latch, and still read perfectly plausibly in the
+        chronicle, because there is no crash to catch it. The acceptance test is
+        the clock: measured over 26 seeds, the earliest honest unlock is 15.0
+        sim-minutes, so a tier that appears in the first few minutes of a fresh
+        seed means the comparison is backwards.
+
+        The dwell must be UNBROKEN - one tick below the threshold puts it back
+        to zero. That is what keeps the opening honeymoon from handing the tier
+        over for free: agents spawn at morale 0.6 with every need at zero, so
+        colony mean sits above 0.55 for the first 47-132 s of every seed
+        measured, and any dwell at or under ~140 s unlocks during it.
+
+        Latched: once True it is never set False again. A later famine does not
+        un-teach masonry. An unlatched gate would also be actively worse than no
+        tier at all - colony morale is noisy at these headcounts (2-10 agents)
+        and crosses 0.55 constantly, so huts would flicker between timber and
+        stone as it wobbled.
+
+        Accumulating ``dt`` rather than counting whole seconds is deliberate: the
+        measurement that chose 180 s sampled once per sim-second, so a per-tick
+        accumulator is strictly finer-grained and cannot unlock any earlier than
+        the sampled model predicted.
+        """
+        if self.hut_tier_unlocked:
+            return
+        m = self.colony_morale()
+        self.hut_tier_dwell = (self.hut_tier_dwell + dt) if m >= HUT_TIER_MORALE else 0.0
+        if self.hut_tier_dwell >= HUT_TIER_DWELL_SEC:
+            self.hut_tier_unlocked = True
+            self.log_event("They have learned to raise walls of stone.")
 
     # ------------------------------------------------------------ helpers --
     def log_event(self, text: str) -> None:
@@ -752,6 +854,18 @@ class World:
             "build_queue": list(self.build_queue),
             "chronicle": list(self.chronicle),
             "stats": dict(self.stats),
+            # Additive, so SAVE_VERSION stays 1 and persist.py never quarantines
+            # anything: from_dict reads both with .get(key, default), and a build
+            # old enough not to know them ignores them. The partial dwell is
+            # saved alongside the latch so a reload never costs more than the
+            # tick it happened on - saving only the latch would silently reset a
+            # colony 179 seconds into earning it, every single save.
+            "hut_tier_unlocked": bool(self.hut_tier_unlocked),
+            "hut_tier_dwell": float(self.hut_tier_dwell),
+            # upgrade_job is NOT here. It is derived from the chosen hut's
+            # state["upgrade"] and republished on the first director pass after
+            # a load; persisting it would create a second copy that can disagree
+            # with the structure it describes.
         }
 
     @classmethod
@@ -769,6 +883,24 @@ class World:
         # one. See _init_colony_state for what that cost last time. Saved values
         # go over the top of these below.
         w._init_colony_state()
+        # The stone-hut tier, straight after the defaults it overwrites. A save
+        # written before the tier existed carries neither key and simply loads
+        # locked with an empty accumulator, then re-earns it - the "growth"
+        # precedent at structures.py:1174-1177.
+        #
+        # Everything here is coerced defensively rather than trusted, because
+        # from_dict is the one function in this file that must not raise:
+        # persist.load_world treats an exception as a corrupt save and
+        # QUARANTINES it, so a single junk value in a hand-edited file does not
+        # lose the tier, it loses the colony. `or 0.0` was enough for null and
+        # nothing else - "banana" raised ValueError and a list or dict raised
+        # TypeError. nan/inf are rejected too: the accumulator does self-heal
+        # (the next sub-threshold tick resets it to 0.0), but an inf sitting
+        # above HUT_TIER_DWELL_SEC unlocks the tier on the first tick, which is
+        # not what a corrupt file should be able to buy.
+        w.hut_tier_unlocked = bool(d.get("hut_tier_unlocked", False))
+        w.hut_tier_dwell = _finite(d.get("hut_tier_dwell"), 0.0,
+                                   lo=0.0, hi=HUT_TIER_DWELL_SEC)
         # Persisted so a user who turns rotation off keeps it off across a
         # restart; the default above is what an older save falls back to.
         w.auto_scene_rotate = bool(d.get("auto_scene_rotate", True))

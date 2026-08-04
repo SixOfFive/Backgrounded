@@ -59,6 +59,11 @@ __all__ = [
     "plan_ladder",
     "FIRE_LIGHT_COLOR",
     "BURN_LIGHT_COLOR",
+    "HUT_MATERIALS",
+    "HUT_DEFAULT_MATERIAL",
+    "HUT_UPGRADE_COST",
+    "HUT_UPGRADE_WORK",
+    "HUT_STONE_MAX_HP",
 ]
 
 #: Kinds that write themselves into Terrain's effective-surface overlay when
@@ -101,6 +106,40 @@ HUT_CAPACITY_MAX = 5
 #: and running the stores down has to read as a settlement contracting rather
 #: than a building blinking. ~5%/s is a ~20 s time constant.
 GROWTH_LERP_RATE = 0.05
+
+#: What a hut's walls can be made of. The colony's building tech tier is a
+#: ``material`` key on :attr:`Structure.state`, *not* a second structure kind:
+#: a new kind would mean chasing eight literal ``"hut"`` comparisons across five
+#: sim files (the birth gate in world.py among them - miss it and births stall
+#: silently) plus four hardcoded tables, all to say "same building, different
+#: walls". A state key round-trips through :func:`_json_safe` for free and
+#: breaks no ``kind == "hut"`` comparison anywhere.
+#:
+#: This tuple is the sim-side mirror of ``render.atlas.HUT_KINDS``. sim/ must
+#: never import render/, so the two are kept in step by hand. The failure mode
+#: of drift is cosmetic and one-directional: a material named here that the
+#: atlas does not know falls through ``Atlas.resolve`` and draws as timber. It
+#: cannot crash.
+HUT_MATERIALS: tuple[str, ...] = ("wood", "stone")
+#: What a hut is when nothing says otherwise - including every save written
+#: before any of this existed, where the key is simply absent.
+HUT_DEFAULT_MATERIAL: str = "wood"
+#: Stone to re-wall one finished timber hut. Stone only, deliberately: it keeps
+#: the cost legible ("a stone hut costs stone") and off the wood/fibre economy
+#: the hut ladder and the firepit already compete for. The real gate is not this
+#: price but the *surplus* rule in behaviour - stone no pending build has a
+#: claim on - which is why a 10-stone upgrade never starves a 4-stone hut.
+HUT_UPGRADE_COST: dict[str, int] = {RES_STONE: 10}
+#: Seconds of applied work once the stone is on site, mirroring
+#: ``StructureSpec.build_time`` for one stage. Longer than a hut stage (9 s)
+#: because it is the whole building, not a quarter of one.
+HUT_UPGRADE_WORK: float = 14.0
+#: A stone hut's max hp, up from the timber spec's 130. Note this changes what
+#: counts as damaged: ``StructureRegistry.damaged`` compares hp/max_hp, so a
+#: stone hut sitting at 130 hp now reads as damaged where the identical timber
+#: hut did not. That is intended - a stone hut has more to lose - but it does
+#: mean slightly more repair traffic after the first upgrade lands.
+HUT_STONE_MAX_HP: float = 190.0
 
 
 @dataclass(frozen=True)
@@ -554,6 +593,180 @@ class Structure:
         elif self.kind == "stockpile":
             self.state.setdefault("shown", {})
 
+    # -------------------------------------------------------------- upgrade --
+    # Re-walling a finished hut in stone. The shape below mirrors the build
+    # path one-for-one - missing -> deliver -> advance -> completes on one frame
+    # - because that is the loop the haulers and _h_build already know how to
+    # drive, and mirroring it means a save taken mid-upgrade resumes mid-upgrade
+    # for exactly the same reason a save taken mid-build does.
+    #
+    # What it deliberately does NOT do is reuse `repair()`'s trick of flipping
+    # `built` back to False to restart the build in place. That is right for
+    # rubble and wrong here: built=False would hide the hut from _free_hut and
+    # _pick_hut (both pass built_only=True), break has_room() for anyone asleep
+    # inside, and drop it out of the birth gate's hut count in world.py - so
+    # starting an upgrade would silently stall births colony-wide. So the
+    # upgrade borrows repair()'s *idea* (act on a live Structure without
+    # destroying its id or evicting its occupants) while touching none of the
+    # fields repair() touches: built, stage, progress, occupants, growth,
+    # capacity and hp all carry on exactly as they were. Somebody can be asleep
+    # in the hut while it is being re-walled.
+    def material(self) -> str:
+        """What this hut's walls are made of; ``HUT_DEFAULT_MATERIAL`` if unset.
+
+        Answers for non-huts too, so callers need no ``kind == "hut"`` guard.
+        The strip/lower matches ``Atlas.resolve`` exactly - a hand-edited
+        ``"STONE "`` reads as stone in both places, and an unknown material
+        reads as timber in both places rather than as stone here and timber on
+        screen. Never raises.
+        """
+        try:
+            mat = str(self.state.get("material") or "").strip().lower()
+        except (TypeError, ValueError, AttributeError):
+            return HUT_DEFAULT_MATERIAL
+        return mat if mat in HUT_MATERIALS else HUT_DEFAULT_MATERIAL
+
+    @property
+    def is_upgrading(self) -> bool:
+        """True while an upgrade job is pending on this structure."""
+        return isinstance(self.state.get("upgrade"), dict)
+
+    def can_upgrade(self) -> bool:
+        """Is this a finished timber hut with nothing already in flight on it?"""
+        return (
+            self.kind == "hut"
+            and self.built
+            and not self.is_ruined
+            and not self.is_burning
+            and self.material() == HUT_DEFAULT_MATERIAL
+            and not self.is_upgrading
+        )
+
+    def upgrade_cost(self) -> dict[str, int]:
+        """A *copy* of the upgrade price, so a caller cannot edit the module."""
+        return dict(HUT_UPGRADE_COST)
+
+    def upgrade_delivered(self) -> dict[str, int]:
+        """Stone already hauled here for the upgrade. ``{}`` if not upgrading.
+
+        Mirrors the :attr:`delivered` property: the sub-dict is created in place
+        when it is missing, so callers can write to what they get back.
+        """
+        up = self.state.get("upgrade")
+        if not isinstance(up, dict):
+            return {}
+        d = up.get("delivered")
+        if not isinstance(d, dict):
+            d = {}
+            up["delivered"] = d
+        return d
+
+    def upgrade_missing(self) -> dict[str, int]:
+        """What still has to be hauled here before the work can proceed.
+
+        Exact mirror of :meth:`missing_for_stage` - positive shortfalls only.
+        """
+        if not self.is_upgrading:
+            return {}
+        have = self.upgrade_delivered()
+        out: dict[str, int] = {}
+        for res, qty in HUT_UPGRADE_COST.items():
+            short = int(qty) - int(have.get(res, 0))
+            if short > 0:
+                out[res] = short
+        return out
+
+    def upgrade_completion(self) -> float:
+        """Applied-work fraction, 0..1. 0.0 when nothing is being upgraded.
+
+        Deliberately *not* blended with how much stone has arrived: both
+        consumers - the director's job entry and the builder's handler - want
+        the work number, and a blended one would report progress for a hut
+        nobody has swung a hammer at yet.
+        """
+        up = self.state.get("upgrade")
+        if not isinstance(up, dict):
+            return 0.0
+        return _clamp01(_as_float(up, "progress", 0.0))
+
+    def start_upgrade(self, now: float = 0.0) -> bool:
+        """Open an upgrade job on this hut. False if it is not eligible.
+
+        Touches nothing but the one state key: not `built`, not `stage`, not
+        `progress`, not `occupants`, not `hp`, not `growth`, not `capacity`.
+        Everything about the hut carries on as it was until the work lands.
+
+        ``now`` is the world clock, stamped into the job so the director can see
+        how long it has gone unclaimed. It lives here rather than on the derived
+        ``world.upgrade_job`` because that dict is rebuilt every director pass
+        and never persisted - an age kept there would reset to zero on the next
+        pass and again on every reload, which is precisely the measurement that
+        has to survive. Defaults to 0.0 so an existing caller still works; the
+        cost of not passing it is a job that reads as maximally patient.
+        """
+        if not self.can_upgrade():
+            return False
+        self.state["upgrade"] = {"to": "stone", "delivered": {}, "progress": 0.0,
+                                 "opened": float(now)}
+        return True
+
+    def deliver_upgrade(self, res: str, qty: int) -> int:
+        """Accept up to `qty` of `res` toward the upgrade. Returns units taken."""
+        if qty <= 0 or not self.is_upgrading or self.is_ruined:
+            return 0
+        want = self.upgrade_missing().get(res, 0)
+        take = min(int(qty), int(want))
+        if take <= 0:
+            return 0
+        have = self.upgrade_delivered()
+        have[res] = int(have.get(res, 0)) + take
+        return take
+
+    def advance_upgrade(self, dt: float, rate: float = 1.0) -> bool:
+        """Apply `dt` seconds of work. True on the frame the upgrade lands.
+
+        Work waits on delivery exactly the way :meth:`advance` does - an
+        undelivered upgrade burns no time, so a builder standing at a hut with
+        no stone in it makes no progress rather than finishing it for free.
+        """
+        if not self.is_upgrading or self.is_ruined or dt <= 0.0:
+            return False
+        if self.upgrade_missing():
+            return False
+        up = self.state.get("upgrade")
+        if not isinstance(up, dict):   # cannot happen; is_upgrading just said so
+            return False
+        per = max(0.25, float(HUT_UPGRADE_WORK))
+        prog = _as_float(up, "progress", 0.0)
+        prog += (float(dt) * max(0.0, float(rate))) / per
+        if prog < 1.0:
+            up["progress"] = _clamp01(prog)
+            return False
+        # Landed. This single assignment to state["material"] is the whole of
+        # the sim's rendering obligation: renderer.py already passes the state
+        # dict into atlas.get, and Atlas.resolve("hut", {"material": "stone"})
+        # answers "hut_stone". The kind stays "hut", so the growth ladder, the
+        # birth gate, capacity and every hut lookup keep working untouched.
+        to = str(up.get("to") or "").strip().lower()
+        self.state["material"] = to if to in HUT_MATERIALS else "stone"
+        self.state.pop("upgrade", None)
+        self.max_hp = float(HUT_STONE_MAX_HP)
+        self.hp = self.max_hp        # the same full heal advance() gives
+        # Stone does not burn. If it was alight when the last course went on,
+        # it is not any more; from here `ignite` refuses outright.
+        self.state.pop("burning", None)
+        return True
+
+    def cancel_upgrade(self) -> None:
+        """Drop an in-flight upgrade job.
+
+        Stone already delivered is *not* refunded - it is sunk into the
+        building, exactly as a build stage's delivered resources are when a site
+        is abandoned. Refunding would make cancelling free and give the director
+        an incentive to churn.
+        """
+        self.state.pop("upgrade", None)
+
     # --------------------------------------------------------------- damage --
     @property
     def is_ruined(self) -> bool:
@@ -608,11 +821,26 @@ class Structure:
         self.built = False
         self.hp = 0.0
         self.occupants = []
+        # Rubble cannot be mid-upgrade: the job goes, along with any stone
+        # already hauled for it. `state["material"]` is deliberately KEPT, so a
+        # stone hut that burns down and is repaired comes back in stone. It
+        # rebuilds at timber prices, which is slack - and chosen: a fire the
+        # player could not prevent should not un-teach the colony masonry.
+        self.state.pop("upgrade", None)
 
     # ------------------------------------------------------------------ fire --
     def ignite(self) -> bool:
         """Set alight. Returns True if it actually caught."""
         if self.is_ruined or not self.spec.flammable:
+            return False
+        # A re-walled hut simply does not catch. This cannot live in
+        # `spec.flammable` or in `events._FLAMMABLE`: both are per-KIND (and the
+        # second is derived from the first) while material is per-INSTANCE, so
+        # one stone hut would make every hut in the colony fireproof.
+        # Seeded-stream safe: StructureRegistry.update draws its rng.random()
+        # *before* calling ignite(), so refusing here does not change how many
+        # numbers come off the stream and a seed still replays identically.
+        if self.kind == "hut" and self.material() == "stone":
             return False
         if self.state.get("burning"):
             return False
@@ -1147,6 +1375,7 @@ class Structure:
                 if isinstance(v, (int, float))
             }
         _sanitise_bonfire(kind, state)
+        _sanitise_upgrade(kind, state)
         s = cls(
             id=_as_int(d, "id", 0),
             kind=kind,
@@ -1167,6 +1396,13 @@ class Structure:
         if s.built:
             s.stage = max_stage
             s.progress = 0.0
+        # An upgrade only exists on a standing, finished hut - `_sanitise_upgrade`
+        # cannot check that, because `built` and `ruined` are not both readable
+        # until the Structure exists. A half-built or collapsed hut carrying an
+        # upgrade job is a hand-edited or half-flushed save; drop the job rather
+        # than let advance_upgrade re-wall a building that is not there.
+        if not s.built or s.is_ruined:
+            s.state.pop("upgrade", None)
         # A save from before hut growth existed has no `growth`. Seeding it from
         # the age term (the store term is not knowable until the world hands us
         # a stockpile) stops every hut in an old colony visibly re-inflating
@@ -1239,6 +1475,89 @@ def _sanitise_bonfire(kind: str, state: dict[str, Any]) -> None:
             ok = False
     if not ok:
         state.pop("bonfire_t", None)
+
+
+def _sanitise_upgrade(kind: str, state: dict[str, Any]) -> None:
+    """Make the wall-material keys in a loaded ``state`` safe, in place.
+
+    Same rule as :func:`_sanitise_bonfire`: *degrade to a plain timber hut,
+    never raise*. A save carrying ``material: "sponge"``, ``material: 7``, a
+    ``progress`` of NaN or an upgrade job on a grave has to load as a perfectly
+    ordinary building, because the alternative - an exception inside
+    ``StructureRegistry.from_dict`` - loses the player's whole settlement to a
+    typo.
+
+    Nothing here is reachable from a save this version wrote. It is entirely for
+    hand-edited files, files from a future build with a third material, and a
+    half-flushed autosave.
+    """
+    if not isinstance(state, dict):
+        return
+    if "material" in state:
+        raw = state.get("material")
+        mat = raw.strip().lower() if isinstance(raw, str) else ""
+        if mat in HUT_MATERIALS:
+            # Store the canonical spelling so the value the renderer strips and
+            # the value `material()` compares are the same string on disk too.
+            state["material"] = mat
+        else:
+            # POP rather than coerce to "wood": absent and "wood" mean the same
+            # thing everywhere, and popping stops a hand-edited save
+            # round-tripping its garbage back out to disk forever.
+            state.pop("material", None)
+    up = state.get("upgrade")
+    if not isinstance(up, dict) or kind != "hut":
+        # Only a hut can be re-walled. Anything else carrying the key is a
+        # corrupt save; drop it rather than let a grave report is_upgrading.
+        state.pop("upgrade", None)
+        return
+    to = up.get("to")
+    to = to.strip().lower() if isinstance(to, str) else ""
+    clean: dict[str, Any] = {"to": to if to in HUT_MATERIALS else "stone"}
+    delivered: dict[str, int] = {}
+    raw_delivered = up.get("delivered")
+    if isinstance(raw_delivered, dict):
+        for res, qty in raw_delivered.items():
+            # Only resources the upgrade actually charges for: a save claiming
+            # 40 delivered fibre must not make upgrade_missing() look satisfied.
+            if not isinstance(res, str) or res not in HUT_UPGRADE_COST:
+                continue
+            if isinstance(qty, bool) or not isinstance(qty, (int, float)):
+                continue
+            try:
+                fq = float(qty)
+            except (TypeError, ValueError):
+                continue
+            # isfinite before int(): int(inf) raises OverflowError, which is not
+            # in the (TypeError, ValueError) every other loader here catches.
+            if not math.isfinite(fq) or fq <= 0.0:
+                continue
+            delivered[res] = min(int(fq), int(HUT_UPGRADE_COST[res]))
+    clean["delivered"] = delivered
+    prog = up.get("progress")
+    p = 0.0
+    if isinstance(prog, (int, float)) and not isinstance(prog, bool):
+        try:
+            fp = float(prog)
+        except (TypeError, ValueError):
+            fp = 0.0
+        if math.isfinite(fp):
+            p = _clamp01(fp)
+    clean["progress"] = p
+    # When the job opened, in world seconds. The director ages an unclaimed job
+    # off this, so a junk or missing value must not make a job read as infinitely
+    # patient (which would let it outrank real work forever) - anything
+    # unreadable is dropped, and a dropped stamp reads as "opened just now",
+    # the conservative end.
+    opened = up.get("opened")
+    if isinstance(opened, (int, float)) and not isinstance(opened, bool):
+        try:
+            fo = float(opened)
+        except (TypeError, ValueError):
+            fo = float("nan")
+        if math.isfinite(fo) and fo >= 0.0:
+            clean["opened"] = fo
+    state["upgrade"] = clean
 
 
 # ---------------------------------------------------------------- registry --
@@ -1617,6 +1936,55 @@ if __name__ == "__main__":  # pragma: no cover - smoke test
         h.update(1.0, w)
     print(f"  ruined hut: scale {grown_scale:.3f} -> {h.scale():.3f}"
           f" growth {h.growth:.3f} standing_t {h.standing_t:.1f}")
+
+    # --------------------------------------------------- stone hut upgrade --
+    print("hut upgrade:")
+    up_hut = w.structures.create("hut", 560.0, w.terrain.ground_y(560.0), built=True)
+    up_hut.enter(41)
+    up_hut.enter(42)
+    before_id, before_occ, before_cap = up_hut.id, list(up_hut.occupants), up_hut.capacity()
+    print(f"  timber: material={up_hut.material()} can_upgrade={up_hut.can_upgrade()}"
+          f" cost={up_hut.upgrade_cost()} missing={up_hut.upgrade_missing()}")
+    print("  start:", up_hut.start_upgrade(), "missing now", up_hut.upgrade_missing(),
+          f"built={up_hut.built} stage={up_hut.stage} occ={up_hut.occupants}"
+          f" cap={up_hut.capacity()}")
+    print("  work with no stone on site advances nothing:",
+          up_hut.advance_upgrade(5.0), up_hut.upgrade_completion())
+    print("  deliver 4 then 20 ->", up_hut.deliver_upgrade(RES_STONE, 4),
+          up_hut.deliver_upgrade(RES_STONE, 20), "delivered", up_hut.upgrade_delivered())
+    ticks = 0
+    while up_hut.is_upgrading and ticks < 2000:
+        ticks += 1
+        up_hut.advance_upgrade(1.0 / 30.0)
+        if ticks == 200:   # mid-upgrade save, reloaded mid-upgrade
+            mid = Structure.from_dict(up_hut.to_dict())
+            print(f"  mid-upgrade save at {up_hut.upgrade_completion():.3f}"
+                  f" -> reloads upgrading={mid.is_upgrading}"
+                  f" at {mid.upgrade_completion():.3f}"
+                  f" delivered={mid.upgrade_delivered()} occ={mid.occupants}")
+    print(f"  finished in {ticks / 30.0:.1f}s: material={up_hut.material()}"
+          f" hp={up_hut.hp:.0f}/{up_hut.max_hp:.0f} upgrading={up_hut.is_upgrading}"
+          f" id kept={up_hut.id == before_id} occ kept={up_hut.occupants == before_occ}"
+          f" cap {before_cap}->{up_hut.capacity()} built={up_hut.built}")
+    print("  stone hut refuses to catch:", up_hut.ignite(), "burning", up_hut.is_burning)
+    print("  cannot upgrade twice:", up_hut.can_upgrade(), up_hut.start_upgrade())
+    stone_back = Structure.from_dict(up_hut.to_dict())
+    print("  round trip:", stone_back.material(), "max_hp", stone_back.max_hp)
+    # A pre-tier save has no `material` key at all and must load as timber.
+    pre = up_hut.to_dict()
+    pre["state"] = {k: v for k, v in pre["state"].items() if k != "material"}
+    print("  pre-tier save:", Structure.from_dict(pre).material(),
+          "state", Structure.from_dict(pre).state.get("material"))
+    junk = Structure.from_dict({
+        "kind": "hut", "built": True, "state": {
+            "material": "  STONE ",
+            "upgrade": {"to": "sponge", "delivered": {"fibre": 40, "stone": 1e9},
+                        "progress": float("nan")},
+        },
+    })
+    print("  junk save ->", junk.material(), junk.state.get("upgrade"))
+    print("  upgrade on rubble dropped:", Structure.from_dict(
+        {"kind": "hut", "built": False, "state": {"upgrade": {"to": "stone"}}}).is_upgrading)
 
     # persistence
     w.stockpile[RES_WOOD] = 60

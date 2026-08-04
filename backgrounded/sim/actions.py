@@ -123,7 +123,7 @@ ACTION_KINDS: tuple[str, ...] = (
     "BuildStructure", "RepairStructure", "Eat", "Sleep", "WarmAtFire",
     "CookFood", "PlantSapling", "Farm", "Mine", "Converse", "Celebrate",
     "Mourn", "FleeFrom", "ClimbTo", "Lookout", "FollowParent", "Panic",
-    "CleanLitter",
+    "CleanLitter", "UpgradeStructure",
 )
 
 _TREE_KINDS = ("tree", "pine", "oak", "deadtree")
@@ -1761,6 +1761,132 @@ def _h_build(a: Action, ag: Any, w: Any, dt: float) -> None:
     a.phase = "fetch"
 
 
+def _h_upgrade(a: Action, ag: Any, w: Any, dt: float) -> None:
+    """Re-wall a standing timber hut in stone. Same machine as `_h_build`.
+
+    Structurally identical to `_h_build` - fetch, approach, work - against the
+    upgrade half of the Structure API instead of the build half. It is a
+    separate handler rather than a branch inside `_h_build` because `_h_build`
+    sets ``a.done`` the instant ``s.built`` is True, and a hut being upgraded is
+    built the whole time: folding this in would have meant a flag threaded
+    through every early return in there, on a hot path, for one job.
+
+    Nothing is claimed and nothing is reserved, so there is no `_CLEANUP` entry
+    for this kind. An abandoned upgrade leaves the delivered stone in the hut
+    and the job open, exactly as an abandoned build leaves a site standing; the
+    director hands it straight back out on its next pass.
+    """
+    s = structure_by_id(w, a.target)
+    if s is None:
+        # A reloaded action, or one whose target was collapsed and rebuilt under
+        # it. The director's published job is the authority on which hut is
+        # being re-walled, so re-read it rather than failing.
+        job = getattr(w, "upgrade_job", None)
+        if isinstance(job, dict) and job.get("id") is not None:
+            a.target = job.get("id")
+            s = structure_by_id(w, a.target)
+    if s is None or getattr(s, "is_ruined", False):
+        a.failed = True
+        return
+    if not s.is_upgrading:
+        # Somebody else laid the last course, or the hut collapsed and
+        # `collapse()` dropped the job. Either way this is finished work, not
+        # failed work - failing it would cost the agent the hysteresis bonus and
+        # look like a botched job in the debug view.
+        a.done = True
+        return
+
+    need = s.upgrade_missing()
+    carrying = getattr(ag, "carrying", None)
+    carry_qty = int(getattr(ag, "carry_qty", 0) or 0)
+
+    if not need:
+        a.phase = "work"
+    elif carrying in need and carry_qty > 0:
+        a.phase = "approach"
+    elif _has_load(ag, a) and _load_is_useful(ag, a, need):
+        # The stash arm, and it is not optional. Routing on the hand alone
+        # deadlocks the moment a villager fetches stone with wood already
+        # shouldered: `_carry_add` puts the stone in the action's stash, the
+        # hand still holds wood, the top of the next tick re-routes to "fetch",
+        # and he walks back and draws *another* armful of stone out of the
+        # stockpile. Unbounded, once per pass. Same failure `_h_build` records
+        # above; same fix.
+        a.phase = "approach"
+    else:
+        a.phase = "fetch"
+
+    if a.phase == "fetch":
+        want_res, want_qty = None, 0
+        for res, qty in sorted(need.items(), key=lambda kv: -kv[1]):
+            have = stock_qty(w, res)
+            if have > 0:
+                want_res, want_qty = res, min(qty, have, CARRY_CAP)
+                break
+        if want_res is None:
+            a.data["short"] = {k: int(v) for k, v in need.items()}
+            a.failed = True
+            return
+        sp = nearest_structure(w, "stockpile", ag.x, built_only=True)
+        tx = sp.x if sp is not None else colony_center(w)
+        a.pose = "walk"
+        rem = step_toward(ag, w, tx, dt)
+        if rem <= REACH:
+            got = stock_take(w, want_res, want_qty)
+            if got <= 0:
+                a.failed = True
+                return
+            _carry_add(ag, a, want_res, got)
+            a.phase = "approach"
+        elif a.t > 90.0:
+            a.failed = True
+        return
+
+    if a.phase == "approach":
+        a.pose = "carry"
+        rem = step_toward(ag, w, float(s.x), dt, speed=WALK_SPEED * 0.92)
+        if rem <= REACH * 1.6:
+            res = getattr(ag, "carrying", None)
+            qty = int(getattr(ag, "carry_qty", 0) or 0)
+            if res and qty > 0:
+                took = s.deliver_upgrade(res, qty)
+                left = qty - took
+                ag.carry_qty = left
+                if left <= 0:
+                    ag.carrying = None
+            stash = a.data.get("stash")
+            if isinstance(stash, dict):
+                for r, q in list(stash.items()):
+                    took = s.deliver_upgrade(str(r), int(q))
+                    stash[r] = int(q) - took
+                    if stash[r] <= 0:
+                        stash.pop(r, None)
+            a.phase = "work" if not s.upgrade_missing() else "fetch"
+        elif a.t > 120.0:
+            a.failed = True
+        return
+
+    if a.phase == "work":
+        a.pose = "build"        # an existing pose; the tier adds no render work
+        _halt(ag)
+        _face(ag, float(s.x) - float(ag.x))
+        _adjust(ag, "fatigue", 0.012 * dt)
+        completed = s.advance_upgrade(dt, _work_rate(ag))
+        if completed:
+            name = getattr(ag, "name", "Someone")
+            chronicle(w, f"{name} re-walled the hut in stone.")
+            # "hut", not "hut_stone": the celebration table is keyed on sim
+            # kinds, and the sim kind never changes - only state["material"].
+            push_celebration(w, float(s.x), float(s.y), "hut")
+            _adjust(ag, "morale", 0.18)
+            a.done = True
+        elif s.upgrade_missing():
+            a.phase = "fetch"
+        return
+
+    a.phase = "fetch"
+
+
 def _h_repair(a: Action, ag: Any, w: Any, dt: float) -> None:
     s = structure_by_id(w, a.target)
     if s is None:
@@ -3130,6 +3256,7 @@ _HANDLERS: dict[str, Callable[[Action, Any, Any, float], None]] = {
     "ForageBerries": _h_gather,
     "HaulToStockpile": _h_haul,
     "BuildStructure": _h_build,
+    "UpgradeStructure": _h_upgrade,
     "RepairStructure": _h_repair,
     "Eat": _h_eat,
     "Sleep": _h_sleep,

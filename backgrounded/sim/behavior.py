@@ -84,6 +84,7 @@ from .actions import (
 from .entities import GRAVITY
 from .structures import (
     CROSSING_KINDS,
+    HUT_UPGRADE_COST,
     Structure,
     StructureRegistry,
     plan_ladder,
@@ -98,6 +99,8 @@ __all__ = [
     "update_director",
     "assign_roles",
     "next_build_kind",
+    "stone_surplus",
+    "pick_hut_upgrade",
     "find_chasm",
     "find_cutoff",
     "plan_crossing",
@@ -375,6 +378,38 @@ KIND_PRIORITY: dict[str, float] = {
     "totem": 0.40,
 }
 
+#: The stone-hut upgrade's weight, and the ceiling on how much any villager
+#: wants to do it. Both numbers exist to keep the tier a luxury.
+#:
+#: 0.30 is deliberately *below* the totem (0.40), the least urgent thing the
+#: colony ever queues: re-walling a hut that already keeps the rain off must
+#: lose to food, warmth, sleep, and to raising a hut that does not exist yet.
+#: This project has already shipped a bug where a cleanup job outranked shelter
+#: and the colony froze; an upgrade is a strictly more optional job than that.
+#:
+#: The appetite is a hard multiplicative cap rather than a tuning knob: even a
+#: builder (build affinity 1.00) standing in a stockpile full of stone scores
+#: this at most 0.45, comfortably under Eat/Sleep/WarmAtFire at any real need
+#: and under BuildStructure for every kind above `totem`. Capping the score is
+#: what makes that structural rather than merely true at today's numbers - the
+#: CLEANUP_SCORE_MAX precedent.
+HUT_UPGRADE_PRIORITY = 0.30   # below the totem (0.40), the lowest thing queued
+HUT_UPGRADE_APPETITE = 0.45   # ceiling on the UpgradeStructure utility score
+
+#: ...and the ceiling an unclaimed job climbs to, over
+#: :data:`HUT_UPGRADE_PATIENCE_SEC` of nobody picking it up. 0.72 is chosen
+#: against the two scores it has to sit between: Celebrate is 0.82*morale + 0.18,
+#: so 0.72 clears it up to morale 0.66 (the pooled colony mean is ~0.50 and the
+#: tier unlocks at 0.55, so that covers the ordinary case and deliberately not a
+#: euphoric colony - a settlement having the best day of its life is allowed to
+#: keep dancing). Hunger, fatigue and cold all climb past 0.72 well before they
+#: are dangerous, so an agent who actually needs something still goes and gets it.
+HUT_UPGRADE_APPETITE_MAX = 0.72
+#: Seconds of going unclaimed before a job reaches that ceiling. Long enough
+#: that a colony with real work to do is never diverted by a fresh job, short
+#: enough that the measured 6573 s worst-case wait cannot recur.
+HUT_UPGRADE_PATIENCE_SEC = 480.0
+
 _COLD_SCENES = (SCENE_BLIZZARD, SCENE_NIGHT_STORM)
 _TREE_KINDS = ("tree", "pine", "oak")
 _STONE_KINDS = ("rock", "boulder", "stone", "outcrop")
@@ -526,6 +561,48 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
         )
     else:
         s["BuildStructure"] = 0.0
+
+    # --------------------------------------------------------- upgrade ------
+    # Re-walling a standing hut in stone. Its own channel, never the build
+    # queue: `score_actions` only ever looks at queue[0], and an upgrade at
+    # priority 0.30 would sort to the back of it and never be seen (and
+    # `_h_build` would finish instantly on a hut that is already built).
+    #
+    # No `unmet` term and no priority weighting - the ceiling does not climb as
+    # the job nears completion. That is on purpose: this is the least important
+    # job in the colony and it should stay the least important job right up to
+    # the last hammer blow.
+    #
+    # It does climb with how long the job has gone UNCLAIMED, which is a
+    # different thing and fixes a measured priority inversion. At the flat 0.45
+    # ceiling the upgrade won 403 of 59779 scored samples - 0.7% - and the
+    # second most common thing beating it was Celebrate, at 17.1%. Celebrate
+    # scores 0.82*morale + 0.18, so at the tier's own unlock threshold of 0.55
+    # morale it sits at 0.63 and the upgrade could never win: the colony earns
+    # masonry by being happy, and being happy is exactly what makes them dance
+    # instead of doing the work they just unlocked. Measured lag from a job
+    # opening to a stone hut standing ran 59 s on the best seed and 6573 s on
+    # the worst, so the chronicle announced the tier and the player then watched
+    # nothing happen for an hour and a half.
+    #
+    # Raising the flat ceiling over Celebrate would also raise it over hungry
+    # and tired agents, which is the wrong trade. Ageing the job leaves the
+    # normal priority alone and only bounds the wait.
+    job = getattr(world, "upgrade_job", None)
+    if isinstance(job, dict) and reg is not None:
+        avail = _availability(world, job.get("needs") or {})
+        opened = job.get("opened")
+        if isinstance(opened, (int, float)) and not isinstance(opened, bool):
+            age = max(0.0, float(getattr(world, "world_time", 0.0)) - float(opened))
+        else:
+            age = 0.0
+        patience = _clamp01(age / max(1.0, HUT_UPGRADE_PATIENCE_SEC))
+        ceiling = (HUT_UPGRADE_APPETITE
+                   + (HUT_UPGRADE_APPETITE_MAX - HUT_UPGRADE_APPETITE) * patience)
+        s["UpgradeStructure"] = _clamp01(
+            aff["build"] * ceiling * (0.28 + 0.72 * avail))
+    else:
+        s["UpgradeStructure"] = 0.0
 
     # ---------------------------------------------------------- repair ------
     s["RepairStructure"] = 0.0
@@ -1067,6 +1144,24 @@ def _mk_build(agent: Any, world: Any) -> Action | None:
     return make_action("BuildStructure", target=pick.get("id"))
 
 
+def _mk_upgrade(agent: Any, world: Any) -> Action | None:
+    """Target the hut the director published, or nothing at all.
+
+    Returning None when there is no job follows `_mk_clean`: a stale score can
+    then never launch an action with no premise, so the villager drops straight
+    through to the next-best thing instead of spending a decision cycle on a
+    job that fails on its first update. `_h_upgrade` still re-reads the job id
+    itself, for the action that was serialised and reloaded.
+    """
+    job = getattr(world, "upgrade_job", None)
+    if not isinstance(job, dict):
+        return None
+    sid = job.get("id")
+    if sid is None:
+        return None
+    return make_action("UpgradeStructure", target=sid)
+
+
 def _mk_repair(agent: Any, world: Any) -> Action | None:
     reg = structures_of(world)
     if reg is None:
@@ -1163,6 +1258,7 @@ _MAKERS: dict[str, Callable[[Any, Any], Action | None]] = {
     "WarmAtFire": _mk_warm,
     "CookFood": _mk_cook,
     "BuildStructure": _mk_build,
+    "UpgradeStructure": _mk_upgrade,
     "RepairStructure": _mk_repair,
     "Converse": _mk_converse,
     "Celebrate": _mk_celebrate,
@@ -1352,6 +1448,15 @@ def update_director(world: Any, dt: float) -> None:
         log.debug("site selection failed", exc_info=True)
 
     try:
+        _stake_upgrade(world, reg)
+    except Exception:
+        log.debug("upgrade selection failed", exc_info=True)
+        try:
+            world.upgrade_job = None
+        except Exception:
+            pass
+
+    try:
         queue: list[dict[str, Any]] = []
         for s in reg.incomplete():
             queue.append({
@@ -1375,6 +1480,23 @@ def update_director(world: Any, dt: float) -> None:
             deficit = qty - stock_qty(world, res)
             if deficit > 0:
                 short[res] = deficit
+
+        # The upgrade's shortfall is folded in AFTER the build queue's, and with
+        # max() rather than +=. `_gather_urgency` reads this dict, so this is
+        # what sends somebody to the quarry for the last two stone an upgrade
+        # wants when nothing else needs any. max() is the point: an ordinary
+        # build's stone need is always the larger number and so always the one
+        # that survives, and an upgrade can never inflate a real build's
+        # shortfall into a bigger emergency than it is.
+        job = getattr(world, "upgrade_job", None)
+        if isinstance(job, dict):
+            for res, qty in (job.get("needs") or {}).items():
+                try:
+                    deficit = int(qty) - stock_qty(world, str(res))
+                except (TypeError, ValueError):
+                    continue
+                if deficit > 0:
+                    short[str(res)] = max(short.get(str(res), 0), deficit)
         _publish(world, queue, short)
     except Exception:
         log.debug("build queue update failed", exc_info=True)
@@ -1486,6 +1608,131 @@ def _stake_out_site(world: Any, reg: StructureRegistry) -> None:
     s = reg.create(kind, x, y, rng=rng_of(world), state=extra or None)
     chronicle(world, _stake_line(world, kind))
     log.debug("director staked %s at %.0f", kind, x)
+
+
+# ===========================================================================
+#  Stone-hut upgrades
+# ===========================================================================
+def stone_surplus(world: Any, reg: StructureRegistry | None = None) -> int:
+    """Stone in the store that nothing else already has a claim on.
+
+    This one subtraction is the whole reason the stone-hut tier cannot starve a
+    real build. The upgrade is paid for out of what is left over *after* every
+    incomplete site and every other in-flight upgrade has been costed, so an
+    upgrade is only ever affordable when the firepit/hut/barricade line is not
+    waiting on stone - even though re-walling one hut costs 2.5x a whole timber
+    hut's stone.
+
+    It is also why the gate is a surplus rather than a stone *target*: a target
+    would be a work order. Working poses multiply hunger 1.6x and fatigue 1.5x
+    (entities.py), and morale targets 1 - max(hunger, fatigue, warmth), so
+    sending the colony to the quarry to afford the upgrade would lower the very
+    morale that opens the tier. A surplus is passive; it is noticed, not chased.
+
+    Returns the raw int, which may be negative when the queue is over-committed.
+    """
+    try:
+        have = int(stock_qty(world, RES_STONE))
+    except (TypeError, ValueError):
+        return 0
+    reg = reg if reg is not None else structures_of(world)
+    if reg is None:
+        return have
+    owed = 0
+    try:
+        for s in reg.incomplete():
+            owed += int(s.total_remaining_cost().get(RES_STONE, 0))
+        for s in reg.all():
+            if s.is_upgrading:
+                owed += int(s.upgrade_missing().get(RES_STONE, 0))
+    except Exception:
+        log.debug("stone_surplus accounting failed", exc_info=True)
+        return 0
+    return have - owed
+
+
+def pick_hut_upgrade(
+    world: Any, reg: StructureRegistry | None = None
+) -> Structure | None:
+    """The one hut the colony should be re-walling in stone, or None.
+
+    The step order below is load-bearing, and step 2 in particular:
+
+    * Resuming an in-flight job is checked FIRST, ahead of both the tier latch
+      and the affordability test. If the surplus check came first, a stockpile
+      that dipped below the price mid-job would drop `world.upgrade_job` to
+      None, `score_actions` would zero UpgradeStructure, and the builder would
+      wander off a half-delivered upgrade that nothing would ever pick back up.
+      Checking it first also means a save taken mid-upgrade always resumes.
+    * Concurrency is 1, colony-wide. Two half-re-walled huts is worse reading
+      than one finished one, and it keeps the stone accounting to a single job.
+
+    No RNG is consulted anywhere here, so which hut goes to stone is
+    reproducible from the seed.
+    """
+    reg = reg if reg is not None else structures_of(world)
+    if reg is None:
+        return None
+    try:
+        for s in reg.all():
+            if s.is_upgrading:
+                return s                      # 2. resume, always
+        if not getattr(world, "hut_tier_unlocked", False):
+            return None                       # 3. the tier is not learned yet
+        cands = [s for s in reg.all() if s.can_upgrade()]
+        if not cands:
+            return None
+        if stone_surplus(world, reg) < sum(HUT_UPGRADE_COST.values()):
+            return None
+        # The oldest hut standing turns to stone first: the founding house being
+        # rebuilt, which reads as the settlement returning to its own origin
+        # rather than as a random hut changing colour. Tie-broken on the lowest
+        # id so two huts raised in the same tick still order deterministically.
+        return max(cands, key=lambda s: (s.standing_t, -s.id))
+    except Exception:
+        log.debug("pick_hut_upgrade failed", exc_info=True)
+        return None
+
+
+def _stake_upgrade(world: Any, reg: StructureRegistry) -> None:
+    """Publish `world.upgrade_job` - the upgrade's equivalent of a build site.
+
+    Deliberately NOT an entry in ``world.build_queue``. That is the obvious
+    implementation and it fails silently: `score_actions` reads ``queue[0]``
+    only, so a 0.30-priority upgrade sorted to the back would never be scored,
+    and `_h_build` sets ``a.done`` the instant ``s.built`` is True - which an
+    upgrading hut always is - so a builder who did reach it would burn an AI
+    tick per pass doing nothing. Its own channel and its own action kind is what
+    makes the tier actually run.
+
+    `world.upgrade_job` is derived state, rebuilt from scratch on every director
+    pass and never persisted. The truth lives in ``Structure.state["upgrade"]``;
+    a saved copy would be a second source of truth that can disagree with the
+    first.
+    """
+    s = pick_hut_upgrade(world, reg)
+    if s is None:
+        world.upgrade_job = None
+        return
+    if not s.is_upgrading:
+        s.start_upgrade(float(getattr(world, "world_time", 0.0)))
+        # Only on the frame the job actually opens - never on the resume path,
+        # or a reload would re-announce an upgrade the colony started an hour
+        # ago and the chronicle would read as a stutter.
+        chronicle(world, "They have stone enough to re-wall the hut.")
+    up = s.state.get("upgrade") or {}
+    world.upgrade_job = {
+        "id": int(s.id),
+        "kind": "hut",
+        "x": float(s.x),
+        "y": float(s.y),
+        "completion": float(s.upgrade_completion()),
+        "priority": HUT_UPGRADE_PRIORITY,
+        "needs": {k: int(v) for k, v in s.upgrade_missing().items()},
+        # Carried through from the structure, which is the only copy that
+        # survives a reload - this dict is rebuilt every director pass.
+        "opened": up.get("opened"),
+    }
 
 
 #: Why a crossing is going up, in the chronicle's voice. Keyed by the reason

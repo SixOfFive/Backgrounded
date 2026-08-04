@@ -326,6 +326,28 @@ MORALE_TO_GROW = 0.45
 #: Sleeping space gates growth too: roughly this many people per finished hut.
 POP_PER_HUT = 3
 
+# ----------------------------------------------------------- hut tier ------
+#: The colony earns masonry by being *content*, not by hitting a resource
+#: target - see World._tick_hut_tier. Colony morale here is the mean over the
+#: living, the same number MORALE_TO_GROW above is compared against, so the two
+#: gates cannot drift apart.
+#:
+#: Both values were measured over 26 seeds x 50 sim-min, sampling colony mean
+#: morale once per sim-second. Pooled mean morale is 0.496, so 0.55 sits a
+#: little above typical: 21/26 colonies unlock, earliest at 15.0 min, median
+#: 24.2 min, and the five that never do miss by only 7-65 s of dwell. 0.60 is a
+#: stretch nobody sustains (the longest run above it has a median of 143 s,
+#: shorter than any usable dwell) and 0.65 unlocked 1 seed in 16 - dead code.
+HUT_TIER_MORALE = 0.55          # colony-mean morale that counts as "content"
+#: ...and it must be SUSTAINED, unbroken, for this long. The dwell is what
+#: stops the opening honeymoon from handing the tier over for free: agents spawn
+#: at morale 0.6 with every need at zero, so colony mean stays above 0.55 for the
+#: first 47-132 s of every seed measured. 180 s clears the worst observed
+#: honeymoon by 48 s; 150 s clears it by 18 s, which is too thin a margin to
+#: trust on a seed nobody sampled. Anything at or under ~140 s fires in the first
+#: two minutes regardless of threshold - that was measured too, and rejected.
+HUT_TIER_DWELL_SEC = 180.0      # seconds it must be sustained, unbroken
+
 # ---------------------------------------------------------- hut growth ------
 #: A hut is not a fixed object. It grows with the time it has stood and with
 #: how well stocked the colony is, so a long-lived, well-fed camp visibly
