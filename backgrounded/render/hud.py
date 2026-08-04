@@ -816,8 +816,20 @@ def _build(world, show_roster: bool) -> tuple[pygame.Surface, list]:
     y += LINE
 
     if ufo_line:
-        panel.blit(_text(f"taken {taken}" + (f", back {back}" if back else ""),
-                         DIM, 11), (PAD, y))
+        ufo_text = f"taken {taken}" + (f", back {back}" if back else "")
+        ut = _text(ufo_text, DIM, 11)
+        panel.blit(ut, (PAD, y))
+        # The one row that arrived without a hover zone, because the line and
+        # the zones were written on separate branches. It needs one more than
+        # most: "taken 2" is the panel's only counter that is neither a death
+        # nor a birth, and the tooltip is where that can actually be said.
+        zones.append((pygame.Rect(PAD, y, max(ut.get_width(), 40), LINE),
+                      "Taken by the lights",
+                      (f"{taken} lifted away by the ufo",
+                       f"{back} of them put back",
+                       "",
+                       "not counted among the dead - they leave no grave, "
+                       "and some come home")))
         y += LINE
 
     sp = world.stockpile

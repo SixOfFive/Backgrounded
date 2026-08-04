@@ -106,14 +106,39 @@ class World:
         # long run could be trusted. Same offset trick as above.
         self.ufo: Ufo = Ufo(seed=self.seed ^ 0x71F)
 
-        # Colony-level state
+        self._init_colony_state()
+        self._seed_population()
+
+    def _init_colony_state(self) -> None:
+        """Colony-level defaults, for a fresh world *and* a loaded one.
+
+        Called by ``__init__`` and by ``from_dict``, and that is the entire
+        reason it exists as a method. ``from_dict`` builds with
+        ``cls.__new__(cls)``, so it never runs ``__init__`` and a field set only
+        there is simply absent on every loaded world. The failure is close to
+        silent: subsystem ticks run behind ``_guarded``, so the AttributeError
+        is caught, logged once to a file nobody is watching, and the subsystem
+        is switched off for the rest of the session.
+
+        ``auto_scene_rotate`` went exactly that way - added to ``__init__``
+        only, which killed the scene subsystem on every reloaded world and took
+        the 10-minute rotation and the harvest-claim sweep down with it. That
+        instance was fixed by adding one line to ``from_dict``; this is the fix
+        for the next one, because a default added here now reaches both paths
+        whether or not anyone remembers the second.
+
+        ``from_dict`` calls this BEFORE reading the save, then overwrites what
+        the save actually carries - so these are defaults, not a reset.
+        """
         self.auto_scene_rotate: bool = True     # flip scene every SCENE_ROTATE_SEC
         self.stockpile: dict[str, int] = {r: 0 for r in ALL_RESOURCES}
         self.build_queue: list[str] = []
         self.chronicle: deque[str] = deque(maxlen=CHRONICLE_MAX)
         self.stats: dict[str, int] = dict(STAT_DEFAULTS)
 
-        # Subsystems that have failed and been disabled this session.
+        # Subsystems that have failed and been disabled this session. Never
+        # carried across a load: a subsystem that died in a previous session
+        # deserves a fresh start in this one.
         self._disabled: set[str] = set()
 
         # Things the player's Hand tool is currently carrying, by id. Transient
@@ -121,8 +146,6 @@ class World:
         # held and no one can end up frozen in the air across a restart.
         self.held_agent_ids: set[int] = set()
         self.held_prop_ids: set[int] = set()
-
-        self._seed_population()
 
     # ------------------------------------------------------------ startup --
     def _pick_style(self) -> str:
@@ -741,16 +764,13 @@ class World:
         w.pyrng = random.Random(w.seed ^ 0x5EED)
         w.world_time = float(d.get("world_time", 0.0))
         w.tick_count = int(d.get("tick_count", 0))
-        w._disabled = set()
-        w.held_agent_ids = set()
-        w.held_prop_ids = set()
-        # from_dict builds the instance with __new__, so anything set only in
-        # __init__ is simply absent here. Leaving this one out meant every
-        # *reloaded* world raised AttributeError on its first _tick_scene and -
-        # because subsystem ticks are fail-soft - silently disabled the "scene"
-        # subsystem for the rest of the session, killing both the 10-minute
-        # scene rotation and the harvest-claim sweep. Persisted so a user who
-        # turns rotation off keeps it off across a restart.
+        # Every colony-level default, in one call shared with __init__, so a
+        # field can no longer exist on a fresh world and be missing on a loaded
+        # one. See _init_colony_state for what that cost last time. Saved values
+        # go over the top of these below.
+        w._init_colony_state()
+        # Persisted so a user who turns rotation off keeps it off across a
+        # restart; the default above is what an older save falls back to.
         w.auto_scene_rotate = bool(d.get("auto_scene_rotate", True))
 
         def _sub(key, loader, fallback):
