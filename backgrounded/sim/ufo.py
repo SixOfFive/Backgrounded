@@ -17,6 +17,28 @@ gravestone. They are remembered in :attr:`Ufo.abducted`, and a later cycle may
 bring one back (``UFO_RETURN_CHANCE``) with their original name, colour and
 generation intact - dazed, but home.
 
+Keeping the books
+-----------------
+Precisely because no death hook fires, the roster change has to be booked by
+hand or the colony's headcount stops adding up - and it did: a run that lost
+somebody to the lights reported one fewer survivor with no death to explain it,
+which made whatever scene or terrain was under test look more lethal than it
+was. Exactly two lines do the booking, and both sit on the line where the
+roster itself changes:
+
+* :meth:`Ufo._complete_abduction` books ``world.stats["abducted"]`` where
+  ``population.remove()`` succeeds, and
+* :meth:`Ufo._materialise` books ``world.stats["returned"]`` where
+  ``population.add()`` succeeds - *not* when the delivery beam finishes, which
+  is ``UFO_BEAM_SEC`` later and may never happen at all.
+
+``World.reconcile()`` is the invariant those two keep::
+
+    births + returned - deaths - abducted - alive == 0
+
+Neither counter is a death and neither must ever be folded into one: an
+abductee has no grave, and a quarter of them walk back out of the beam.
+
 Holding the victim
 ------------------
 An agent under the beam must not walk away. Every tick of ``beam``/``return``
@@ -483,11 +505,21 @@ class Ufo:
             self._go_depart()
             return
 
-        self.abducted.append(rec)
-        if len(self.abducted) > MAX_ABDUCTED:
-            del self.abducted[: len(self.abducted) - MAX_ABDUCTED]
+        # Booked on the line the roster changed, and only once the removal is
+        # known to have succeeded. There is no death hook on this path by
+        # design, so if this increment is not here then nothing anywhere
+        # records that a living person left and the colony simply reads as
+        # having lost someone to nothing at all.
         self.taken_count += 1
         _bump(world, "abducted")
+
+        self.abducted.append(rec)
+        if len(self.abducted) > MAX_ABDUCTED:
+            # The oldest record falls off the end: that one is never coming
+            # back. It stays counted as abducted and is never counted as
+            # returned, which is exactly right - the books still balance, the
+            # person is just permanently gone.
+            del self.abducted[: len(self.abducted) - MAX_ABDUCTED]
         _chronicle(world, f"{name} is taken by the lights.")
         self._keep_colony_up(world)
         self._go_depart()
@@ -646,6 +678,23 @@ class Ufo:
         except Exception:
             pass
         self.target_id = _i(agent.id, 0)
+
+        # Book the return HERE, on the line the roster changed, not in
+        # _complete_return UFO_BEAM_SEC later. add() above put a living agent
+        # back among the living; counting it at the end of the beam left a
+        # 4.5s window in which somebody was alive and accounted for by nothing,
+        # so any save or measurement taken inside it read one head over. Worse,
+        # a delivery that aborts inside that window - the returnee dies
+        # mid-beam, or _tick_deliver loses them - never reached the old
+        # increment at all, and the books stayed permanently one short. Mirror
+        # of _complete_abduction booking "abducted" where remove() succeeds.
+        #
+        # Chronicled here for the same reason: the line has to be as
+        # unloseable as the count, or somebody reappears in the world with the
+        # log saying nothing about where they came from.
+        self.returned_count += 1
+        _bump(world, "returned")
+        _chronicle(world, f"The lights give {agent.name} back, dazed.")
         return True
 
     def _pending_record(self) -> dict[str, Any] | None:
@@ -691,10 +740,11 @@ class Ufo:
         except Exception:
             log.debug("could not daze %s", name, exc_info=True)
 
+        # Counted and chronicled back in _materialise, on the line that put
+        # them on the roster. Doing either again here would double-book one
+        # return and leave the books reading a head over - and this method is
+        # the half of the delivery that is allowed not to happen.
         self._forget(self.target_id)
-        self.returned_count += 1
-        _bump(world, "returned")
-        _chronicle(world, f"{name} is set down again, dazed.")
         self._go_depart()
 
     def _forget(self, aid: Any) -> None:

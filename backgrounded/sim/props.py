@@ -55,6 +55,7 @@ Call shapes without a world (``reg.tick(terrain, rng, dt)``) simply use 1.0.
 from __future__ import annotations
 
 import math
+import zlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Iterator
 
@@ -230,6 +231,20 @@ _CROSS_KIND = 0.55
 
 
 # ------------------------------------------------------------------ helpers --
+
+
+def _name_variant(name: object) -> int:
+    """A stable per-name variant, in 0..0xFFFF.
+
+    crc32 rather than hash(): CPython salts str hashing per process, so
+    ``hash("Vessa")`` differs on every launch. Using it for a headstone's shape
+    meant the same seed produced a different grave each run - measured
+    26436 / 11962 / 12501 for one name across three processes - so a save
+    diverged byte-for-byte the moment anybody died, and a headstone standing all
+    evening changed shape across a restart. A seeded run has to be reproducible;
+    hash() of a str never is.
+    """
+    return zlib.crc32(str(name).encode("utf-8", "replace")) & 0xFFFF
 
 
 def _f(v: object, default: float = 0.0) -> float:
@@ -612,7 +627,7 @@ class PropRegistry:
             KIND_GRAVE,
             x,
             y,
-            variant=abs(hash(str(name))) & 0xFFFF,
+            variant=_name_variant(name),
             state={"name": str(name), "generation": _i(generation, 0), "age": 0.0},
         )
 
@@ -831,7 +846,7 @@ def place_grave(
         px,
         terrain.ground_y(px),
         scale=1.0,
-        variant=abs(hash(str(name))) & 0xFFFF,
+        variant=_name_variant(name),
         state={"name": str(name), "generation": _i(generation, 0), "age": 0.0},
     )
 

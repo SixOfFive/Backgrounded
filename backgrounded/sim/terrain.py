@@ -156,6 +156,41 @@ _SLOPE_HALF: float = SLOPE_SPAN * 0.5
 #: |slope| at or below this counts as "flat enough to build on".
 FLAT_SLOPE: float = 0.28
 
+# -- where a deck may come down -----------------------------------------------
+# A deck's end ramp is sized to whatever step it has to shed and the deck level
+# is clamped to what those ramps can land on, which between them guarantee the
+# *planking* never introduces a cliff.  Neither says anything about the ground
+# the ramp comes down on, because until seed 20260728 there was nothing to say:
+# the crossing director stakes its ends on standable columns.  "Standable" there
+# means "outside the reachability graph's walls", and a wall only registers when
+# its relief clears BARRIER_MIN_RELIEF - so a 144 px chasm wall is invisible to
+# it, the far end got staked 70 px (``CROSSING_RIM_TOL``) down a face whose own
+# gradient peaks at 9.8, and the finished bridge's last two planks read as cliff.
+# The deck cannot flatten ground it does not cover, so the answer is to carry
+# the ramp on past the rim and land it on ground somebody can walk off.
+
+#: How far past its nominal end a deck's end ramp may be pushed to find that
+#: ground, px.  A face steep enough to trigger the search is by definition
+#: steeper than ``MAX_SLOPE_CLIMB``, so the 70 px of drop the director is
+#: allowed to hide behind is at most 27 px of run; 40 covers that with room for
+#: a wobbled surface.  This is a fail-soft ceiling, not the working bound: the
+#: search stops at the *first* column it can land on, so what a deck actually
+#: swallows is the unwalkable face and nothing past it - measured over 138
+#: staked crossings, 34 of the 42 extensions taken were 8 px or shorter.
+DECK_LANDING_REACH: int = 40
+
+#: Columns past a deck's end whose ``is_cliff`` answer the deck can still move.
+#: ``slope`` is a central difference reaching 2.5 px each way, so from the
+#: fourth column out the reading is pure geology and no ramp changes it.
+DECK_JOIN_PROBE: int = 3
+
+#: How far the ground may fall below the nominal end before the landing search
+#: gives up, px.  Going *down* off the end of a deck is not the case this
+#: solves: extending that way would span a second hole for free and hand the
+#: colony a ledge out over it.  Same 8 px scale the crossing planner uses for
+#: "nothing meaningfully sticks through the planking".
+DECK_LANDING_DROP: float = 8.0
+
 #: Cosine falloff width used by :meth:`Terrain.deform` with ``blend='smooth'``.
 DEFORM_EDGE: int = 24
 
@@ -1287,6 +1322,69 @@ class Terrain:
             return None
         return a, b
 
+    def _deck_landing(self, end: int, step: int, absslope: np.ndarray) -> int:
+        """The column a deck's end ramp should actually come down on.
+
+        ``step`` is ``+1`` for the right-hand end and ``-1`` for the left, i.e.
+        the direction *away* from the span.  Returns ``end`` unchanged whenever
+        the ground there is fit to be walked off - which is the overwhelmingly
+        common case and costs one array max - and otherwise the nearest column
+        outward that is, so the deck carries on over the rim rather than
+        stopping part-way down it.  See the notes on ``DECK_LANDING_REACH`` for
+        why this case exists at all.
+
+        "Fit to be walked off" is ``is_cliff``'s own test and nothing stricter:
+        the 0.92 margin is the one ``find_climb_face`` uses, for agents sampling
+        at fractional x, and ``slope`` is an average over its 5 px window, so a
+        window that holds under the margin cannot read over the limit once the
+        ramp - itself capped at ``MAX_SLOPE_WALK`` - is laid into it.  Holding
+        out for genuinely *walkable* ground was tried and is wrong: hillsides
+        run at 1.1 for a hundred px at a stretch, which agents simply climb, and
+        insisting on 0.9 walked the search past every honest landing on them.
+        """
+        w = self.W
+        last = w - 1
+
+        def window(col: int) -> tuple[int, int]:
+            """Inclusive column range from ``col`` out to the join probe."""
+            far = col + step * DECK_JOIN_PROBE
+            return max(0, min(col, far)), min(last, max(col, far))
+
+        def worst(col: int) -> float:
+            """Steepest raw ground in the join window outward of ``col``."""
+            lo, hi = window(col)
+            return float(np.max(absslope[lo : hi + 1]))
+
+        limit = MAX_SLOPE_CLIMB * 0.92
+        if worst(end) <= limit:
+            return end
+        # The floor under the search, and it is measured over the whole join
+        # window rather than off ``end`` alone.  Generation can leave a single
+        # column standing 50 px proud of its neighbours, the pair search is
+        # happy to stake an end on top of one (seed 43, 'cliffs', x=1252), and
+        # against that column every real landing beside it looks like a drop -
+        # so the ramp stays on the spike and the deck hangs off it.  Reading the
+        # lowest ground in the window instead costs nothing on an honest rim,
+        # where the ground only climbs away from the end.
+        lo, hi = window(end)
+        base = float(np.max(self.height[lo : hi + 1]))
+        for d in range(1, DECK_LANDING_REACH + 1):
+            col = end + step * d
+            if col < 0 or col > last:
+                break
+            # y grows downward: a column *below* that floor is the ground
+            # falling away, not a rim being climbed out of.  Following it would
+            # carry the planking out over the drop and hand the colony a free
+            # ledge above whatever is under it.
+            if float(self.height[col]) > base + DECK_LANDING_DROP:
+                break
+            if worst(col) <= limit:
+                return col
+        # Nothing better within reach.  Keep the bridge: a crossing that ends
+        # awkwardly still joins the two sides, and refusing to stamp would leave
+        # the colony split with the wood already spent.
+        return end
+
     def stamp_deck(
         self, x0: float, x1: float, y: float, ramp: float = CROSSING_RAMP_PX
     ) -> bool:
@@ -1303,6 +1401,12 @@ class Terrain:
         seed 5, where the two rims of the chasm differ by 21 px - over
         MAX_SLOPE_CLIMB, so the finished bridge still ended in a cliff and
         agents still refused the last five columns of it.
+
+        The span is a request, not a promise: an end staked on ground too steep
+        to walk off is carried outward until it has something to land on (see
+        ``_deck_landing``), so the deck may finish a little wider than it was
+        asked for.  ``clear_crossing`` follows the overlay rather than the span
+        for exactly that reason.
         """
         try:
             span = self._span_indices(x0, x1)
@@ -1313,6 +1417,14 @@ class Terrain:
             if not np.isfinite(level):
                 return False
             level = float(np.clip(level, HARD_MIN, HARD_MAX))
+
+            # Where the ramps come down, before anything is sized off it: both
+            # the level clamp and the ramp length below read `height[a]` and
+            # `height[b]`, so moving an end afterwards would size the ramp for a
+            # join it no longer has.
+            absslope = np.abs(self.column_slope(raw=True))
+            a = self._deck_landing(a, -1, absslope)
+            b = self._deck_landing(b, +1, absslope)
 
             n = b - a + 1
             # Cap how far the deck may sit off the ground it has to come down
@@ -1388,6 +1500,14 @@ class Terrain:
         An overlay left holding nothing but NaN is dropped entirely, which puts
         ``ground_y`` back on its no-overlay fast path once the last bridge in
         the world falls down.
+
+        The columns cleared are the ones the overlay actually occupies, not just
+        the span asked for.  ``stamp_deck`` is allowed to carry its end ramps a
+        little past the span it was handed, and the caller only remembers the
+        span - so clearing that literally would leave the tail of a collapsed
+        bridge behind as a scrap of walkable deck hanging over the rim.  The
+        walk outward is bounded by the same reach the stamp is and only follows
+        an end that is stamped, so it can never swallow a neighbour.
         """
         try:
             span = self._span_indices(x0, x1)
@@ -1399,9 +1519,17 @@ class Terrain:
                 ov = getattr(self, name)
                 if ov is None or ov.size != self.W:
                     continue
-                if bool(np.isfinite(ov[a : b + 1]).any()):
+                fin = np.isfinite(ov)
+                floor = max(0, a - DECK_LANDING_REACH)
+                ceil = min(self.W - 1, b + DECK_LANDING_REACH)
+                lo, hi = a, b
+                while lo > floor and fin[lo] and fin[lo - 1]:
+                    lo -= 1
+                while hi < ceil and fin[hi] and fin[hi + 1]:
+                    hi += 1
+                if bool(fin[lo : hi + 1].any()):
                     hit = True
-                ov[a : b + 1] = np.nan
+                ov[lo : hi + 1] = np.nan
                 if not bool(np.isfinite(ov).any()):
                     setattr(self, name, None)
             if hit:

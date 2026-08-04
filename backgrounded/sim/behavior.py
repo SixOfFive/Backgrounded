@@ -28,9 +28,12 @@ import numpy as np
 from ..constants import (
     BARRICADE_EDGE_FRAC,
     BARRICADE_MIN_POP,
+    BARRIER_MIN_RELIEF,
+    CHASM_SAFE_GRADIENT,
     CLEANUP_SCORE_MAX,
     CROSSING_MAX_SPAN,
     CROSSING_MIN_DEPTH,
+    FALL_LETHAL_SPEED,
     FARM_FIELD_SIZE,
     LITTER_CLUSTER_FULL,
     LITTER_CLUSTER_MIN,
@@ -53,6 +56,7 @@ from ..constants import (
     RES_WOOD,
     SCENE_BLIZZARD,
     SCENE_NIGHT_STORM,
+    WALK_SPEED,
 )
 from .actions import (
     CARRY_CAP,
@@ -77,6 +81,7 @@ from .actions import (
     structures_of,
     world_now,
 )
+from .entities import GRAVITY
 from .structures import (
     CROSSING_KINDS,
     Structure,
@@ -218,6 +223,85 @@ HAZARD_MEMORY = 420.0
 #: Generous: people topple *while walking away from* a rim they just slipped on,
 #: and the body lands further out than the edge it went over.
 HAZARD_SLACK = 45.0
+
+# ------------------------------------------------------ faces that kill only --
+# A face can be lethal without being a *barrier*. `Terrain.barriers()` wants
+# both an unclimbable slope and BARRIER_MIN_RELIEF (150 px) of relief, because
+# relief is what makes a face something the colony has to build its way past -
+# cutting on slope alone shatters an ordinary hills map into ~150 regions, since
+# generation guarantees a cliff on every map and agents climb the small ones all
+# day. That threshold is load-bearing and is left exactly where it is.
+#
+# But "small enough not to divide the map" is not "small enough to be safe", and
+# a 'cliffs' map is made of the difference: it is a staircase of one-column steps
+# ~54 px tall. 54 px is under BARRIER_MIN_RELIEF so no barrier is emitted and
+# `find_cutoff` sees nothing wrong; it is *also* under `entities.STEP_FALL_MAX`
+# (FALL_LETHAL_SPEED**2 / 2g = 64.2 px), so the walk code lets people stroll
+# straight off it. Both of those readings are of the face alone, and the face
+# alone is not what you fall down: measured on seed 21, an agent came off the lip
+# at x=845 (y=589.3) and landed at x=862 (y=654.7) - a 65 px drop, impact
+# 342 px/s against a 340 px/s limit - because the ground *below* the step keeps
+# falling away at nearly 1:1 while the body is in the air. Twelve extra pixels of
+# run-out is the whole difference between a step people hop off all day and a
+# funeral, and nothing in the survey was looking at it.
+#
+# So there is a second kind of thing in the way: steep enough that a slip does
+# not self-arrest, and with enough left to fall that the landing kills. It is
+# answered with a ladder like any other face - but only where one has actually
+# killed somebody, which is the whole of the rationing. See the note below
+# HAZARD_FACE_SLACK for what happened when the colony was allowed to go looking.
+
+#: How far a body falls before it is travelling at FALL_LETHAL_SPEED, from rest.
+#: The same number `entities.STEP_FALL_MAX` is derived from, and the reason a
+#: 54 px step is harmless on its own.
+FALL_LETHAL_DROP = FALL_LETHAL_SPEED * FALL_LETHAL_SPEED / (2.0 * GRAVITY)
+#: ...and how far it travels sideways in that time, which is the window the drop
+#: has to be measured over.
+#:
+#: The factor of two is measured, not padding. A falling agent is still being
+#: *steered*: `_ground_step` runs before `_fall_step` in the same update and each
+#: writes its own displacement, so an airborne villager walking toward something
+#: covers ground at twice the walk speed. On the seed 21 death the trace reads
+#: vx = 31.98 (0.94 * WALK_SPEED) with x advancing 2.19 px per tick - 65.7 px/s.
+#: Taking the single walk speed instead reads the drop at x+13 rather than x+26,
+#: which on that face is 63.0 px against a 64.2 px threshold: it misses the fall
+#: that actually happened by a pixel.
+HAZARD_RUNOUT = 2.0 * WALK_SPEED * FALL_LETHAL_SPEED / GRAVITY
+#: Probe width for the steepness test, px. Matches `Terrain._build_reach`'s own
+#: BARRIER_PROBE so a hazardous face and a barrier are found on the same reading
+#: of the ground, and the two can never disagree about where a face begins.
+HAZARD_PROBE = 3
+#: How far outside a hazardous face's own geometry a body is still that face's
+#: doing. Far tighter than HAZARD_SLACK, and it is not a style choice: `lo`/`hi`
+#: already span the lip and the ground the fall ends on, so a body from this
+#: face is *inside* them by construction, and the margin only covers the launch
+#: being a fraction of the way down the step. These faces come in staircases 40
+#: px apart, and at HAZARD_SLACK's 45 px one corpse is claimed by both of its
+#: neighbours - measured, that buys two ladders for one death, which is the
+#: closest this feature came to the failure it was written to avoid.
+HAZARD_FACE_SLACK = 4.0
+#
+# NOTE for anyone tempted to answer these faces *before* one of them kills
+# somebody. It was written, measured and taken out again. The survey is cheap
+# and the traffic signal is good - counting which faces the colony crosses
+# between director passes ranks them clearly (on seed 21: 48, 34, 28, 9, 7, 5, 2
+# over ten faces) - and it does not matter, because the cost is not in finding
+# them:
+#
+#   * A crossing is the one *blocking* build, ahead of even the firepit, and a
+#     rail against a step people have survived all day is not that. Staked
+#     during the founding scatter it finished seed 21 with 6 alive and one hut,
+#     against 9 alive and three.
+#   * Deferred behind fire, stores and a roof it still finished 7 alive: the
+#     ladder makes a one-way step climbable both ways, the settlement's centre
+#     follows it out onto the terrace, and the colony is then living somewhere
+#     it had no reason to be.
+#   * Over 19 'cliffs'-bearing seeds it was a wash - 8 falls against 10 - while
+#     costing three survivors.
+#
+# A body is different: it is evidence rather than a guess, it names one face out
+# of ten, and answering it is what the ranking already does for barriers.
+
 #: Dwell for an obstacle that has already killed, or that is holding somebody
 #: down a hole. ``CUTOFF_DWELL`` exists to confirm that a split is real; a wall
 #: with a body at the foot of it needs no confirming, and neither does a man
@@ -1618,15 +1702,18 @@ def _barricade_site(
 #  Reachability: has the colony been cut off, and what would fix it?
 # ===========================================================================
 #
-# Three steps, deliberately separated so each can be tested on its own:
+# Four steps, deliberately separated so each can be tested on its own:
 #
-#   _reach()        ask the terrain which stretches of map are connected
-#   find_cutoff()   decide whether the split actually costs the colony anything
-#   plan_crossing() turn that into a bridge or a ladder the director can stake
+#   _reach()         ask the terrain which stretches of map are connected
+#   _hazard_faces()  ...and where it kills people without being divided at all
+#   find_cutoff()    decide whether any of that costs the colony anything
+#   plan_crossing()  turn that into a bridge or a ladder the director can stake
 #
-# The terrain owns the graph and caches it against its own ``epoch``, so digging
-# a pit, a mudslide or a finished deck all re-survey exactly once. Everything in
-# here is on the director's 2 s cadence, never per agent per tick.
+# The terrain owns the connectivity graph and caches it against its own
+# ``epoch``, so digging a pit, a mudslide or a finished deck all re-survey
+# exactly once; the hazardous-face survey is cached on the world against the
+# same epoch, for the same reason. Everything in here is on the director's 2 s
+# cadence, never per agent per tick.
 
 
 def _reach(world: Any) -> tuple[Any, tuple[tuple[int, int, float], ...]]:
@@ -1768,7 +1855,16 @@ def _must_cross(o: dict[str, Any], home: int, region: int) -> bool:
     Region ids increase left to right and an obstacle separates everything at
     or left of ``left`` from everything at or right of ``right``, so this is
     two integer comparisons rather than a graph walk.
+
+    Always ``False`` for a hazardous face, which by definition does *not*
+    divide the map: both of its sides carry the same region id, and answering
+    "yes" for a region against itself - which the comparisons below would - has
+    every wanted thing on the map claiming to be behind every lethal step near
+    it. A hazardous face is answered on the evidence of what it is doing to
+    people, never on what happens to be on the far side of it.
     """
+    if o.get("hazard"):
+        return False
     if region in o["inner"]:
         return True
     if home in o["inner"]:
@@ -1776,6 +1872,212 @@ def _must_cross(o: dict[str, Any], home: int, region: int) -> bool:
     if home <= o["left"] and region >= o["right"]:
         return True
     return home >= o["right"] and region <= o["left"]
+
+
+def _bool_runs(mask: Any) -> list[tuple[int, int]]:
+    """Contiguous ``True`` runs of a 1-D bool mask as half-open ``(a, b)``.
+
+    Same shape as ``Terrain._runs`` - deliberately a copy rather than an import,
+    because that one is module-private and this module is the only other place
+    that reads a boundary mask the way ``_build_reach`` does.
+    """
+    m = np.asarray(mask, dtype=np.int8)
+    if m.size == 0:
+        return []
+    d = np.diff(m)
+    starts = (np.flatnonzero(d == 1) + 1).tolist()
+    ends = (np.flatnonzero(d == -1) + 1).tolist()
+    if m[0]:
+        starts.insert(0, 0)
+    if m[-1]:
+        ends.append(int(m.size))
+    return list(zip(starts, ends))
+
+
+#: Whether the hazardous-face survey runs at all. OFF, on measurement.
+#:
+#: The idea is sound - a face can kill without dividing the map, so the
+#: reachability survey (which needs BARRIER_MIN_RELIEF to avoid shattering an
+#: ordinary map into 150 regions) cannot see it - and the implementation below
+#: does fire end to end. It just does not help, and two independent
+#: verifications said so:
+#:
+#:   * 40-seed A/B, 12 sim-minutes, 9 agents: with the survey on, 20 falls and
+#:     338 survivors of 360; with it stubbed to return (), the same. Inside the
+#:     run-to-run noise floor - outcome-neutral, not an improvement.
+#:   * 10-seed A/B: nine seeds identical with it off, down to the same crossing
+#:     timestamps. The single seed it touches - 21, the only 'cliffs' map -
+#:     prevented zero falls there and finished with one FEWER survivor (83 -> 82).
+#:
+#: The reason is structural rather than a tuning miss, which is why it is gated
+#: rather than retuned: the survey only produces faces on 'cliffs' terrain (mean
+#: 9.6 per map there, under 0.2 everywhere else, 147 of 160 maps return none),
+#: and a face is only ever built for once a body is already lying at it. So it
+#: cannot prevent a first fall by construction - it answers a death that has
+#: already happened, and spends a colony's wood doing it.
+#:
+#: Left in place rather than deleted because the analysis and the geometry are
+#: worth keeping: making it act on the *risk* rather than on a corpse - and
+#: proving that pays for the wood - is the work that would make it earn its
+#: place. Turn this on again with that measurement in hand.
+HAZARD_FACES_ENABLED = False
+
+
+def _hazard_faces(world: Any) -> tuple[dict[str, Any], ...]:
+    """Faces that kill without dividing the map, shaped like obstacles.
+
+    Each entry carries the same keys ``_rank_obstacles`` and ``_site_crossing``
+    read off a barrier group - ``lo``, ``hi``, ``relief``, ``left``, ``right``,
+    ``inner``, ``mid`` - plus ``hazard`` (always ``True``), the ``lip`` and
+    ``toe`` of the face and the ``edge`` people actually go over. ``lo``/``hi``
+    bracket the lip and the ground the fall ends on, and ``relief`` is that whole
+    drop rather than the face's own height, which is the number a ladder has to
+    defeat.
+
+    This is a *survey*, not a work list. On a 'cliffs' map it returns four to
+    twenty-two faces (mean 9.6 over 40 seeds; every other style averages under
+    0.2 and 147 of 160 return none at all), and only the one a body is lying at
+    is ever built for - see the note at ``HAZARD_FACE_SLACK``.
+
+    Two tests, both from the physics rather than from taste:
+
+    * **A slip here does not self-arrest.**  ``CHASM_SAFE_GRADIENT`` is that
+      knee, measured by driving the real fall integrator down synthetic faces:
+      a slip pitches you forward at a fixed 16 px/s while gravity pulls at
+      ``GRAVITY``, so below about 14:1 the face falls away slower than the body
+      does and you re-contact it, and above it you do not.  The gradient is read
+      as the steepest *single-column* step in the face, because the heightmap is
+      linearly interpolated and that is therefore the true local slope - the
+      5 px central difference ``column_slope`` reports would read seed 21's
+      54 px step as 11.04, sitting exactly on the threshold by coincidence.
+    * **There is enough left to fall.**  Not the face's relief: the drop from
+      the lip to the deepest ground within ``HAZARD_RUNOUT`` of its foot, which
+      is as far as a body gets before gravity has it at ``FALL_LETHAL_SPEED``.
+
+    Anything that already clears ``BARRIER_MIN_RELIEF`` is skipped: that is a
+    barrier, ``barriers()`` reports it, and the existing planner owns it.
+
+    Cached against the terrain's ``epoch`` exactly like the reachability sweep,
+    so a stamped ladder re-surveys once and the face it defeated drops off this
+    list (the effective surface reads the ramp, and the ramp is not steep).
+    Never raises: this is on the director's 2 s pass, forever, unattended.
+    """
+    if not HAZARD_FACES_ENABLED:
+        return ()
+    terr = getattr(world, "terrain", None)
+    epoch = int(getattr(terr, "epoch", 0) or 0)
+    try:
+        if int(getattr(world, "_bhv_hzf_epoch", -1)) == epoch:
+            cached = getattr(world, "_bhv_hzf", None)
+            if cached is not None:
+                return cached
+    except Exception:
+        pass
+    try:
+        found = _compute_hazard_faces(world)
+    except Exception:
+        log.debug("hazardous face survey failed", exc_info=True)
+        found = ()
+    for name, value in (("_bhv_hzf", found), ("_bhv_hzf_epoch", epoch)):
+        try:
+            setattr(world, name, value)
+        except Exception:
+            pass
+    return found
+
+
+def _compute_hazard_faces(world: Any) -> tuple[dict[str, Any], ...]:
+    surf = _surface_of(world)
+    lab, _bars = _reach(world)
+    if surf is None or lab is None:
+        return ()
+    w = int(surf.size)
+    p = int(HAZARD_PROBE)
+    if w <= p + 2 or int(lab.size) != w:
+        return ()
+
+    # Same reading of the ground as `Terrain._build_reach`: |dy/dx| over the
+    # probe, in whichever direction is uphill, widened to every boundary the
+    # probe window covers.
+    g = (surf[: w - p] - surf[p:]) / float(p)
+    bad = np.abs(g) > MAX_SLOPE_CLIMB
+    aided = _climb_aided(world, w)
+    if aided is not None:
+        # A finished ladder is precisely the thing that makes a face survivable,
+        # so a window touching its ramp is not a hazard however steep the rock
+        # under it is. Same exemption `is_cliff` and `_build_reach` make.
+        bad &= ~(aided[: w - p] | aided[p:])
+    cut = np.zeros(w - 1, dtype=bool)
+    for k in range(p):
+        cut[k : k + bad.size] |= bad
+
+    drop1 = np.abs(np.diff(surf))
+    reach = int(math.ceil(HAZARD_RUNOUT))
+    out: list[dict[str, Any]] = []
+    for a, b in _bool_runs(cut):
+        # Boundaries a..b-1 are cut, so columns a..b are the face and a and b
+        # are the last standable column on each side.
+        if b <= a:
+            continue
+        face = surf[a : b + 1]
+        if float(face.max() - face.min()) >= BARRIER_MIN_RELIEF:
+            continue                    # a barrier; barriers() already has it
+        # The edge people actually go over is the steepest single column in the
+        # run, not its rim: the probe is 3 px wide, so a run typically opens two
+        # columns of ordinary hillside before the step itself. Getting this
+        # wrong is not cosmetic - it is what a ladder has to be laid across, and
+        # a ramp that starts two columns short of the drop answers nothing.
+        edge = a + int(np.argmax(drop1[a:b]))
+        if float(drop1[edge]) <= CHASM_SAFE_GRADIENT:
+            continue                    # a slip here self-arrests
+        # Smaller y is higher ground, so the lip is whichever rim is smaller.
+        if float(surf[a]) <= float(surf[b]):
+            lip, toe, step = a, b, 1
+        else:
+            lip, toe, step = b, a, -1
+        j0 = int(np.clip(toe, 0, w - 1))
+        j1 = int(np.clip(toe + step * reach, 0, w - 1))
+        lo_j, hi_j = min(j0, j1), max(j0, j1)
+        # The deepest ground the body can still be over when gravity has it at
+        # the lethal speed. Deepest rather than furthest: where the run-out dips
+        # and rises again the fall ends in the dip, and that is the landing.
+        land = lo_j + int(np.argmax(surf[lo_j : hi_j + 1]))
+        drop = float(surf[land]) - float(surf[lip])
+        if drop < FALL_LETHAL_DROP:
+            continue                    # too short to reach a killing speed
+        region = _region_of(lab, lip)
+        out.append({
+            "lo": int(min(lip, land)),
+            "hi": int(max(lip, land)),
+            "relief": drop,
+            # A hazardous face divides nothing, so both sides are one region.
+            # `_must_cross` refuses these outright and `_joins` has its own
+            # branch; the keys are here so an entry is interchangeable with a
+            # barrier group everywhere else.
+            "left": int(region),
+            "right": int(region),
+            "inner": frozenset(),
+            # The drop itself, not the middle of the run: it is what people go
+            # over, what a ladder has to be laid across, and what "nearest"
+            # should mean when two of these are close together.
+            "mid": float(edge) + 0.5,
+            "hazard": True,
+            "lip": int(lip),
+            "toe": int(toe),
+            "edge": int(edge),
+        })
+    return tuple(out)
+
+
+def _climb_aided(world: Any, w: int) -> Any:
+    """Per-column "a ladder's ramp is here", or ``None`` if the terrain cannot
+    say. Duck-typed: several test stubs have no overlays at all."""
+    ov = getattr(getattr(world, "terrain", None), "climb", None)
+    try:
+        arr = np.asarray(ov)
+        return np.isfinite(arr) if arr.ndim == 1 and arr.size == w else None
+    except Exception:
+        return None
 
 
 # ----------------------------------------------------- who is it hurting? --
@@ -1872,8 +2174,9 @@ def _roster(world: Any) -> list[Any]:
 
 def _hazard_hits(world: Any, o: dict[str, Any]) -> int:
     """How many people this obstacle has killed lately."""
-    lo = float(o["lo"]) - HAZARD_SLACK
-    hi = float(o["hi"]) + HAZARD_SLACK
+    slack = HAZARD_FACE_SLACK if o.get("hazard") else HAZARD_SLACK
+    lo = float(o["lo"]) - slack
+    hi = float(o["hi"]) + slack
     n = 0
     for hx, _ht in getattr(world, "_bhv_hazard", ()) or ():
         if lo <= hx <= hi:
@@ -1980,8 +2283,13 @@ def _charge(world: Any, wanted: bool, now: float) -> float:
 
 def _compute_cutoff(world: Any) -> dict[str, Any] | None:
     lab, bars = _reach(world)
-    if lab is None or not bars:
+    if lab is None:
+        return None
+    if not bars and not _hazard_faces(world):
         return None                     # one connected map: nothing to answer
+    # A map can be perfectly connected and still be killing people: 17 of 40
+    # 'cliffs' maps report no barrier at all and every one of them carries four
+    # or more lethal steps. Only a map with neither leaves early.
 
     alive = alive_agents(world)
     center = colony_center(world)
@@ -2112,15 +2420,26 @@ def _compute_cutoff(world: Any) -> dict[str, Any] | None:
         # reported a perfectly connected colony with nothing to build. A wall
         # with bodies under it is a thing in the way whatever the reachability
         # graph believes, so it gets to ask for a crossing on its own evidence.
-        lethal = [(o, _hazard_hits(world, o)) for o in obs]
+        #
+        # Hazardous faces are in the same pool, and this is the whole reason
+        # they exist: on seed 21 the fall deaths are at a 54 px step that is not
+        # a barrier and never will be, so before this the fallback surveyed a
+        # perfectly connected colony, found no wall anywhere near the bodies,
+        # and answered "nothing to build" for twelve minutes while people kept
+        # going over the same edge.
+        pool = tuple(obs) + _hazard_faces(world)
+        lethal = [(o, _hazard_hits(world, o)) for o in pool]
         lethal = [(o, n) for o, n in lethal if n]
         if not lethal:
             return None
         o = max(lethal, key=lambda e: (e[1], -abs(e[0]["mid"] - center)))[0]
-        # A rim column belongs to the region it overlooks, so the outer rim on
-        # the far side is a point in the far region and needs no search.
-        cands.append((2, float(o["hi"] if home <= int(o["left"]) else o["lo"]),
-                      "falls"))
+        if o.get("hazard"):
+            cands.append((2, float(o["mid"]), "falls"))
+        else:
+            # A rim column belongs to the region it overlooks, so the outer rim
+            # on the far side is a point in the far region and needs no search.
+            cands.append((2, float(o["hi"] if home <= int(o["left"]) else o["lo"]),
+                          "falls"))
     # Worst problem first; among equals, the nearest one, because that is also
     # the cheapest to answer and the one the colony is walking into.
     weight, tx, reason = max(cands, key=lambda c: (c[0], -abs(c[1] - center)))
@@ -2245,7 +2564,9 @@ def _crossing_geometry(world: Any, cut: dict[str, Any]) -> dict[str, Any] | None
     """
     lab, bars = _reach(world)
     surf = _surface_of(world)
-    if lab is None or not bars or surf is None:
+    if lab is None or surf is None:
+        return None
+    if not bars and not _hazard_faces(world):
         return None
     home = int(cut["home"])
 
@@ -2264,6 +2585,7 @@ def _crossing_geometry(world: Any, cut: dict[str, Any]) -> dict[str, Any] | None
         plan = _site_crossing(world, lab, bars, surf, home, o, cut)
         if plan is not None:
             plan["urgent"] = bool(o["urgent"])
+            plan["hazard"] = bool(o.get("hazard"))
             plan["obstacle"] = (int(o["lo"]), int(o["hi"]))
             return plan
     return None
@@ -2281,7 +2603,7 @@ def _rank_obstacles(
     - an obstacle with a fall death at the foot of it *is* the problem, whatever
     the reachability graph thinks the colony is short of.
     """
-    obs = _obstacles(world, lab, bars)
+    obs = _obstacles(world, lab, bars) + _hazard_faces(world)
     cands = cut.get("cands") or ((int(cut.get("weight", 1)), float(cut["target_x"]),
                                   str(cut.get("reason", ""))),)
     out: list[dict[str, Any]] = []
@@ -2296,6 +2618,13 @@ def _rank_obstacles(
             if cw > weight or (cw == weight and d < near):
                 weight, reason, near = int(cw), str(cr), d
         hits = _hazard_hits(world, o)
+        if o.get("hazard"):
+            # `_must_cross` is always False for a face that divides nothing, so
+            # a body under it is the only evidence it can rank on - and that is
+            # what the colony noticed, whatever else the survey was reporting.
+            if not hits:
+                continue
+            reason = "falls"
         if not hits and not weight:
             continue                    # in the way of nothing, hurting nobody
         entry = dict(o)
@@ -2324,6 +2653,21 @@ def _site_crossing(
     """A bridge or ladder that actually joins the two sides of ``o``."""
     w = int(surf.size)
     a, c, relief = int(o["lo"]), int(o["hi"]), float(o["relief"])
+
+    if o.get("hazard"):
+        # A face is laddered, and this one cannot be anything else: there is no
+        # hole here, so `_bridge_pair`'s depth test could never pass - and both
+        # sides carry the same region id, so its "land somewhere that helps"
+        # test is meaningless and its search would happily propose a deck to
+        # some unrelated region that happens to be within a span's reach. Go
+        # straight to the ramp. `a` and `c` already bracket the lip and the
+        # ground the fall ends on, so the rise `_ladder_span` measures is the
+        # lethal drop rather than the step's own height.
+        plan = _ladder_plan(world, surf, lab, a, c, relief, cut, stand_high=True)
+        if plan is not None and _joins(lab, o, *plan["span"]):
+            plan["reason"] = str(o.get("reason") or cut["reason"])
+            return plan
+        return None
 
     # Columns strictly inside a wall are the wall itself - a deck that ends
     # there ends in mid-air, and a builder sent to stand there falls. For a
@@ -2402,7 +2746,17 @@ def _joins(lab: Any, o: dict[str, Any], x0: float, x1: float) -> bool:
 
     Cheap on purpose: region ids already encode reachability, so this is two
     lookups rather than a re-survey of merged terrain.
+
+    A hazardous face is the one case region ids cannot answer, because it does
+    not divide the map: both of its sides are the same region, and every ramp
+    anywhere near it would pass. What has to be true instead is that the ramp
+    lies against the lip people actually go over - a ladder built alongside it
+    is a ladder that changes nothing.
     """
+    if o.get("hazard"):
+        edge = int(o["edge"])
+        lo_s, hi_s = min(float(x0), float(x1)), max(float(x0), float(x1))
+        return lo_s <= float(edge) and hi_s >= float(edge + 1)
     ends = {_region_of(lab, x0), _region_of(lab, x1)}
     return ends == {int(o["left"]), int(o["right"])}
 
@@ -2499,9 +2853,25 @@ def _bridge_pair(
 
 def _ladder_plan(
     world: Any, surf: Any, lab: Any, a: int, c: int, relief: float,
-    cut: dict[str, Any]
+    cut: dict[str, Any], *, stand_high: bool = False
 ) -> dict[str, Any] | None:
-    """A ladder against the wall between rims ``a`` and ``c``."""
+    """A ladder against the wall between rims ``a`` and ``c``.
+
+    ``stand_high`` moves the *site* - the column a builder is sent to - from the
+    foot of the ramp to its head. It changes nothing about the ramp itself; the
+    geometry travels in ``span``/``rise`` and is what gets stamped and drawn.
+
+    It exists for hazardous faces, and it is not a preference. The foot of one
+    of those is at the bottom of a drop that kills, and unlike a barrier the
+    colony is not already living down there - so the trip to the build site is
+    the exact trip the ladder is being built to make survivable. Measured on
+    seed 247, whose colony was already losing people over a face at x=59: the
+    site landed at x=11, in the pocket below it, and over 36 minutes the ladder
+    was never finished while the fall count went from 12 to 37 and the site sat
+    staked, holding the one-crossing-at-a-time gate shut against everything
+    else. Sending the builder to the lip instead is the same ramp, reached from
+    the side people are already on.
+    """
     span = _ladder_span(surf, a, c, relief, lab)
     if span is None:
         # Nothing verified against this face. The general survey may still find
@@ -2523,11 +2893,13 @@ def _ladder_plan(
 
     x0, x1, y0, y1 = span
     # The foot is the low end: where a builder stands, and where a ladder rests.
-    foot_x, foot_y = (x0, y0) if y0 > y1 else (x1, y1)
+    low = (x0, y0) if y0 > y1 else (x1, y1)
+    high = (x1, y1) if y0 > y1 else (x0, y0)
+    site_x, site_y = high if stand_high else low
     return {
         "kind": "ladder",
-        "x": float(foot_x),
-        "y": float(foot_y),
+        "x": float(site_x),
+        "y": float(site_y),
         "extra": {"w": (x1 - x0) + 6.0, "span": [float(x0), float(x1)],
                   "rise": [float(y0), float(y1)]},
         "span": (float(x0), float(x1)),

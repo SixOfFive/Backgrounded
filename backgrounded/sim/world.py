@@ -46,6 +46,32 @@ CHRONICLE_MAX = 400
 #: 25 minutes, on a world 1280px wide.
 MAX_GRAVES = 10
 
+#: Seconds a corpse lies there before _reap_dead raises its headstone and books
+#: the death. Named because from_dict has to reason about the same threshold:
+#: the "already buried" flag does not survive a save, so a body loaded from
+#: inside this window has to be re-flagged or it is buried, and counted, twice.
+BURIAL_DELAY = 2.0
+
+#: The declared shape of :attr:`World.stats`. Defined once because __init__ and
+#: from_dict both build it, and a key present in only one of them is a stat that
+#: silently vanishes across a reload.
+#:
+#: "abducted" and "returned" are declared here at zero rather than being
+#: conjured by ufo.py's first increment. A key that only exists once the lights
+#: have actually been makes ``world.stats["abducted"]`` a KeyError on every
+#: world where nothing has happened yet, so every reader has to remember
+#: ``.get()`` - and the readers that did not simply left the abductee out of the
+#: books entirely. That is how "survivors out of 9" came to under-report by
+#: exactly one on every seed where the ufo took somebody, and why a scene or a
+#: terrain change measured against survivor counts looked more lethal than it
+#: was. Being taken is an exit from the roster that is NOT a death; being handed
+#: back is an entry that is NOT a birth. Both now have a line in the ledger.
+STAT_DEFAULTS: dict[str, int] = {
+    "born": 0, "died": 0, "built": 0, "trees_felled": 0,
+    "lightning_strikes": 0, "generations": 1,
+    "abducted": 0, "returned": 0,
+}
+
 
 class World:
     """Everything that persists across a restart."""
@@ -85,10 +111,7 @@ class World:
         self.stockpile: dict[str, int] = {r: 0 for r in ALL_RESOURCES}
         self.build_queue: list[str] = []
         self.chronicle: deque[str] = deque(maxlen=CHRONICLE_MAX)
-        self.stats: dict[str, int] = {
-            "born": 0, "died": 0, "built": 0, "trees_felled": 0,
-            "lightning_strikes": 0, "generations": 1,
-        }
+        self.stats: dict[str, int] = dict(STAT_DEFAULTS)
 
         # Subsystems that have failed and been disabled this session.
         self._disabled: set[str] = set()
@@ -291,7 +314,7 @@ class World:
             # ever reaching the burial threshold: no graves, no replacements,
             # and the colony went extinct with stats["died"] still reading 0.
             agent.dead_t += dt
-            if agent.dead_t < 2.0 or agent.__dict__.get("_buried"):
+            if agent.dead_t < BURIAL_DELAY or agent.__dict__.get("_buried"):
                 continue
             agent.__dict__["_buried"] = True
             self.props.add_grave(agent.x, self.terrain.ground_y(agent.x), agent.name)
@@ -609,6 +632,79 @@ class World:
                 return a
         return None
 
+    def deaths_ever(self) -> int:
+        """Everyone who has ever died, including bodies not yet buried.
+
+        ``stats["died"]`` is NOT that number: it is only incremented once a
+        corpse has lain BURIAL_DELAY seconds and been given a headstone, so for
+        those first two seconds the dead are missing from ``died`` *and* from
+        ``alive_agents()`` at the same time. Any sum built on stats["died"]
+        alone therefore reads one short whenever it is taken in that window -
+        which for a measurement harness that stops on an arbitrary tick is a
+        coin flip. The unburied corpses still on the roster close the gap
+        exactly, because ``_buried`` is set on precisely the same line that
+        increments the stat.
+        """
+        try:
+            pending = sum(1 for a in self.population.agents
+                          if not a.alive and not a.__dict__.get("_buried"))
+        except Exception:
+            pending = 0
+        return int(self.stats.get("died", 0)) + pending
+
+    def reconcile(self) -> dict[str, int]:
+        """The population books and the residual, which must always be zero.
+
+            births + returned - deaths - abducted - alive == 0
+
+        Every way onto the roster and every way off it, as counters, so the
+        colony's headcount is fully explained at any instant:
+
+        * ``births``   - Population.births, incremented by every ``spawn()``,
+                         which includes the founding group. Nothing external
+                         has to remember a "starting population".
+        * ``returned`` - agents the ufo put *back* on the roster, alive. Not a
+                         birth: they already existed and are already in
+                         ``births`` from the first time round.
+        * ``deaths``   - :meth:`deaths_ever`, not stats["died"]; see there.
+        * ``abducted`` - agents the ufo took *off* the roster, alive. Not a
+                         death: no grave, no death hook, and a quarter of them
+                         come back. This is the term that did not exist, and
+                         its absence is what made every abduction read as an
+                         unexplained loss and every balance measurement taken
+                         through it read as one death too many.
+        * ``alive``    - who is actually standing there now.
+
+        ``ok`` is 1 when the figures were actually readable. It exists because
+        this is guarded - the tray may call it on a half-built world - and a
+        bare ``except`` that returned a residual of 0 would report perfect books
+        for a world it could not read at all, which is precisely the kind of
+        silent pass this method was written to stop. Assert on ``ok`` as well as
+        ``residual``.
+
+        Side-effect free and not on any per-tick path.
+        """
+        try:
+            births = int(getattr(self.population, "births", 0))
+            alive = len(self.population.alive_agents())
+            deaths = self.deaths_ever()
+            abducted = int(self.stats.get("abducted", 0))
+            returned = int(self.stats.get("returned", 0))
+            held = len(getattr(self.ufo, "abducted", None) or ())
+        except Exception:
+            log.debug("reconcile failed", exc_info=True)
+            return {"ok": 0, "residual": 0}
+        return {
+            "ok": 1,
+            "births": births,
+            "returned": returned,
+            "deaths": deaths,
+            "abducted": abducted,
+            "alive": alive,
+            "held_by_ufo": held,
+            "residual": births + returned - deaths - abducted - alive,
+        }
+
     # -------------------------------------------------------- persistence --
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -676,9 +772,49 @@ class World:
                             (d.get("stockpile") or {}).items() if k in ALL_RESOURCES})
         w.build_queue = list(d.get("build_queue") or [])
         w.chronicle = deque(d.get("chronicle") or [], maxlen=CHRONICLE_MAX)
-        w.stats = {"born": 0, "died": 0, "built": 0, "trees_felled": 0,
-                   "lightning_strikes": 0, "generations": 1}
-        w.stats.update({k: int(v) for k, v in (d.get("stats") or {}).items()})
+        # Defaults first, saved values over the top: a save written before
+        # "abducted"/"returned" existed simply keeps them at zero instead of
+        # loading a stats dict that KeyErrors the moment anything reads them.
+        saved_stats = d.get("stats") or {}
+        w.stats = dict(STAT_DEFAULTS)
+        w.stats.update({k: int(v) for k, v in saved_stats.items()})
+
+        # ...but zero is only right if the lights had never been. A save from
+        # before the counter existed carries no history, yet the ufo section
+        # still remembers the abductees it is holding - and those are exactly
+        # the people who are alive, off the roster, and subtracted nowhere. Seed
+        # from them so an old save reconciles instead of reading one head over
+        # for the rest of its life.
+        #
+        # Two caveats, both unavoidable and both harmless: this is a NET figure
+        # rather than a history (a legacy save cannot say how many were ever
+        # taken, only how many are still up there), and anyone who fell off the
+        # end of Ufo.abducted at MAX_ABDUCTED is gone from the record entirely.
+        # A held record whose agent IS on the roster is a delivery caught
+        # mid-beam - already handed back, so not off the books - and must not
+        # be counted, or the save reconciles one short in the other direction.
+        if "abducted" not in saved_stats:
+            try:
+                held = getattr(w.ufo, "abducted", None) or ()
+                w.stats["abducted"] = sum(
+                    1 for r in held
+                    if w.population.by_id(int(r.get("id", 0))) is None)
+            except Exception:
+                log.debug("could not seed abducted from a legacy save",
+                          exc_info=True)
+
+        # The "already buried" flag lives in the corpse's __dict__ and is not
+        # part of Stickman.to_dict, so it does not survive a save - but dead_t
+        # does. Without this, any body saved between BURIAL_DELAY and its
+        # retirement off the roster is buried a *second* time on load: a
+        # duplicate headstone, and stats["died"] incremented twice for one
+        # person. The saved stats["died"] already counts them, so re-flag.
+        for a in w.population.agents:
+            try:
+                if not a.alive and a.dead_t >= BURIAL_DELAY:
+                    a.__dict__["_buried"] = True
+            except Exception:
+                continue
 
         if not w.population.alive_agents():
             log.info("loaded world had no survivors; seeding a new group")
