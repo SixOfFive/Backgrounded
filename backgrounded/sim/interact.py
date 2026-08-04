@@ -64,6 +64,12 @@ def grab(world: Any, wx: float, wy: float) -> Grab | None:
 
     if best is not None:
         _mark_held(world, best, True)
+        # Whatever they were standing on, they are not standing on it now. A
+        # lookout plucked off his tower keeps that platform otherwise, and the
+        # physics would haul him back up to it the moment he was let go.
+        obj = _resolve(world, best)
+        if obj is not None and hasattr(obj, "perch_y"):
+            obj.perch_y = None
         return best
 
     # No person nearby: try a prop. Skip water and graves - you cannot pocket a
@@ -245,6 +251,8 @@ def _reground(obj: Any, world: Any, terrain: Any) -> None:
             obj.vy = 0.0
         if hasattr(obj, "on_ground"):
             obj.on_ground = True
+        if hasattr(obj, "perch_y"):
+            obj.perch_y = None
     except Exception:
         pass
 

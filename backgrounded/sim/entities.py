@@ -13,6 +13,12 @@ edges *are* the edge of the world. It never raises: a per-frame path that can
 throw is a per-frame path that will eventually kill an app running unattended
 overnight.
 
+The terrain is not the only thing to stand on. An action that holds somebody
+above the ground - the deck of a watchtower - says so through
+:meth:`Stickman.perch` each tick; anything else up there is read as a body in
+free fall, and being charged gravity for a job you are standing still doing is
+fatal within seconds.
+
 Attrition
 ---------
 :meth:`Stickman.update_needs` is also where a colony can lose someone to
@@ -198,6 +204,22 @@ DESCENT_SLIP_SCALE = 0.12
 #: speed alone does not bound it: on a face that drops 40 px per px of travel,
 #: CLIMB_SPEED sideways is 600 px/s downward, which is a fall with extra steps.
 DESCENT_DROP_RATE = 90.0
+
+#: How long a perch survives without being renewed, in seconds.
+#:
+#: A perch (see :meth:`Stickman.perch`) is a *lease*, not a latch: the action
+#: standing an agent on a platform has to re-assert it every tick, and it
+#: lapses on its own the moment that action stops running. Nothing else can
+#: leave someone standing on air - and there are several ways for an action to
+#: vanish without its cleanup hook firing (world._tick_agents drops the action
+#: outright when a handler raises, die() clears it, a save can be written with
+#: the action missing). A latch would strand an agent 68 px up forever; a lease
+#: sets them down by itself.
+#:
+#: Well above one frame (1/30 s, and _MAX_DT caps a stalled one at 0.1 s) so a
+#: hitch never drops a working lookout off its tower, and short enough that a
+#: genuinely orphaned one is on the ground again within half a second.
+PERCH_LEASE = 0.5
 
 # Attrition. A need pinned at its cap for this long is fatal. Sized well above
 # the time it takes an agent to notice the need and act on it (behaviour
@@ -474,6 +496,15 @@ class Stickman:
     target_x: float | None = None         # walk here; None = stand still
     path_goal: str | None = None          # opaque label for *why* ("stockpile",
                                           # "tree:12"); actions own its meaning
+
+    #: y of the platform this agent is standing on, or None when the terrain
+    #: is its footing. A watchtower deck is not ground - ``ground_y`` knows
+    #: nothing about it - so without this the fall integrator reads anybody up
+    #: there as mid-air and charges them gravity for every second of their
+    #: watch. Set through :meth:`perch`, never written raw. Persisted: a save
+    #: taken with a lookout on his tower must not reload him into a fall.
+    perch_y: float | None = None
+    _perch_t: float = 0.0                 # s since the perch was last renewed
 
     # --- timers -----------------------------------------------------------
     climb_t: float = 0.0                  # s spent on the current climb
@@ -766,6 +797,11 @@ class Stickman:
         self.speech = None
         self.speech_t = 0.0
         self.vx = 0.0
+        # Nothing holds a corpse up. The body drops off the tower it was
+        # standing on and lies where it lands, which is also where its grave
+        # goes; leaving the perch set would hang it in the air instead.
+        self.perch_y = None
+        self._perch_t = 0.0
         _fire_death(self, self.death_cause)
         return True
 
@@ -802,7 +838,9 @@ class Stickman:
         Walks toward ``target_x``, sticks to the terrain surface, climbs steep
         faces (with a slip chance that rises with fatigue and steepness), falls
         under gravity once airborne, dies on an impact faster than
-        ``FALL_LETHAL_SPEED``, and clamps x to the screen. Never raises.
+        ``FALL_LETHAL_SPEED``, and clamps x to the screen. An agent standing on
+        a platform (see :meth:`perch`) does none of that: it stands. Never
+        raises.
         """
         try:
             self._physics(_clamp(_f(dt, 0.0), 0.0, _MAX_DT), terrain, rng or _RNG)
@@ -829,6 +867,8 @@ class Stickman:
             return
 
         gy = _ground_y(terrain, self.x)
+        if self.perch_y is not None and self._perch_step(dt, gy):
+            return                        # standing on a platform, not falling
         airborne = (not self.on_ground) or (self.y < gy - GROUND_SNAP)
         if airborne:
             self._fall_step(dt, terrain, lethal=True)
@@ -1033,6 +1073,65 @@ class Stickman:
             log.exception("descend failed for agent %s (%s)", self.id, self.name)
             return 0.0
 
+    def perch(self, y: float) -> None:
+        """Stand on a platform at *y* for this tick, above the terrain.
+
+        The way to hold an agent off the ground without killing it. Writing y
+        alone is not enough and never was: apply_physics reads anything above
+        ``ground_y`` as airborne, so an action that pinned a lookout to his
+        tower deck had gravity charged against him for every second he stood
+        up there. Measured on the ladder alone - 0.7 s of "climbing" during
+        which he never actually got clear of the ground - vy reached 630 px/s,
+        and the step back onto level ground was scored as a fatal impact. A
+        full watch is 70-190 s, which is TERMINAL_VY and a certain death for
+        anyone who serves one out.
+
+        The mirror of :func:`actions._plant`, which asserts the same agreement
+        against the ground. Renew it every tick for as long as the platform
+        holds the agent up; see :data:`PERCH_LEASE` for why it expires.
+        """
+        try:
+            y = _f(y, self.y)
+            if not math.isfinite(y):
+                return
+            self.perch_y = y
+            self._perch_t = 0.0
+            self.y = y
+            self.vy = 0.0
+            self.fall_t = 0.0
+            self.on_ground = True
+            self.climbing = False
+        except Exception:
+            log.exception("perch failed for agent %s (%s)", self.id, self.name)
+
+    def _perch_step(self, dt: float, gy: float) -> bool:
+        """Hold this tick's perch. False once it lapses and physics resumes."""
+        y = self.perch_y
+        self._perch_t += dt
+        if (y is None or not math.isfinite(y) or y >= gy - GROUND_SNAP
+                or self._perch_t > PERCH_LEASE):
+            # Lapsed, or the ground has risen to meet the platform. Set them
+            # down rather than hand a body 68 px up to gravity - the lapse
+            # branch only fires when an action vanished mid-watch, and the
+            # small snap is invisible next to killing the agent for it.
+            self.perch_y = None
+            self._perch_t = 0.0
+            self.y = gy
+            self.vy = 0.0
+            self.fall_t = 0.0
+            self.on_ground = True
+            return False
+        self.y = y
+        self.vy = 0.0
+        self.fall_t = 0.0
+        self.on_ground = True
+        # A platform is somewhere you stand, not somewhere you walk: bleed off
+        # any horizontal speed the trip here left behind so the pose reads as
+        # standing and nothing drags the agent off the side of the tower.
+        self.vx *= max(0.0, 1.0 - 9.0 * dt)
+        self._clamp_edges()
+        return True
+
     def _slip(self, d: float) -> None:
         """Lose grip mid-climb: detach from the face and start falling."""
         self.climbing = False
@@ -1122,6 +1221,7 @@ class Stickman:
             "lift_t": float(self.lift_t),
             "beamed": bool(self.beamed),
             "inside": self.inside,
+            "perch_y": None if self.perch_y is None else float(self.perch_y),
             "alive": bool(self.alive),
             "anim_t": float(self.anim_t),
             "target_x": None if self.target_x is None else float(self.target_x),
@@ -1183,6 +1283,14 @@ class Stickman:
         s.beamed = _b(d.get("beamed"), False)
         _ins = d.get("inside")
         s.inside = int(_ins) if isinstance(_ins, (int, float)) else None
+        # The lease starts fresh on load: whichever action put them up there
+        # gets PERCH_LEASE seconds to claim them again, and if the save had no
+        # such action the perch simply lapses and sets them down.
+        _pch = d.get("perch_y")
+        s.perch_y = _f(_pch, s.y) if isinstance(_pch, (int, float)) else None
+        if s.perch_y is not None and not math.isfinite(s.perch_y):
+            s.perch_y = None
+        s._perch_t = 0.0
         s.alive = _b(d.get("alive"), True)
         s.anim_t = _f(d.get("anim_t"), 0.0)
 
@@ -1544,6 +1652,23 @@ if __name__ == "__main__":   # pragma: no cover - headless smoke test
 
     deaths: list[str] = []
     on_death(lambda s, cause: deaths.append(f"{s.name}: {cause}"))
+
+    # A watchtower deck: held 68 px above flat ground for the longest watch a
+    # lookout can draw, then abandoned up there. None of it may become a fall.
+    # Kept ahead of everything else in this block deliberately - it is the one
+    # regression that reads as a working colony right up until it isn't.
+    deck_pop = Population()
+    guard = deck_pop.spawn(200.0, 400.0, rng=rng)
+    for _ in range(int(30 * 190)):
+        guard.perch(400.0 - 68.0)              # what the Lookout action does
+        guard.apply_physics(1.0 / 30.0, terrain, rng)
+        assert guard.vy == 0.0, ("gravity charged against a perch", guard.vy)
+    assert guard.alive and guard.y == 400.0 - 68.0, guard.summary()
+    for _ in range(int(30 * 2)):               # nobody renews the lease now
+        guard.apply_physics(1.0 / 30.0, terrain, rng)
+    assert guard.alive and not deaths, (guard.summary(), deaths)
+    assert guard.perch_y is None and guard.y == 400.0, guard.summary()
+    print("perch: 190s aloft with vy", guard.vy, "- set down at", guard.y)
 
     walker = pop.agents[0]
     walker.walk_to(900.0, "beyond the drop")
