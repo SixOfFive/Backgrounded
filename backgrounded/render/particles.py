@@ -363,15 +363,33 @@ class ParticleSystem:
     # ------------------------------------------------------------ terrain --
 
     def _ground_heights(self, terrain: Any, xs: np.ndarray) -> np.ndarray:
-        """Vectorised ground y for each x. Works off ``terrain.height`` when
+        """Vectorised ground y for each x. Works off ``terrain.surface()`` when
         present, otherwise samples ``ground_y`` at 96 points and interpolates."""
         if terrain is None:
             return np.full(xs.shape, RENDER_H * 0.78, np.float32)
         prof = self._ground
-        key = id(terrain)
+        # Keyed on the terrain's epoch as well as its identity. A bridge deck
+        # gets stamped into the same Terrain object mid-session, so identity
+        # alone would pin the profile to whatever the world looked like on the
+        # first frame - and rain that keeps falling through a finished deck is
+        # exactly what that stale cache looks like on screen.
+        key = (id(terrain), int(getattr(terrain, "epoch", 0)))
         if prof is None or self._ground_key != key or prof.shape[0] != RENDER_W:
             prof = None
-            h = getattr(terrain, "height", None)
+            # surface(), not height: a finished bridge or ladder is an overlay
+            # on top of the raw heightmap, and weather has to land on the deck
+            # the walkers are standing on rather than on the chasm floor under
+            # it. surface() hands back `height` itself when nothing is stamped,
+            # so the common case costs an identity check and no array work.
+            h = None
+            surf_fn = getattr(terrain, "surface", None)
+            if callable(surf_fn):
+                try:
+                    h = surf_fn()
+                except Exception:
+                    h = None
+            if h is None:
+                h = getattr(terrain, "height", None)
             if isinstance(h, np.ndarray) and h.ndim == 1 and h.size >= 2:
                 if h.size == RENDER_W:
                     prof = h.astype(np.float32, copy=False)

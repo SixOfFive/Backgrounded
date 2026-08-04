@@ -26,6 +26,7 @@ from __future__ import annotations
 import math
 import random
 import time
+import zlib
 from typing import Any, Sequence
 
 import pygame
@@ -96,6 +97,22 @@ KIND_VARIANTS: dict[str, int] = {
     "barricade": 4,         # spiked palisades raised near the world edges
 }
 
+#: Hut sprite kind -> the material its walls are drawn in.
+#:
+#: The colony's building tech tier is a ``material`` key on ``Structure.state``,
+#: not a second structure kind - a new kind would mean chasing eight literal
+#: ``"hut"`` comparisons across five sim files and four hardcoded tables, all to
+#: say "same building, different walls". So the material becomes a *picture*
+#: here and nowhere else, exactly the way ``resolve`` already turns a bush
+#: carrying berries into ``bush_berry``. Everything past ``resolve`` - the cache
+#: key, the growth ladder, ``size``/``anchor`` - just sees another kind string.
+#: Add a material by adding a row; :func:`_mirror_hut_aliases` wires the rest.
+HUT_KINDS: dict[str, str] = {
+    "hut": "wood",
+    "hut_stone": "stone",
+}
+_HUT_KIND_FOR_MATERIAL: dict[str, str] = {m: k for k, m in HUT_KINDS.items()}
+
 #: A crop is a prop, not a buildable, but its growth reads on the same *stage*
 #: axis the atlas already caches by: stage 0 is a freshly tilled seedling bed,
 #: the stages between are green shoots getting taller, and the last is heavy
@@ -158,6 +175,25 @@ def _sync_with_sim() -> None:
             KIND_SIZE.setdefault(kind, (48, 48))
     except Exception:
         return
+
+
+def _mirror_hut_aliases() -> None:
+    """Give every non-wood hut kind the same registry numbers as ``hut``.
+
+    They are one building drawn in different walls, so they must share the
+    variant count, the stage ladder, the art-stage count and the canvas. Copied
+    rather than written out per material because ``_sync_with_sim`` may have
+    just moved ``hut``'s numbers to whatever the sim declares: a hardcoded
+    stone-hut row would silently leave the stone version one stage short of
+    finished the next time somebody edits ``StructureSpec("hut", ...)``.
+    """
+    for kind in HUT_KINDS:
+        if kind == "hut":
+            continue
+        KIND_VARIANTS[kind] = KIND_VARIANTS.get("hut", 4)
+        STRUCTURE_STAGES[kind] = STRUCTURE_STAGES.get("hut", 5)
+        ART_STAGES[kind] = ART_STAGES.get("hut", 4)
+        KIND_SIZE[kind] = KIND_SIZE.get("hut", (78, 64))
 
 
 # kind -> base sprite size in pixels
@@ -648,23 +684,69 @@ def _bake_firepit(stage: int, rng: random.Random) -> pygame.Surface:
 
 
 def _hut_window(surf: pygame.Surface, cx: float, cy: float, ww: float, wh: float,
-                s: float, mullion: bool = False) -> None:
-    """A dark opening with a timber lintel and sill, rim-lit on the upper left."""
+                s: float, mullion: bool = False,
+                lintel: Color = WOOD, sill: Color = WOOD_DARK) -> None:
+    """A dark opening with a lintel and sill, rim-lit on the upper left.
+
+    *lintel* / *sill* default to timber; a masonry wall passes stone, because a
+    wood-brown lintel sitting in grey courses reads as a mistake rather than as
+    a different material.
+    """
     unit = max(1, int(round(s)))
     rect = pygame.Rect(int(cx - ww * 0.5), int(cy - wh * 0.5),
                        max(2, int(round(ww))), max(2, int(round(wh))))
     pygame.draw.rect(surf, _rgba((16, 12, 10), 230), rect)
-    _line(surf, WOOD, (rect.left - unit, rect.top - unit),
+    _line(surf, lintel, (rect.left - unit, rect.top - unit),
           (rect.right + unit, rect.top - unit), max(1, int(round(1.6 * s))))
-    _line(surf, WOOD_DARK, (rect.left - unit, rect.bottom),
+    _line(surf, sill, (rect.left - unit, rect.bottom),
           (rect.right + unit, rect.bottom), max(1, int(round(1.4 * s))))
     _rim_line(surf, rect.topleft, rect.bottomleft, 95)
     _rim_line(surf, (rect.left, rect.top - 1), (rect.right, rect.top - 1), 70)
     if mullion:
-        _line(surf, WOOD, (rect.centerx, rect.top), (rect.centerx, rect.bottom), unit, 220)
+        _line(surf, lintel, (rect.centerx, rect.top), (rect.centerx, rect.bottom), unit, 220)
 
 
-def _bake_hut(stage: int, rng: random.Random, scale: float = 1.0) -> pygame.Surface:
+def _hut_masonry(surf: pygame.Surface, left: int, right: int, top: int,
+                 bottom: int, s: float, jog: float) -> None:
+    """Fill a wall rectangle with staggered stone courses.
+
+    Deliberately the same vocabulary as :func:`_bake_wall` - alternating
+    ``STONE``/``STONE_DARK`` blocks, a dark mortar outline, every other course
+    offset, a faint rim along each course line - but sized from the wall it is
+    filling rather than from that baker's fixed canvas. A stone hut and a stone
+    wall standing beside each other have to read as the same masonry, or the
+    hut looks like it wandered in from another game.
+
+    *jog* is the per-variant stagger, a fraction of a block: two stone huts
+    side by side with identical coursing look like one building stamped twice.
+    """
+    if right - left < 2 or bottom - top < 2:
+        return
+    pygame.draw.rect(surf, _rgba(STONE_DARK),
+                     pygame.Rect(left, top, right - left, bottom - top))
+    ch = max(3, int(round(7.0 * s)))            # course height
+    bw = max(4, int(round(11.0 * s)))           # block width
+    course = 0
+    y = bottom
+    while y > top:
+        ty = max(top, y - ch + 1)
+        bx = left - int(round(bw * jog)) * (course % 2)
+        col = 0
+        while bx < right:
+            x0, x1 = max(left, bx), min(right, bx + bw - 1)
+            if x1 - x0 > 1 and y - ty > 0:
+                rect = pygame.Rect(x0, ty, x1 - x0, y - ty)
+                pygame.draw.rect(surf, _rgba(STONE if (course + col) % 2 else STONE_DARK), rect)
+                pygame.draw.rect(surf, _rgba(STONE_DARK, 200), rect, 1)
+            bx += bw
+            col += 1
+        _rim_line(surf, (left, ty), (right, ty), 55)
+        y -= ch
+        course += 1
+
+
+def _bake_hut(stage: int, rng: random.Random, scale: float = 1.0,
+              material: str = "wood") -> pygame.Surface:
     """Bake a hut at *scale*, geometry recomputed rather than upscaled.
 
     Growth is not zoom. As ``scale`` climbs the walls take a bigger share of a
@@ -672,6 +754,15 @@ def _bake_hut(stage: int, rng: random.Random, scale: float = 1.0) -> pygame.Surf
     structure the small hut does not have: a stone footing, then a window, then a
     second window and a smoke hole, and at the top of the range a second doorway
     - two dwellings under one roof.
+
+    *material* swaps the walls, not the building. Stone gets coursed masonry
+    (:func:`_hut_masonry`), stone quoins, stone lintels and shorter eaves -
+    masonry needs less overhang to keep the rain off than daub does, and that
+    shorter roof is what tells the two apart at 30 px across in the dark. The
+    roof frame and the thatch stay timber in both: you cannot make a rafter out
+    of stone, and keeping the roof shared means every growth gate above
+    (footing, windows, smoke hole, second doorway) composes with either wall
+    without a second copy of the ladder.
 
     The caller seeds *rng* per ``(kind, variant, stage)``, so a hut keeps its own
     jitter as it grows; details must not pop when it crosses a bucket. Vertical
@@ -684,6 +775,25 @@ def _bake_hut(stage: int, rng: random.Random, scale: float = 1.0) -> pygame.Surf
     g = hut_growth(s)
     w, h = hut_dims(s)
     surf = pygame.Surface((w, h), pygame.SRCALPHA)
+    stone = material == "stone"
+
+    # Per-variant character, drawn up front and unconditionally. The variant
+    # axis existed and was wired all the way through the sim, saves and the
+    # cache key, but nothing in here ever touched `rng` past the scaffolding
+    # stages - all four finished huts baked to the same bytes (md5 3e131ce4).
+    # Drawing the knobs before any branch is what makes them safe: consume the
+    # stream inside a `if g > ...` and the same hut re-rolls its character the
+    # moment it crosses a growth bucket, which is the popping the docstring
+    # above promises not to do. Fractions throughout, never pixel counts, for
+    # the same reason.
+    pitch = rng.uniform(-0.026, 0.028)      # ridge height, fraction of canvas
+    overhang = rng.uniform(0.78, 1.12)      # eave length multiplier
+    door_f = rng.uniform(0.21, 0.28)        # doorway width, fraction of the wall
+    win_t = rng.uniform(0.15, 0.27)         # where the near window sits
+    jog = rng.uniform(0.28, 0.62)           # masonry course stagger
+    lean = rng.uniform(-1.0, 1.0)           # how badly the stakes were driven
+    extra = rng.randint(0, 1)               # one more wall band / thatch course
+    far_t = 1.0 - win_t                     # the far window, and later the far door
 
     def lw(n: float) -> int:
         """A base-art line width in pixels, thickened with the sprite."""
@@ -700,12 +810,18 @@ def _bake_hut(stage: int, rng: random.Random, scale: float = 1.0) -> pygame.Surf
     # Walls claim more of the height as the hut grows (0.54h -> 0.60h) and the
     # ridge lifts slightly, so the roof reads long and low instead of pointy.
     wall_top = int(h * (0.46 - 0.06 * g))
-    ridge = int(h * (0.12 - 0.02 * g))
+    ridge = max(1, int(h * (0.12 - 0.02 * g + pitch)))
     wall_h = max(2, base - wall_top)
     cx = w // 2
     # Clamped to the canvas: a roof that overhangs past its own surface gets its
     # corners sliced off, which is exactly the detail the rim highlight sells.
-    eave = max(1, min(_hut_eave(s, g), left - 1, w - right - 2))
+    # Stone carries a shorter eave - see the material note in the docstring.
+    reach = int(round(_hut_eave(s, g) * overhang * (0.78 if stone else 1.0)))
+    eave = max(1, min(reach, left - 1, w - right - 2))
+    # Quoins on a stone hut, corner posts on a timber one.
+    post = STONE_DARK if stone else WOOD_DARK
+    lintel = STONE_LIGHT if stone else WOOD
+    sill = STONE if stone else WOOD_DARK
 
     def fx(t: float) -> int:
         """Horizontal position as a fraction *across the walls*, not the canvas.
@@ -716,16 +832,23 @@ def _bake_hut(stage: int, rng: random.Random, scale: float = 1.0) -> pygame.Surf
         return int(left + wall_span * t)
 
     if stage == 0:
-        post_h = int(h * 0.22)
+        # A timber hut starts as driven stakes; a stone one starts as squat set
+        # footing blocks, which is the only cue the material gets this early.
+        post_h = int(h * (0.13 if stone else 0.22))
         for x in (left, fx(0.32), fx(0.68), right):
-            _line(surf, WOOD_DARK, (x, base), (x + rng.uniform(-1, 1) * s, base - post_h), lw(3))
+            # Per-post scruff on top of the variant's own slant. Safe to draw
+            # from the stream here: nothing in this branch is gated on growth,
+            # so the four tilts come out the same at every bucket.
+            tilt = (lean + rng.uniform(-0.8, 0.8)) * s
+            _line(surf, post, (x, base), (x + tilt, base - post_h), lw(5 if stone else 3))
             _rim_line(surf, (x - 1, base - lw(2)), (x - 1, base - post_h + lw(1)), 80)
         _ellipse(surf, EARTH, cx, base, w * 0.42, 3.0 * s)
         return surf
 
-    # posts
+    # posts. The wall plate across the top stays timber whatever the walls are
+    # made of - it is what the rafters land on.
     for x in (left, right):
-        _line(surf, WOOD_DARK, (x, base), (x, wall_top), lw(4))
+        _line(surf, post, (x, base), (x, wall_top), lw(4))
     _line(surf, WOOD_DARK, (left, wall_top), (right, wall_top), lw(3))
 
     if stage == 1:
@@ -739,24 +862,31 @@ def _bake_hut(stage: int, rng: random.Random, scale: float = 1.0) -> pygame.Surf
         return surf
 
     # walls
-    _poly(surf, WOOD_DARK, [(left, base), (left, wall_top), (right, wall_top), (right, base)])
-    bands = 4 + int(round(2.0 * g))
-    span = max(2, wall_h // (bands + 1))
-    for i in range(bands):
-        y = wall_top + lw(5) + i * span
-        if y >= base - 1:
-            break
-        _line(surf, WOOD, (left + lw(2), y), (right - lw(2), y), 1, 150)
+    if stone:
+        _hut_masonry(surf, left, right, wall_top, base, s, jog)
+    else:
+        _poly(surf, WOOD_DARK,
+              [(left, base), (left, wall_top), (right, wall_top), (right, base)])
+        bands = 4 + int(round(2.0 * g)) + extra
+        span = max(2, wall_h // (bands + 1))
+        for i in range(bands):
+            y = wall_top + lw(5) + i * span
+            if y >= base - 1:
+                break
+            _line(surf, WOOD, (left + lw(2), y), (right - lw(2), y), 1, 150)
 
     # A grown hut sits on stone. Drawn before the openings so the doorway cuts
-    # through it rather than standing on a plinth.
+    # through it rather than standing on a plinth. On masonry the plinth has to
+    # run a shade *lighter* than the wall: the STONE_DARK footing that grounds a
+    # timber hut just disappears into the courses above it.
     if g > 0.15:
         fh = lw(4) + int(round(3.0 * g * s))
-        pygame.draw.rect(surf, _rgba(STONE_DARK),
+        plinth, cobble = (STONE, STONE_LIGHT) if stone else (STONE_DARK, STONE)
+        pygame.draw.rect(surf, _rgba(plinth),
                          pygame.Rect(left, base - fh, max(2, right - left), fh))
         step = max(4, int(round(9.0 * s)))
         for bx in range(left, max(left + 1, right - 2), step):
-            _ellipse(surf, STONE, bx + step * 0.5, base - fh * 0.55, step * 0.34, fh * 0.34)
+            _ellipse(surf, cobble, bx + step * 0.5, base - fh * 0.55, step * 0.34, fh * 0.34)
         _rim_line(surf, (left, base - fh), (right, base - fh), 90)
 
     if stage == 2:
@@ -771,7 +901,7 @@ def _bake_hut(stage: int, rng: random.Random, scale: float = 1.0) -> pygame.Surf
         lspan = float(wall_top + lw(3) - ridge)
         _poly(surf, THATCH, [(left - eave, wall_top + lw(3)), (cx, ridge),
                              (right + eave, wall_top + lw(3))])
-        courses = 5 + int(round(3.0 * g))
+        courses = 5 + int(round(3.0 * g)) + extra
         for i in range(courses):
             t = 0.18 + (0.80 / courses) * i
             ly = wall_top + lw(3) - lspan * t
@@ -797,30 +927,37 @@ def _bake_hut(stage: int, rng: random.Random, scale: float = 1.0) -> pygame.Surf
         win_y = wall_top + wall_h * 0.34
         win_w, win_h = wall_span * 0.17, wall_h * 0.30
         if g > 0.30:
-            _hut_window(surf, fx(0.20), win_y, win_w, win_h, s, g > 0.70)
+            _hut_window(surf, fx(win_t), win_y, win_w, win_h, s, g > 0.70, lintel, sill)
         if 0.55 < g <= 0.78:
-            _hut_window(surf, fx(0.80), win_y, win_w, win_h, s, g > 0.70)
+            _hut_window(surf, fx(far_t), win_y, win_w, win_h, s, g > 0.70, lintel, sill)
 
-        dw = max(6, int(round(wall_span * 0.24)))
+        dw = max(6, int(round(wall_span * door_f)))
         dh = max(8, int(round(wall_h * 0.58)))
         door = pygame.Rect(cx - dw // 2, base - dh - lw(1), dw, dh)
         pygame.draw.rect(surf, _rgba((16, 12, 10), 235), door)
+        if stone:
+            # A masonry opening cannot span itself; the timber hut's doorway is
+            # a gap between studs and needs nothing.
+            _line(surf, lintel, (door.left - lw(2), door.top - lw(1)),
+                  (door.right + lw(2), door.top - lw(1)), lw(2))
         _rim_line(surf, (door.left - 1, door.top - 1), (door.left - 1, base - lw(2)), 90)
         _rim_line(surf, (door.left - 1, door.top - 1), (door.right - 1, door.top - 1), 70)
 
         if g > 0.78:
             # top of the range: a second doorway, plus a gable window above the
-            # main one - the hut has become a longhouse for two families
+            # main one - the hut has become a longhouse for two families. The
+            # second door lands exactly where the second window was, so the
+            # crossover at g == 0.78 reads as the opening being enlarged.
             d2w = max(5, int(round(wall_span * 0.17)))
             d2h = max(7, int(round(wall_h * 0.50)))
-            d2 = pygame.Rect(fx(0.80) - d2w // 2, base - d2h - lw(1), d2w, d2h)
+            d2 = pygame.Rect(fx(far_t) - d2w // 2, base - d2h - lw(1), d2w, d2h)
             pygame.draw.rect(surf, _rgba((16, 12, 10), 235), d2)
-            _line(surf, WOOD, (d2.left - lw(1), d2.top - lw(1)),
+            _line(surf, lintel, (d2.left - lw(1), d2.top - lw(1)),
                   (d2.right + lw(1), d2.top - lw(1)), lw(2))
             _rim_line(surf, (d2.left - 1, d2.top - 1), (d2.left - 1, base - lw(2)), 85)
             _rim_line(surf, (d2.left - 1, d2.top - 1), (d2.right - 1, d2.top - 1), 65)
             _hut_window(surf, cx, wall_top + wall_h * 0.20, wall_span * 0.13,
-                        wall_h * 0.16, s)
+                        wall_h * 0.16, s, False, lintel, sill)
 
     _ellipse(surf, EARTH, cx, base, w * 0.44, 3.0 * s)
     return surf
@@ -1175,6 +1312,7 @@ _STRUCTURE_BAKERS = {
 }
 
 _sync_with_sim()
+_mirror_hut_aliases()      # after the sync, so the aliases adopt the sim's numbers
 
 
 # --------------------------------------------------------------------------
@@ -1203,7 +1341,18 @@ class Atlas:
     # ------------------------------------------------------------- baking --
 
     def _rng(self, kind: str, variant: int, stage: int) -> random.Random:
-        return random.Random((self.seed * 31 + hash((kind, variant, stage))) & 0x7FFFFFFF)
+        """The per-sprite jitter stream, seeded so it survives a restart.
+
+        crc32 rather than ``hash()``: CPython salts str hashing per process, so
+        the tuple hash this used to key on changed on every launch and *every*
+        rng-driven sprite was redrawn differently each run - measured tree
+        variant-0 at md5 be386bcf then 5b4b2fa0, one grave at d67d0a83 then
+        0539a9bb across two fresh processes. Nothing crashed, which is why it
+        survived: a forest that quietly reshuffles itself overnight just looks
+        like a forest. Same trap and same fix as ``sim.props._name_variant``.
+        """
+        tag = f"{kind}\x1f{int(variant)}\x1f{int(stage)}".encode("utf-8", "replace")
+        return random.Random((self.seed * 31 + zlib.crc32(tag)) & 0x7FFFFFFF)
 
     @staticmethod
     def _art_stage(kind: str, stage: int) -> int:
@@ -1223,9 +1372,10 @@ class Atlas:
     def _bake_one(self, kind: str, variant: int, stage: int,
                   scale: float = 1.0) -> pygame.Surface:
         rng = self._rng(kind, variant, stage)
-        if kind == "hut":
+        material = HUT_KINDS.get(kind)
+        if material is not None:
             # the only kind whose art is a function of scale, not a resample
-            return _bake_hut(self._art_stage("hut", stage), rng, scale)
+            return _bake_hut(self._art_stage(kind, stage), rng, scale, material)
         baker = _STRUCTURE_BAKERS.get(kind)
         if baker is not None:
             return baker(self._art_stage(kind, stage), rng)
@@ -1280,14 +1430,15 @@ class Atlas:
         the first hut to cross a bucket does not bake mid-frame.
         """
         n = 0
-        st = self.stages("hut") - 1
-        for v in range(self.variants("hut")):
-            for idx in range(1, HUT_GROWTH_BUCKETS):
-                try:
-                    self._hut_sprite(v, st, hut_bucket_scale(idx))
-                    n += 1
-                except Exception:
-                    continue
+        for kind in HUT_KINDS:
+            st = self.stages(kind) - 1
+            for v in range(self.variants(kind)):
+                for idx in range(1, HUT_GROWTH_BUCKETS):
+                    try:
+                        self._hut_sprite(kind, v, st, hut_bucket_scale(idx))
+                        n += 1
+                    except Exception:
+                        continue
         return n
 
     # ------------------------------------------------------------ queries --
@@ -1311,8 +1462,12 @@ class Atlas:
 
     @staticmethod
     def is_structure(kind: str) -> bool:
-        """True if *kind* is a multi-stage buildable."""
-        return kind in _STRUCTURE_BAKERS
+        """True if *kind* is a multi-stage buildable.
+
+        The hut aliases are in here too: they have the same stage ladder as
+        ``hut``, they just are not reached through ``_STRUCTURE_BAKERS``.
+        """
+        return kind in _STRUCTURE_BAKERS or kind in HUT_KINDS
 
     def size(self, kind: str, scale: float = 1.0) -> tuple[int, int]:
         """Sprite size in pixels at *scale*.
@@ -1320,7 +1475,7 @@ class Atlas:
         Reports what :meth:`get` will actually hand back, bucket quantisation and
         the hut's extra height gain included - not the naive ``base * scale``.
         """
-        if kind == "hut" and float(scale) > float(HUT_SCALE_MIN) - 1e-6:
+        if kind in HUT_KINDS and float(scale) > float(HUT_SCALE_MIN) - 1e-6:
             return hut_dims(hut_bucket_scale(hut_growth_bucket(scale)))
         w, h = KIND_SIZE.get(kind, (2, 2))
         s = max(0.05, float(scale))
@@ -1351,6 +1506,16 @@ class Atlas:
                     return "bush_berry"
             except (TypeError, ValueError):
                 return kind
+        if isinstance(state, dict) and kind == "hut":
+            # The building tech tier is ``state["material"]`` on the Structure,
+            # not a second structure kind - see :data:`HUT_KINDS`. Anything
+            # missing or unrecognised stays a timber hut, so every save written
+            # before the tier existed renders exactly as it did before.
+            try:
+                mat = str(state.get("material", "") or "").strip().lower()
+            except (TypeError, ValueError):
+                return kind
+            return _HUT_KIND_FOR_MATERIAL.get(mat, kind)
         return kind
 
     @staticmethod
@@ -1405,8 +1570,8 @@ class Atlas:
             ns = self.stages(kind)
             v = int(variant) % nv
             st = max(0, min(int(stage), ns - 1))
-            if kind == "hut" and float(scale) > float(HUT_SCALE_MIN) - 1e-6:
-                return self._hut_sprite(v, st, float(scale))
+            if kind in HUT_KINDS and float(scale) > float(HUT_SCALE_MIN) - 1e-6:
+                return self._hut_sprite(kind, v, st, float(scale))
             bucket = int(round(float(scale) * SCALE_BUCKET))
             bucket = max(2, min(bucket, 160))
             key = (kind, v, st, bucket)
@@ -1438,23 +1603,27 @@ class Atlas:
         except Exception:
             return self._missing
 
-    def _hut_sprite(self, variant: int, stage: int, scale: float) -> pygame.Surface:
-        """Grown hut for *scale*, baked once per growth bucket.
+    def _hut_sprite(self, kind: str, variant: int, stage: int,
+                    scale: float) -> pygame.Surface:
+        """Grown hut of *kind* for *scale*, baked once per growth bucket.
 
         A hut's scale drifts by a fraction of a percent per tick, so the whole
-        point is that the bucket - not the raw scale - is the cache key.
+        point is that the bucket - not the raw scale - is the cache key. *kind*
+        is one of :data:`HUT_KINDS` and goes into the key unchanged, so a stone
+        hut and a timber one at the same size can never be served each other's
+        sprite.
         """
         idx = hut_growth_bucket(scale)
         if idx == 0 and abs(float(HUT_SCALE_MIN) - 1.0) < 1e-6:
             # bucket 0 *is* the base bake; don't hold a second copy of it
-            key = ("hut", variant, stage, int(SCALE_BUCKET))
+            key = (kind, variant, stage, int(SCALE_BUCKET))
         else:
-            key = ("hut", variant, stage, HUT_BUCKET_KEY + idx)
+            key = (kind, variant, stage, HUT_BUCKET_KEY + idx)
         hit = self._cache.get(key)
         if hit is not None:
             return hit
         try:
-            spr = self._bake_one("hut", variant, stage, hut_bucket_scale(idx))
+            spr = self._bake_one(kind, variant, stage, hut_bucket_scale(idx))
         except Exception:
             spr = self._missing
         self._cache[key] = spr
@@ -1536,6 +1705,12 @@ if __name__ == "__main__":  # pragma: no cover - smoke test
     print(f"baked {len(atlas._cache)} sprites in {atlas.bake_ms:.1f} ms")
     assert atlas.bake_ms < 400.0, "atlas bake budget blown"
 
+    # A golden number, not a re-run: two Atlases inside one process agree even
+    # when the seeding is salted, so the only way to catch a slide back to
+    # hash() of a str from a single process is to pin the value it must produce.
+    assert abs(atlas._rng("tree", 0, 0).random() - 0.32432691957352955) < 1e-12, \
+        "sprite rng is no longer reproducible across processes"
+
     # contact sheet of everything, on a dark background
     cell = 128
     cols = 8
@@ -1565,15 +1740,18 @@ if __name__ == "__main__":  # pragma: no cover - smoke test
     st_final = STRUCTURE_STAGES.get("hut", 5) - 1
     dims = [atlas.hut_bucket(hut_bucket_scale(i)) for i in range(HUT_GROWTH_BUCKETS)]
     strip_w = sum(d[2][0] + 16 for d in dims) + 16
-    strip_h = max(d[2][1] for d in dims) + 40
-    strip = pygame.Surface((strip_w, strip_h))
+    row_h = max(d[2][1] for d in dims) + 40
+    strip = pygame.Surface((strip_w, row_h * len(HUT_KINDS)))
     strip.fill((18, 20, 26))
-    gy = strip_h - 16
-    pygame.draw.line(strip, (44, 48, 54), (0, gy), (strip_w, gy), 1)
-    px = 16
-    for idx, drawn, (sw, sh) in dims:
-        atlas.blit(strip, "hut", px + sw // 2, gy, 0, st_final, drawn)
-        px += sw + 16
+    # One row per material: the point of the strip is that both walls climb the
+    # same ladder and pick up the same growth details at the same buckets.
+    for row, hkind in enumerate(HUT_KINDS):
+        gy = row * row_h + row_h - 16
+        pygame.draw.line(strip, (44, 48, 54), (0, gy), (strip_w, gy), 1)
+        px = 16
+        for idx, drawn, (sw, sh) in dims:
+            atlas.blit(strip, hkind, px + sw // 2, gy, 0, st_final, drawn)
+            px += sw + 16
     try:
         pygame.image.save(strip, str(CAPTURE_DIR / "hut_growth.png"))
         print("wrote hut_growth.png to", CAPTURE_DIR)
@@ -1592,11 +1770,27 @@ if __name__ == "__main__":  # pragma: no cover - smoke test
     n = 0
     for i in range(4000):
         sc = HUT_SCALE_MIN + (HUT_SCALE_MAX - HUT_SCALE_MIN) * (i / 3999.0)
-        atlas.get("hut", i % 4, st_final, sc)
-        n += 1
+        for hkind in HUT_KINDS:
+            atlas.get(hkind, i % 4, st_final, sc)
+            n += 1
     dt = (time.perf_counter() - t0) / n * 1e6
     print(f"drifting-scale get(): {dt:.2f} us/call, cache {before} -> {len(atlas._cache)}")
     assert len(atlas._cache) == before, "drifting hut scale is not hitting the bucket cache"
+
+    # The variant axis is wired through the sim, the saves and the cache key, so
+    # it has to actually change the picture; and a stone hut must never be
+    # served a timber one's sprite at the same size.
+    for sc in (1.0, 1.4, HUT_SCALE_MAX):
+        for hkind in HUT_KINDS:
+            seen = {pygame.image.tobytes(atlas.get(hkind, v, st_final, sc), "RGBA")
+                    for v in range(atlas.variants(hkind))}
+            assert len(seen) == atlas.variants(hkind), f"{hkind} variants collapsed at {sc}"
+        assert (pygame.image.tobytes(atlas.get("hut", 0, st_final, sc), "RGBA")
+                != pygame.image.tobytes(atlas.get("hut_stone", 0, st_final, sc), "RGBA")), \
+            "stone hut is baking the timber drawing"
+    assert Atlas.resolve("hut", {"material": "stone"}) == "hut_stone"
+    assert Atlas.resolve("hut", {"material": "sponge"}) == "hut"   # unknown -> timber
+    assert Atlas.resolve("hut", None) == "hut"                     # pre-tier save
 
     t0 = time.perf_counter()
     for _ in range(2000):

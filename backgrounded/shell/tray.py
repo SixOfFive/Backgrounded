@@ -32,7 +32,7 @@ import uuid
 from ctypes import wintypes
 from typing import Any, Callable
 
-from ..constants import SCENES, SCENE_LABELS, SCENE_ROTATE_SEC
+from ..constants import RENDER_SIZE, SCENES, SCENE_LABELS, SCENE_ROTATE_SEC
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +63,11 @@ WM_LBUTTONUP = 0x0202
 WM_CONTEXTMENU = 0x007B
 WM_APP = 0x8000
 WM_TRAYICON = WM_APP + 17
+# Posted by the app when the tooltip's contents have gone stale. It is a posted
+# message rather than a direct call because Shell_NotifyIconW is talking about
+# *this thread's* window: keeping every touch of the icon on the pump thread is
+# the same discipline that makes PostQuitMessage work above.
+WM_TRAY_REFRESH = WM_APP + 18
 
 # window styles
 WS_OVERLAPPED = 0x00000000
@@ -100,10 +105,13 @@ ID_CLEAR_GRAVES = 1045
 ID_NAMES = 1046
 ID_LOG = 1047
 ID_AUTO_SCENE = 1048
+ID_STATS = 1049
+ID_ACTIVITY = 1050
 ID_SAVE = 1005
 ID_EXIT = 1006
 ID_SCENE_BASE = 2000
 ID_SPEED_BASE = 3000
+ID_SCALE_BASE = 4000
 
 SPEEDS: tuple[tuple[str, float], ...] = (
     ("0.5x", 0.5),
@@ -111,6 +119,13 @@ SPEEDS: tuple[tuple[str, float], ...] = (
     ("2x", 2.0),
     ("4x", 4.0),
 )
+
+# Preview window size, as a multiple of the render surface. Offered as fixed
+# steps rather than a free number because the tray has no way to type one, and
+# because the useful range is bounded at both ends: below 50% the name plates
+# stop being readable, above 150% a 1600x1000 frame no longer fits a 1080p
+# screen. Dragging the window border still works and is not tracked here.
+WINDOW_SCALES: tuple[float, ...] = (0.5, 0.75, 1.0, 1.25, 1.5)
 
 ICON_SIZE = 32
 TOOLTIP = "Backgrounded"
@@ -582,6 +597,24 @@ class Tray:
 
     # ---------------------------------------------------------- shell icon --
 
+    def _tip(self) -> str:
+        """Tooltip text, which carries the paused state.
+
+        A paused colony is indistinguishable from a running one that happens to
+        be quiet - the wallpaper simply stops changing - and ``paused`` persists
+        across restarts, so the freeze can outlive any memory of having asked
+        for it. The window caption says so too, but the whole point of this app
+        is that the window is usually hidden, which leaves the tray as the only
+        thing left to ask.
+        """
+        try:
+            if bool(self._state().get("paused")):
+                return f"{TOOLTIP} - paused"
+        except Exception:
+            log.debug("tray: could not read paused state for the tooltip",
+                      exc_info=True)
+        return TOOLTIP
+
     def _nid(self) -> NOTIFYICONDATAW:
         nid = NOTIFYICONDATAW()
         nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
@@ -590,8 +623,37 @@ class Tray:
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
         nid.uCallbackMessage = WM_TRAYICON
         nid.hIcon = self._hicon or None
-        nid.szTip = TOOLTIP
+        nid.szTip = self._tip()
         return nid
+
+    def refresh(self) -> None:
+        """Ask the pump thread to re-read state and repaint the icon's tooltip.
+
+        Safe to call from any thread, and a no-op before the window exists (the
+        first ``_add_icon`` reads the state itself, so a run that starts paused
+        is already labelled).
+        """
+        hwnd = self.hwnd
+        if not hwnd or self._stopping:
+            return
+        try:
+            user32.PostMessageW(hwnd, WM_TRAY_REFRESH, 0, 0)
+        except Exception as exc:
+            log.debug("tray: could not post a tooltip refresh: %s", exc)
+
+    def _update_icon(self) -> None:
+        """Re-send the icon data (tray thread only). Adds it if it went missing."""
+        if not self.hwnd:
+            return
+        if not self._icon_added:
+            self._add_icon()
+            return
+        try:
+            nid = self._nid()
+            if not shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid)):
+                log.debug("tray: NIM_MODIFY failed")
+        except Exception as exc:
+            log.debug("tray: could not update the icon: %s", exc)
 
     def _add_icon(self) -> None:
         if not self.hwnd:
@@ -623,6 +685,9 @@ class Tray:
         try:
             if msg == WM_TRAYICON:
                 self._on_tray_message(int(lparam) & 0xFFFF)
+                return 0
+            if msg == WM_TRAY_REFRESH:
+                self._update_icon()
                 return 0
             if self._wm_taskbar_created and msg == self._wm_taskbar_created:
                 # Explorer restarted; our icon went with it.
@@ -740,8 +805,38 @@ class Tray:
                     ID_SPEED_BASE + active, MF_BYCOMMAND)
             user32.AppendMenuW(menu, MF_STRING | MF_POPUP, speed_menu, "Speed")
 
+        # --- Window size submenu, radio-checked on the active multiplier
+        scale_menu = int(user32.CreatePopupMenu() or 0)
+        if scale_menu:
+            subs.append(scale_menu)
+            for i, value in enumerate(WINDOW_SCALES):
+                w = max(1, int(RENDER_SIZE[0] * value))
+                h = max(1, int(RENDER_SIZE[1] * value))
+                user32.AppendMenuW(scale_menu, MF_STRING, ID_SCALE_BASE + i,
+                                   f"{value * 100:.0f}%\t{w} x {h}")
+            try:
+                current = float(state.get("window_scale", 1.0))
+            except (TypeError, ValueError):
+                current = 1.0
+            active = -1
+            for i, value in enumerate(WINDOW_SCALES):
+                if abs(value - current) < 1e-6:
+                    active = i
+                    break
+            if active >= 0:
+                user32.CheckMenuRadioItem(
+                    scale_menu, ID_SCALE_BASE,
+                    ID_SCALE_BASE + len(WINDOW_SCALES) - 1,
+                    ID_SCALE_BASE + active, MF_BYCOMMAND)
+            user32.AppendMenuW(menu, MF_STRING | MF_POPUP, scale_menu,
+                               "Window Size")
+
+        user32.AppendMenuW(menu, flag(bool(state.get("show_stats", True))),
+                           ID_STATS, "Show Stats")
         user32.AppendMenuW(menu, flag(bool(state.get("show_names", True))),
                            ID_NAMES, "Show Names")
+        user32.AppendMenuW(menu, flag(bool(state.get("show_activity", True))),
+                           ID_ACTIVITY, "Show Activity")
         user32.AppendMenuW(menu, flag(bool(state.get("show_log", True))),
                            ID_LOG, "Show Log")
         user32.AppendMenuW(menu, flag(bool(state["paused"])), ID_PAUSE, "Pause")
@@ -801,8 +896,12 @@ class Tray:
             self._emit("new_terrain", None)
         elif cmd == ID_CLEAR_GRAVES:
             self._emit("clear_graves", None)
+        elif cmd == ID_STATS:
+            self._emit("toggle_stats", None)
         elif cmd == ID_NAMES:
             self._emit("toggle_names", None)
+        elif cmd == ID_ACTIVITY:
+            self._emit("toggle_activity", None)
         elif cmd == ID_LOG:
             self._emit("toggle_log", None)
         elif cmd == ID_AUTO_SCENE:
@@ -815,6 +914,8 @@ class Tray:
             self._emit("scene", SCENES[cmd - ID_SCENE_BASE])
         elif ID_SPEED_BASE <= cmd < ID_SPEED_BASE + len(SPEEDS):
             self._emit("speed", SPEEDS[cmd - ID_SPEED_BASE][1])
+        elif ID_SCALE_BASE <= cmd < ID_SCALE_BASE + len(WINDOW_SCALES):
+            self._emit("window_scale", WINDOW_SCALES[cmd - ID_SCALE_BASE])
         else:
             log.debug("tray: unknown menu command %d", cmd)
 

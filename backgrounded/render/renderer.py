@@ -105,6 +105,9 @@ class Renderer:
         # Last screen-shake offset baked into the returned frame, so draw_hud
         # can match it on the wallpaper path.
         self._shake: tuple[int, int] = (0, 0)
+        # (disabled subsystem names, hud scale, rendered plate) - see
+        # _fault_banner. The scale is part of the key, not just the content.
+        self._fault_plate: tuple[tuple[str, ...], float, pygame.Surface] | None = None
 
     # ------------------------------------------------------------- public --
     def draw(self, world, dt: float) -> pygame.Surface:
@@ -269,8 +272,70 @@ class Renderer:
                                offset=off, mouse=mouse)
             if self.show_log:
                 hud.draw_log(surf, world, offset=off)
+            # Deliberately not behind show_stats/show_log: this is a fault
+            # report, not a statistic, and hiding the panels must not hide it.
+            plate = self._fault_banner(world)
+            if plate is not None:
+                r = plate.get_rect()
+                r.midtop = (surf.get_width() // 2 + int(off[0]), 12 + int(off[1]))
+                surf.blit(plate, r)
         except Exception:
             log.debug("hud draw failed", exc_info=True)
+
+    def _fault_banner(self, world) -> "pygame.Surface | None":
+        """Plate naming any subsystem the world has switched off, or None.
+
+        ``World._guarded`` disables a subsystem for the rest of the session the
+        first time it raises, and logs it - but the app runs under pythonw with
+        no console, so the StreamHandler app.py attaches writes those records to
+        a ``None`` stdout and they are simply gone. That is exactly how a dead
+        scene rotation once shipped with every smoke check passing (see
+        tools/smoke.py, "no subsystem disabled itself after a reload"). A colony
+        running for hours with no weather, no population or no lighting is the
+        worst failure this thing has and the one the user is least able to spot,
+        so it gets said on the frame rather than only in a log nobody reads.
+
+        Cached on the disabled set *and the HUD scale*: this is on the frame loop
+        and the set only changes when something dies, which is at most a handful
+        of times ever. The scale belongs in the key because it is baked into the
+        two font sizes below, and it is a live user dial - [ and ] move it at
+        runtime - so keying on the names alone left the banner frozen at whatever
+        size it happened to be built at while every other panel resized around it.
+        """
+        try:
+            names = tuple(sorted(str(n) for n in (getattr(world, "_disabled", ()) or ())))
+        except Exception:
+            return None
+        if not names:
+            return None
+        scale = float(getattr(hud, "HUD_SCALE", 1.0) or 1.0)
+        hit = self._fault_plate
+        if hit is not None and hit[0] == names and abs(hit[1] - scale) < 1e-6:
+            return hit[2]
+        try:
+            font = pygame.font.SysFont("consolas,dejavusansmono,couriernew",
+                                       max(8, int(round(11 * scale))), bold=True)
+            sub = pygame.font.SysFont("consolas,dejavusansmono,couriernew",
+                                      max(7, int(round(9 * scale))))
+            head = font.render("SUBSYSTEM OFFLINE: " + ", ".join(names),
+                               True, (235, 112, 112))
+            tail = sub.render("this colony is running degraded - restart to recover",
+                              True, (196, 202, 214))
+            pad = max(4, int(round(6 * scale)))
+            w = max(head.get_width(), tail.get_width()) + pad * 2
+            h = head.get_height() + tail.get_height() + pad * 2 + 2
+            plate = pygame.Surface((w, h), pygame.SRCALPHA)
+            plate.fill((18, 10, 12, 214))
+            pygame.draw.rect(plate, (168, 62, 62), plate.get_rect(),
+                             max(1, int(round(scale))))
+            plate.blit(head, ((w - head.get_width()) // 2, pad))
+            plate.blit(tail, ((w - tail.get_width()) // 2,
+                              pad + head.get_height() + 2))
+        except Exception:
+            log.debug("fault banner build failed", exc_info=True)
+            return None
+        self._fault_plate = (names, scale, plate)
+        return plate
 
     # ------------------------------------------------------------ terrain --
     def _terrain_surface(self, terrain) -> pygame.Surface:
@@ -398,9 +463,23 @@ class Renderer:
                 blaze = bool(getattr(st, "bonfire_active", False))
             except Exception:
                 blaze = False
+            # Structure.scale() is 1.0 for everything but a finished hut, where
+            # it rides `growth` up to HUT_SCALE_MAX. It used to be dropped on the
+            # floor here, so a hut the sim had already grown - wider footprint,
+            # taller silhouette, more sleepers - still drew as the 78x64 box it
+            # was founded as, and the growth ladder the atlas bakes at startup
+            # was unreachable. Passed undamped: width_now/height_now/top_y/
+            # contains_point are all already this number, so drawing anything
+            # else puts the sprite out of step with the sim's own footprint.
             try:
+                scale = BONFIRE_DRAW_SCALE if blaze else st.scale()
+            except Exception:
+                scale = 1.0
+            try:
+                # `state` picks the wall material for a hut (Atlas.resolve);
+                # absent or unknown is timber, which is every save so far.
                 spr = self.atlas.get(st.kind, st.variant, stage=st.stage,
-                                     scale=BONFIRE_DRAW_SCALE if blaze else 1.0)
+                                     scale=scale, state=getattr(st, "state", None))
             except Exception:
                 continue
             if spr is None:

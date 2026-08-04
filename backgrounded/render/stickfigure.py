@@ -17,6 +17,11 @@ from straight-up. The whole skeleton is mirrored by ``facing``, optionally
 rotated about the hip (falling, lying down), then translated to world space.
 Limbs on the far side are drawn first and dimmed, which is what gives a
 two-line figure any sense of depth at 21 pixels tall.
+
+Worn gear - the spear and the leather jerkin - lives in ``creatures.draw_gear``
+but is drawn from inside this module's main draw, so it gets the skeleton that
+has already been solved and the colours the limbs were painted with instead of
+posing and lighting the figure a second time.
 """
 from __future__ import annotations
 
@@ -667,6 +672,68 @@ def _solve(s: Stickman, p: _Pose, h: float, name: str,
     )
 
 
+# -------------------------------------------------------------- worn gear --
+#: Poses that plant the hands or lay the body flat, where a held spear ends up
+#: buried. ``creatures._draw_spear`` aims the shaft down the elbow->hand vector,
+#: which is what makes it obey every pose for free, but it is 0.98 body-heights
+#: long and nothing clamps it at the ground.
+#:
+#: Measured by rendering, not by modelling the geometry: an armed agent and an
+#: unarmed one drawn into the same surface for 240 samples of each pose, and the
+#: gear-only pixels below the lowest foot counted. Worst sample per pose:
+#:
+#:   cartwheel 73   handstand 63   split 43   sleep 40   dead 38
+#:   idle      22   walk       4   fall   0
+#:
+#: A geometry sweep is the obvious way to measure this and it disagreed with the
+#: render on exactly one pose, so the pixels win. ``split`` is the pose in
+#: question: it looks upright and was first grouped with idle and walk, but the
+#: hands go to the floor beside the hips and it buries MORE than ``sleep`` or
+#: ``dead``, both of which were never in doubt. ``fall`` is deliberately absent
+#: despite being airborne - a falling body has its arms up and the shaft never
+#: reaches the feet at all.
+#:
+#: ``idle`` at 22 px is the one real case left, and it is not fixable from here:
+#: gating it would mean nobody ever visibly carries a spear while standing
+#: still. It wants a ground clamp inside ``creatures._draw_spear``, which is a
+#: look decision (a clamped spear becomes a stub; carrying it butt-down like a
+#: staff is the other answer) rather than a bug to quietly pick a side on.
+#:
+#: The jerkin stays on in every case: it is worn, it follows the torso through
+#: any rotation, and dropping the whole call here would strip armour off every
+#: sleeper whether or not they ever owned a spear.
+_SPEAR_GROUNDED: frozenset[str] = frozenset({
+    "cartwheel", "handstand", "flip", "backflip", "sleep", "dead", "split",
+})
+
+
+@dataclass(slots=True, frozen=True)
+class _Disarmed:
+    """An agent as seen with its spear set down.
+
+    ``creatures.draw_gear`` paints the jerkin and the shaft from one call and
+    has no flag to split them, and that file is not ours to change. Handed a
+    solved skeleton it reads exactly ``weapon``, ``armour`` and ``alive`` off
+    the agent, so this stand-in drops the spear and nothing else. If draw_gear
+    ever reads a fourth field this has to learn it too - the price of the trick.
+    """
+
+    armour: Any
+    alive: bool
+    weapon: str = ""
+
+
+#: ``render.creatures``, resolved on the first frame. The import has to happen
+#: inside the draw - creatures reaches back into this module for a skeleton, and
+#: an import-time edge either way makes the pair genuinely circular - but paying
+#: for it per agent per frame is not free: a relative ``from .creatures import
+#: draw_gear`` in the hot path measured +1.9 us on a 29 us unarmed stickman draw
+#: (+6.5%), against +0.8 us for the same work behind this cache. The module and
+#: not the function is what is held, so that patching ``creatures.draw_gear``
+#: still takes effect - which is how the gear A/B measurement switches it off.
+_creatures: Any = None
+
+
 # ------------------------------------------------------------- main draw --
 def draw_stickman(
     surf: pygame.Surface,
@@ -741,6 +808,28 @@ def _draw(surf: pygame.Surface, s: Stickman, t: float,
     _line(surf, base, sk.elbows[0], sk.hands[0], w)
 
     _disc(surf, base, sk.head, sk.head_r)
+
+    # Worn gear goes between the body and whatever is in the hand. The jerkin
+    # has to land after the torso line to read as covering the chest rather
+    # than hanging behind it, and the spear is in the front fist, so it belongs
+    # in front of the whole figure, head included - an overhead chop swings it
+    # past the face. Both sit *under* the carried icon and the candle below: a
+    # permanent loadout can afford to be occluded by what someone is doing right
+    # now, and a 2 px resource icon loses a fight with a shaft crossing it.
+    #
+    # base and silhouette cross untouched. They already carry the corpse fade
+    # and the renderer's lit/unlit verdict, and the scene light multiplies the
+    # whole world surface later, so gear dims with the limbs for free. Applying
+    # a light term here as well would dim it twice.
+    global _creatures
+    if _creatures is None:
+        from . import creatures as _c        # local: see _creatures above
+        _creatures = _c
+    gear_of: Any = s
+    if sk.pose in _SPEAR_GROUNDED and getattr(s, "weapon", None):
+        gear_of = _Disarmed(getattr(s, "armour", 0.0),
+                            bool(getattr(s, "alive", True)))
+    _creatures.draw_gear(surf, gear_of, sk, t, base, silhouette)
 
     if getattr(s, "carrying", None) and int(getattr(s, "carry_qty", 0) or 0) > 0:
         _draw_carried(surf, s, sk, base, silhouette)

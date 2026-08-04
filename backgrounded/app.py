@@ -103,9 +103,7 @@ class App:
             log.info("generated a new world (seed=%d)", self.world.seed)
         else:
             self.world.events.request_scene(self.cfg.scene)
-        # Honour the config's auto-scene switch (default on): the world flips to
-        # a random new scene every SCENE_ROTATE_SEC unless the user turned it off.
-        self.world.auto_scene_rotate = bool(getattr(self.cfg, "auto_scene_change", True))
+        self._apply_world_config()
 
         # --- pygame ------------------------------------------------------
         pygame.init()
@@ -115,6 +113,7 @@ class App:
         self.renderer = Renderer()
         self.renderer.show_stats = getattr(self.cfg, "show_stats", True)
         self.renderer.show_names = getattr(self.cfg, "show_names", True)
+        self.renderer.show_activity = getattr(self.cfg, "show_activity", True)
         self.renderer.show_log = getattr(self.cfg, "show_log", True)
         # HUD size is a module-level dial rather than a Renderer flag because the
         # wallpaper bake and the window overlay go through the same two draw
@@ -145,6 +144,27 @@ class App:
         # once per frame - see _bake_hud.
         self._frame_no = 0
         self._hud_frame = -1
+        # Mirrors Preview's own fullscreen flag, refreshed from the event pump.
+        # Only the tray's window-size command reads it, and only so it can leave
+        # fullscreen properly instead of resizing out from under it.
+        self._fullscreen = False
+
+    # -------------------------------------------------------- world config --
+    def _apply_world_config(self) -> None:
+        """Push the settings the World keeps its own live copy of onto it.
+
+        Called for the world the app starts with *and* for every world built
+        afterwards. World's default for auto_scene_rotate is True and has to
+        stay that way (from_dict leans on it for saves written before the flag
+        existed), so a fresh World from "Start Over" arrives with rotation on no
+        matter what the tray checkbox says - and then the menu shows one thing
+        while the weather does another until the next restart, which is the
+        exact desync toggle_auto_scene exists to prevent.
+        """
+        if self.world is None:
+            return
+        self.world.auto_scene_rotate = bool(
+            getattr(self.cfg, "auto_scene_change", True))
 
     # ---------------------------------------------------------- tray glue --
     def _tray_state(self) -> dict:
@@ -156,8 +176,10 @@ class App:
             "wallpaper_enabled": self.cfg.wallpaper_enabled,
             "show_stats": getattr(self.cfg, "show_stats", True),
             "show_names": getattr(self.cfg, "show_names", True),
+            "show_activity": getattr(self.cfg, "show_activity", True),
             "show_log": getattr(self.cfg, "show_log", True),
             "auto_scene_change": getattr(self.cfg, "auto_scene_change", True),
+            "window_scale": getattr(self.cfg, "window_scale", 1.0),
         }
 
     def _drain_commands(self) -> None:
@@ -226,10 +248,27 @@ class App:
             self._save_config("wallpaper_enabled")
         elif kind == "toggle_pause":
             cfg.paused = not cfg.paused
+            # The caption carries the marker for anyone watching the window, but
+            # the window is usually hidden and `paused` survives a restart, so
+            # the tooltip has to say it too or a frozen wallpaper has no
+            # explanation anywhere.
+            self.tray.refresh()
             self._save_config("paused")
         elif kind == "speed":
             cfg.sim_speed = float(payload)
             self._save_config("sim_speed")
+        elif kind == "window_scale":
+            scale = float(payload)
+            if scale > 0.05:
+                cfg.window_scale = scale
+                # Resizing a fullscreen window drops it back to a window behind
+                # Preview's back, leaving it convinced it is still fullscreen -
+                # the next F11 then looks broken. Leave first, via the method
+                # that owns the flag.
+                if self._fullscreen:
+                    self._fullscreen = self.preview.toggle_fullscreen()
+                self.preview.set_scale(scale)
+                self._save_config("window_scale")
         elif kind == "scene" and payload in SCENES:
             cfg.scene = payload
             self.world.events.request_scene(payload)
@@ -242,6 +281,10 @@ class App:
             self.renderer.show_names = not self.renderer.show_names
             cfg.show_names = self.renderer.show_names
             self._save_config("show_names")
+        elif kind == "toggle_activity":
+            self.renderer.show_activity = not self.renderer.show_activity
+            cfg.show_activity = self.renderer.show_activity
+            self._save_config("show_activity")
         elif kind == "toggle_log":
             self.renderer.show_log = not self.renderer.show_log
             cfg.show_log = self.renderer.show_log
@@ -251,8 +294,7 @@ class App:
             # tick actually reads, so both move together or the menu would show
             # one thing while the weather did another.
             cfg.auto_scene_change = not getattr(cfg, "auto_scene_change", True)
-            if self.world is not None:
-                self.world.auto_scene_rotate = cfg.auto_scene_change
+            self._apply_world_config()
             self._save_config("auto_scene_change")
             log.info("auto scene rotation %s",
                      "on" if cfg.auto_scene_change else "off")
@@ -266,7 +308,12 @@ class App:
             persist.save_world(self.world)
         elif kind == "reset":
             persist.save_world(self.world)
+            # Drop any Hand drag first: the Grab holds ids belonging to the
+            # world about to be thrown away, and the next mouse move would drag
+            # whichever entity in the *new* colony happens to reuse that id.
+            self.tools.release_all(self.world)
             self.world = World(scene=cfg.scene)
+            self._apply_world_config()
             log.info("world reset (seed=%d)", self.world.seed)
 
     # --------------------------------------------------------------- loop --
@@ -295,6 +342,7 @@ class App:
         # frame has already been seen. Self-guarding: a hidden, unfocused or
         # un-zoomed preview does nothing here.
         self.preview.pan_keys(dt)
+        self._fullscreen = bool(pointer.get("fullscreen", self._fullscreen))
         self.tools.handle(pointer.get("pointer"), self.world, self.world.world_time)
         step = pointer.get("hud_scale")
         if step:
@@ -401,7 +449,11 @@ class App:
         pop = len(w.population.alive_agents())
         z = getattr(self.preview, "zoom", 1.0)
         zoom = f" - {z:.1f}x" if z > 1.01 else ""
-        return (f"Backgrounded - {w.events.scene} - pop {pop} "
+        # Leading, not trailing: the taskbar button and Alt-Tab both truncate the
+        # caption from the right, and a paused world that has been paused since
+        # some previous session looks exactly like a broken one.
+        paused = "[PAUSED] " if self.cfg.paused else ""
+        return (f"{paused}Backgrounded - {w.events.scene} - pop {pop} "
                 f"gen {w.population.generation} - "
                 f"wood {w.stockpile.get('wood',0)} stone {w.stockpile.get('stone',0)} "
                 f"food {w.stockpile.get('food',0)}{zoom} - "

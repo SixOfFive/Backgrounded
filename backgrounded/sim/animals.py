@@ -48,6 +48,7 @@ from __future__ import annotations
 import logging
 import math
 import random
+import zlib
 from dataclasses import dataclass
 from typing import Any, Iterator
 
@@ -332,6 +333,32 @@ def _rand(rng: Any) -> float:
 
 def _uniform(rng: Any, lo: float, hi: float) -> float:
     return lo + (hi - lo) * _rand(rng)
+
+
+def _record_seed(d: Any) -> int:
+    """A seed derived from a save record, for a load that was handed none.
+
+    ``World.from_dict`` loads every subsystem through a one-argument helper, so
+    :meth:`AnimalRegistry.from_dict` has no world seed to work from. Falling
+    back to an unseeded registry meant a save written before ``next_spawn``
+    existed picked its first incursion from the module RNG: five loads of one
+    record gave 282.99 / 164.73 / 180.10 / 189.59 / 182.23 s, i.e. a reloaded
+    world diverged from itself. crc32 of what the record *does* carry, never
+    hash() - CPython salts str hashing per process, which would only move the
+    divergence from per-load to per-launch.
+    """
+    parts = ["animals"]
+    if isinstance(d, dict):
+        parts.append(str(_i(d.get("next_id"), 0)))
+        parts.append("%.4f" % _f(d.get("t"), 0.0))
+        raw = d.get("animals")
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                if isinstance(item, dict):
+                    parts.append("%s:%d" % (item.get("kind"), _i(item.get("id"), 0)))
+                else:
+                    parts.append("?")
+    return zlib.crc32("|".join(parts).encode("utf-8", "replace"))
 
 
 def _pick(rng: Any, options: tuple[str, ...]) -> str:
@@ -1069,9 +1096,15 @@ class AnimalRegistry:
         }
 
     @classmethod
-    def from_dict(cls, d: Any) -> "AnimalRegistry":
-        """Defensive load: an unreadable record is dropped, not fatal."""
-        reg = cls()
+    def from_dict(cls, d: Any, seed: int | None = None) -> "AnimalRegistry":
+        """Defensive load: an unreadable record is dropped, not fatal.
+
+        ``seed`` is optional so a caller that *does* hold the world seed can
+        thread it through; World.from_dict cannot, so without one we derive a
+        stable seed from the record itself - see :func:`_record_seed` for what
+        went wrong when this was a bare ``cls()``.
+        """
+        reg = cls(seed=_record_seed(d) if seed is None else int(seed))
         if not isinstance(d, dict):
             return reg
         raw = d.get("animals")

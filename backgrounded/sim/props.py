@@ -675,9 +675,31 @@ class PropRegistry:
             return []
         if not (hasattr(rng, "random") and hasattr(rng, "integers")):
             if self._fallback_rng is None:
-                self._fallback_rng = np.random.default_rng()
+                self._fallback_rng = np.random.default_rng(self._fallback_seed(src))
             rng = self._fallback_rng
         return tick_props(self, terrain, rng, _f(dt, 0.0), src)  # type: ignore[arg-type]
+
+    def _fallback_seed(self, src: object) -> int:
+        """Seed for the stream used when the caller ticked us without one.
+
+        The guard above has to stay - ``reg.tick(world, dt)`` against a world
+        that has no ``rng`` (a stub, a half-built World) must not raise on a
+        per-frame path - but ``default_rng()`` with no argument draws from the
+        OS entropy pool, which quietly made every such run irreproducible:
+        measured across three processes, 20 sim-minutes of the same registry
+        and seed ended in three different forests.  Take the World's own seed
+        when there is one; otherwise crc32 the registry's identity so a given
+        registry at least always falls back to the same stream.  crc32 and not
+        hash() for the reason spelled out in :func:`_name_variant`.
+        """
+        s = getattr(src, "seed", None)
+        if isinstance(s, (int, float)) and not isinstance(s, bool):
+            return int(s) & 0xFFFFFFFF
+        ident = "props|%d|%s" % (
+            self.next_id,
+            ",".join("%d:%s" % (p.id, p.kind) for p in self._props.values()),
+        )
+        return zlib.crc32(ident.encode("utf-8", "replace"))
 
     # -- persistence -------------------------------------------------------
 
@@ -819,8 +841,16 @@ def plant_sapling(
     rng: np.random.Generator | None = None,
 ) -> Prop:
     """Feature 17 - a stickman plants a sapling that will become a tree."""
-    gen = rng if rng is not None else np.random.default_rng()
     px = float(np.clip(_f(x), 4.0, float(terrain.W - 5)))
+    # ``rng`` stays optional - not every caller holds a Generator - but an
+    # unseeded ``default_rng()`` here meant the sapling's variant, and so the
+    # shape of the tree it becomes, was drawn from OS entropy: three processes
+    # planting the same four saplings got three different sets of variants.
+    # Derive it from where the sapling went in and which one it is instead;
+    # crc32 rather than hash(), see :func:`_name_variant`.
+    gen = rng if rng is not None else np.random.default_rng(
+        zlib.crc32(("sapling|%d|%.3f" % (reg.next_id, px)).encode("utf-8"))
+    )
     return reg.spawn(
         KIND_SAPLING,
         px,

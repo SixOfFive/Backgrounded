@@ -718,6 +718,39 @@ def _pay(world: Any, a: Action, cost: dict[str, int]) -> bool:
     return True
 
 
+def _paid_up(agent: Any, kind: str) -> bool:
+    """True when `agent` is mid-`kind` and has already settled the bill.
+
+    ``score_combat`` gates the two crafts on :func:`_can_afford`, which asks
+    "can the colony buy this?". But :func:`_pay` empties the stock the instant
+    the crafter reaches the bench, so a craft already under way answers *no
+    about itself*. Hide sits at 0 for ~79% of all sim-seconds, so that was
+    nearly every armour craft: the in-flight action scored 0.0, choose_action
+    drops zero-scored kinds before it reaches its keep-the-running-action
+    guard, and the agent wandered off 7.x s into an 8 s craft. Measured over 20
+    seeds x 900 s: 104 of 129 armour crafts abandoned after paying, all 104
+    with the stock spent on the very craft being cancelled, 61 of them past the
+    seven-second mark. Spears escaped only because wood and stone are held in
+    bulk (114 of 120 completed).
+
+    The bill is paid; whether we can afford it is a settled question. The
+    pre-payment gate in :func:`make_combat_action` is untouched - an agent who
+    cannot afford a craft still cannot start one.
+    """
+    a = getattr(agent, "action", None)
+    if a is None or getattr(a, "kind", None) != kind:
+        return False
+    if getattr(a, "finished", False):
+        return False
+    try:
+        # 'paid' present with no 'made' is the whole distinguishing state: _pay
+        # sets it, _h_craft pops it on completion and _c_craft pops it on the
+        # refund, so a stale or already-refunded action never matches.
+        return isinstance(a.data.get("paid"), dict) and not a.data.get("made")
+    except Exception:
+        return False
+
+
 def _h_craft(a: Action, ag: Any, w: Any, dt: float) -> None:
     spec = _CRAFT_SPEC.get(a.kind)
     if spec is None:
@@ -1029,9 +1062,13 @@ def score_combat(agent: Any, world: Any) -> dict[str, float]:
         # standing at the end.
         threatened = animal is not None and dist <= FLEE_RADIUS
         if role != "child" and not threatened:
-            if not armed and _can_afford(world, SPEAR_COST):
+            # ``or _paid_up`` so a craft that has already spent its materials
+            # does not score itself out of existence - see _paid_up.
+            if not armed and (_can_afford(world, SPEAR_COST)
+                              or _paid_up(agent, "CraftSpear")):
                 out["CraftSpear"] = _clamp01(0.55 + 0.32 * fresh)
-            if not armoured and _can_afford(world, ARMOUR_COST):
+            if not armoured and (_can_afford(world, ARMOUR_COST)
+                                 or _paid_up(agent, "CraftArmour")):
                 out["CraftArmour"] = _clamp01(0.50 + 0.25 * fresh)
     except Exception:
         log.debug("score_combat failed", exc_info=True)

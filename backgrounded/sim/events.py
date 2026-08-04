@@ -75,6 +75,10 @@ from ..constants import (
     SCENES,
 )
 from .lighting import LIGHTNING_COLOR, METEOR_COLOR, daylight_factor, is_night
+# props and structures own what burns; see _FLAMMABLE below. Both are leaves -
+# neither imports events (nor lighting), so this cannot close a cycle.
+from .props import FLAMMABLE as _PROP_FLAMMABLE, KINDS as _PROP_KINDS
+from .structures import STRUCTURE_SPECS
 
 log = logging.getLogger(__name__)
 
@@ -596,8 +600,29 @@ _TRANSITIONS: dict[str, dict[str, float]] = {
     SCENE_VOLCANO:     {SCENE_ASHFALL: 5, SCENE_WILDFIRE: 2, SCENE_CLEAR: 2},
 }
 
-_FLAMMABLE = ("tree", "bush", "sapling", "shrub", "log", "grass", "hut", "wall",
-              "watchtower", "bridge", "totem", "scaffold")
+#: Extra names for things this module may be handed that are not registered
+#: kinds at all - duck-typed stand-ins from other modules and from the smoke
+#: tests. Filtered against the registries below so one can never contradict a
+#: spec: only names nothing else claims survive.
+_FLAMMABLE_ALIASES = frozenset({"shrub", "log", "grass", "scaffold"})
+
+#: Kind names that catch fire, for objects with no ``flammable`` flag of their
+#: own to read (Prop has the property; Structure only has ``spec.flammable``).
+#:
+#: Derived, never written down. This was a hand-kept tuple and it drifted out of
+#: agreement with STRUCTURE_SPECS: it listed 'wall' (spec says flammable=False)
+#: and omitted 'stockpile', 'ladder' and the 'crop' prop. A bolt landing beside
+#: a wall therefore picked the wall as its nearest fuel, Structure.ignite()
+#: refused it, and _ignite() reported success anyway - so the strike consumed
+#: its one ignition on something that cannot burn and the hut 20 px behind it
+#: never caught. Measured: wall+hut, bolt on the wall, nothing alight.
+_FLAMMABLE: frozenset[str] = (
+    (frozenset(_PROP_FLAMMABLE)
+     | frozenset(k for k, s in STRUCTURE_SPECS.items() if s.flammable)
+     | _FLAMMABLE_ALIASES)
+    - frozenset(k for k in _PROP_KINDS if k not in _PROP_FLAMMABLE)
+    - frozenset(k for k, s in STRUCTURE_SPECS.items() if not s.flammable)
+)
 
 
 # ------------------------------------------------------- generic utilities --
@@ -884,6 +909,8 @@ def _panic(world: Any, agent: Any, target_x: float, duration: float,
 def _is_flammable(prop: Any) -> bool:
     if getattr(prop, "burning", False) or getattr(prop, "burnt", False):
         return False
+    if getattr(prop, "is_burning", False) or getattr(prop, "is_ruined", False):
+        return False        # Structure spells both of those differently
     if getattr(prop, "destroyed", False) or not getattr(prop, "alive", True):
         return False
     flag = getattr(prop, "flammable", None)
@@ -897,18 +924,25 @@ def _is_flammable(prop: Any) -> bool:
 
 
 def _ignite(world: Any, prop: Any) -> bool:
+    """Set something alight. Returns whether it actually caught.
+
+    The return value is load-bearing: three callers write a chronicle line off
+    it ("Flames take hold in the brush."). Discarding what ``ignite()`` said and
+    returning True regardless meant a refusal - ruined, already burning, or a
+    kind whose spec says it does not burn - still printed the line with nothing
+    alight anywhere on the map. Only ``False`` counts as a refusal; ``set_fire``
+    and older stubs return None and are still taken at their word.
+    """
     if prop is None:
         return False
     for meth in ("ignite", "set_fire"):
         fn = getattr(prop, meth, None)
         if callable(fn):
             try:
-                fn()
-                return True
+                return fn() is not False
             except TypeError:
                 try:
-                    fn(1.0)
-                    return True
+                    return fn(1.0) is not False
                 except Exception:
                     pass
             except Exception:

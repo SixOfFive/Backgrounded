@@ -28,7 +28,7 @@ class Config:
     population_target: int = 6
     auto_scene_change: bool = True    # let scenes evolve on their own
     scene_min_sec: float = 180.0      # dwell time before an auto scene switch
-    window_scale: float = 1.0         # preview window size multiplier
+    window_scale: float = 1.0         # preview size, from Tray > Window Size
     restore_wallpaper_on_exit: bool = True
     log_level: str = "INFO"
 
