@@ -33,6 +33,34 @@ gone caps an incursion at its own pack size and makes the losses finite.
 break off and run. It is what makes a spear worth carrying: killing one wolf
 ends the fight rather than just shortening it by a third.
 
+*Scale is not food.* An animal that bites a colonist wearing the dragon's own
+hide (``relic == RELIC_SCALE``) gives up on that person permanently - see
+:data:`Animal.scale_refused` and :meth:`AnimalRegistry._refuse_scale`. The bite
+itself still goes through ``Stickman.hurt`` unchanged, because the 0.9 clamp in
+there is the single source of truth about armour and nothing here is allowed to
+special-case it. The clamp alone is not enough, though, and that is the whole
+reason this exists: ``ARMOUR_DRAGONSCALE`` lets 10% through, so a full
+``ANIMAL_LEAVE_SEC`` (90 s) mauling still does 0.8 dps x 90 = 72 damage from a
+wolf and 1.5 x 90 = **135** from a bear, against ``MAX_HEALTH`` of 100. Armour
+sold as impenetrable that gets its wearer eaten by a bear in a minute and a half
+is a bug, and it is a bug on *this* side of the boundary: the wearer is not
+tougher, the predator is meant to lose interest. Refusing the target rather than
+zeroing the damage keeps leather (0.45) behaving exactly as it does today.
+
+Measured, and measured honestly. The unit pass below pins a bear on a wearer for
+its whole patience: with the refusal the wearer walks away on 99.5 hp, and with
+a lone wearer the bear gives up and leaves the map rather than chewing. But over
+16 same-seed colonies x 60 sim-min - clean / clamp only / clamp + refusal - the
+wearer was mauled in 4 of 16 control runs and **0 of 16 in both** armoured arms,
+so in a live world the clamp was already enough and the refusal's marginal
+benefit is not measurable at n=16. It is insurance against the pinned-bear case,
+not a buff anyone can see in the numbers. What the run does rule out is the
+displacement worry - refusing a target sends the animal to somebody else, and
+colony mauling deaths went 3.50 -> 3.12 -> 2.81 per run across the three arms,
+i.e. down if anything, and inside the noise either way (scale - none is -0.69
+maulings, 95% CI [-1.56, +0.18]). Total deaths moved +1.12 [-2.25, +4.50]:
+nothing.
+
 *Nothing here flies or falls.* ``y`` is assigned from ``terrain.ground_y(x)``
 after every move and there is no ``vy`` at all, so an animal cannot fall to its
 death or hang in the air. Steep ground shortens the horizontal step instead
@@ -62,6 +90,7 @@ from ..constants import (
     ANIMAL_SPAWN_MIN,
     ANIMAL_STATS,
     ANIMAL_WOLF,
+    RELIC_SCALE,
     RENDER_W,
     RES_HIDE,
     SCENE_CLEAR,
@@ -192,6 +221,16 @@ _WAVE_FALLBACK = {
     "gone":   "The animals melt back into the dark.",
 }
 
+#: Said once per colony, the first time dragonscale turns a bite. Per kind for
+#: the same reason ``_WAVE_LINES`` is: "The bear's teeth" is a different
+#: sentence from "The wolves'", and this is a line a person reads.
+_SCALE_LINES: dict[str, str] = {
+    ANIMAL_WOLF: "The wolf's teeth find nothing but scale.",
+    ANIMAL_BEAR: "The bear's jaws find nothing but scale.",
+    ANIMAL_BOAR: "The boar's tusks find nothing but scale.",
+}
+_SCALE_FALLBACK = "Its teeth find nothing but scale."
+
 _RNG = random.Random()
 
 
@@ -284,6 +323,18 @@ def _agent_by_id(world: Any, aid: int | None) -> Any:
         if _i(getattr(a, "id", -1), -1) == int(aid):
             return a
     return None
+
+
+def _scaled(agent: Any) -> bool:
+    """True when *agent* is wearing the dragon's own hide.
+
+    Reads the relic slot, not ``armour``. Deliberate: ``armour`` is a float and
+    a lucky number there would silently switch this on for something that is
+    only leather-plus - the relic is a name, and only one thing sets it.
+    Duck-typed so a stub agent (or a save from before relics existed, where the
+    field is simply absent) reads as unarmoured rather than raising.
+    """
+    return str(getattr(agent, "relic", "") or "") == RELIC_SCALE
 
 
 def _log(world: Any, text: str) -> None:
@@ -438,6 +489,21 @@ class Animal:
     #: purpose - render only ever has to know about STATES.
     feed_t: float = 0.0
 
+    #: Stickman id this animal has given up on because they were wearing
+    #: dragonscale, or None. One slot, not a set: an animal only ever holds one
+    #: target, ``ANIMAL_LEAVE_SEC`` is 90 s, and the colony mean is ~7 people,
+    #: so "the one it just tried" is the whole population of interest. Persisted
+    #: so a save taken mid-incursion does not hand the wearer back to the pack -
+    #: an old save simply has no key and defaults to None, which is today's
+    #: behaviour exactly. Safe to hold as a bare id because
+    #: ``entities.Population.spawn`` never reuses one, so a refusal cannot
+    #: alias onto a replacement colonist who arrives later. The one case a
+    #: single slot does not cover is TWO scale wearers in one colony, where the
+    #: animal alternates and overwrites this each time; that costs a few extra
+    #: approach/attack flips and ~0.1 damage a bite, and it takes two quadruped
+    #: kills to arise at all, so a set is not worth carrying in every save file.
+    scale_refused: int | None = None
+
     # ------------------------------------------------------------ derived --
     @property
     def alive(self) -> bool:
@@ -520,6 +586,8 @@ class Animal:
             "anim_t": float(self.anim_t),
             "fleeing": bool(self.fleeing),
             "feed_t": float(self.feed_t),
+            "scale_refused": (None if self.scale_refused is None
+                              else int(self.scale_refused)),
         }
 
     @classmethod
@@ -547,6 +615,10 @@ class Animal:
         a.anim_t = _f(d.get("anim_t"), 0.0)
         a.fleeing = _b(d.get("fleeing"), False)
         a.feed_t = max(0.0, _f(d.get("feed_t"), 0.0))
+        ref = d.get("scale_refused")
+        a.scale_refused = (int(ref)
+                           if isinstance(ref, (int, float))
+                           and not isinstance(ref, bool) else None)
         if a.fleeing and a.state in (STATE_APPROACH, STATE_ATTACK):
             a.state = STATE_FLEE
         if a.state in (STATE_APPROACH, STATE_ATTACK):
@@ -573,6 +645,11 @@ class AnimalRegistry:
         self._wave_size: int = 0        # how many arrived
         self._wave_killed: int = 0      # how many the colony brought down
         self._wave_took: int = 0        # how many people they killed
+        #: One-shot for the dragonscale line. Colony-wide, not per animal and
+        #: not per wave: "the first time it saves them" is a moment, and a pack
+        #: of three would otherwise print it three times in one incursion.
+        #: Persisted, so it stays a moment across a reload too.
+        self._scale_told: bool = False
 
     # ----------------------------------------------------------- container --
     def __len__(self) -> int:
@@ -930,6 +1007,16 @@ class AnimalRegistry:
             log.debug("hurt() failed on agent %s", getattr(target, "id", "?"),
                       exc_info=True)
 
+        if not killed and _scaled(target):
+            # The bite landed and did nothing worth doing. Note that the damage
+            # above was NOT skipped: Stickman.hurt's clamp is the only thing in
+            # the game that knows what armour is worth, and a scale-wearer down
+            # to their last few hit points can still be finished by a wolf -
+            # which is why this branch sits under `not killed` rather than in
+            # front of the bite.
+            self._refuse_scale(world, a, target)
+            return
+
         if killed:
             name = str(getattr(target, "name", "Someone"))
             _log(world, f"{name} was killed by a {a.kind}.")
@@ -942,6 +1029,33 @@ class AnimalRegistry:
             self._enter(a, STATE_LEAVE, keep_feed=True)
             a.feed_t = FEED_SEC
             self._wave_withdraw(a)
+
+    def _refuse_scale(self, world: Any, a: Animal, target: Any) -> None:
+        """Give up on a dragonscale wearer, for good.
+
+        Not a flee and not a leave: the animal is neither hurt nor frightened,
+        it has simply found nothing it can eat. It goes back to APPROACH with
+        the wearer struck off its list, so ``_pick_target`` hands it whoever is
+        next - and if the wearer was the last person standing, _pick_target
+        returns None and ``_approach_step`` walks it off the map. That fallback
+        is why the refusal is a target filter rather than a damage exemption:
+        the "everyone else is dead" case needs no special code at all.
+
+        Rejected: adding a large ``FOCUS_PENALTY``-style score penalty in
+        ``_pick_target`` instead. It reads the same until the wearer is the
+        only one left, at which point the penalty loses to an empty field and
+        the pack chews on them for the full 90 s anyway - which is the bear
+        case in the module docstring, i.e. exactly the thing this fixes.
+        """
+        aid = _i(getattr(target, "id", -1), -1)
+        if aid >= 0:
+            a.scale_refused = aid
+        if not self._scale_told:
+            self._scale_told = True
+            _log(world, _SCALE_LINES.get(a.kind, _SCALE_FALLBACK))
+        a.target_id = None
+        a.vx = 0.0
+        self._enter(a, STATE_APPROACH)
 
     def _exit_step(self, world: Any, a: Animal, dt: float) -> None:
         """Flee or leave: head for the nearer screen edge, then despawn."""
@@ -989,6 +1103,8 @@ class AnimalRegistry:
             aid = _i(getattr(ag, "id", -1), -1)
             if aid < 0:
                 continue
+            if a.scale_refused is not None and aid == int(a.scale_refused):
+                continue          # already tried them; they were wearing scale
             score = abs(_f(getattr(ag, "x", 0.0)) - a.x)
             score += FOCUS_PENALTY * self._attackers_on(aid, a.id)
             if a.target_id is not None and aid == int(a.target_id):
@@ -1122,6 +1238,7 @@ class AnimalRegistry:
             "wave_size": int(self._wave_size),
             "wave_killed": int(self._wave_killed),
             "wave_took": int(self._wave_took),
+            "scale_told": bool(self._scale_told),
         }
 
     @classmethod
@@ -1158,6 +1275,7 @@ class AnimalRegistry:
         reg._wave_size = max(0, _i(d.get("wave_size"), len(reg.animals)))
         reg._wave_killed = max(0, _i(d.get("wave_killed"), 0))
         reg._wave_took = max(0, _i(d.get("wave_took"), 0))
+        reg._scale_told = _b(d.get("scale_told"), False)
         if not reg.animals:
             reg._reset_wave()
         return reg
@@ -1348,6 +1466,73 @@ if __name__ == "__main__":   # pragma: no cover - headless balance harness
     assert dead_stubs <= 1, dead_stubs
     print("unit: one boar, no escape, no fighting back -> stub deaths",
           dead_stubs)
+
+    # -- dragonscale: the bear case from the module docstring ---------------
+    # 90 s of bear at the clamped 10% is 135 damage against 100 health, so the
+    # clamp on its own is NOT enough and this is the assertion that says so.
+    # Two stubs: one in scale at 200, one bare at 1100. The bear has to end up
+    # on the bare one, the wearer has to be untouched after the first bite, and
+    # the line has to be said exactly once.
+    class _ScaleWorld(_StubWorld):
+        def __init__(self, *, lone: bool = False):
+            super().__init__()
+            self._agents[0].relic = RELIC_SCALE
+            self._agents[0].armour = 1.0
+            if lone:
+                self._agents = self._agents[:1]
+
+    sw5 = _ScaleWorld()
+    reg5 = AnimalRegistry(seed=7)
+    bear5 = reg5.spawn_wave(sw5, kind=ANIMAL_BEAR, edge=-1)[0]
+    bear5.x = 210.0                       # already on top of the wearer
+    for _ in range(int(30 * ANIMAL_LEAVE_SEC)):
+        reg5.tick(sw5, DT)
+        if not reg5.all():
+            break
+    wearer, bystander = sw5._agents[0], sw5._agents[1]
+    assert wearer.alive, "dragonscale wearer was eaten"
+    # One bite got through the clamp; nothing like a mauling did.
+    assert 100.0 - wearer.hp < 2.0, wearer.hp
+    assert sum(1 for ln in sw5.lines if "nothing but scale" in ln) == 1, sw5.lines
+    assert bear5.scale_refused == wearer.id, bear5.scale_refused
+    print("unit: bear off the scale-wearer | wearer hp", f"{wearer.hp:.1f}",
+          "| bystander hp", f"{bystander.hp:.1f}")
+
+    # ...and with nobody else to eat, it walks off the map instead of chewing.
+    sw6 = _ScaleWorld(lone=True)
+    reg6 = AnimalRegistry(seed=8)
+    bear6 = reg6.spawn_wave(sw6, kind=ANIMAL_BEAR, edge=-1)[0]
+    bear6.x = 210.0
+    for _ in range(int(30 * ANIMAL_LEAVE_SEC)):
+        reg6.tick(sw6, DT)
+        if not reg6.all():
+            break
+    assert sw6._agents[0].alive and reg6.count() == 0, (
+        sw6._agents[0].hp, reg6.count())
+    print("unit: lone scale-wearer, bear gave up and left | hp",
+          f"{sw6._agents[0].hp:.1f}")
+
+    # -- the BFG's line of fire uses the ordinary damage path ---------------
+    # Lane 3's beam sweeps animals with the same Animal.hurt a spear uses, so
+    # the ONLY thing this module has to guarantee is that an absurd amount of
+    # damage still reaps like any other kill: hides to the stockpile once, the
+    # wave counter moved, the nerve check run. Nothing here special-cases the
+    # weapon and nothing should - a beam kill that paid different hides from a
+    # spear kill is the "hides and kill counts stay honest" bug.
+    from ..constants import BFG_DAMAGE
+    sw7 = _StubWorld()
+    reg7 = AnimalRegistry(seed=9)
+    beamed = reg7.spawn_wave(sw7, kind=ANIMAL_WOLF, edge=-1)
+    assert len(beamed) == 3
+    for victim in beamed[:2]:             # two of three, in one "shot"
+        assert victim.hurt(BFG_DAMAGE) is True
+    reg7.tick(sw7, DT)
+    assert sw7.stockpile.get(RES_HIDE, 0) == 2, sw7.stockpile
+    assert reg7._wave_killed == 2, reg7._wave_killed
+    assert reg7.count() == 1 and beamed[2].state == STATE_FLEE, beamed[2].summary()
+    print("unit: BFG-sized hit -> hides", sw7.stockpile.get(RES_HIDE, 0),
+          "| wave_killed", reg7._wave_killed,
+          "| survivor", beamed[2].state)
 
     # ------------------------------------------------------ live scenarios --
     def run(seed: int, seconds: float, *, gear: str,

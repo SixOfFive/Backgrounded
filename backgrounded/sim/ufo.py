@@ -39,6 +39,32 @@ roster itself changes:
 Neither counter is a death and neither must ever be folded into one: an
 abductee has no grave, and a quarter of them walk back out of the beam.
 
+The ward (a relic interrupt, and why it fires where it fires)
+-------------------------------------------------------------
+An agent wearing ``RELIC_AMULET`` under the beam destroys the craft. The
+trigger sits in :meth:`_tick_beam` at ``UFO_WARD_AT`` (2.4 s), **strictly
+before** the ``self.t >= UFO_BEAM_SEC`` completion branch, and that placement
+is the entire accounting argument:
+
+* Not at ``t == 0``. ``BEAM_FADE`` is 0.7 s, so at the start of the beam there
+  is nothing on screen yet and the saucer would appear to explode for nothing.
+* Not at completion. :meth:`_complete_abduction` is the line that calls
+  ``population.remove()`` and books ``stats["abducted"]``. Firing after it
+  means either double-booking the roster or un-booking it, and un-booking is
+  exactly the corruption this module was rewritten to fix.
+* Firing *before* it means ``_complete_abduction`` is **never called** on a
+  warded beam. ``stats["abducted"]`` cannot move, the roster never changes,
+  and ``World.reconcile()``'s residual needs no new term and cannot drift. A
+  beam that was interrupted is not an abduction, so nothing about it is
+  counted as one.
+
+:attr:`abducted` is deliberately **not** cleared by the wreck. That list is the
+only route by which anyone ever comes back (see ``_begin``'s ``want_return``
+path); emptying it would silently and permanently lose up to
+``MAX_ABDUCTED`` people who were still eligible for return. The saucer that
+arrives ``UFO_WRECK_RESPAWN`` later inherits the roster of the one that was
+destroyed - it is the same :class:`Ufo` object with a new hull.
+
 Holding the victim
 ------------------
 An agent under the beam must not walk away. Every tick of ``beam``/``return``
@@ -62,7 +88,10 @@ Render contract (render/ reads, never writes)
 beam's ground trapezoid, and :meth:`light_source` gives world.py a
 ``LightSource(**d)``-shaped dict so a beam at night actually lights the ground
 under it. The victim's own ``lift_t`` (0..1) is how far up the beam they are
-drawn; sim never moves their ``y``.
+drawn; sim never moves their ``y``. ``phase == PHASE_WRECK`` with
+``wrecked == True`` is a hull falling out of the sky - draw it broken, tumbling
+and unlit, and note that ``beam_poly()`` and ``light_source()`` both go empty
+the instant the ward fires.
 """
 from __future__ import annotations
 
@@ -83,11 +112,29 @@ from ..constants import (
 )
 from .entities import Stickman
 
+#: The relic half of the ward. Declared in constants.py by the workstream that
+#: owns that file; the fallbacks are here so this module still imports - and the
+#: ward still holds - in a checkout where that append has not landed yet. Same
+#: numbers either way, and constants.py wins the moment it exists. This is the
+#: idiom combat_actions.py already uses for MELEE_CEILING.
+try:                                    # pragma: no cover - trivial
+    from ..constants import RELIC_AMULET, RELIC_NONE
+except ImportError:                     # pragma: no cover - trivial
+    RELIC_AMULET = "amulet"
+    RELIC_NONE = ""
+try:                                    # pragma: no cover - trivial
+    from ..constants import UFO_WARD_AT, UFO_WRECK_FALL_SEC, UFO_WRECK_RESPAWN
+except ImportError:                     # pragma: no cover - trivial
+    UFO_WARD_AT = 2.4
+    UFO_WRECK_FALL_SEC = 1.4
+    UFO_WRECK_RESPAWN = 2400.0
+
 log = logging.getLogger(__name__)
 
 __all__ = [
     "Ufo",
     "PHASE_IDLE", "PHASE_ARRIVE", "PHASE_BEAM", "PHASE_DEPART", "PHASE_RETURN",
+    "PHASE_WRECK",
     "PHASES",
 ]
 
@@ -97,8 +144,12 @@ PHASE_ARRIVE = "arrive"
 PHASE_BEAM = "beam"
 PHASE_DEPART = "depart"
 PHASE_RETURN = "return"
+#: Warded. The hull is falling; there is no beam and no target. Terminal - it
+#: only ever goes to idle, and never back to arrive.
+PHASE_WRECK = "wreck"
 PHASES: tuple[str, ...] = (
     PHASE_IDLE, PHASE_ARRIVE, PHASE_BEAM, PHASE_DEPART, PHASE_RETURN,
+    PHASE_WRECK,
 )
 
 # ------------------------------------------------------------------ tuning --
@@ -147,6 +198,11 @@ MIN_COLONY = 2
 #: all-night run cannot grow the save without bound.
 MAX_ABDUCTED = 6
 
+WRECK_FLASH_COLOR: tuple[int, int, int] = (180, 255, 210)
+WRECK_SCORCH_R = 26.0
+#: Horizontal tumble of the falling hull, px. Cosmetic; render reads x/y.
+WRECK_TUMBLE = 7.0
+
 #: What being taken and put down again does to you.
 DAZED_FATIGUE = 0.92
 DAZED_MORALE = 0.06
@@ -192,6 +248,29 @@ def _color(value: Any, default: tuple[int, int, int]) -> tuple[int, int, int]:
     except Exception:
         return default
     return (int(_clamp(r, 0, 255)), int(_clamp(g, 0, 255)), int(_clamp(b, 0, 255)))
+
+
+# ------------------------------------------------- derived ward constants --
+# Down here, not up in the tuning block, because they are *coerced* through
+# _f(): constants.py is another workstream's file and a junk value there must
+# not stop this module importing.
+#
+#: Seconds into a beam at which an amulet-wearer's ward fires.
+#:
+#: Clamped rather than asserted. The whole accounting argument (see the module
+#: docstring) is that the ward fires *strictly before* the completion branch, so
+#: a constants.py that ever set UFO_WARD_AT >= UFO_BEAM_SEC would silently turn
+#: the ward off and abduct the wearer anyway - which is worse than a mistimed
+#: explosion, because it looks like the feature simply does not work.
+WARD_AT: float = min(max(0.05, _f(UFO_WARD_AT, 2.4)), UFO_BEAM_SEC * 0.75)
+
+#: The wreck: how long the hull takes to fall, and how long before another one
+#: comes. The respawn is the balance valve - one amulet must not delete the
+#: abduction system for the rest of the colony's life (3.04 abductions per
+#: colony-hour measured is far too much content to switch off with a single
+#: drop), so the ward is an *event*, not a state.
+WRECK_FALL_SEC: float = max(0.2, _f(UFO_WRECK_FALL_SEC, 1.4))
+WRECK_RESPAWN: float = max(1.0, _f(UFO_WRECK_RESPAWN, 2400.0))
 
 
 def _approach(cur: float, target: float, rate: float, dt: float) -> float:
@@ -291,6 +370,117 @@ def _rand_x(rng: random.Random) -> float:
     return rng.uniform(_EDGE_PAD, RENDER_W - _EDGE_PAD)
 
 
+def _relic(agent: Any) -> str:
+    """What *agent* is wearing, as a string. Duck-typed on purpose.
+
+    ``Stickman.relic`` is added by the workstream that owns entities.py, and
+    ``sim/relics.py`` is another file again. Reading the slot with getattr costs
+    one attribute lookup and means this module needs no import from either, so a
+    checkout where neither has landed simply never sees an amulet.
+    """
+    try:
+        v = getattr(agent, "relic", "")
+        return v if isinstance(v, str) else ""
+    except Exception:
+        return ""
+
+
+def _consume_relic(agent: Any) -> None:
+    """Burn the amulet. It is a one-shot; the wearer walks away without it.
+
+    Prefers ``items.unequip()``, because that is where the mirroring rules live
+    (dragonscale mirrors ``armour``, the bfg mirrors ``weapon``) and they must
+    not be duplicated here. The bare attribute write below is the fallback, and
+    it is correct *for the amulet specifically* - the amulet is the one relic
+    with nothing mirrored, so there is no second slot to clear.
+
+    THE MODULE IS ``items``, NOT ``relics``. This said ``from .relics import
+    unequip`` and there has never been a ``sim/relics.py`` - the feature shipped
+    as ``sim/items.py``. The import therefore raised ImportError on every single
+    call and fell through to the fallback, forever, and nothing ever showed it:
+    the fallback is silent, it is the right answer for the amulet, and the
+    except clause is a bare ``except Exception``. It was written speculatively
+    against a filename another workstream was expected to use, and the guess was
+    never checked against the tree. (combat_actions.py:1611 has the identical
+    line and the identical bug; that file is not this lane's to edit.)
+
+    Kept as ``unequip`` and NOT switched to ``items.consume()``, which is the
+    obvious-looking tidy-up and would be a double-count: consume() bumps
+    ``stats["relics_used"]`` itself, and the caller at _wreck() already bumps it
+    on the next line. One spend, one increment.
+
+    Still lazily imported and still guarded. items.py pulls in the relic
+    registry, this module is otherwise import-light enough to be exercised
+    against a bare ``object()`` world (see the never-raises block in __main__),
+    and the same reasoning already applies to _scorch's props import below.
+    """
+    try:
+        from .items import unequip as _unequip           # noqa: PLC0415
+    except Exception:
+        try:
+            agent.relic = RELIC_NONE
+        except Exception:
+            log.debug("could not consume the amulet", exc_info=True)
+        return
+    try:
+        _unequip(agent)
+    except Exception:
+        try:
+            agent.relic = RELIC_NONE
+        except Exception:
+            pass
+
+
+def _flash(world: Any, intensity: float, decay: float,
+           color: tuple[int, int, int]) -> None:
+    """A transient global flash, if the world has a lighting rig."""
+    try:
+        fn = getattr(getattr(world, "lighting", None), "add_flash", None)
+        if callable(fn):
+            fn(float(intensity), float(decay), tuple(color))
+    except Exception:
+        log.debug("wreck flash failed", exc_info=True)
+
+
+def _scorch(world: Any, x: float, radius: float) -> None:
+    """Leave a burn scar where the hull came down. The evidence, and the point.
+
+    Lazy import: props.py pulls in numpy and the terrain, and this module is
+    otherwise import-light enough to be exercised against a bare object() world
+    (see the never-raises block in __main__). Same reason throwing.py imports
+    altitude lazily.
+    """
+    try:
+        from .props import place_scorch                  # noqa: PLC0415
+    except Exception:
+        return
+    try:
+        props = getattr(world, "props", None)
+        terrain = getattr(world, "terrain", None)
+        if props is None or terrain is None:
+            return
+        place_scorch(props, terrain, float(x), float(radius))
+    except Exception:
+        log.debug("wreck scorch failed", exc_info=True)
+
+
+def _bump_existing(world: Any, key: str) -> None:
+    """Increment ``world.stats[key]`` **only if it is already declared**.
+
+    world.py declares its counters in STAT_DEFAULTS precisely so that no reader
+    has to remember ``.get()``, and its own comment records what conjuring a key
+    from a first increment cost last time. This module does not own that file,
+    so it will not invent a key there - it books the relic spend when the
+    counter exists and stays silent when it does not.
+    """
+    try:
+        stats = getattr(world, "stats", None)
+        if isinstance(stats, dict) and key in stats:
+            stats[key] = _i(stats.get(key), 0) + 1
+    except Exception:
+        pass
+
+
 # =================================================================== Ufo ====
 class Ufo:
     """The lights over the ridge. One instance, owned by World."""
@@ -315,6 +505,10 @@ class Ufo:
         self.ground_y: float = RENDER_H * 0.72   # ground under the beam, cached
         self.taken_count: int = 0
         self.returned_count: int = 0
+        #: True from the instant the ward fires until a fresh hull arrives.
+        #: Render's cue to draw a broken, tumbling craft instead of a whole one.
+        self.wrecked: bool = False
+        self.wrecked_count: int = 0
         self._sweep_t: float = 0.0           # derived; see _release_strays
 
     # ------------------------------------------------------------ schedule --
@@ -340,6 +534,7 @@ class Ufo:
                 PHASE_BEAM: self._tick_beam,
                 PHASE_RETURN: self._tick_deliver,
                 PHASE_DEPART: self._tick_depart,
+                PHASE_WRECK: self._tick_wreck,
             }.get(self.phase)
             if handler is None:
                 self._go_idle()
@@ -399,16 +594,45 @@ class Ufo:
         self.t = 0.0
         self.phase = PHASE_ARRIVE
         self.active = True
+        # A new hull. The wreck flag is a render cue for the falling one, not a
+        # permanent mark on the record - and self.abducted deliberately survives
+        # the wreck, so this craft arrives still carrying the last one's roster.
+        self.wrecked = False
         return True
 
     def _hover_for(self, ground_y: float) -> float:
         return _clamp(ground_y - HOVER_HEIGHT, HOVER_Y_MIN, HOVER_Y_MAX)
 
     def _pick_victim(self, world: Any) -> Any:
+        """Who the beam comes down on. An amulet *lures* the craft.
+
+        The draw is taken **unconditionally**, before the amulet is looked for,
+        and that ordering is not style - it is the reproducibility rule. If this
+        short-circuited to the bearer without drawing, the ufo's seeded stream
+        would advance differently on any world where an amulet exists, and a
+        world with no amulet would stop being bit-identical to the build that
+        shipped before relics did. That is a divergence which only appears in
+        colonies that have already earned a relic: the worst possible place to
+        go looking for it. Draw, *then* override.
+
+        Why lure at all: measured, 73 abductions over 16 colonies x 90 sim-min
+        with a mean living population of 7.04. Without the lure, P(the beam
+        picks the one bearer) is 1/pop, an expected wait of ~2.3 colony-hours
+        from a drop that itself arrives about once per 15.3 colony-hours. That
+        chain is long enough that the amulet would essentially never fire, and
+        an item that never fires is not an item.
+
+        Ties (two bearers) go to the first on the roster rather than to a second
+        draw, for the same stream-stability reason.
+        """
         crowd = [a for a in _alive(world) if not getattr(a, "taken", False)]
         if len(crowd) <= MIN_LEFT_BEHIND:
             return None
-        return crowd[self._rng.randrange(len(crowd))]
+        pick = crowd[self._rng.randrange(len(crowd))]
+        for a in crowd:
+            if _relic(a) == RELIC_AMULET:
+                return a
+        return pick
 
     def _delivery_x(self, world: Any) -> float:
         """Set them down near the settlement if there is one, else anywhere."""
@@ -469,8 +693,86 @@ class Ufo:
         self._hold(victim, progress)
         self.ground_y = _ground_y(world, self.hold_x)
 
+        # THE WARD. This branch must stay ABOVE the completion branch below.
+        # Above it, _complete_abduction is never called for a warded beam, so
+        # population.remove() never runs, stats["abducted"] never moves, and
+        # reconcile()'s residual is untouched. Below it, the roster would be
+        # changed and then un-changed and the books would stop balancing. See
+        # the module docstring; this is the whole design.
+        if self.t >= WARD_AT and _relic(victim) == RELIC_AMULET:
+            self._detonate(world, victim)
+            return
+
         if self.t >= UFO_BEAM_SEC:
             self._complete_abduction(world, victim)
+
+    # -- the ward ----------------------------------------------------------
+    def _detonate(self, world: Any, victim: Any) -> None:
+        """The amulet answers the beam. Let go, burn the charm, come apart.
+
+        Order matters in exactly one place: the victim is released *before*
+        anything else can throw. ``_hold`` never writes ``agent.y`` - it writes
+        x, vx, vy, lift_t and beamed - so the wearer is standing precisely where
+        they stood the whole time. There is no fall, no pin-aloft, and no
+        FALL_LETHAL_SPEED exposure; releasing is purely a matter of clearing the
+        flags that stop them acting.
+        """
+        name = str(getattr(victim, "name", "Someone"))
+
+        # 1. let go. _release_victim finds them on the roster (they are still on
+        #    it - nothing was booked), _release clears beamed/pose/lift_t.
+        self._release_victim(world)
+        self._release(victim)
+        try:
+            victim.taken = False
+        except Exception:
+            pass
+
+        # 2. the amulet is consumed. One drop is one saucer.
+        _consume_relic(victim)
+        _bump_existing(world, "relics_used")
+
+        # 3. the hull. Flash now, at the burst; the scorch goes down where it
+        #    lands, in _crash.
+        self.wrecked = True
+        self.wrecked_count += 1
+        self.target_id = None
+        self.returning = False
+        self.t = 0.0
+        self.phase = PHASE_WRECK
+        self.active = True
+        self.y = self.hover_y
+        self.ground_y = _ground_y(world, self.hold_x)
+        _flash(world, 1.0, 0.6, WRECK_FLASH_COLOR)
+        _chronicle(world, f"The lights take hold of {name} - and burst.")
+
+        # 4. self.abducted is NOT cleared, deliberately. It is the only route by
+        #    which anyone comes back; emptying it here would silently and
+        #    permanently lose up to MAX_ABDUCTED people who were still eligible
+        #    for return, and nothing anywhere would record that it had happened.
+
+    def _tick_wreck(self, world: Any, dt: float) -> None:
+        """The hull falls from hover to ground over WRECK_FALL_SEC."""
+        self.active = True
+        self.t += dt
+        u = _clamp(self.t / max(0.05, WRECK_FALL_SEC), 0.0, 1.0)
+        # u*u, not u: it drops, it does not glide down.
+        self.y = self.hover_y + (self.ground_y - self.hover_y) * (u * u)
+        self.x = _clamp(self.hold_x + math.sin(self.t * 21.0) * WRECK_TUMBLE
+                        * (1.0 - u), _EDGE_PAD, RENDER_W - _EDGE_PAD)
+        if u >= 1.0:
+            self._crash(world)
+
+    def _crash(self, world: Any) -> None:
+        """It hits. Scorch, chronicle, and a very long wait for the next one."""
+        self.x = self.hold_x
+        self.y = self.ground_y
+        _scorch(world, self.hold_x, WRECK_SCORCH_R)
+        _chronicle(world, "Whatever that was, it is not coming back tonight.")
+        # Booked on the line the timer is actually set, in this module's usual
+        # style: the chronicle line promises the long absence, so it belongs
+        # where the long absence is written and nowhere else.
+        self._go_idle(next_in=WRECK_RESPAWN)
 
     def _complete_abduction(self, world: Any, victim: Any) -> None:
         """Lift completes: off the roster, into :attr:`abducted`. No grave."""
@@ -717,6 +1019,11 @@ class Ufo:
 
         self.t += dt
         progress = _clamp(self.t / max(0.1, UFO_BEAM_SEC), 0.0, 1.0)
+        # No ward on this beam, deliberately. The amulet is a charm against
+        # being *taken*; a delivery is the craft putting somebody back, and
+        # detonating over the returnee would destroy the saucer at the one
+        # moment it is doing the colony a favour - and would strand it holding
+        # a record for someone already re-added to the roster.
         self._hold(agent, 1.0 - progress)      # lowered, not lifted
         self.ground_y = _ground_y(world, self.hold_x)
 
@@ -794,14 +1101,21 @@ class Ufo:
         self.target_id = None
         self.active = True
 
-    def _go_idle(self) -> None:
+    def _go_idle(self, next_in: float | None = None) -> None:
+        """Home and waiting. *next_in* overrides the usual random interval.
+
+        The override exists for the wreck, and it takes no draw at all: rolling
+        an interval only to throw it away would re-phase every later visit
+        against a build where nobody ever wore an amulet, for no gain.
+        """
         self.phase = PHASE_IDLE
         self.active = False
         self.returning = False
         self.target_id = None
         self.t = 0.0
         self.y = SPAWN_Y
-        self.next_in = self._interval()
+        self.next_in = self._interval() if next_in is None \
+            else max(0.0, _f(next_in, 0.0))
 
     def _panic_reset(self, world: Any) -> None:
         """Something threw. Let go of whoever we were holding and go home."""
@@ -946,6 +1260,8 @@ class Ufo:
         if self.phase == PHASE_IDLE:
             bits.append(f"next in {self.next_in:.0f}s")
         bits.append(f"taken={self.taken_count} returned={self.returned_count}")
+        if self.wrecked or self.wrecked_count:
+            bits.append(f"wrecked={self.wrecked_count}")
         if self.abducted:
             bits.append("held: " + ", ".join(str(r.get("name")) for r in self.abducted))
         return " ".join(bits)
@@ -968,6 +1284,8 @@ class Ufo:
             "ground_y": float(self.ground_y),
             "taken_count": int(self.taken_count),
             "returned_count": int(self.returned_count),
+            "wrecked": bool(self.wrecked),
+            "wrecked_count": int(self.wrecked_count),
         }
 
     @classmethod
@@ -995,6 +1313,10 @@ class Ufo:
                                 0.0, float(RENDER_H))
             u.taken_count = max(0, _i(d.get("taken_count"), 0))
             u.returned_count = max(0, _i(d.get("returned_count"), 0))
+            # Absent in every save written before the ward existed, which is the
+            # ordinary case and reads as "this one has never been shot down".
+            u.wrecked = _b(d.get("wrecked"), False)
+            u.wrecked_count = max(0, _i(d.get("wrecked_count"), 0))
 
             tid = d.get("target_id")
             u.target_id = _i(tid, 0) if isinstance(tid, (int, float)) and not \
@@ -1029,6 +1351,14 @@ class Ufo:
             elif u.phase in (PHASE_BEAM, PHASE_RETURN) and u.target_id is None:
                 u.phase = PHASE_DEPART
                 u.t = 0.0
+            elif u.phase == PHASE_WRECK:
+                # Left alone on purpose. A wreck has no target by construction
+                # (_detonate clears it), so the normalisation above would
+                # otherwise mistake a falling hull for a beam with nobody in it
+                # and fly it back out of the sky. It also implies wrecked: a
+                # save that says "wreck" and "not wrecked" is a contradiction,
+                # and the phase is the one that drives the tick.
+                u.wrecked = True
         except Exception:
             log.warning("ufo save unreadable; starting idle", exc_info=True)
             return cls()
@@ -1116,6 +1446,72 @@ if __name__ == "__main__":   # pragma: no cover - headless, runs a real World
     LightSource(**seen_light)          # must be constructible as-is
     assert len(poly) == 4 and poly[2][1] > poly[0][1]
 
+    print("-- the ward -----------------------------------------------------")
+    # An amulet-wearer under the beam destroys the craft, and the books do not
+    # move: an abduction that never completed is not an abduction. reconcile()
+    # is asserted before AND after, because a residual that was already non-zero
+    # would make the after-check meaningless.
+    for seed in (11, 12, 13, 14):
+        w = World(seed=seed)
+        # The world owns a ufo of its own and world.tick() drives it. Park it:
+        # a second craft taking somebody honestly would move stats["abducted"]
+        # and this test would then be measuring the wrong saucer.
+        w.ufo.next_in = 1e9
+        u = Ufo(seed=seed)
+        before = w.reconcile()
+        assert before["ok"] == 1 and before["residual"] == 0, before
+        wearer = w.population.alive_agents()[0]
+        wearer.relic = RELIC_AMULET
+        wid = wearer.id
+        abducted_before = int(w.stats.get("abducted", 0))
+        births_before = int(w.population.births)
+        scorch_before = {p.id for p in w.props.all_of("scorch")}
+        u.summon(0.5)
+        for _ in range(int(120.0 / SIM_DT)):
+            w.tick(SIM_DT)
+            u.tick(w, SIM_DT)
+            if u.wrecked_count and u.phase == PHASE_IDLE:
+                break
+        after = w.reconcile()
+        still = next((a for a in w.population.alive_agents()
+                      if a.id == wid), None)
+        fresh = [p for p in w.props.all_of("scorch")
+                 if p.id not in scorch_before and abs(p.x - u.hold_x) < 40.0]
+        print(f"seed {seed}: {u.summary()} | residual={after['residual']} "
+              f"abducted={w.stats['abducted']} wearer_alive={still is not None} "
+              f"relic={getattr(still, 'relic', None)!r} "
+              f"wreck scorch at {[round(p.x) for p in fresh]}")
+        assert u.wrecked_count == 1, "the ward never fired"
+        assert after["ok"] == 1 and after["residual"] == 0, after
+        assert w.stats["abducted"] == abducted_before, "a warded beam booked an abduction"
+        assert int(w.population.births) == births_before, "the ward spawned somebody"
+        assert still is not None and still.alive, "the wearer was taken anyway"
+        assert getattr(still, "relic", "") == RELIC_NONE, "the amulet was not consumed"
+        assert not getattr(still, "beamed", False), "still held by a dead craft"
+        assert _f(getattr(still, "lift_t", 0.0)) == 0.0, "left hanging in the beam"
+        assert u.next_in >= WRECK_RESPAWN - 1.0, u.next_in
+        assert fresh, "the wreck left no mark on the ground"
+        lines = [c for c in w.chronicle if "burst" in c or "coming back" in c]
+        assert len(lines) == 2, lines
+        for line in lines:
+            print("   ", line)
+
+    # ...and the lure: the beam picks the bearer, not a random head.
+    w = World(seed=21)
+    u = Ufo(seed=21)
+    crowd = w.population.alive_agents()
+    assert len(crowd) >= 3, "need a crowd to prove a lure"
+    crowd[-1].relic = RELIC_AMULET
+    assert u._pick_victim(w) is crowd[-1], "the amulet did not lure the beam"
+    # The draw is still taken, so a world with no amulet is unchanged. Same
+    # seed, same call count, same victim as a build that never heard of relics.
+    a = Ufo(seed=21)._pick_victim(w)
+    crowd[-1].relic = RELIC_NONE
+    b = Ufo(seed=21)._pick_victim(w)
+    print(f"lure: with={a.name!r} without={b.name!r} (stream unchanged: "
+          f"{b is Ufo(seed=21)._pick_victim(w)})")
+    assert b is Ufo(seed=21)._pick_victim(w)
+
     print("-- persistence --------------------------------------------------")
     blob = u.to_dict()
     clone = Ufo.from_dict(blob)
@@ -1123,6 +1519,11 @@ if __name__ == "__main__":   # pragma: no cover - headless, runs a real World
     assert Ufo.from_dict(None).phase == PHASE_IDLE
     assert Ufo.from_dict({"phase": "nonsense", "abducted": [1, "x"]}).phase == PHASE_IDLE
     assert Ufo.from_dict({"phase": PHASE_BEAM, "target_id": None}).phase == PHASE_DEPART
+    # A wreck has no target by construction, so it must NOT be normalised into
+    # a depart the way an orphaned beam is - that would fly the hull back up.
+    _wr = Ufo.from_dict({"phase": PHASE_WRECK, "target_id": None})
+    assert _wr.phase == PHASE_WRECK and _wr.wrecked, _wr.summary()
+    _wr.tick(object(), 0.05)               # and it must still tick worldless
     junk = Ufo.from_dict({"x": float("nan"), "t": "boom", "next_in": None})
     assert junk.phase == PHASE_IDLE and math.isfinite(junk.x)
     print("round-trip ok;", clone.summary())

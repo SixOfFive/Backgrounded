@@ -35,6 +35,7 @@ import pygame
 from ..constants import (
     MORPH_GIRTH_MAX,
     MORPH_GIRTH_MIN,
+    RELIC_BFG,
     RENDER_H,
     RENDER_W,
     RES_COOKED,
@@ -713,14 +714,25 @@ class _Disarmed:
 
     ``creatures.draw_gear`` paints the jerkin and the shaft from one call and
     has no flag to split them, and that file is not ours to change. Handed a
-    solved skeleton it reads exactly ``weapon``, ``armour`` and ``alive`` off
-    the agent, so this stand-in drops the spear and nothing else. If draw_gear
-    ever reads a fourth field this has to learn it too - the price of the trick.
+    solved skeleton it reads exactly ``weapon``, ``armour``, ``alive`` and now
+    ``relic`` off the agent, so this stand-in drops the HELD things and nothing
+    else. The docstring used to warn that "if draw_gear ever reads a fourth
+    field this has to learn it too - the price of the trick", and then it did:
+    relics arrived and this class silently answered "" for all of them.
+
+    That mattered because relics split into two kinds. The BFG is HELD, so it
+    belongs on the ground with the spear - measured, an ungated BFG drives
+    161-253 px of itself underground in these poses, worse than the spear does.
+    The other four are WORN: dragonscale, the amulet, the ironshod boots and the
+    cairnstone have no reason to come off because their owner is asleep, dead or
+    mid-cartwheel, and stripping them was a straight visual bug - a sleeping
+    villager lost the armour they are still wearing.
     """
 
     armour: Any
     alive: bool
     weapon: str = ""
+    relic: str = ""
 
 
 #: ``render.creatures``, resolved on the first frame. The import has to happen
@@ -827,8 +839,12 @@ def _draw(surf: pygame.Surface, s: Stickman, t: float,
         _creatures = _c
     gear_of: Any = s
     if sk.pose in _SPEAR_GROUNDED and getattr(s, "weapon", None):
+        # Held things go down; worn things stay on. Only the BFG is filtered out
+        # of the relic slot - see _Disarmed for the measured reason it has to be.
+        rel = str(getattr(s, "relic", "") or "")
         gear_of = _Disarmed(getattr(s, "armour", 0.0),
-                            bool(getattr(s, "alive", True)))
+                            bool(getattr(s, "alive", True)),
+                            relic="" if rel == RELIC_BFG else rel)
     _creatures.draw_gear(surf, gear_of, sk, t, base, silhouette)
 
     if getattr(s, "carrying", None) and int(getattr(s, "carry_qty", 0) or 0) > 0:

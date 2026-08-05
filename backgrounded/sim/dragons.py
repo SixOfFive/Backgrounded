@@ -1065,6 +1065,28 @@ class DragonRegistry:
         #: earned the gate - and only by summon().
         self._forced: bool = False
 
+        #: ``(kind, x)`` for every dragon that died since somebody last looked.
+        #: TRANSIENT: deliberately absent from to_dict and from_dict.
+        #:
+        #: This is the same idiom the module already uses for
+        #: ``Dragon._refused_pending`` - raise a flag and let somebody else turn
+        #: it into an event - and it is here for the same reason. ``_reap`` has
+        #: no business knowing what loot is, what the drop table says, or that
+        #: relics exist at all; this module still imports nothing from items.py.
+        #: ``RelicRegistry.drain_slain`` reads it duck-typed and clears it.
+        #:
+        #: Transient because ``World.tick`` runs ``_guarded("relics", ...)`` in
+        #: the very next line after ``_guarded("dragons", ...)``, so the list is
+        #: drained in the same frame it is raised and cannot cross a save. If it
+        #: were persisted, a save taken between the raise and the drain would
+        #: carry a phantom drop that spawns a second relic on load.
+        #:
+        #: The trim in ``_reap`` is the bound that makes that safe to be wrong
+        #: about: if "relics" is ever ``_guarded``-disabled, or if anyone
+        #: reorders those two guards, this list must not grow without limit for
+        #: the rest of an unattended overnight run.
+        self.slain: list[tuple[str, float]] = []
+
     # ---------------------------------------------------------- container --
     def __len__(self) -> int:
         return len(self.dragons)
@@ -2253,6 +2275,29 @@ class DragonRegistry:
                 # Same phrasing as animals._reap, deliberately: a dragon brought
                 # down should read in the chronicle the way a bear does.
                 _log(world, f"The {d.noun} is brought down.")
+                # ...and raise the drop signal. Only on the `not alive` branch:
+                # the other way out of this loop is PHASE_IDLE, which is a dragon
+                # that got bored and LEFT, and a departure must not pay loot.
+                #
+                # Recorded before _release_victim and remove() so d.x is still
+                # where it died rather than wherever the teardown leaves it.
+                #
+                # Trimmed to the last 8. Nothing here knows whether anyone is
+                # listening: the drain is a separate subsystem behind its own
+                # _guarded name and can be switched off for the session by one
+                # exception, at which point this list is the only thing in the
+                # module that would grow forever. 8 is well above any plausible
+                # frame's kill count (the measured peak is 3, under a forced
+                # summon every 45 s) so the trim never actually discards a drop
+                # in play - it is the bound, not a policy.
+                try:
+                    self.slain.append((str(d.kind), float(d.x)))
+                    del self.slain[:-8]
+                except Exception:
+                    # A registry rehydrated by an older from_dict has no `slain`.
+                    # Losing one drop is the right cost; taking the "dragons"
+                    # subsystem down for the session over loot is not.
+                    log.debug("could not record a slain dragon", exc_info=True)
             self._release_victim(world, d)
             self.remove(d)
 

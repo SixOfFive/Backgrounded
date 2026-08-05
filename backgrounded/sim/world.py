@@ -32,6 +32,7 @@ from . import behavior, names
 from .actions import sweep_claims
 from .animals import AnimalRegistry
 from .dragons import DragonRegistry
+from .items import RelicRegistry
 from .throwing import SpearRegistry
 from .ufo import Ufo
 from .entities import GRAVE_DELAY, Population, Stickman
@@ -74,6 +75,56 @@ STAT_DEFAULTS: dict[str, int] = {
     "born": 0, "died": 0, "built": 0, "trees_felled": 0,
     "lightning_strikes": 0, "generations": 1,
     "abducted": 0, "returned": 0,
+    # The dragon relics, declared here at zero for exactly the reason the two
+    # lines above are. items.py bumps these through a `.get()`-style helper that
+    # only writes a key that already exists, so a counter conjured on first use
+    # would be missing on every world where no dragon has died yet - and the HUD
+    # readers would each have to remember .get() or KeyError on a fresh colony.
+    #
+    # "raised" is a separate line from "born" ON PURPOSE. A cairnstone raising is
+    # not a birth: reconcile() reads population.births (which Population.spawn
+    # bumps for us, cancelling against the roster entry so the residual stays
+    # zero by construction), while stats["born"] is a display counter the player
+    # reads as "children". Adding a raising to it would say the colony had a baby
+    # every time it dug one back up.
+    "relics_found": 0, "relics_used": 0, "raised": 0,
+    # The wyrm-gun's two counters, and they are here for the third time this
+    # lesson has been paid for. combat_actions._bump_stat writes them with
+    # ``st[key] = int(st.get(key, 0) or 0) + 1``, which CONJURES the key on the
+    # first shot - so on every world where nobody has ever pulled the trigger,
+    # ``stats["bfg_shots"]`` is a KeyError rather than a zero. That is exactly
+    # the shape of the "abducted" bug two lines above: the readers that forgot
+    # .get() did not crash loudly, they quietly left the number out, and a
+    # balance measurement taken through them was wrong for hours before anyone
+    # noticed. A counter that does not exist until the event happens cannot be
+    # used to prove the event never happened - which is the single most useful
+    # thing these two are for, since a hostile proof of this feature measured
+    # bfg_shots == 0 across 16 seeds and that zero had to be read as "inert",
+    # not "unread".
+    #
+    # NOT display counters. Nothing in the HUD reads them; they exist so a
+    # A/B run can assert the gun fired at all.
+    "bfg_shots": 0, "bfg_misfires": 0,
+    # ...and the other two the same trigger writes. These were missed rather
+    # than deferred - they are the same family, bumped by the same function in
+    # the same file as the two above, and they are the pair that answers the
+    # question the user actually asked ("can one shot leave a single stickman
+    # standing?"). A hostile proof reading stats["bfg_heedless"] on a colony
+    # where nobody had fired would have got a KeyError, not a zero, which is the
+    # third time this exact shape has cost this project a measurement.
+    "bfg_heedless": 0, "bfg_friendly_deaths": 0,
+    # DELIBERATELY NOT DECLARED, and recorded here so the next hand does not
+    # think they were forgotten: "animals_killed", "spears_thrown",
+    # "spears_thrown_child", "spears_hit", "spears_missed", "spears_recovered",
+    # "throw_damage", "animals_seen", "last_animal_t". All are conjured on first
+    # use by their own subsystems and all have the same latent bug. They are not
+    # added because (a) they belong to measurements this lane does not own and
+    # declaring them changes what a fresh world's stats dict contains under
+    # somebody else's test, and (b) "last_animal_t" is a TIMESTAMP, not a
+    # counter - a default of 0 there would mean "an animal was seen at world
+    # time zero", which is worse than absent. Whoever owns throwing.py and
+    # combat_actions.py should close the rest; this dict is the right home for
+    # them when they do.
 }
 
 
@@ -134,6 +185,21 @@ class World:
         # measured re-phase confound that moved mean deaths 16% on its own.
         self.dragons: DragonRegistry = DragonRegistry(seed=self.seed ^ 0xD4A)
         self.spears: SpearRegistry = SpearRegistry(seed=self.seed ^ 0x59EA)
+        # What the dragons leave behind. Its own seeded stream, offset like every
+        # registry above it, and the single source of randomness for the WHOLE
+        # relic feature - the skeletal's 50/50 drop, BFG_MISFIRE, BFG_HEEDLESS.
+        # Sharing pyrng would be the expensive mistake here rather than a tidy
+        # one: behavior.choose_action draws from pyrng once per scored candidate,
+        # and adding a single inert candidate to that stream moved mean deaths
+        # 11.33 -> 13.17 (+16%) with 0/24 seeds matching on any metric. A misfire
+        # roll landing in the middle of it would re-phase every wolf spawn in the
+        # colony, and only on the worlds that had earned a relic.
+        #
+        # A registry and not a plain field, so it does NOT go in
+        # _init_colony_state: from_dict loads it through _sub with a seeded
+        # fallback, exactly as dragons and spears are loaded, which is what makes
+        # it present on both construction paths. See from_dict.
+        self.relics: RelicRegistry = RelicRegistry(seed=self.seed ^ 0x2E11)
 
         self._init_colony_state()
         self._seed_population()
@@ -276,6 +342,16 @@ class World:
         # second this frame is a no-op rather than a second helping of gravity.
         self._guarded("spears", lambda: self.spears.tick(self, dt))
         self._guarded("dragons", lambda: self.dragons.tick(self, dt))
+        # Immediately after "dragons" and before "ufo", and the order is
+        # load-bearing rather than aesthetic. DragonRegistry.slain is a transient
+        # list raised by _reap on the frame a dragon dies and drained here; put
+        # this line above "dragons" instead and every drop is served a frame
+        # late, which is survivable, but a save taken in that gap carries a
+        # phantom kill that spawns its relic a second time on load. Draining in
+        # the same frame it is raised is what makes `slain` safe to leave out of
+        # to_dict. Before "ufo" because the amulet is a relic the saucer has to
+        # be able to see this frame.
+        self._guarded("relics", lambda: self.relics.tick(self, dt))
         self._guarded("ufo", lambda: self.ufo.tick(self, dt))
         self._guarded("lights", self._rebuild_lights)
         self._guarded("lighting", lambda: self.lighting.tick(dt))
@@ -413,7 +489,39 @@ class World:
             if agent.dead_t < BURIAL_DELAY or agent.__dict__.get("_buried"):
                 continue
             agent.__dict__["_buried"] = True
-            self.props.add_grave(agent.x, self.terrain.ground_y(agent.x), agent.name)
+            # The generation goes onto the headstone. It was being dropped on the
+            # floor here - add_grave has taken one since it was written and this
+            # call never passed it, so every grave in the world read generation 0
+            # - and a cairnstone raising reads it straight back off the stone to
+            # put the same person back with the same number. Without this, anyone
+            # raised is a first-generation founder no matter who they were.
+            self.props.add_grave(agent.x, self.terrain.ground_y(agent.x),
+                                 agent.name, getattr(agent, "generation", 0))
+            # Whatever they were carrying falls where they fell. Here rather than
+            # in Stickman.die() because this is the ONE funnel every death goes
+            # through whatever killed them, and it is already one-shot per corpse
+            # behind the _buried flag above - so a relic cannot be dropped twice
+            # and duplicated. drop_from() never raises and returns None for the
+            # overwhelmingly common case of a colonist who owned nothing.
+            #
+            # The one relic this does NOT recover is a BFG lost to a misfire:
+            # combat_actions destroys the weapon BEFORE it deals the blast damage
+            # precisely so a wielder who kills themselves cannot re-drop the gun
+            # here. That asymmetry is the BFG's balance valve - it is the only
+            # item in the set that can leave the world.
+            #
+            # getattr rather than self.relics, and this is not defensive
+            # decoration: _reap_dead runs inside _guarded("agents"), the single
+            # most load-bearing guard in the file. An AttributeError here would
+            # not lose a relic, it would disable ageing, hunger, burial and
+            # replacement for the rest of the session - the exact failure
+            # _init_colony_state's docstring was written about. Both construction
+            # paths set self.relics, so this branch should be unreachable; it
+            # costs one lookup a death to make sure a wrong assumption about that
+            # stays cheap.
+            _relics = getattr(self, "relics", None)
+            if _relics is not None:
+                _relics.drop_from(self, agent)
             self.stats["died"] += 1
             # One chronicle line per death, here, because every cause funnels
             # through this reaper. "death" is not a template kind - it fell
@@ -579,6 +687,106 @@ class World:
         except Exception:
             log.debug("morph chronicle failed for %r", getattr(s, "name", "?"),
                       exc_info=True)
+
+    def raise_the_dead(self, grave: Any, by: str = "") -> bool:
+        """The cairnstone: put the person under *grave* back on the roster.
+
+        *by* is the bearer's name and is optional purely so the one-argument call
+        in the contract still works. Pass it: with it the chronicle gets the line
+        that names both people, which is the line worth screenshotting, and
+        without it all the world can honestly say is that somebody came back.
+
+        Returns True only if somebody actually stood up. **The caller consumes
+        the relic on True and keeps it on False** - a refusal must not eat the
+        item, or a bearer who walks to a headstone while the colony happens to be
+        full loses the rarest half of the skeletal's drop table for nothing.
+        Consuming here instead would hide that decision inside a method that has
+        four separate ways to decline.
+
+        THE LEDGER. This needs no new term in :meth:`reconcile`. That residual is
+        ``births + returned - deaths - abducted - alive``; ``Population.spawn``
+        bumps ``population.births`` and the roster gains one entry, so the two
+        cancel and the residual stays zero by construction. What it must NOT do
+        is touch ``stats["born"]`` - that is the display counter the player reads
+        as children, and a raising is not a birth. ``stats["raised"]`` is its own
+        line in STAT_DEFAULTS.
+
+        THE CAP. ``len(alive_agents()) >= MAX_POP`` is checked FIRST and refuses.
+        Not optional and not theoretical: the ufo's return path shipped exactly
+        this bug once by adding straight to the roster and peaked a long run at
+        11 against a MAX_POP of 10. Every growth path in this file funnels
+        through a cap check; this is one more of them.
+        """
+        try:
+            if grave is None or getattr(grave, "kind", "") != "grave":
+                return False
+            if not getattr(grave, "alive", True):
+                return False          # already weathered away, or already raised
+            if len(self.population.alive_agents()) >= MAX_POP:
+                return False
+
+            state = getattr(grave, "state", None) or {}
+            if not isinstance(state, dict):
+                return False
+            dead_name = str(state.get("name") or "").strip()
+            # Coerced through _finite rather than int()/float() directly, and not
+            # out of tidiness: a headstone whose state was hand-edited to
+            # {"generation": "old"} would raise inside the try below, and the
+            # except branch logs a full traceback. An action that re-scores this
+            # grave every couple of seconds would then write one traceback per
+            # attempt into a log file nobody is watching, forever. Junk should
+            # decline quietly, not shout.
+            gen = int(_finite(state.get("generation"), 1.0, lo=0.0, hi=1e6)) or 1
+            x = _finite(getattr(grave, "x", None), -1.0,
+                        lo=0.0, hi=float(RENDER_W))
+            if x < 0.0:
+                return False
+            if not dead_name:
+                # A headstone with nobody's name on it. Older saves have these -
+                # _reap_dead only started passing the generation through with
+                # this change, and a hand-edited prop can carry anything. Nothing
+                # to raise, so refuse rather than inventing a stranger: the whole
+                # point of the item is that the player recognises the name.
+                return False
+
+            # Population.spawn only honours a requested name if it is NOT already
+            # in used_names, and the dead keep their names reserved forever so no
+            # two colonists are ever confused for each other. Discard it for the
+            # length of this one call, or the raising comes back under a brand
+            # new name and the item silently stops being what it says it is.
+            # spawn() re-adds it on the way through.
+            self.population.used_names.discard(dead_name)
+            s = self.population.spawn(
+                x=x, y=self.terrain.ground_y(x),
+                rng=self.pyrng,
+                name=dead_name,
+                generation=gen,
+                birth_time=self.world_time,
+            )
+            if s.name != dead_name:
+                # spawn() fell back to a fresh name anyway (a live colonist is
+                # somehow already called this). Put the reservation back so the
+                # buried name stays spoken for, and let the new arrival stand -
+                # rolling the spawn back would be a second, worse surgery on the
+                # roster than living with a stranger.
+                self.population.used_names.add(dead_name)
+
+            self.props.remove(grave)
+            self.stats["raised"] += 1
+            bearer = str(by or "").strip()
+            if bearer and bearer != s.name:
+                self.log_event(f"{bearer} sets the wyrm's stone on the grave, "
+                               f"and {s.name} draws breath.")
+            else:
+                self.log_event(f"The wyrm's stone goes down on a grave, and "
+                               f"{s.name} draws breath.")
+            return True
+        except Exception:
+            # Never fatal: this is reached from an action handler, which runs
+            # inside _guarded("agents"). Losing a raising is a bad afternoon;
+            # losing the agents subsystem is the colony.
+            log.exception("raise_the_dead failed")
+            return False
 
     def spawn_visitor(self, x: float) -> str | None:
         """Player's Spawn tool: a newcomer appears at x, if there is room."""
@@ -949,6 +1157,9 @@ class World:
             "animals": self.animals.to_dict(),
             "dragons": self.dragons.to_dict(),
             "spears": self.spears.to_dict(),
+            # Ground relics and the relic stream's draw count. What a colonist is
+            # WEARING is not here: that rides on Stickman.to_dict, in entities.py.
+            "relics": self.relics.to_dict(),
             "ufo": self.ufo.to_dict(),
             "auto_scene_rotate": bool(getattr(self, "auto_scene_rotate", True)),
             "stockpile": dict(self.stockpile),
@@ -1073,6 +1284,36 @@ class World:
                          lambda: DragonRegistry(seed=w.seed ^ 0xD4A))
         w.spears = _sub("spears", SpearRegistry.from_dict,
                         lambda: SpearRegistry(seed=w.seed ^ 0x59EA))
+        # Relics, on the same terms and for the same reasons. Every save written
+        # before this feature existed has no "relics" key at all, and _sub treats
+        # ABSENT as the ordinary case: it logs at DEBUG and regenerates, without
+        # the "save section unusable" WARNING that reads as corruption. That
+        # distinction was added to _sub precisely because loading a perfectly good
+        # pre-dragon colony used to print an alarming line; do not undo it by
+        # reaching for d["relics"] here.
+        #
+        # The fallback is SEEDED, which is the load-bearing half: a bare
+        # RelicRegistry() draws its seed from the global random module, so a world
+        # whose section was missing or unreadable would come back permanently
+        # non-reproducible and nothing downstream could tell. That bug has been
+        # fixed in this file three times now (events, animals, then dragons and
+        # spears); this is the same shape, so it gets the same treatment on the
+        # way in. Same 0x2E11 offset as __init__.
+        #
+        # ...and the LOADER is seeded too, which is where this differs from the
+        # four lines above it and is worth the extra lambda. RelicRegistry
+        # .from_dict is defensive by contract - it never raises, it returns an
+        # empty registry - so _sub's except branch is unreachable for this
+        # section and the seeded fallback never actually runs. A hand-edited
+        # `"relics": "banana"` would therefore load a registry seeded by crc32 of
+        # the junk instead of by the world, and be silently on a different stream
+        # for the rest of its life. Threading w.seed ^ 0x2E11 through makes the
+        # seed come from the world in every case; it is the same value the save
+        # carries on any honest load, so nothing changes for a real one.
+        w.relics = _sub("relics",
+                        lambda raw: RelicRegistry.from_dict(
+                            raw, seed=w.seed ^ 0x2E11),
+                        lambda: RelicRegistry(seed=w.seed ^ 0x2E11))
 
         w.stockpile = {r: 0 for r in ALL_RESOURCES}
         w.stockpile.update({k: int(v) for k, v in
@@ -1082,9 +1323,52 @@ class World:
         # Defaults first, saved values over the top: a save written before
         # "abducted"/"returned" existed simply keeps them at zero instead of
         # loading a stats dict that KeyErrors the moment anything reads them.
-        saved_stats = d.get("stats") or {}
+        #
+        # Coerced key by key rather than in one comprehension, and that is a fix
+        # rather than a style change. This was
+        # ``w.stats.update({k: int(v) for k, v in saved_stats.items()})``, and
+        # every hostile value in a hand-edited save came straight out of it as an
+        # exception: "banana" raises ValueError, [] and None raise TypeError,
+        # float("nan") raises ValueError, float("inf") raises OverflowError, and
+        # a "stats" section that is a LIST rather than a dict raises
+        # AttributeError on .items(). from_dict is the one method in this file
+        # that must not raise - persist.load_world reads any exception as a
+        # corrupt save and QUARANTINES it - so a single junk counter did not cost
+        # the counter, it cost the colony. Same reasoning, and the same fix
+        # shape, as hut_tier_dwell forty lines up.
+        #
+        # A bad value falls back to the DEFAULT for that key (or 0 for a key this
+        # build has never heard of), because a stat is a tally: losing one is a
+        # cosmetic wrong number, and there is nothing better to guess.
+        #
+        # Unknown keys are still carried through, deliberately. A save written by
+        # a newer build carries counters this one has no name for, and dropping
+        # them would silently reset them on the first load by an older binary.
+        # NORMALISED TO A DICT ONCE, HERE, and the name is reused below by the
+        # legacy-"abducted" block's ``"abducted" not in saved_stats``. That
+        # membership test is why this is not simply inlined: the old code leaned
+        # on ``d.get("stats") or {}`` to guarantee a container, and dropping the
+        # ``or {}`` while adding the isinstance check moved the crash rather than
+        # fixing it - ``"abducted" not in 42`` is a TypeError, and a save with
+        # ``"stats": 42`` was quarantined by the very method meant to rescue it.
+        # Caught by the junk-load proof; do not un-normalise this.
+        raw_stats = d.get("stats")
+        if not isinstance(raw_stats, dict):
+            if raw_stats:
+                log.warning("save section 'stats' was %s, not a mapping; "
+                            "counters reset to defaults",
+                            type(raw_stats).__name__)
+            raw_stats = {}
+        saved_stats = raw_stats
         w.stats = dict(STAT_DEFAULTS)
-        w.stats.update({k: int(v) for k, v in saved_stats.items()})
+        for k, v in saved_stats.items():
+            # A non-string key cannot be one of ours and cannot survive JSON as
+            # anything but a string anyway, so it is a hand-edit. Skip it rather
+            # than letting it into a dict[str, int].
+            if not isinstance(k, str):
+                continue
+            w.stats[k] = int(_finite(v, float(STAT_DEFAULTS.get(k, 0)),
+                                     lo=-1e12, hi=1e12))
 
         # ...but zero is only right if the lights had never been. A save from
         # before the counter existed carries no history, yet the ufo section

@@ -19,7 +19,7 @@ from __future__ import annotations
 import random
 from typing import Any, Iterable
 
-from ..constants import RENDER_W
+from ..constants import CAUSE_DISINTEGRATED, RENDER_W
 
 # --------------------------------------------------------------------- roles --
 ROLE_GATHERER = "gatherer"
@@ -359,6 +359,24 @@ EVENT_TEMPLATES: dict[str, tuple[str, ...]] = {
         "{name} died old, by the fire.",
         "{name} lived long and died quietly.",
     ),
+    # The wyrm-gun's kill, on a colonist. Registered here AND in DEATH_KINDS
+    # below, and the pair is the whole point: a cause with a mapping but no
+    # template renders as "Something happened.", and a cause with neither falls
+    # through to the generic "{name} was lost to {cause}." - which is how this
+    # one read until now ("X was lost to disintegrated.", a database field in the
+    # middle of a chronicle).
+    #
+    # No {where} and no {other}: the beam kills at up to BFG_RANGE and through
+    # anything but terrain, so the victim's own ground tells you nothing about
+    # what happened, and naming the shooter here would be wrong on a misfire -
+    # where the only person the gun kills is the one holding it. combat_actions
+    # already chronicles the shot itself with the wielder's name, so the two
+    # lines land together and the reader joins them up.
+    "died_disintegrated": (
+        "{name} was caught by the wyrm-gun's light, and there was nothing left.",
+        "The green fire went through {name}.",
+        "{name} came apart where the beam found them.",
+    ),
     "died": (
         "{name} died.",
         "{name} was lost to {cause}.",
@@ -537,6 +555,18 @@ DEATH_KINDS: dict[str, str] = {
     "quake": "died_quake",
     "age": "died_age",
     "old": "died_age",
+    # The wyrm-gun. THE KEY IS THE IMPORTED CONSTANT ("disintegrated"), not a
+    # literal like every other line above it, and the exception is deliberate.
+    # Every key here is a cause string some other module writes onto
+    # Stickman.death_cause, and the rest are written as literals in the module
+    # that raises them, so a literal here can only drift if two literals drift
+    # together. This one has a NAME - combat_actions imports
+    # CAUSE_DISINTEGRATED - so spelling it out here would be the one place the
+    # table could silently fall out of step with the code that fills it, and the
+    # symptom would be soft: the death still happens, the chronicle just quietly
+    # goes back to "X was lost to disintegrated." Importing costs nothing, since
+    # this module already imports RENDER_W from the same file.
+    CAUSE_DISINTEGRATED: "died_disintegrated",
 }
 
 

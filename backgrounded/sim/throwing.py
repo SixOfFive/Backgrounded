@@ -258,6 +258,22 @@ def _bump(world: Any, key: str, n: int = 1) -> None:
         pass
 
 
+#: ``sim.altitude.clearance`` once it has been looked for, or None if there is
+#: no such module. ``_ALT_LOOKED`` is separate because None is a real answer.
+#:
+#: The lookup is cached because a FAILING import is not. Python caches a
+#: successful import in sys.modules and never pays for it again, but a missing
+#: module re-walks the whole of sys.path on every single call - and this package
+#: lives on a network drive, where that measured 5237 us against 0.33 us for a
+#: resolved one. Roughly sixteen thousand times, on a helper called per hitbox
+#: per candidate per shot. sim/altitude.py does not currently exist, so the slow
+#: path was the ONLY path. The try/except was written to be tolerant of a module
+#: another workstream had not landed yet, which was right; paying for that
+#: tolerance per call was the mistake.
+_ALT_CLEARANCE: Any = None
+_ALT_LOOKED: bool = False
+
+
 def clearance(world: Any, obj: Any) -> float:
     """px between *obj* and the ground under it. 0.0 for anything on it.
 
@@ -267,13 +283,19 @@ def clearance(world: Any, obj: Any) -> float:
     "it is on the ground" - so a missing module changes nothing for wolves and
     simply makes flyers reachable, which is the safe direction to fail in.
     """
-    try:
-        from .altitude import clearance as _c          # noqa: PLC0415
-    except Exception:
+    global _ALT_CLEARANCE, _ALT_LOOKED
+    if not _ALT_LOOKED:
+        _ALT_LOOKED = True
+        try:
+            from .altitude import clearance as _c      # noqa: PLC0415
+            _ALT_CLEARANCE = _c
+        except Exception:
+            _ALT_CLEARANCE = None
+    if _ALT_CLEARANCE is None:
         alt = getattr(obj, "alt", None)
         return _f(alt, 0.0) if isinstance(alt, (int, float)) else 0.0
     try:
-        return _f(_c(world, obj), 0.0)
+        return _f(_ALT_CLEARANCE(world, obj), 0.0)
     except Exception:
         return 0.0
 

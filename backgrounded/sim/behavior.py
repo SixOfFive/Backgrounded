@@ -47,6 +47,7 @@ from ..constants import (
     MAT_STONE,
     MAX_SLOPE_CLIMB,
     MAX_SLOPE_WALK,
+    RELIC_FETCH_RANGE,
     RENDER_W,
     RES_COOKED,
     RES_FIBRE,
@@ -409,6 +410,113 @@ HUT_UPGRADE_APPETITE_MAX = 0.72
 #: that a colony with real work to do is never diverted by a fresh job, short
 #: enough that the measured 6573 s worst-case wait cannot recur.
 HUT_UPGRADE_PATIENCE_SEC = 480.0
+
+#: Wanting a dragon's relic off the ground. Same two-number shape as the hut
+#: upgrade above, and for the same reason - but the numbers are not the same,
+#: because the two jobs fail in opposite directions.
+#:
+#: The hut upgrade is permanent: nobody claiming it costs the colony nothing but
+#: time, so it is allowed to sit at 0.45 and merely be *bounded*. A relic rots
+#: at ``RELIC_DECAY_SEC`` (1800 s) and drops about once every four raw colony-
+#: hours, so "nobody picked it up" is not a delay, it is the whole feature never
+#: happening. That asymmetry is why the floor here (0.62) is above the upgrade's
+#: *ceiling* (0.45), and it is set against the bands in this file rather than
+#: chosen: it clears Mourn (0.68) only after ageing, clears Celebrate
+#: (0.82*morale + 0.18) at the pooled mean morale of ~0.50 = 0.59, and loses to
+#: Eat, Sleep and WarmAtFire from the moment any of those needs is real.
+#:
+#: MEASURED at these numbers, 20 same-seed colonies x 60 sim-min, a relic
+#: forced onto the ground every 600 s (120 drops): 118 of 120 claimed, mean
+#: wait 45.0 s, median 27 s, p90 88 s, worst 351 s, and *nothing* rotted. The
+#: same 20 seeds with the score forced to 0.001 - the job existing but nobody
+#: wanting it, which is the stone-hut failure mode - claimed 0 of 120 and let
+#: 60 of them decay. For scale, the stone-hut upgrade's worst measured wait was
+#: 6573 s and it went unclaimed for up to 110 sim-minutes.
+RELIC_APPETITE = 0.62
+#: ...and where it gets to once nobody has claimed it. 0.90 is a hard bound, not
+#: a preference. It has to stay under ``combat_actions``' FleeAnimal floor of
+#: 0.92 and its FightAnimal floor of 0.95, or a wolf at the door loses to a
+#: trinket in the dirt; and it has to stay under :data:`OVERRIDE_FLOOR` (0.95)
+#: or the fetch becomes an *interrupt* that yanks people off a build.
+RELIC_APPETITE_MAX = 0.90
+#: Seconds unclaimed before it reaches that ceiling. Half the hut's 480 for the
+#: reason above: this job has a deadline and that one does not. 240 s also buys
+#: the ageing term seven full windows inside RELIC_DECAY_SEC, so a relic that
+#: lands somewhere awkward gets escalated long before it rots.
+RELIC_PATIENCE_SEC = 240.0
+#: "No relic is worth walking into a wolf for" used to be a constant here
+#: (RELIC_SAFE_RADIUS = 200.0) and a pair of checks in :func:`_score_loot`. It
+#: is now ``combat_actions.FETCH_SAFE_RADIUS``, enforced once inside
+#: ``combat_actions.fetchable_relic``, which this file asks. The number and its
+#: justification moved intact; only the second copy is gone. Reason: this file
+#: owning a gate that the *action* also had to enforce is how the feature came
+#: to be scored by one lane and unbuildable by another.
+#:
+#: What the score is worth to somebody who is NOT the closest candidate.
+#:
+#: Without it the whole colony wants the same trinket at the same score, so the
+#: whole colony walks to it. MEASURED flat, 6 seeds x 60 sim-min: seven people
+#: fetching at once on the worst seed, 232 FetchRelic actions started for 6
+#: relics claimed, 1085 person-seconds walking. The tail is self-inflicted -
+#: ``RelicRegistry.take()`` returns False for everyone after the first, so the
+#: losers fail on arrival and re-score straight back into it.
+#:
+#: 0.72 is a damper, not a lock. A hard "only the nearest may score it" hands
+#: the relic to one person who may be asleep in a hut all night with nobody
+#: able to take over; at 0.72 the far villagers keep a live candidate (0.42 to
+#: 0.45 fresh, 0.61 to 0.65 fully aged) that still beats Wander, CleanLitter
+#: and topping up
+#: a full stockpile, so an idle colonist does go - they just no longer drop a
+#: build to race for it.
+#:
+#: Re-measured on the same 6 seeds, peak people fetching at once, flat -> damped:
+#: 4->1, 1->1, 6->2, 7->8, 4->4, 4->3. The crowding it was aimed at is gone on
+#: the seeds that had it. Total starts and person-seconds are NOT a clean
+#: comparison and are not claimed as one - changing any score re-phases the
+#: world, so the two arms diverge into different colonies, and both totals are
+#: dominated by two seeds with a different problem entirely.
+#:
+#: That other problem, diagnosed rather than guessed by logging every start on
+#: the worst seed: all 153 of them are in the SAME terrain region as the
+#: fetcher, and the colony is pacing back and forth against an unclimbable face
+#: at x~1110 trying to reach a relic at 1301. That is ``actions._note_blocked``
+#: - a blocked agent fails its goal after BLOCKED_GIVE_UP = 2.0 s, re-scores,
+#: and the relic (whose score is still climbing with age) simply wins again.
+#: Every goal behind a wall does this today, RetrieveSpear included; it is not
+#: a bystander problem and RELIC_BYSTANDER does not and should not fix it.
+#: Deaths on that seed were 5 against a control of 18, so it costs the colony
+#: nothing measurable. Left alone on purpose: the fix belongs with the blocked/
+#: timeout path, not with the appetite.
+RELIC_BYSTANDER = 0.72
+
+#: Wanting to spend the cairnstone on a headstone. Same two-number ageing shape
+#: as the relic appetite above, and the same ceiling for the same hard reason -
+#: it must stay under FleeAnimal's floor (0.92), FightAnimal's (0.95) and
+#: :data:`OVERRIDE_FLOOR` (0.95), so a wolf at the door beats a resurrection and
+#: a raising never becomes an *interrupt* that yanks somebody off a build.
+#:
+#: The floor is higher than the relic's 0.62 because the two jobs have opposite
+#: crowding problems and this one has none. There is exactly one cairnstone
+#: bearer and they are the only person in the world who can do this, so there is
+#: nobody to damp against and no stampede to prevent: :data:`RELIC_BYSTANDER`
+#: has no analogue here. What is left is only "does the bearer actually go", and
+#: at 0.80 they beat Mourn (0.68), Celebrate at the pooled mean morale (0.59),
+#: and every chore - while still losing to Eat, Sleep and WarmAtFire the moment
+#: any of those is real, which is right: a colonist should not starve holding a
+#: rock.
+#:
+#: The one case 0.80 loses is a euphoric colony mid-party (Celebrate is
+#: 0.82*morale + 0.18, so it passes 0.80 at morale 0.76). That resolves itself
+#: within CELEBRATION_FRESH, and the ageing term below closes it anyway. It is
+#: also the correct outcome for the ten seconds it lasts: let them finish the
+#: dance, then go and dig somebody up.
+RAISE_APPETITE = 0.80
+RAISE_APPETITE_MAX = 0.90
+#: Seconds of carrying the stone with a reachable grave before it gets there.
+#: :data:`RELIC_PATIENCE_SEC`, deliberately the same clock: this is the same
+#: "somebody has a job and nobody is doing it" failure the loot appetite and
+#: the stone-hut upgrade both hit, and it should not need a third number.
+RAISE_PATIENCE_SEC = RELIC_PATIENCE_SEC
 
 _COLD_SCENES = (SCENE_BLIZZARD, SCENE_NIGHT_STORM)
 _TREE_KINDS = ("tree", "pine", "oak")
@@ -782,6 +890,14 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
         s.update(score_combat(agent, world))
     except Exception:
         log.debug("combat scoring unavailable", exc_info=True)
+    # Wanting the loot is scored last of all, after the combat merge, because
+    # it has to be able to *lose* to a wolf that combat_actions has just scored
+    # and to *beat* the calm-colony chores scored above. See _score_loot.
+    _score_loot(s, agent, world, danger)
+    # And spending the cairnstone, for the same reason and in the same place:
+    # it has to lose to a wolf combat_actions just scored and beat everything
+    # the colony was calmly getting on with. See _score_raise.
+    _score_raise(s, agent, world, danger)
     return s
 
 
@@ -1036,6 +1152,241 @@ def _grave_to_mourn(world: Any, agent: Any) -> Structure | None:
         except Exception:
             continue
     return best
+
+
+# ------------------------------------------------------------------- loot --
+def _relic_target(agent: Any, world: Any) -> Any:
+    """The relic *agent* should go and get, straight from the action layer.
+
+    ``combat_actions.fetchable_relic`` is the only answer to this question and
+    this file deliberately does not have a second one. It used to: a local
+    ``_relic_near`` that asked ``world.relics.nearest`` and a local pair of
+    ``_wolf_within`` checks. Two independent notions of "a relic worth walking
+    to" in two files owned by two lanes is precisely the arrangement that let
+    the appetite be tuned to three decimal places against a walk that did not
+    exist.
+
+    Still entirely fail-soft: a checkout with no combat_actions, a test stub
+    with no registry and a save written before relics existed must all read as
+    "there is no loot", never as an exception on the frame path.
+    """
+    try:
+        from .combat_actions import fetchable_relic
+        return fetchable_relic(agent, world)
+    except Exception:
+        return None
+
+
+def _raise_target(agent: Any, world: Any) -> Any:
+    """The headstone a cairnstone-bearer should walk to. Same contract."""
+    try:
+        from .combat_actions import raisable_grave
+        return raisable_grave(agent, world)
+    except Exception:
+        return None
+
+
+def _kind_is_wired(kind: str) -> bool:
+    """True once ``combat_actions`` actually owns an action of that kind.
+
+    The score and the action machine live in different files by contract, and
+    they land separately. Scoring a kind that ``make_combat_action`` cannot
+    build is not harmless: ``choose_action`` skips the candidate but has
+    already spent a ``rng.uniform(0, TIEBREAK)`` off ``world.pyrng`` on it, and
+    that stream is the one wolves spawn from. So an appetite stays switched
+    off until the other half exists, and a checkout where it does not is
+    bit-identical to the build before any of this - which is the only safe
+    posture when four lanes merge into one branch.
+
+    Fails closed. If a kind is ever renamed, that job stops being done and its
+    count in a run goes to zero, which is loud; the alternative failure - phase
+    drift nobody can see - is not.
+
+    THIS GUARD DID ITS JOB AND THAT IS THE PROBLEM IT LEAVES BEHIND. It held
+    the loot appetite at exactly zero for a whole release, correctly, because
+    ``FetchRelic`` genuinely did not exist - and a switch that silently and
+    correctly disables a shipped feature reads identically to a feature that
+    works. 18 relics dropped, 0 picked up, and loot-on/loot-off bit-identical
+    on 16 of 16 seeds. Keep the guard; do not trust a green run that never
+    asserted a *non*-zero. The measurement that matters is relics picked up per
+    colony-hour, and it must be greater than zero.
+    """
+    try:
+        from .combat_actions import COMBAT_ACTION_KINDS
+        return kind in COMBAT_ACTION_KINDS
+    except Exception:
+        return False
+
+
+def _fetch_is_wired() -> bool:
+    """True once ``combat_actions`` owns FetchRelic. See :func:`_kind_is_wired`."""
+    return _kind_is_wired("FetchRelic")
+
+
+def _closest_claimant(world: Any, x: float) -> Any:
+    """Which living colonist is nearest to *x* and could actually fetch it.
+
+    Same eligibility as :func:`_score_loot` itself - not a child, not taken,
+    not already carrying a relic - so the "nearest" this hands back is the
+    nearest *candidate* rather than the nearest body. Ties break on id so two
+    people standing on the same pixel do not both read as closest, which would
+    put the stampede straight back.
+    """
+    best, best_key = None, None
+    for ag in alive_agents(world):
+        try:
+            if getattr(ag, "taken", False) or str(getattr(ag, "relic", "") or ""):
+                continue
+            if _role(ag) == "child":
+                continue
+            key = (abs(float(getattr(ag, "x", 0.0)) - x),
+                   int(getattr(ag, "id", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+        if best_key is None or key < best_key:
+            best, best_key = ag, key
+    return best
+
+
+def _score_loot(s: dict[str, float], agent: Any, world: Any,
+                danger: Any) -> None:
+    """Score ``FetchRelic`` in place. The last word on it, deliberately.
+
+    ``score_combat`` owns the *action* - the walk, the claim, the re-acquire
+    when somebody beat you to it - and may score it too. This runs after that
+    merge and overwrites, because every number the score has to be justified
+    against lives in THIS file: Celebrate, Eat, Sleep, WarmAtFire, Mourn, the
+    0.35 danger cap, :data:`OVERRIDE_FLOOR` and :data:`HYSTERESIS_BONUS`. A
+    ceiling tuned anywhere else is tuned against numbers it cannot see, which
+    is precisely how the stone-hut upgrade came to score 0.45 against a
+    Celebrate of 0.63 and go unclaimed for up to 110 sim-minutes.
+
+    The key is only *raised* here when there is a real relic to fetch. On a
+    world with no relics this writes 0.0 and nothing else, and a 0.0 candidate
+    is dropped by ``choose_action`` before it draws its tiebreak - so such a
+    world is bit-identical to the build before relics existed. That is not a
+    nicety: behaviour draws ``rng.uniform(0, TIEBREAK)`` off ``world.pyrng``
+    once per positive candidate, the same stream wolves spawn from, and adding
+    one inert candidate to it has been measured at +16% mean deaths.
+
+    Measured cost of the candidate itself, 20 same-seed triples of 60 sim-min:
+    no relics 12.70 deaths/colony, relics present but scored 0.001 (the
+    candidate and nothing else) 13.85, relics present and actually fetched
+    13.10. Paired, live - none is +0.40 deaths with a 95% CI of [-2.86, +3.66];
+    the phase shuffle alone is +1.15. So the cost of everybody wanting the loot
+    is not distinguishable from the cost of *scoring* it at n=20, and neither is
+    distinguishable from zero. Cause of death moved nowhere either: mauled
+    68 / 81 / 67 across the three arms.
+    """
+    s["FetchRelic"] = 0.0
+    try:
+        if not _fetch_is_wired():
+            return
+        if not getattr(agent, "alive", True) or getattr(agent, "taken", False):
+            return
+        # One relic slot per person, so somebody already carrying one is not a
+        # candidate - and nobody is ever both impenetrable and holding the BFG.
+        if str(getattr(agent, "relic", "") or ""):
+            return
+        # Children follow a parent. Every other gear-and-danger behaviour in
+        # this game excludes them (CraftSpear, FightAnimal, ThrowSpear); a
+        # nine-year-old picking up the wyrm-gun is not a feature.
+        if _role(agent) == "child":
+            return
+        # Standing in something that is trying to kill us. The colony-wide cap
+        # above clamps needs to 0.35 under hazard; loot gets no score at all,
+        # because 0.35 still wins a frame where everything else happens to be
+        # zero and "walked into the fire for a trinket" is not a story worth
+        # shipping.
+        if danger:
+            return
+
+        ax = float(getattr(agent, "x", 0.0))
+        # ONE question, asked of the file that owns the walk. fetchable_relic
+        # applies every gate that makes setting off a bad idea - nothing hunting
+        # at either end (FETCH_SAFE_RADIUS), inside FETCH_SEEK, and not one this
+        # agent has already failed to reach and is snubbing - so a relic that
+        # scores here is a relic that make_combat_action will actually build a
+        # walk to. The eligibility checks above are kept because they are
+        # cheaper than the call and because they are also the ones this file can
+        # justify; the object choice is not this file's to make.
+        relic = _relic_target(agent, world)
+        if relic is None:
+            return
+        rx = float(getattr(relic, "x", ax))
+
+        dist = abs(rx - ax)
+        near = 1.0 - _clamp01(dist / max(1.0, RELIC_FETCH_RANGE))
+        age = max(0.0, float(getattr(relic, "age", 0.0) or 0.0))
+        patience = _clamp01(age / max(1.0, RELIC_PATIENCE_SEC))
+        ceiling = (RELIC_APPETITE
+                   + (RELIC_APPETITE_MAX - RELIC_APPETITE) * patience)
+        # Distance is a small term on purpose. It decides *who* goes - the
+        # nearest villager scores highest and wins the tiebreak - and it is not
+        # allowed to decide *whether* anyone does, which is what the ageing
+        # term is for. At 0.10 the far end of RELIC_FETCH_RANGE gives up ten
+        # percent of the ceiling, which is enough to order seven people and not
+        # enough to strand a relic on the far side of the map.
+        # Everybody except the nearest candidate takes RELIC_BYSTANDER, so one
+        # person goes and the rest only join in if they had nothing better on.
+        claimant = _closest_claimant(world, rx)
+        damp = 1.0 if (claimant is None or claimant is agent) else RELIC_BYSTANDER
+        s["FetchRelic"] = _clamp01(
+            min(RELIC_APPETITE_MAX, ceiling * (0.90 + 0.10 * near)) * damp)
+    except Exception:
+        log.debug("relic scoring failed", exc_info=True)
+        s["FetchRelic"] = 0.0
+
+
+def _score_raise(s: dict[str, float], agent: Any, world: Any,
+                 danger: Any) -> None:
+    """Score ``RaiseTheDead`` in place. Same construction as :func:`_score_loot`.
+
+    ``World.raise_the_dead()`` shipped with **zero callers**. The cairnstone is
+    the second most common drop in the table, so the most likely thing to find
+    in the dirt was an item with no use, and the ``stats["raised"]`` line that
+    was carefully kept out of ``stats["born"]`` counted nothing for anybody.
+
+    The ageing clock is the GRAVE'S OWN AGE, not a timer on the bearer. props.py
+    already advances ``state["age"]`` on every headstone each tick, and it
+    persists, so this needs no new state on the agent and no new field in a
+    save - the same trick the loot appetite plays with ``Relic.age``. It reads
+    correctly too: an old headstone is one nobody has done anything about.
+
+    A fresh grave still scores :data:`RAISE_APPETITE`, which already beats every
+    calm-colony job, so the ageing term is a backstop rather than the mechanism.
+    That is on purpose: the stone-hut upgrade's failure was a job that was only
+    ever *bounded* above, and this one has a deadline - the bearer can die, and
+    ``MAX_GRAVES`` weathering will eventually take the headstone.
+    """
+    s["RaiseTheDead"] = 0.0
+    try:
+        if not _kind_is_wired("RaiseTheDead"):
+            return
+        if not getattr(agent, "alive", True) or getattr(agent, "taken", False):
+            return
+        # Not gated on `_role(agent) == "child"` or on carrying the stone here:
+        # raisable_grave applies both, and duplicating them is what this change
+        # is undoing. The two gates below are the ones only this file can make.
+        if danger:
+            return
+        grave = _raise_target(agent, world)
+        if grave is None:
+            return
+
+        age = 0.0
+        try:
+            state = getattr(grave, "state", None)
+            if isinstance(state, dict):
+                age = max(0.0, float(state.get("age", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            age = 0.0
+        patience = _clamp01(age / max(1.0, RAISE_PATIENCE_SEC))
+        s["RaiseTheDead"] = _clamp01(
+            RAISE_APPETITE + (RAISE_APPETITE_MAX - RAISE_APPETITE) * patience)
+    except Exception:
+        log.debug("raise scoring failed", exc_info=True)
+        s["RaiseTheDead"] = 0.0
 
 
 # ===========================================================================

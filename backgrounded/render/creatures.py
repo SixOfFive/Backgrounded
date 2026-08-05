@@ -9,8 +9,12 @@ draws three of them:
   slow, boars are low and wide with tusks.
 * :func:`draw_ufo` - a saucer with a dark dome, cycling rim lights and an
   additive abduction beam. The abductee rises inside the beam.
-* :func:`draw_gear` - the spear and the leather armour, drawn onto an existing
-  stick figure. Called from the stickman draw path.
+* :func:`draw_gear` - the spear, the leather armour and whichever of the five
+  dragon relics the agent is wearing, drawn onto an existing stick figure.
+  Called from the stickman draw path. The relic *drawings* live in
+  ``render/items.py``; what lives here is the decision of when to ask for one
+  and how it stacks with the jerkin, because this is the function that already
+  owns the torso.
 
 **Read-only w.r.t. sim state.** Nothing here writes to a World, an agent, an
 animal or the saucer - ``lift_t`` in particular is *read* to place the abductee
@@ -61,6 +65,7 @@ from ..constants import (
     ANIMAL_STATS,
     ANIMAL_WOLF,
     ARMOUR_LEATHER,
+    RELIC_KINDS,
     RENDER_H,
     RENDER_W,
     UFO_BEAM_SEC,
@@ -1068,10 +1073,61 @@ _SPEAR_HEAD: Color = (162, 166, 176)
 _LEATHER: Color = (92, 60, 38)
 _LEATHER_RIM: Color = (138, 100, 62)
 
+#: The five wire strings a ``Stickman.relic`` may hold, as a set for the hot
+#: path. Read here rather than through ``items.relic_of`` on purpose - see
+#: :func:`_relic_of`.
+_RELIC_SET: frozenset[str] = frozenset(RELIC_KINDS)
+
+#: ``render.items``, resolved on the first relic that is actually drawn.
+#:
+#: It cannot be a module-level import and never will be: ``items.py`` imports
+#: this module's primitives (``_line``, ``_disc``, ``_poly``, ``_dim``, ``_lit``,
+#: ``_SIL_COLOR``, ``_state_of``, ``_find_ufo``) at *its* import time and
+#: deliberately so - a relic drawn with a different line helper than the spear in
+#: the same fist antialiases differently and reads as a different object. An
+#: import back the other way at module level makes the pair genuinely circular,
+#: and whichever of the two the renderer reaches first hands the other a
+#: half-built module. ``stickfigure.py`` holds ``creatures`` behind exactly this
+#: idiom for the same reason, and records the cost it is avoiding: a relative
+#: import in the hot path measured +1.9 us per figure against +0.8 us cached.
+#:
+#: Deferred to the first *relic* rather than the first frame because 62.5% of
+#: colonies never kill a dragon: :func:`_relic_of` answers "no relic" with a
+#: getattr and a set lookup and never touches this at all.
+#:
+#: Three states, not two: ``None`` is "not looked yet", a module is the answer,
+#: and ``False`` is "the import failed, stop trying". Without the third the
+#: retry happens once per relic wearer per frame forever, and an ImportError is
+#: not cheap - a colony with a BFG would pay for a stack unwind sixty times a
+#: second to be told the same thing.
+_items: Any = None
+
+
+def _relic_of(agent: Any) -> str:
+    """The relic *agent* is wearing, or ``""``. Never raises.
+
+    A deliberate local twin of ``items.relic_of``. This runs for every agent on
+    every frame, and the common answer is "" - resolving a module through a
+    cache to be told that is work the fast path should not do, and importing
+    ``render.items`` (numpy beam bakes and all) into a process whose colony has
+    never seen a dragon is work it should not do either.
+
+    Duck-typed rather than typed against ``Stickman.relic`` for the reason
+    ``items.relic_of`` records: ``stickfigure._Disarmed`` hands this function a
+    three-field stand-in for the poses that put a weapon down, and an unknown
+    string (a save from a future kind, a half-written field) must degrade to
+    "no relic" rather than to a traceback in the figure draw.
+    """
+    try:
+        val = getattr(agent, "relic", "")
+    except Exception:
+        return ""
+    return val if isinstance(val, str) and val in _RELIC_SET else ""
+
 
 def draw_gear(surf: pygame.Surface, agent: Any, sk: Any = None, t: float = 0.0,
               base: Sequence[int] | None = None, silhouette: bool = False) -> None:
-    """Draw an agent's spear and armour.
+    """Draw an agent's spear, armour and relic.
 
     Meant to be called from ``stickfigure._draw`` right after the limbs, where
     the skeleton and colours are already in hand::
@@ -1081,15 +1137,28 @@ def draw_gear(surf: pygame.Surface, agent: Any, sk: Any = None, t: float = 0.0,
 
     Every argument after *agent* is optional: given only an agent, the
     skeleton is solved here. Read-only, fails soft, and draws nothing at all
-    for an unarmed, unarmoured agent - which is the common case, so that path
-    is two ``getattr`` calls and a return.
+    for an unarmed, unarmoured, relicless agent - which is the common case, so
+    that path is three ``getattr`` calls and a return.
+
+    The relic branch is the fix for a feature that shipped fully drawn and
+    entirely unreachable: ``render/items.py`` has had five worn drawings in it
+    since the relics landed, and the string "relic" appeared nowhere in this
+    file, so four of the five were invisible on their wearer and the fifth
+    (dragonscale, which mirrors itself into ``agent.armour``) showed up as a
+    generic leather jerkin.
     """
     try:
         weapon = str(getattr(agent, "weapon", "") or "")
         armour = fx.attr_num(agent, "armour", default=0.0)
+        relic = _relic_of(agent)
         has_spear = weapon == WEAPON_SPEAR
         has_armour = armour >= ARMOUR_LEATHER * 0.5
-        if not (has_spear or has_armour):
+        # The relic HAS to be in this test. A BFG carrier's gun replaces their
+        # spear, so `weapon` is "bfg9000" and `has_spear` is False, and they
+        # usually have no jerkin either - without the third term the one
+        # villager holding the loudest object in the game returns right here
+        # with nothing drawn.
+        if not (has_spear or has_armour or relic):
             return
         if sk is None:
             from .stickfigure import build_skeleton      # local: avoids a cycle
@@ -1104,10 +1173,64 @@ def draw_gear(surf: pygame.Surface, agent: Any, sk: Any = None, t: float = 0.0,
         else:
             flat = None
 
-        if has_armour:
+        # Resolved inside its own guard, not inside the outer one. items.py
+        # pulls in numpy for the beam bakes and reaches back into this module
+        # for primitives, so it has strictly more ways to fail on import than
+        # anything else here - and if it took the outer handler with it, a
+        # broken relic module would strip the jerkin off every armoured
+        # villager and the shaft out of every fist. A relic that cannot be
+        # drawn must cost exactly the relic.
+        art: Any = None
+        if relic:
+            global _items
+            if _items is None:
+                try:
+                    from . import items as _i           # local: see _items above
+                    _items = _i
+                except Exception:
+                    log.warning("render.items would not import; relics are off "
+                                "for this session", exc_info=True)
+                    _items = False                      # sentinel: do not retry
+            art = _items or None
+
+        # The dragonscale mirrors itself into `agent.armour` - that is what
+        # makes it absorb damage with no edit to the combat path - so its
+        # wearer passes the jerkin test too and would get leather drawn under
+        # plate on one torso. Which relics own the chest is asked of the module
+        # that draws them rather than decided here, so a sixth relic that also
+        # covers the body needs no edit in this file.
+        if has_armour and not (art is not None and art.covers_torso(relic)):
             _draw_armour(surf, sk, flat, fade)
         if has_spear:
             _draw_spear(surf, sk, flat, fade)
+        if art is not None:
+            # Last, and over the spear. Four of the five sit on the body
+            # (throat, chest, hip, feet) where nothing else competes; the fifth
+            # is a two-handed gun that has to occlude the arms holding it, the
+            # way the spear occludes the fist.
+            art.draw_worn(surf, agent, sk, float(t), flat, fade, kind=relic)
+            # ...and then the head comes back, for the one relic big enough to
+            # take it. `stickfigure` draws worn gear in front of the whole
+            # figure, head included, and is right to: an overhead chop should
+            # swing a spear past the face. That rule was written against a 2 px
+            # shaft. The BFG is a ~10 px block held in both fists, and in the
+            # poses that raise the hands to head height (chop, panic, dance) it
+            # covered 91-97% of the head disc - the wielder read as headless.
+            # Re-stamping the head in the colour it was already painted with is
+            # the whole fix: the gun ends up behind the face and in front of
+            # everything else, which is where a carried object belongs anyway.
+            #
+            # `base` and not a colour of our own. It is the exact value
+            # stickfigure._draw used, corpse fade and silhouette verdict
+            # included, so the disc lands pixel-identical to the one underneath
+            # rather than as a slightly wrong head. Skipped when there is none
+            # (a contact sheet calling draw_gear with only an agent), because a
+            # guessed head colour is worse than the occlusion.
+            if base is not None and art.hides_head(relic, sk):
+                head = getattr(sk, "head", None)
+                if head is not None:
+                    _disc(surf, (int(base[0]), int(base[1]), int(base[2])),
+                          head, float(getattr(sk, "head_r", 2.0)))
     except Exception:
         # No getattr on `agent` in here. The handler used to log the agent's
         # name, which meant a sim object whose attribute access raised got its

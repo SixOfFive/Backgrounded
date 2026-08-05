@@ -26,7 +26,7 @@ from collections import Counter
 import pygame
 
 from ..constants import (
-    DAY_LENGTH_SEC, RES_COOKED, RES_FIBRE, RES_FOOD, RES_STONE,
+    DAY_LENGTH_SEC, MAX_HEALTH, RES_COOKED, RES_FIBRE, RES_FOOD, RES_STONE,
     RES_WOOD, SCENE_LABELS, SCENE_ROTATE_SEC,
 )
 from ..sim.names import role_label
@@ -386,6 +386,37 @@ def _need_color(v: float) -> tuple[int, int, int]:
     return GOOD if v < 0.45 else (WARN if v < 0.75 else BAD)
 
 
+def _health_color(v: float) -> tuple[int, int, int]:
+    """Colour for a health fraction, where FULL IS GOOD.
+
+    The inverse of :func:`_need_color`, and that inversion is the whole reason
+    this exists rather than reusing it. Every other bar on the roster is a
+    *need*: hunger, fatigue and cold all run empty-is-fine to full-is-dying, and
+    the panel's own legend says "(full=bad)". Health runs the other way. Sharing
+    a colour ramp between the two would mean a dying agent's health bar went
+    green at the moment it should be screaming, which is worse than not drawing
+    it at all - a glanceable panel that lies is not glanceable.
+    """
+    return BAD if v < 0.30 else (WARN if v < 0.65 else GOOD)
+
+
+def _health_frac(agent) -> float:
+    """0..1 health, tolerant of an agent that has none.
+
+    Read through MAX_HEALTH rather than assumed to be a fraction already, and
+    clamped, because relics push raw damage well past the nominal range -
+    dragons._devour deals MAX_HEALTH * 10 - and a bar drawn from an unclamped
+    ratio would run off the end of the panel.
+    """
+    try:
+        hp = float(getattr(agent, "health", MAX_HEALTH))
+    except (TypeError, ValueError):
+        return 1.0
+    if hp != hp:                                  # nan
+        return 1.0
+    return 0.0 if hp <= 0.0 else min(1.0, hp / float(MAX_HEALTH or 1.0))
+
+
 def _bar(surf: pygame.Surface, x: int, y: int, w: int, h: int,
          frac: float, color: tuple[int, int, int]) -> None:
     frac = 0.0 if frac < 0.0 else (1.0 if frac > 1.0 else frac)
@@ -713,6 +744,14 @@ def _agent_tip(a) -> tuple[str, tuple[str, ...]]:
         if getattr(a, "holds_candle", False):
             body.append("holding a candle")
         body.append("")
+        # Health in points rather than a percentage, unlike the needs below it:
+        # the damage numbers in this game are authored against MAX_HEALTH (a
+        # spear does SPEAR_DAMAGE, a dragon's maw deals ten times the bar), so
+        # "62/100" tells you how many more hits they have in them and "62%"
+        # does not.
+        hp = _health_frac(a)
+        body.append(f"{'health:':<8}{int(round(hp * float(MAX_HEALTH))):3d}"
+                    f"/{int(MAX_HEALTH)}")
         for label, val in (("hungry", getattr(a, "hunger", 0.0)),
                            ("tired", getattr(a, "fatigue", 0.0)),
                            ("cold", getattr(a, "warmth", 0.0))):
@@ -852,7 +891,9 @@ def _build(world, show_roster: bool) -> tuple[pygame.Surface, list]:
         at += len(part) + 1
     y += LINE
     if show_roster:
-        panel.blit(_text("needs: hun=hungry tir=tired cld=cold (full=bad)",
+        # hp is called out separately from the three needs because it is the one
+        # bar on the row where a full bar is good news.
+        panel.blit(_text("hp=health (full=good) | hun tir cld (full=bad)",
                          (108, 116, 132), 9), (PAD, y))
         y += LINE - 2
     y += 4
@@ -881,17 +922,31 @@ def _build(world, show_roster: bool) -> tuple[pygame.Surface, list]:
             panel.blit(ds, (PAD + 76, y))
             y += LINE - 2
 
-            # need bars: hunger / fatigue / cold. Full bar == bad.
-            bw = 20
+            # Health, then the three needs. hp leads deliberately: it is the one
+            # that means someone is about to die, and it is also the one that
+            # runs the other way (full is good), so putting it first and giving
+            # it its own colour ramp stops the eye reading the row as four bars
+            # of the same thing.
+            #
+            # bw drops 20 -> 16 and the gap 6 -> 5 to buy the fourth column. Four
+            # at the old width ran to x=190 and the right-aligned role label
+            # starts around 219 on a nine-character role, which is a 29 px margin
+            # - too close to trust with a font the system chooses at runtime.
+            # At 16 the row ends at 162 and the margin is 57.
+            bw = 16
             bx = PAD + 13
             # Spelled out rather than h/f/c: those read as health/food, which
             # is neither what they measure nor which way round they run.
-            for lbl, val in (("hun", a.hunger), ("tir", a.fatigue),
-                             ("cld", a.warmth)):
+            hp = _health_frac(a)
+            for lbl, val, col in (
+                ("hp", hp, _health_color(hp)),
+                ("hun", float(a.hunger), _need_color(float(a.hunger))),
+                ("tir", float(a.fatigue), _need_color(float(a.fatigue))),
+                ("cld", float(a.warmth), _need_color(float(a.warmth))),
+            ):
                 panel.blit(_text(lbl, DIM, 9), (bx, y - 2))
-                _bar(panel, bx + 16, y + 1, bw, 4, float(val),
-                     _need_color(float(val)))
-                bx += 16 + bw + 6
+                _bar(panel, bx + 14, y + 1, bw, 4, val, col)
+                bx += 14 + bw + 5
             role = str(getattr(a, "role", ""))[:9]
             rs = _text(role, DIM, 9)
             panel.blit(rs, (PANEL_W - PAD - rs.get_width(), y - 2))

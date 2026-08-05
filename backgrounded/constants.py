@@ -312,6 +312,32 @@ UFO_INTERVAL_MAX = 1500.0
 UFO_BEAM_SEC = 4.5                 # hover + beam before the lift completes
 UFO_RETURN_CHANCE = 0.25           # sometimes they get dropped back, dazed
 
+#: Seconds into the beam at which an amulet-bearing victim wards it off and the
+#: saucer comes apart. **Must stay strictly below UFO_BEAM_SEC**, and the check
+#: must sit ABOVE the completion branch in ``Ufo._tick_beam``, because that is
+#: the whole accounting argument for the item:
+#:
+#:   * not 0.0 - BEAM_FADE is 0.7 s, so at t=0 there is no beam drawn yet and the
+#:     saucer appears to detonate for nothing;
+#:   * not at completion - ``_complete_abduction`` is the line that calls
+#:     ``pop.remove()`` and bumps ``stats["abducted"]``. Firing after it means
+#:     either double-booking the roster or un-booking it, and ``reconcile()``'s
+#:     residual (births + returned - deaths - abducted - alive) stops being zero.
+#:
+#: Firing strictly before it means ``_complete_abduction`` is NEVER CALLED on a
+#: warded beam: the roster never changes, no stat moves, and the ledger needs no
+#: new term. That corruption has already been found and fixed once in this
+#: project (see world.reconcile) - do not reintroduce it by moving this number
+#: above UFO_BEAM_SEC or by moving the check below the completion branch.
+UFO_WARD_AT = 2.4
+#: Seconds the wrecked hull takes to fall from hover altitude to the ground.
+UFO_WRECK_FALL_SEC = 1.4
+#: Seconds before a wrecked saucer is replaced. Deliberately long (40 min against
+#: a measured 3.04 abductions per colony-hour): one amulet must not switch the
+#: abduction system off for the rest of the colony's life. The ward is an EVENT,
+#: not a state.
+UFO_WRECK_RESPAWN = 2400.0
+
 # -------------------------------------------------------------- population --
 #: The colony breathes between these. Deaths are no longer replaced one-for-one
 #: - the number is allowed to fall, and a colony with food, shelter and morale
@@ -733,3 +759,287 @@ DRAGON_MAX_FED: dict[str, int] = {
     DRAGON_SERPENT: 1,
     DRAGON_SKELETAL: 0,
 }
+
+# ------------------------------------------------------------------ relics --
+# What a dead dragon leaves behind. One slot per colonist (``Stickman.relic``),
+# so nobody is ever both impenetrable and holding the gun.
+#
+# THE RARITY IS THE DRAGON, NOT A DICE THROW ON TOP OF IT. Every non-flyover
+# dragon death drops exactly one relic and there is no second roll. Measured, 16
+# seeds x 90 sim-min of an unmodified World: 19 visits and 6 kills over 24
+# colony-hours, i.e. 0.250 kills per RAW colony-hour and 1.14 per GATED one (the
+# stone-hut gate latched in 12 of 16 seeds at a median of ~58 min, and the four
+# that never latched could never see a relic at all). A 30% drop roll on top of
+# that would be one item per 13 colony-hours, which is dead content by the
+# brief's own standard; 6 of 16 seeds saw a relic inside 90 minutes from cold,
+# which already satisfies "not everybody has one".
+#
+# THE RARITY IS STILL THE DRAGON. WHICH RELIC IS NO LONGER THE DRAGON'S NAME.
+# The first table paired one relic to one dragon kind, which multiplied the
+# item's rarity by its dragon's: the bfg9000 hung off the serpent, the rarest
+# kind and the least-killed of the five, and it dropped ZERO times in one 32
+# colony-hour sample and 0.073 times per colony-hour in a 96 colony-hour one -
+# reaching 6 colonies out of 48. Ironshod boots, off the skeletal's coin flip,
+# were rarer still at 0.031. Both are items the design leans on: the gun is the
+# headline, and the boots are the only answer in the game to falling, which
+# kills more colonists than anything else. Over those same 96 colony-hours the
+# boots caught exactly ZERO lethal landings.
+#
+# ``sim/items.DROP_WEIGHTS`` is therefore weighted rather than paired (every
+# kind can leave any relic, its signature one likeliest) and carries a pity rule
+# for the first gun and the first pair of boots a colony ever earns. A/B on the
+# same 48 seeds: bfg9000 0.073 -> 0.125 per colony-hour (6 -> 12 colonies of
+# 48), ironshod 0.031 -> 0.073 (3 -> 7), lethal landings caught 0 -> 4. The
+# number of relics per dead dragon is unchanged at exactly one, so nothing above
+# moves: the total drop RATE is the same 0.4-0.5 (0.448 -> 0.406, inside the
+# noise) and only the mix is different.
+#
+# The drop table itself lives in ``sim/items.py`` beside the code that reads it,
+# following the precedent of ``throwing.py``'s tuning block: numbers only one
+# mechanic reads live with the mechanic, and it keeps this file single-owner so
+# two workstreams cannot collide in it.
+RELIC_NONE   = ""
+RELIC_SCALE  = "dragonscale"
+RELIC_AMULET = "amulet"
+RELIC_BFG    = "bfg9000"
+RELIC_BOOTS  = "ironshod"
+RELIC_CAIRN  = "cairnstone"
+RELIC_KINDS: tuple[str, ...] = (RELIC_SCALE, RELIC_AMULET, RELIC_BFG,
+                                RELIC_BOOTS, RELIC_CAIRN)
+
+#: Dragonscale, mirrored into ``Stickman.armour`` so every existing reader - the
+#: damage path, ``combat_actions._armoured``, ``render.draw_gear`` - keeps
+#: working with no edit at all.
+#:
+#: "1.0" does NOT mean invulnerable, and that is deliberate rather than a
+#: rounding accident. ``Stickman.hurt`` reads
+#: ``taken = amount * (1.0 - _clamp(self.armour, 0.0, 0.9))``, so the existing
+#: 0.9 clamp turns this into 90% absorbed: impenetrable is EFFECTIVE, not
+#: literal. That clamp is the whole design - nothing has to be special-cased, a
+#: hand-edited save claiming ``armour: 9.9`` still lands on 0.9, and no agent can
+#: ever be immortal.
+#:
+#: MEASURED, and this is the honest ceiling on the item: over 16 seeds x 90
+#: sim-min, 293 deaths, only TWO causes route through ``Stickman.hurt`` at all -
+#: mauled (73, 24.9%) and devoured (10, 3.4%). The other 200 (lightning 54, fire
+#: 46, fall 27, drown 22, cold 20, meteor 18, mudslide 11, hunger 2) go through
+#: ``events._kill -> Population.kill -> Stickman.die`` and NEVER TOUCH ARMOUR.
+#: The strongest armour conceivable addresses about a quarter of what kills this
+#: colony. The dragon's own maw is already immune: ``_devour`` deals
+#: ``MAX_HEALTH * 10.0`` = 1000, of which 10% = exactly MAX_HEALTH, so a
+#: dragonscale wearer is still eaten. That 10x predates this item and anticipates
+#: it exactly - leave it alone.
+ARMOUR_DRAGONSCALE = 1.0
+
+#: The wyrm-gun. Held in ``Stickman.weapon`` instead of a spear, which is meant
+#: to be the entire cost of carrying it.
+#:
+#: WHAT THIS NOTE USED TO CLAIM, AND WHY IT WAS WRONG. It said the cost "costs
+#: no code to enforce: ``throwing.can_throw`` tests ``weapon != WEAPON_SPEAR``
+#: exactly and ``combat_actions._armed`` tests the same, so a BFG carrier
+#: automatically cannot throw and cannot melee." Both halves of that are true
+#: and the conclusion still does not follow, because it only looks at the READS
+#: and never at the WRITES. The slot is not a lock. Three live paths assign to
+#: it (``combat_actions._craft_apply`` and ``_h_retrieve_spear``, both to
+#: WEAPON_SPEAR, and ``throwing`` to WEAPON_NONE on release), and the first is
+#: on the daily round of every idle adult:
+#:
+#:   ``score_craft`` gates CraftSpear on ``not armed``, where ``armed`` is
+#:   ``_armed(agent)`` - deliberately spear-only. A BFG carrier therefore reads
+#:   as UNARMED to the crafting goal, scores CraftSpear at 0.55-0.87, and
+#:   ``_craft_apply`` then does ``agent.weapon = WEAPON_SPEAR`` with no check on
+#:   what was already in the slot. The wyrm-gun is overwritten - not dropped,
+#:   not chronicled, gone. ``Stickman.relic`` still reads ``bfg9000``, so the
+#:   colonist is still "carrying" it: ``_bfg()`` is False forever after, the gun
+#:   can never fire again, and because the one relic slot is still occupied that
+#:   colonist can never pick up another relic either.
+#:
+#:   combat_actions already owns the predicate that fixes this. It wrote
+#:   ``_combat_capable`` (``_armed or _bfg``) for exactly this class of mistake
+#:   and then used it in ONE place, the flee gate. The craft gate is the second
+#:   place it belongs.
+#:
+#: MEASURED, real World, a carrier handed the gun at t=0 on level ground with a
+#: hostile always in range: the slot was overwritten by CraftSpear at t=53s
+#: (seed 62) and t=31s (seed 63); the third carrier died at t=7s still holding
+#: it. From there it cycles CraftSpear -> ThrowSpear -> RetrieveSpear forever.
+#: Over 3 seeds x 90s with a target permanently available, ``score_bfg``
+#: returned 0.0 on 2700 of 2700 ticks and the dominant reason - 1736 to 2001 of
+#: them, 64-74% - was "not holding the gun (weapon='')". Over 4 seeds x 30
+#: sim-min of GUARANTEED carry (re-armed the instant the colony had no BFG):
+#: 0 shots, 0 misfires, 0.00 shots/colony-hour.
+#:
+#: THE FIX IS NOT IN THIS FILE and was deliberately not attempted from here.
+#: Retuning a number cannot stop an assignment; CraftSpear must decline for a
+#: relic-weapon holder (or route through ``items``), and combat_actions.py
+#: belongs to another workstream. Recorded here because this is where the false
+#: "costs no code to enforce" reasoning was written down, and the next hand will
+#: read it before they read the handler.
+#:
+#: Read BFG_MISFIRE's carry-life arithmetic with this in mind: it is derived per
+#: SHOT, and a gun that is overwritten before it fires has no misfire rate at
+#: all.
+WEAPON_BFG = "bfg9000"
+BFG_RANGE      = 420.0
+#: == throwing.THROW_MIN_RANGE. Inside this you are shooting your own boots.
+BFG_MIN_RANGE  = 34.0
+#: Perpendicular half-width of the beam. Everything whose ``throwing._target_box``
+#: overlaps the corridor goes down; TERRAIN stops the beam and a body does not,
+#: which is why "wipes out animals" and "kills everything in line of sight" are
+#: one mechanic and not two.
+BFG_CORRIDOR   = 22.0
+#: How big a misfire LOOKS. **No longer a damage radius** - read this before
+#: retuning it, because the name is now a half-truth kept on purpose.
+#:
+#: THE SPEC WAS CORRECTED, in the author's words: '"randomly explodes taking out
+#: the stickmen" .. "stickman", just himself .. so its an or situation .. could
+#: possibly leave a single stickman'. The gun has two failure modes and they are
+#: an OR, not one blast that scales up:
+#:
+#:   MISFIRE  -> the gun comes apart and kills THE WIELDER ALONE. Not his
+#:               neighbours, not the man who walked over to talk to him.
+#:   HEEDLESS -> the shot goes down the corridor and kills every stickman on the
+#:               line as well as the animals. THAT is the one that can wipe most
+#:               of a colony and leave a single survivor, and it stays fully
+#:               lethal - see BFG_HEEDLESS and BFG_CORRIDOR, both untouched.
+#:
+#: At 70 px of lethal blast (roughly a hut's width, and a measured mean of 1.915
+#: colonists inside it) the misfire reliably caught the neighbours, which made
+#: the two outcomes the same outcome at a different radius and left the *failure*
+#: of the weapon doing the mass casualties instead of the shot the wielder chose
+#: to take. ``combat_actions._bfg_misfire`` now hurts ``agent`` and nobody else,
+#: so no damage path reads this value at all any more.
+#:
+#: STILL 70.0, AND DELIBERATELY NOT ZEROED. It was briefly set to 0.0 from this
+#: file as a way of enforcing the new spec through the old distance filter, which
+#: was the wrong lever twice over: combat_actions had already removed that filter
+#: (so it bought nothing), and ``render/items.draw_misfire`` defaults its ring
+#: radius to this constant, so zero would have silently shrunk the explosion to a
+#: 2 px dot. The flash is the whole reason a viewer knows what killed the
+#: colonist. The light says "70 px of that went up", and it did - it just no
+#: longer kills the man standing in it. Do not add a second constant for the
+#: visual either; one number, one meaning, no drift.
+BFG_BLAST_R    = 70.0
+#: DELIBERATELY 9x AND NOT ``_devour``'s 10x, and the two must be checked
+#: together by anyone tuning either. Through the armour clamp: unarmoured takes
+#: 900 and dies, ARMOUR_LEATHER takes 495 and dies, ARMOUR_DRAGONSCALE takes 90
+#: against 100 health and SURVIVES AT 10 HP. One constant buys the interaction
+#: the scale exists for - the impenetrable armour walks out of a BFG beam - and
+#: costs nothing anywhere else. At 10x the scale takes exactly 100, dies, and
+#: that interaction silently disappears.
+BFG_DAMAGE     = MAX_HEALTH * 9.0
+BFG_COOLDOWN   = 9.0
+BFG_WINDUP     = 1.1
+#: Chance a shot comes apart instead of firing: no ray, no blast, the WIELDER
+#: takes BFG_DAMAGE and NOBODY ELSE DOES (see BFG_BLAST_R above for the spec
+#: correction), and the relic is DESTROYED rather than dropped. The only item in
+#: the set that can leave the world, and that asymmetry is its balance valve -
+#: the mean carried life of a BFG is 1/0.256 = 3.9 colony-hours.
+#:
+#: THAT 3.9 HOURS IS AN ESTIMATE PER SHOT, AND IT DOES NOT HOLD IN THE BUILD AS
+#: IT STANDS. It is 1/(BFG_MISFIRE x shots-per-hour) and assumed 3.2 shots per
+#: colony-hour; the measured rate is 0.00 over 4 seeds x 30 sim-min of
+#: guaranteed carry, and 2 shots over 16 seeds x 20 sim-min of ordinary play.
+#: The gun is not surviving longer because it is safe - it is being overwritten
+#: in the weapon slot by CraftSpear long before it ever fires. See WEAPON_BFG
+#: above for the measurement and for why the fix is not in this file. Do not
+#: re-tune this constant against the shipped rate: tuning a misfire chance
+#: against a weapon that never pulls the trigger is fitting noise. Re-measure
+#: once the slot is defended, then decide.
+#:
+#: Deliberately NOT re-tuned upward now that the misfire is wielder-only. It is
+#: tempting - the misfire kills ~1.9 fewer people than it used to, so 0.08
+#: "buys less" than it did. But the 3.9-colony-hour carry life is the number the
+#: whole item is balanced around (it is what stops one lucky drop from arming a
+#: colony forever) and that depends on the misfire RATE, not on the body count.
+#: Raise this and the gun stops existing. The other way to make a misfire hurt
+#: more is not available: hurting the bystanders is precisely what the corrected
+#: spec rules out.
+BFG_MISFIRE    = 0.08
+#: Chance the wielder fires anyway with a friendly standing in the corridor.
+#:
+#: NOT squeamishness - this is what makes the item shippable. Measured geometry,
+#: 8 seeds x 60 sim-min, 5083 shot opportunities: mean 1.129 friendlies in the
+#: corridor, P(line clear) only 0.445, so MORE THAN HALF of all shots have a
+#: colonist in the beam. At heedless = 1.0 the wielder kills 6.12 of its own
+#: colony per hour against a measured baseline of 11.75 deaths/hour, which ends
+#: every colony inside sixty minutes. At 0.20 it is 1.64/hour (+14%), one
+#: single-shot colony wipe per 59.7 colony-hours of carry, so P(a given BFG ends
+#: the colony that found it) ~= 6.5% - roughly one in fifteen.
+#:
+#: Both numbers come out of a SHADOW Monte Carlo (500 trials over the measured
+#: geometry, calibrated to the measured engagement rate of 262 throws / 6210
+#: opportunities = 4.22%). It does not feed deaths back into the world, so it
+#: biases single-shot wipes DOWN and per-shot friendly deaths UP, and it does not
+#: model collapse by attrition at all. Re-measure both in a live A/B over >= 16
+#: seeds before trusting them.
+BFG_HEEDLESS   = 0.20
+#: Cause string for a BFG kill on a colonist. NOW REGISTERED in
+#: ``names.DEATH_KINDS`` -> ``died_disintegrated``, with templates, which is what
+#: the previous note here asked the next hand to do ("add the template first,
+#: then the mapping" - both landed together).
+#:
+#: What it read like before: an unregistered cause falls through to the generic
+#: ``died`` line, so the chronicle said "X was lost to disintegrated." - true,
+#: but the one death in the game that should read like an event read like a
+#: database field. The half-fix to avoid is registering the mapping WITHOUT the
+#: template, because a kind with no template renders as "Something happened."
+CAUSE_DISINTEGRATED = "disintegrated"
+
+#: Seconds a relic lies unclaimed before it rots away, so an unreachable drop at
+#: the far edge of the map does not litter the world forever. Same idea as
+#: ``throwing.SPEAR_LIFE_SEC`` (600) but three times longer, because a relic
+#: arrives once per 4 raw colony-hours and a spear arrives every fight.
+RELIC_DECAY_SEC   = 1800.0
+#: How far a colonist will walk to fetch one. Deliberately wider than
+#: ``throwing.THROW_MAX_RANGE``: the colony clusters near its stockpile, and a
+#: radius that only covered the camp would mean most drops were never claimed.
+RELIC_FETCH_RANGE = 520.0
+#: == throwing.RETRIEVE_RADIUS. Close enough to stoop and pick it up.
+RELIC_PICKUP_R    = 18.0
+#: Cap on relics lying on the ground at once, in the style of ANIMAL_MAX_ALIVE
+#: and MAX_SPEARS. The oldest is recycled rather than the drop being refused - a
+#: cap that swallows loot silently is worse than one that forgets old loot.
+MAX_RELICS        = 6
+
+#: What ironshod boots cost you instead of your life. Still routed through
+#: ``Stickman.hurt``, so it goes through armour (a scale-wearer in boots takes 3)
+#: and a boot-wearer already at low health can still die of the fall - the item
+#: removes the instant-death gate, it does not remove falling.
+#:
+#: MEASURED: falls are the 4th cause of death at 27 of 293 (9.2%), 1.7 per
+#: colony-90min. One wearer out of a mean 7.04 alive prevents ~0.24 fall deaths
+#: per colony-90min - small, safe, and exactly right for a common drop.
+#:
+#: "THE MOST COMMON DROP IN THE TABLE", WHICH IS WHAT THIS USED TO SAY, WAS
+#: NEVER TRUE. Under the paired table the boots came off the skeletal on a coin
+#: flip and measured 2 drops in 32 colony-hours - tied for the rarest thing in
+#: the game bar the bfg9000, which managed none at all. They are now the second
+#: heaviest weight in every row of ``sim/items.DROP_WEIGHTS`` and the second
+#: item its pity rule speaks for. Every row now weights them first or second
+#: (third only on the serpent, whose row belongs to the gun), which is what the
+#: sentence above always assumed and never had.
+#:
+#: RE-MEASURED, and 9.2% is the LOW end of the range rather than the number.
+#: Two fresh passes on the current build, causes latched at the tick of death
+#: (an end-of-run scan of the roster reads near zero, because ``_reap_dead``
+#: retires buried corpses - that mistake produced an empty histogram first
+#: time):
+#:
+#:   * 6 seeds x 30 sim-min, all SCENE_NIGHT_STORM: 33 deaths, 11.0/colony-hour,
+#:     falls 6 (18.2%) behind lightning 10 and level with mauled 8 / mudslide 8.
+#:   * one seed per scene x 12 sim-min across all of SCENES: 25 deaths, falls 4
+#:     (16.0%), 2nd behind mauled 13.
+#:
+#: So falls are 16-18% and 2nd-3rd, not 9.2% and 4th, and the item is worth
+#: correspondingly more than the paragraph above says. The brief that prompted
+#: this work quoted a third figure again - 191 of 565, 33.8%, the LARGEST cause
+#: - which neither pass here reproduced; scene mix moves this number hard (0 of
+#: 4 in flood, 1 of 1 in ashfall / earthquake / volcano) and run length moves it
+#: too, so a fall share quoted without both is not comparable. Nothing was
+#: retuned on the strength of any of them: 30.0 is defensible across the whole
+#: 9-34% range, and re-tuning against a share that swings 4x with the weather
+#: would be fitting the sample. What this note now protects against is the
+#: opposite mistake - somebody reading "9.2%, 4th cause" and deciding the boots
+#: are not worth their slot.
+FALL_SURVIVED_DAMAGE = 30.0

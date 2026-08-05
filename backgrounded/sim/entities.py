@@ -50,6 +50,7 @@ import numpy as np
 from ..constants import (
     CLIMB_SPEED,
     FALL_LETHAL_SPEED,
+    FALL_SURVIVED_DAMAGE,
     MAX_SLOPE_CLIMB,
     MAX_SLOPE_WALK,
     RENDER_H,
@@ -58,6 +59,7 @@ from ..constants import (
     SCENE_BLIZZARD,
     SCENE_NIGHT_STORM,
     SCENE_WILDFIRE,
+    ARMOUR_DRAGONSCALE,
     ARMOUR_NONE,
     HEALTH_REGEN_PER_SEC,
     MAX_HEALTH,
@@ -68,8 +70,14 @@ from ..constants import (
     MORPH_SCALE_MIN,
     MORPH_SPAWN_CHANCE,
     MORPH_TABLE,
+    RELIC_BFG,
+    RELIC_BOOTS,
+    RELIC_KINDS,
+    RELIC_NONE,
+    RELIC_SCALE,
     STICK_PALETTE,
     WALK_SPEED,
+    WEAPON_BFG,
     WEAPON_NONE,
 )
 from .names import (
@@ -244,6 +252,13 @@ DEFAULT_GROUND_Y = RENDER_H * 0.72   # used only when terrain is unavailable
 _MAX_DT = 0.1               # clamp: a stalled frame must not teleport anyone
 _EDGE_MIN = 0.0
 _EDGE_MAX = float(RENDER_W - 1)
+
+#: Health at or below this is dead, not "barely alive". See :meth:`Stickman.hurt`
+#: for the soft-lock this exists to close - damage sized to land exactly on zero
+#: lands a few times 1e-14 ABOVE it in binary, and the difference decided whether
+#: a dragon could ever be killed. Nine orders of magnitude below MAX_HEALTH, so
+#: no caller can be meaning to leave someone standing inside it.
+_HEALTH_EPSILON = 1.0e-9
 
 _RNG = random.Random()
 
@@ -473,6 +488,38 @@ class Stickman:
     armour: float = ARMOUR_NONE        # 0..1 fraction of damage absorbed
     attack_cd: float = 0.0             # seconds until the next swing lands
     target_animal: int | None = None   # animal id this agent is fighting
+
+    #: The one relic slot: "" or a member of ``constants.RELIC_KINDS``.
+    #:
+    #: A REAL FIELD, and that is the whole point of it being here. ``items.equip``
+    #: writes ``agent.relic`` and for one release this class had no such field, so
+    #: python happily created a bare instance attribute that ``to_dict`` never saw:
+    #: a colony's entire loot evaporated on the next save/load, silently, with no
+    #: warning and no way to tell from inside the game. ``beamed`` above is the
+    #: same bug, already fixed, with the same note. If a module outside sim/items
+    #: needs to remember something about an agent, it goes in this dataclass.
+    #:
+    #: sim/items.py owns what the value MEANS; this module only stores it and
+    #: reads one kind of it (:data:`RELIC_BOOTS`, in :meth:`_fall_step`). The read
+    #: is a bare ``==`` against the constant rather than a call to ``items.worn``
+    #: on purpose - entities.py sits underneath almost everything in sim/ and is
+    #: not going to start importing its dependents to test a string.
+    #:
+    #: The dragonscale and the wyrm-gun ALSO mirror into ``armour`` and ``weapon``
+    #: (see ``items.equip``); ``from_dict`` re-asserts those mirrors on load so a
+    #: save cannot come back holding the coat and wearing none of it.
+    relic: str = RELIC_NONE
+
+    #: How many times ironshod boots have turned a lethal landing into a bruise.
+    #: SAVES, not interventions: a booted faller who lands on 5 hp and dies of
+    #: the bruise anyway is not counted here (see :meth:`_boots_catch`).
+    #:
+    #: Persisted, and it exists to be *measurable*. The relic feature shipped once
+    #: already in a state where every effect was inert and nothing in the stats
+    #: could show it, which is how it survived review; a counter that rides on the
+    #: agent needs no world reference (``_fall_step`` has none) and lets a harness
+    #: sum it over the population to prove the boots fired at all.
+    fall_saves: int = 0
 
     # --- abduction -------------------------------------------------------
     # Taken is not the same as dead: no corpse, no grave, and they may come
@@ -763,12 +810,37 @@ class Stickman:
         Armour is a flat fraction absorbed rather than a hit-point pool: a
         stickman in leather takes roughly half as long to bring down, which is
         the difference between a wolf pack being a funeral and being a fight.
+
+        The epsilon on the death test is not defensive tidying, it is a fix for a
+        live soft-lock, and it is worth writing down because the same shape will
+        come back. ``dragons._devour`` deals ``MAX_HEALTH * 10.0`` = 1000 and
+        ``ARMOUR_DRAGONSCALE`` clamps to 0.9 absorbed, which the constants file
+        documents as "exactly MAX_HEALTH, so a dragonscale wearer is still
+        eaten". In binary it is not exactly MAX_HEALTH::
+
+            1000.0 * (1.0 - 0.9)  ==  99.99999999999997
+            100.0 - that          ==  2.842170943040401e-14   # > 0.0
+
+        So a scale-wearer at EXACTLY full health walked out of a dragon's mouth
+        with 2.8e-14 hp while one at 99 hp died - a difference of one part in
+        10^15 deciding whether the mechanic works. Worse, ``_devour`` reads
+        ``hurt`` returning False as "nobody died, so I have not fed", never sets
+        ``sated``, and a dragon that never sates never becomes killable: the
+        colony's best armour permanently disabled the dragon fight for that
+        world. Tried and rejected: rewriting the arithmetic as
+        ``amount - amount * absorbed`` (which happens to be exact for these two
+        numbers) - it fixes this pair by luck and moves the residue somewhere
+        else, and it perturbs every other damage number in the game by an ulp.
+        Snapping the *result* fixes the whole class, and 1e-9 hp against
+        MAX_HEALTH = 100 is nine orders of magnitude below anything a caller
+        means by "still standing".
         """
         if not self.alive or amount <= 0.0:
             return False
         taken = float(amount) * (1.0 - _clamp(self.armour, 0.0, 0.9))
         self.health = max(0.0, self.health - taken)
-        if self.health <= 0.0:
+        if self.health <= _HEALTH_EPSILON:
+            self.health = 0.0
             return self.die(cause)
         return False
 
@@ -1160,10 +1232,57 @@ class Stickman:
             self.on_ground = True
             self.vy = 0.0
             self.vx *= 0.25
-            if lethal and impact > FALL_LETHAL_SPEED:
+            if lethal and impact > FALL_LETHAL_SPEED and not self._boots_catch():
                 self.die("fall")
             else:
                 self.fall_t = 0.0
+
+    def _boots_catch(self) -> bool:
+        """True when ironshod boots took this landing, so the caller must not kill.
+
+        THE ONLY RELIC EFFECT THAT LIVES IN THIS MODULE, and the one that pays
+        best. Falling is the largest single killer in the game (191 of 565 deaths
+        over 16 seeds x 120 sim-min), and it is one of the causes that never
+        touched ``Stickman.hurt`` at all: a landing above ``FALL_LETHAL_SPEED``
+        went straight to ``die()``, so armour, health and every other survivable-
+        damage idea in the codebase were simply not consulted. That is why the
+        boots were a no-op for a release - ``FALL_SURVIVED_DAMAGE`` existed, was
+        documented down to the measured effect size, and had zero readers.
+
+        Routed through :meth:`hurt` deliberately, because constants.py specifies
+        it that way ("Still routed through ``Stickman.hurt``, so it goes through
+        armour ... and a boot-wearer already at low health can still die of the
+        fall"). So the boots remove the instant-death gate, not gravity: land on
+        30 hp and you still die, with ``death_cause`` still "fall", and the grave,
+        the chronicle line and the stats all read exactly as they did before.
+
+        The boots are NOT consumed. They are worn gear, not a charge - the amulet
+        and the cairnstone are the two that spend themselves, and both do it
+        through ``items.consume`` where ``relics_used`` can be booked. Nothing
+        here touches the relic slot, so one pair saves its wearer as often as the
+        wearer falls, which is the point of it being the common drop.
+
+        Named for what the BOOTS did rather than for what the agent did, because
+        the caller has to read as "a lethal landing kills you, unless the boots
+        catch it" - one exception to ordinary lethality, not a second way to die.
+        """
+        if self.relic != RELIC_BOOTS:
+            return False
+        # hurt() may still kill them, and if it does the cause is already the
+        # fall, so the caller's die() must not run again either way - which is
+        # what returning True here guarantees.
+        killed = self.hurt(FALL_SURVIVED_DAMAGE, "fall")
+        if not killed:
+            # Counted AFTER the damage, and only when they got up again.
+            # Bumping it before the hurt (which is how this was first written)
+            # counts the branch firing rather than the life saved, so a colony
+            # whose every booted faller landed on 5 hp and died anyway would
+            # report a tidy row of "saves" next to their graves. Nothing is lost
+            # by the stricter reading: "did the branch run at all" is still
+            # answerable from the death record, because a booted agent who dies
+            # here is still in the histogram under "fall".
+            self.fall_saves += 1
+        return True
 
     def _clamp_edges(self) -> None:
         """The screen edges are the edge of the world. Hard walls, no escape."""
@@ -1217,6 +1336,8 @@ class Stickman:
             "armour": float(self.armour),
             "attack_cd": float(self.attack_cd),
             "target_animal": self.target_animal,
+            "relic": str(self.relic),
+            "fall_saves": int(self.fall_saves),
             "taken": bool(self.taken),
             "lift_t": float(self.lift_t),
             "beamed": bool(self.beamed),
@@ -1278,6 +1399,25 @@ class Stickman:
         s.attack_cd = _f(d.get("attack_cd"), 0.0)
         ta = d.get("target_animal")
         s.target_animal = int(ta) if isinstance(ta, (int, float)) else None
+        # The relic slot. Validated against RELIC_KINDS on the way IN, exactly as
+        # morph is, so a hand edit or a save from a newer build reads as "carrying
+        # nothing" rather than as an item with no behaviour attached and no way to
+        # take it off. items.worn() re-checks on the way out; both ends validate
+        # because either end can be the one a future caller trusts.
+        rel = _s(d.get("relic"), RELIC_NONE) or RELIC_NONE
+        s.relic = rel if rel in RELIC_KINDS else RELIC_NONE
+        # Re-assert the two mirrors items.equip() writes. A save produced by this
+        # build always has them already, so this is a no-op in practice and is
+        # here for the case that is not: armour and weapon are separate persisted
+        # fields, and a save with the relic but not its mirror would reload
+        # someone visibly wearing the dragonscale who takes full damage, or
+        # holding the wyrm-gun with a spear's reach. The relic is the source of
+        # truth for its own effect; nothing else can be.
+        if s.relic == RELIC_SCALE:
+            s.armour = max(s.armour, ARMOUR_DRAGONSCALE)
+        elif s.relic == RELIC_BFG:
+            s.weapon = WEAPON_BFG
+        s.fall_saves = max(0, _i(d.get("fall_saves"), 0))
         s.taken = _b(d.get("taken"), False)
         s.lift_t = _f(d.get("lift_t"), 0.0)
         s.beamed = _b(d.get("beamed"), False)
@@ -1675,6 +1815,24 @@ if __name__ == "__main__":   # pragma: no cover - headless smoke test
     for _ in range(int(30 * 40)):
         pop.apply_physics(1.0 / 30.0, terrain, rng)
 
+    # STEP_FALL_MAX is 64 px and this ledge is 200, so a WALKING agent now
+    # refuses it and gives the goal up - that refusal is exactly what the
+    # constant was added for. It also quietly rotted this block: everything
+    # below wanted a fall death and there was no longer any way to walk into
+    # one, so `deaths == 1` had been failing here since STEP_FALL_MAX shipped
+    # (tools/smoke.py only imports this module, so nothing was watching). Put
+    # him over the lip explicitly instead. The subject under test is the fall
+    # integrator and the grave hand-off, not the pathing, and the pathing now
+    # has its own assertion on the line above.
+    assert walker.alive and walker.x < 600.0, walker.summary()
+    walker.x, walker.y = 700.0, 200.0
+    walker.on_ground, walker.vy = False, 0.0
+    # Long enough to fall, die, and lie there past GRAVE_DELAY - collect_graves
+    # below needs the corpse to have aged, so this must not break early.
+    for _ in range(int(30 * (GRAVE_DELAY + 8.0))):
+        pop.apply_physics(1.0 / 30.0, terrain, rng)
+    assert not walker.alive and walker.death_cause == "fall", walker.summary()
+
     print(walker.summary())
     print("deaths:", deaths)
     print("stats:", {k: round(v, 3) for k, v in pop.stats().items()})
@@ -1740,4 +1898,94 @@ if __name__ == "__main__":   # pragma: no cover - headless smoke test
     assert junk.morph == MORPH_NONE and junk.height() == AGENT_HEIGHT, junk.morph
     assert Stickman.from_dict({"id": 6, "morph": ["nope"]}).morph == MORPH_NONE
     print("morph round-trip ok:", back.summary(), round(back.height(), 1), "px")
+
+    # --- relics: the slot survives a save, and the boots actually catch ----
+    # All three of these are regressions, not features. The relic feature
+    # shipped once measuring 100% inert - 18 drops, 0 pickups, 0 effects, and 16
+    # of 16 seeds bit-identical with the whole thing switched off - so every part
+    # of it that lives in this module is pinned here by an assertion that fails
+    # loudly rather than by a comment saying it ought to work.
+    import json as _json
+
+    scribe = Population()
+    wearer = scribe.spawn(300.0, 400.0, rng=rng)
+    for kind in RELIC_KINDS:
+        wearer.relic = kind
+        if kind == RELIC_SCALE:
+            wearer.armour = ARMOUR_DRAGONSCALE
+        elif kind == RELIC_BFG:
+            wearer.weapon = WEAPON_BFG
+        # Through json, not just to_dict/from_dict: the save file is json, and a
+        # value that round-trips in memory but not through the file is the exact
+        # shape of bug this whole block exists to catch.
+        twin = Stickman.from_dict(_json.loads(_json.dumps(wearer.to_dict())))
+        assert twin.relic == kind, (kind, twin.relic)
+        assert twin.armour == wearer.armour and twin.weapon == wearer.weapon
+    print("relic slot round-trips for all", len(RELIC_KINDS), "kinds")
+
+    # Junk in the slot reads as carrying nothing, and the mirrors are re-asserted
+    # even when a save lost them.
+    assert Stickman.from_dict({"relic": "excalibur"}).relic == RELIC_NONE
+    assert Stickman.from_dict({"relic": 7}).relic == RELIC_NONE
+    assert Stickman.from_dict({"relic": None}).relic == RELIC_NONE
+    assert Stickman.from_dict({}).relic == RELIC_NONE, "a pre-relic save broke"
+    assert Stickman.from_dict(
+        {"relic": RELIC_SCALE, "armour": 0.0}).armour == ARMOUR_DRAGONSCALE
+    assert Stickman.from_dict(
+        {"relic": RELIC_BFG, "weapon": "spear"}).weapon == WEAPON_BFG
+
+    # The boots. Same drop, same seed, same terrain - the only difference is
+    # what is on the wearer's feet. 400 px of fall is well past the 64 px it
+    # takes to reach FALL_LETHAL_SPEED, so this is not a marginal landing.
+    def _drop(relic: str, health: float = MAX_HEALTH) -> Stickman:
+        lone = Population()
+        faller = lone.spawn(700.0, 600.0, rng=random.Random(4242))
+        faller.relic, faller.health = relic, health
+        faller.y, faller.vy, faller.on_ground = 200.0, 0.0, False
+        drop_rng = random.Random(4242)
+        for _ in range(int(30 * 12)):
+            faller.apply_physics(1.0 / 30.0, terrain, drop_rng)
+            if faller.on_ground:
+                break
+        return faller
+
+    bare = _drop(RELIC_NONE)
+    booted = _drop(RELIC_BOOTS)
+    assert not bare.alive and bare.death_cause == "fall", bare.summary()
+    assert booted.alive, "ironshod boots did not catch a lethal fall"
+    assert booted.fall_saves == 1, booted.fall_saves
+    assert booted.health == MAX_HEALTH - FALL_SURVIVED_DAMAGE, booted.health
+    assert booted.relic == RELIC_BOOTS, "the boots were consumed"
+    # ...and they remove the instant-death gate, not gravity: land hurt enough
+    # and the fall still kills you, still as a fall.
+    frail = _drop(RELIC_BOOTS, health=FALL_SURVIVED_DAMAGE * 0.5)
+    assert not frail.alive and frail.death_cause == "fall", frail.summary()
+    # ...and that death is not booked as a save. fall_saves is the number of
+    # lives the boots kept, not the number of times the branch ran, or a colony
+    # that lost every booted faller would still show a row of saves.
+    assert frail.fall_saves == 0, frail.fall_saves
+    assert Stickman.from_dict(booted.to_dict()).fall_saves == 1
+    print(f"boots: bare {bare.death_cause!r} vs booted "
+          f"{booted.health:.0f} hp, saves {booted.fall_saves}")
+
+    # The dragonscale must behave the same at 100 hp as at 99. _devour deals
+    # MAX_HEALTH * 10 against a 0.9 clamp, which is "exactly MAX_HEALTH" in
+    # decimal and 2.8e-14 short of it in binary; before the epsilon in hurt(),
+    # only the wearer at EXACTLY full health walked out of the dragon's mouth,
+    # and dragons.py then read the survival as "not fed" and never sated.
+    for start in (MAX_HEALTH, MAX_HEALTH * 0.99, MAX_HEALTH * 0.5):
+        meal = Stickman(health=start, armour=ARMOUR_DRAGONSCALE,
+                        relic=RELIC_SCALE)
+        assert meal.hurt(MAX_HEALTH * 10.0, "devoured"), \
+            f"a dragonscale wearer at {start} hp survived being eaten"
+        assert meal.health == 0.0, meal.health
+    # ...while the interaction the scale exists FOR is untouched: BFG_DAMAGE is
+    # 9x, not 10x, so the coat still walks out of a beam at 10 hp.
+    gunned = Stickman(health=MAX_HEALTH, armour=ARMOUR_DRAGONSCALE,
+                      relic=RELIC_SCALE)
+    assert not gunned.hurt(MAX_HEALTH * 9.0, "disintegrated"), gunned.health
+    assert 9.5 < gunned.health < 10.5, gunned.health
+    print(f"dragonscale: eaten at 100/99/50 hp, survives a beam at "
+          f"{gunned.health:.0f} hp")
+
     clear_death_listeners()

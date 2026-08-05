@@ -21,6 +21,7 @@ from ..sim.structures import (
     BONFIRE_FADE_UNITS, BONFIRE_RAMP_SEC, CROSSING_KINDS,
 )
 from . import creatures, dragons as dragon_art, fx, hud, sky
+from . import items as relic_art
 from . import throwing as spear_art
 from .atlas import Atlas
 from .particles import ParticleSystem
@@ -175,6 +176,21 @@ class Renderer:
             spear_art.draw_spears(s, world, world.world_time)
         except Exception:
             log.exception("spear draw failed")
+        # Relics lying in the dirt, immediately after the spears and for the
+        # same reasons: a dropped relic is 13 px of ground clutter in the same
+        # band as the wolves, so it has to be INSIDE the light composite or it
+        # is the one object in the colony that glows at 3am. After the bodies,
+        # because anything drawn behind a stickman is simply eaten.
+        #
+        # Its self-lit half - the halo that is how you actually find one at
+        # night - is a separate call after the composite; see draw_relic_fx
+        # below. Two calls rather than one is the whole reason the art reads:
+        # the body drawn here is a dark smudge in the middle of its own pool of
+        # light until that second pass puts the glow back on top.
+        try:
+            relic_art.draw_relics(s, world, world.world_time)
+        except Exception:
+            log.exception("relic draw failed")
         try:
             creatures.draw_mining_dust(s, world, world.world_time)
         except Exception:
@@ -213,6 +229,25 @@ class Renderer:
             creatures.draw_ufo(s, world, world.world_time)
         except Exception:
             log.exception("ufo draw failed")
+
+        # Everything about a relic that makes its own light: the halo over each
+        # one on the ground, a BFG discharge, and the saucer's detonation when an
+        # amulet-wearer refuses to be taken.
+        #
+        # After the composite, next to the saucer, and specifically AFTER it: the
+        # amulet's flash and the falling wreck are drawn over a hull that
+        # creatures.draw_ufo has already put down, so this call going first would
+        # paint the explosion and then paint the intact saucer on top of it.
+        #
+        # This is also why the two relic calls are split. A ground relic needs
+        # both: the body at step 7 so the scene's own light lands on it, and the
+        # glow here so it survives the multiply-down. Measured on a night frame,
+        # the halo is 25x the ink of the object it sits on - at 13 px across, a
+        # relic is found by its light and not by its silhouette.
+        try:
+            relic_art.draw_relic_fx(s, world, world.world_time)
+        except Exception:
+            log.exception("relic fx draw failed")
 
         # The four dragons that fly, at the same layer and for the same reason.
         # A dragon at cruise altitude (150-420 px) is above every light source

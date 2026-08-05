@@ -1,6 +1,6 @@
 """Combat and crafting - the *agent* half of the animal threat.
 
-Six :class:`~.actions.Action` kinds, registered into ``actions._HANDLERS``
+Nine :class:`~.actions.Action` kinds, registered into ``actions._HANDLERS``
 at import so a save taken mid-fight or mid-craft rehydrates correctly:
 
 ==============  ===========================================================
@@ -10,7 +10,32 @@ FightAnimal     close, then swing on ``SPEAR_COOLDOWN``. Armed agents only.
 FleeAnimal      run to a safe distance. What an *unarmed* agent does.
 ThrowSpear      aim, release, and you are now unarmed. See :mod:`.throwing`.
 RetrieveSpear   walk to a spear lying in the dirt and pick it up.
+FireBfg         the dragon relic. A line kill that does not care whose side
+                anyone is on, and an 8% chance of taking the wielder with it.
+FetchRelic      walk to a dragon relic lying in the dirt and put it on.
+RaiseTheDead    carry the cairnstone to a headstone and spend it.
 ==============  ===========================================================
+
+The relic half
+--------------
+FetchRelic and RaiseTheDead are late arrivals, and the reason they are late is
+worth recording because it cost the whole feature a release. The lane that was
+told to make agents *want* loot did not own this file, and the lane that owned
+this file was never told to add a pickup action. Both lanes shipped, both were
+individually correct, and the result measured **18 relics dropped, 0 picked up**
+over 16 seeds x 120 sim-min: no ``FetchRelic`` kind existed, so
+``behavior._fetch_is_wired()`` read False and the appetite - which was written,
+tuned and measured - switched itself off. Loot on and loot off were
+bit-identical on all 16 seeds. Every downstream effect (``bfg_shots``,
+``misfires``, ``raised``, ``scale_refusals``) was zero for the same one reason:
+nothing was ever worn.
+
+So the wanting and the doing now live one import apart on purpose.
+:func:`fetchable_relic` is the single answer to "which relic, if any, may this
+person go and get" and ``behavior._score_loot`` calls it; behaviour still owns
+every *number*, because the bands a fetch has to beat (Celebrate, Mourn, Eat)
+are declared over there and a ceiling tuned against numbers it cannot see is
+exactly how the stone-hut upgrade came to sit unclaimed for 110 sim-minutes.
 
 No pygame. Everything an action touches on ``world`` goes through the accessor
 layer in :mod:`.actions`, plus the small animal layer at the top of this file -
@@ -144,6 +169,7 @@ from .actions import (
     stock_take,
     world_now,
 )
+from .actions import alive_agents as _alive_agents
 from .throwing import (
     RETRIEVE_RADIUS,
     THROW_MAX_RANGE,
@@ -156,6 +182,18 @@ from .throwing import (
     registry_of as spear_registry_of,
     throw_targets,
 )
+#: The beam's geometry is throwing.py's geometry. Deliberately NOT a defensive
+#: import: the whole point of borrowing ``_target_box``/``_ground_y``/
+#: ``_STEP_PX`` is that the sweep and ``flight_clear`` agree, to the pixel,
+#: about where the hillside is and how tall a wolf is. A silent local copy that
+#: drifts out of step with them is a worse outcome than a loud ImportError in
+#: the smoke test, which is what a rename here would produce.
+from .throwing import (          # noqa: PLC2701 - see above
+    _STEP_PX as _BEAM_STEP,
+    _aim_y as _beam_aim_y,
+    _ground_y as _beam_ground_y,
+    _target_box as _beam_box,
+)
 
 #: px. AGENT_HEIGHT (26) plus a spear held overhead - above this a stickman
 #: cannot reach and must throw. Declared in constants.py by the workstream that
@@ -167,16 +205,119 @@ try:                                    # pragma: no cover - trivial
 except ImportError:                     # pragma: no cover - trivial
     MELEE_CEILING = 44.0
 
+#: The wyrm-gun. Same arrangement as MELEE_CEILING above and for the same
+#: reason: constants.py belongs to the relics workstream, and this file has to
+#: import (and behave identically) in a checkout where that append has not
+#: landed. Every number here is the contract's number.
+try:                                    # pragma: no cover - trivial
+    from ..constants import (
+        BFG_BLAST_R,
+        BFG_COOLDOWN,
+        BFG_CORRIDOR,
+        BFG_DAMAGE,
+        BFG_HEEDLESS,
+        BFG_MIN_RANGE,
+        BFG_MISFIRE,
+        BFG_RANGE,
+        BFG_WINDUP,
+        CAUSE_DISINTEGRATED,
+        MAX_POP,
+        RELIC_BFG,
+        RELIC_CAIRN,
+        RELIC_FETCH_RANGE,
+        RELIC_NONE,
+        RELIC_PICKUP_R,
+        WEAPON_BFG,
+    )
+except ImportError:                     # pragma: no cover - trivial
+    WEAPON_BFG = "bfg9000"
+    RELIC_BFG = "bfg9000"
+    RELIC_CAIRN = "cairnstone"
+    RELIC_NONE = ""
+    RELIC_FETCH_RANGE = 520.0
+    RELIC_PICKUP_R = 18.0
+    MAX_POP = 10
+    BFG_RANGE = 420.0
+    BFG_MIN_RANGE = 34.0                # == throwing.THROW_MIN_RANGE
+    BFG_CORRIDOR = 22.0
+    BFG_BLAST_R = 70.0
+    BFG_DAMAGE = MAX_HEALTH * 9.0
+    BFG_COOLDOWN = 9.0
+    BFG_WINDUP = 1.1
+    BFG_MISFIRE = 0.08
+    BFG_HEEDLESS = 0.20
+    CAUSE_DISINTEGRATED = "disintegrated"
+
+#: The relic layer. The module is ``items.py``. It is NOT ``relics.py``, and
+#: that one wrong word is why this import sits at module scope with a working
+#: fallback instead of being a lazy ``from .X import y`` inside the function
+#: that needs it.
+#:
+#: What shipped: ``_destroy_bfg`` did ``from .relics import unequip`` inside a
+#: try/except that swallowed the ImportError *per call*. ufo.py:399 guessed the
+#: same wrong name. Neither ever ran, neither ever said so, and the gun's
+#: unequip-before-the-blast rule - the thing that stops a misfire leaving a
+#: working BFG on the scorch mark for the next colonist - silently did not
+#: exist. A name that is wrong here is wrong once, at import, in front of
+#: tools/smoke.py, and it is logged at ERROR rather than DEBUG for the same
+#: reason: the previous failure mode was that nobody could see it.
+try:                                    # pragma: no cover - trivial
+    from .items import (
+        consume as relic_consume,
+        equip as relic_equip,
+        noun_for as relic_noun,
+        registry_of as relic_registry_of,
+        unequip as relic_unequip,
+        worn as relic_worn,
+    )
+except ImportError:                     # pragma: no cover - trivial
+    logging.getLogger(__name__).error(
+        "sim.items is missing; relics degrade to inert. Fetching, raising and "
+        "the BFG's unequip-on-misfire are all off.")
+
+    def relic_registry_of(world: Any) -> Any:       # type: ignore[misc]
+        return getattr(world, "relics", None)
+
+    def relic_worn(agent: Any) -> str:              # type: ignore[misc]
+        try:
+            return str(getattr(agent, "relic", "") or "")
+        except Exception:
+            return ""
+
+    def relic_equip(agent: Any, kind: str) -> bool:  # type: ignore[misc]
+        return False
+
+    def relic_unequip(agent: Any) -> str:           # type: ignore[misc]
+        # The by-hand clearing _destroy_bfg used to fall through to. Kept here
+        # so there is exactly one copy of it and every caller gets it.
+        kind = relic_worn(agent)
+        for attr, val in (("weapon", WEAPON_NONE), ("relic", RELIC_NONE)):
+            try:
+                setattr(agent, attr, val)
+            except Exception:
+                pass
+        return kind
+
+    def relic_consume(world: Any, agent: Any) -> str:   # type: ignore[misc]
+        return relic_unequip(agent)
+
+    def relic_noun(kind: Any) -> str:               # type: ignore[misc]
+        return "relic"
+
 log = logging.getLogger(__name__)
 
 __all__ = [
     "COMBAT_ACTION_KINDS",
     "score_combat",
     "score_throw",
+    "score_bfg",
+    "beam_sweep",
     "make_combat_action",
     "make_throw_action",
     "install_makers",
     "under_attack",
+    # the relic half - behavior.py imports these to score what it cannot build
+    "fetchable_relic", "raisable_grave",
     # animal accessor layer, reusable by behavior.py / events.py
     "animals_of", "living_animals", "animal_alive", "animal_by_id",
     "animal_id", "animal_kind", "animal_x", "animal_leaving",
@@ -184,9 +325,14 @@ __all__ = [
     "sighting_freshness", "melee_foes",
 ]
 
+#: ``behavior._fetch_is_wired()`` tests ``"FetchRelic" in COMBAT_ACTION_KINDS``
+#: and keeps the loot appetite at zero until it is true. That is the switch the
+#: whole feature hung off for a release; do not rename either string without
+#: reading the matching comment over there.
 COMBAT_ACTION_KINDS: tuple[str, ...] = (
     "CraftSpear", "CraftArmour", "FightAnimal", "FleeAnimal",
-    "ThrowSpear", "RetrieveSpear",
+    "ThrowSpear", "RetrieveSpear", "FireBfg",
+    "FetchRelic", "RaiseTheDead",
 )
 
 # ------------------------------------------------------------------ tuning --
@@ -254,6 +400,92 @@ RETRIEVE_TIMEOUT = 45.0
 CHILD_THROW_MIN_GAP = 72.0
 #: Child range multiplier, and the reason a child stands behind the adults.
 CHILD_RANGE_FRAC = 0.6
+
+# ------------------------------------------------------------------- bfg --
+#: How many candidates deep the BFG scanner looks before giving up. Each one
+#: costs a full corridor sweep (BFG_RANGE / _STEP_PX = 105 samples), and this
+#: runs once per scoring call per wielder, so it is bounded on purpose. Four is
+#: past every realistic engagement: throw_targets is sorted nearest-first and
+#: the whole point of the weapon is that it does not need to pick carefully.
+BFG_SCAN = 4
+#: How long the beam stays on screen, and how many are kept. BOTH ARE NOW DEAD
+#: NUMBERS and are left here only so nobody re-derives them: the lifetime is
+#: ``items.BEAM_LIFE_SEC`` and the cap is ``items.MAX_BEAMS``, because
+#: ``RelicRegistry`` owns the list render reads and the clock that ages it. Sim
+#: had its own copy of both, aged neither, and stamped an absolute world time
+#: into a field render reads as an age - see :func:`_record_beam` for what that
+#: cost. One owner for the beam's clock, and it is not this file.
+BFG_BEAM_DRAW_SEC = 0.25            # informational; items.BEAM_LIFE_SEC decides
+_BFG_BEAM_KEEP = 8                  # informational; items.MAX_BEAMS decides
+#: Right-hand world edge, resolved once. ``actions._clamp_x`` is the one place
+#: that knows how wide the world is.
+_EDGE_MAX_X = _clamp_x(1e9)
+
+# ----------------------------------------------------------------- relics --
+#: How close is close enough to lift a relic. ``RELIC_PICKUP_R`` from
+#: constants.py, named locally only so ``step_toward(arrive=...)`` reads.
+FETCH_ARRIVE = RELIC_PICKUP_R
+#: How far a colonist will walk for one. Deliberately ``RELIC_FETCH_RANGE``
+#: (520) and not ``RETRIEVE_SEEK`` (260, what a spear is worth): a spear can be
+#: re-made from wood and stone, and a dragon relic drops about once every four
+#: raw colony-hours and rots at ``RELIC_DECAY_SEC``. It is the same number
+#: ``behavior.RELIC_FETCH_RANGE`` scores against, and it has to be, or the
+#: scorer wants something the maker refuses to build.
+FETCH_SEEK = RELIC_FETCH_RANGE
+#: No relic is worth walking into a wolf for.
+#:
+#: This number was written and justified in behavior.py, as RELIC_SAFE_RADIUS,
+#: by the lane that scored the appetite - and there it sat next to a *second*
+#: copy of the gate it guards. It lives here now, once, because the gate belongs
+#: with the walk: behaviour decides how badly somebody wants the relic, this
+#: file decides whether setting off is survivable, and the scorer asks this file
+#: (see :func:`fetchable_relic`). Two implementations of one rule in two files
+#: owned by two lanes is the shape of the bug this whole change exists to undo.
+#:
+#: Checked at BOTH ends - where the walker is standing and where the relic lies
+#: - because the second is the one that actually kills: a fetcher who sets off
+#: from a quiet corner of the map and arrives next to the pack has run *toward*
+#: the animal, which is the exact opposite of what FleeAnimal spent its whole
+#: design budget on. Wider than animals.DANGER_RADIUS (110) so the margin
+#: survives the walk.
+FETCH_SAFE_RADIUS = 200.0
+#: 520 px at WALK_SPEED (34 px/s) is ~15 s on the flat; this is four times that,
+#: because the walk is over terrain and ``step_toward`` detours round ledges.
+#: Not open-ended: see FETCH_SNUB_SEC.
+FETCH_TIMEOUT = 60.0
+#: Seconds an agent leaves a particular relic alone after failing to reach it.
+#:
+#: The known failure this exists for, diagnosed on the worst seed of the
+#: appetite's own measurement run: a colony pacing back and forth against an
+#: unclimbable face at x~1110, trying to reach a relic at 1301. A blocked agent
+#: fails its goal after ``actions.BLOCKED_GIVE_UP`` (2.0 s), re-scores, and the
+#: relic - whose score is still *climbing* with age - simply wins again. 153
+#: starts on one seed, all of them into the same wall.
+#:
+#: The appetite comment correctly says this is not a bystander problem and that
+#: RELIC_BYSTANDER must not try to fix it. It is a *goal* problem, so the memory
+#: of having failed lives with the goal, here. One minute is long enough that
+#: the agent gets a real amount of other work done and short enough that a relic
+#: made briefly unreachable by a wandering wolf is not written off.
+#:
+#: Transient, in ``agent.__dict__``, exactly like ``_bfg_next``: a save that
+#: reloaded mid-snub would resume a grudge nobody can see, and forgetting it
+#: costs one wasted walk.
+FETCH_SNUB_SEC = 60.0
+#: How many of those a single agent remembers. Bounded because MAX_RELICS is 6
+#: and a colonist that snubbed every relic in the world should still be holding
+#: six entries, not a leak.
+_SNUB_KEEP = 12
+#: What the cairnstone bearer will cross to reach a headstone. Same seek and the
+#: same timeout as the fetch: the walk is the same walk.
+RAISE_SEEK = RELIC_FETCH_RANGE
+RAISE_TIMEOUT = 60.0
+#: A beat of kneeling at the stone before anybody stands up. Same purpose as
+#: THROW_WINDUP - the rarest thing in the game should be a visible act with a
+#: pose, not a number that changes between frames. Longer than the throw because
+#: nothing is about to eat the bearer: raisable_grave refuses within
+#: FETCH_SAFE_RADIUS of anything hunting.
+RAISE_PLACE_SEC = 1.6
 
 CHASE_SPEED = WALK_SPEED * 1.45
 FLEE_SPEED = WALK_SPEED * 2.2
@@ -755,7 +987,31 @@ def _role(agent: Any) -> str:
 
 
 def _armed(agent: Any) -> bool:
+    """Holding a *spear*. Deliberately not "holding a weapon".
+
+    FightAnimal swings at SPEAR_REACH and ``throwing.can_throw`` launches a
+    spear, and neither may fire for somebody carrying a BFG - who has traded the
+    spear away and cannot melee or throw at all. Widening this predicate is how
+    a BFG carrier would end up walking into a wolf to hit it with a relic.
+    Use :func:`_combat_capable` for "can hurt something", :func:`_bfg` for the
+    gun.
+    """
     return str(getattr(agent, "weapon", WEAPON_NONE) or WEAPON_NONE) == WEAPON_SPEAR
+
+
+def _bfg(agent: Any) -> bool:
+    return str(getattr(agent, "weapon", WEAPON_NONE) or WEAPON_NONE) == WEAPON_BFG
+
+
+def _combat_capable(agent: Any) -> bool:
+    """Can this agent hurt anything at all, by any means?
+
+    The single most load-bearing predicate the relic work adds. Without it a
+    BFG carrier reads as *unarmed* in the flee gate below, scores FleeAnimal at
+    0.92-1.0, and runs away from every wolf it could have vaporised - carrying
+    the rarest item in the game and using it for nothing.
+    """
+    return _armed(agent) or _bfg(agent)
 
 
 def _armoured(agent: Any) -> bool:
@@ -845,11 +1101,32 @@ _CRAFT_SPEC: dict[str, dict[str, Any]] = {
 
 
 def _craft_satisfied(kind: str, agent: Any) -> bool:
-    return _armed(agent) if kind == "CraftSpear" else _armoured(agent)
+    """Does *agent* already have what this craft would give them?
+
+    ``_combat_capable`` and not ``_armed`` for the spear, and that one word is
+    a silent data-loss bug: ``agent.weapon`` is a single slot, so a colonist who
+    found the wyrm-gun and then decided to whittle a spear had
+    ``weapon = WEAPON_SPEAR`` written straight over ``WEAPON_BFG``. The relic
+    field still read ``bfg9000``, so ``items.worn()`` said they were carrying it
+    while ``_bfg()`` said they were not: the rarest item in the game gone, no
+    chronicle line, no drop on the ground, and nothing anywhere that could
+    notice. It is latent today only because no BFG has ever dropped in natural
+    play; it reproduces in two lines the moment one does.
+
+    Saying "satisfied" rather than adding a fourth refusal is deliberate. It is
+    the truthful answer - a colonist holding a weapon that vaporises wolves does
+    not need a sharpened stick - and it closes all three doors at once, because
+    ``score_combat``, ``make_combat_action`` and :func:`_h_craft` all ask this
+    same question. :func:`_craft_apply` refuses as well, for a save rehydrated
+    mid-craft that never passes back through any of them.
+    """
+    return _combat_capable(agent) if kind == "CraftSpear" else _armoured(agent)
 
 
 def _craft_apply(kind: str, agent: Any) -> None:
     if kind == "CraftSpear":
+        if _bfg(agent):
+            return          # never over the wyrm-gun - see _craft_satisfied
         agent.weapon = WEAPON_SPEAR
         return
     try:
@@ -1338,9 +1615,16 @@ def _retrievable_spear(agent: Any, world: Any) -> Any | None:
     beyond "there is one": the walk has to be short (see RETRIEVE_SEEK), and
     nothing may be standing over it. Fetching a spear from under a wolf is how
     an unarmed colonist walks into the one place on the map they must not be.
+
+    ``_combat_capable`` and not ``_armed`` for the same reason CraftSpear uses
+    it - constants.py's note on WEAPON_BFG names both paths, and this is the
+    second one. ``_h_retrieve`` ends with ``ag.weapon = WEAPON_SPEAR``, so a BFG
+    carrier reading as unarmed here would walk over to a stick on the ground and
+    trade the wyrm-gun for it. Identical to ``_armed`` for anybody who has never
+    held a relic.
     """
     try:
-        if _armed(agent):
+        if _combat_capable(agent):
             return None
         ax = float(getattr(agent, "x", 0.0))
         if nearest_animal(world, ax, max_dist=FLEE_RADIUS) is not None:
@@ -1367,7 +1651,7 @@ def _h_retrieve(a: Action, ag: Any, w: Any, dt: float) -> None:
         return
 
     if a.phase == "start":
-        if _armed(ag):
+        if _combat_capable(ag):
             a.done = True                   # somebody handed them one
             return
         sp = reg.nearest_on_ground(float(getattr(ag, "x", 0.0)))
@@ -1398,6 +1682,12 @@ def _h_retrieve(a: Action, ag: Any, w: Any, dt: float) -> None:
 
     if a.phase == "take":
         _halt(ag)
+        if _bfg(ag):
+            # Never over the wyrm-gun, and checked here as well as in
+            # _retrievable_spear because a save rehydrated at this phase never
+            # passes through "start". The spear stays where it is.
+            a.done = True
+            return
         sp = reg.get(a.target)
         if sp is None or not reg.take(sp):
             a.failed = True
@@ -1417,6 +1707,1174 @@ def _h_retrieve(a: Action, ag: Any, w: Any, dt: float) -> None:
         return
 
     a.phase = "start"
+
+
+# ===========================================================================
+#  FireBfg - the wyrm-gun
+#
+#  One action, three behaviours, and they are one mechanic rather than three:
+#
+#  * LINE KILL. A ray from the muzzle to the aim point, clipped at BFG_RANGE
+#    and clipped again at the first terrain intersection. TERRAIN stops the
+#    beam; a body does NOT. Everything whose hitbox overlaps the corridor takes
+#    BFG_DAMAGE - animals, dragons and colonists in the same loop, which is why
+#    "wipes out animals" and "kills everything in line of sight" need one
+#    implementation and not two.
+#  * MISFIRE. Rolled BEFORE the ray exists, p = BFG_MISFIRE. No ray, and no
+#    blast: it takes the WIELDER ALONE, and the relic is destroyed outright. It
+#    is the only item in the set that can leave the world, and that asymmetry is
+#    its balance valve. It was a 70 px sphere that caught the neighbours; see
+#    _bfg_misfire for the author's correction and why the two outcomes had to
+#    stop being the same outcome.
+#  * ENGAGEMENT. Hold fire when a colonist is standing in the corridor, except
+#    on a BFG_HEEDLESS roll. THIS is the one that can leave a single stickman
+#    standing, and it is meant to.
+#
+#  WHY THE CORRIDOR NEVER HELD A CROWD. Shipped, this weapon had killed at most
+#  ONE colonist per shot in 246 forced shots. Three explanations were on the
+#  table and, measured on 381 paired shot geometries from twelve real colonies,
+#  all three are wrong:
+#
+#  * "BFG_CORRIDOR (22 px) is too narrow." It is not. The sweep tests a HITBOX
+#    against the band, so the effective vertical tolerance is already ~35 px.
+#    Taking the half-width from 22 px to 120 px moves the mean number of
+#    colonists in the beam from 1.00 to 1.08. Width was never the lever.
+#  * "The shot re-aims, or declines, to spare friendlies." It never re-aims -
+#    _bfg_target does not look at colonists at all. It DECLINES, on purpose,
+#    4 times in 5 (see BFG_HEEDLESS below), and that is the balance valve.
+#  * "BFG_HEEDLESS (0.20) is simply rare." It is rare by design, and it is a
+#    multiplier on the census, not the reason the census was empty.
+#
+#  The cause was in _beam_stop. Every other part of the mechanic treats the shot
+#  as a lane BFG_CORRIDOR px to either side - the sweep, the beam record, the
+#  stroke render draws - and _beam_stop alone treated it as a HAIRLINE, ending
+#  the beam at the first sample where its axis met the ground, with the whole
+#  upper half of the beam still in clear air. A colony sits on rolling terrain,
+#  so a shot from a 20 px shoulder died at the first 20 px rise. Median reach
+#  was 116 px of a nominal 420. The corridor was not narrow; it was short.
+#
+#  Hairline -> corridor, same 381 geometries:
+#
+#      median reach            116 px  ->  248 px     full range  15.2% -> 34.9%
+#      colonists in the beam   mean 0.63  ->  0.92
+#        two or more                17.1%  ->  23.1%
+#        three or more               3.4%  ->   8.1%
+#        most ever in one line          4  ->      8
+#
+#  A heedless shot is by definition one with a colonist already in the lane, so
+#  the distribution the author asked about - "could possibly leave a single
+#  stickman" - is that census conditioned on >= 1: one 57.7%, two 27.4%, three
+#  9.1%, four to eight 5.8%; mean 1.69. Rare, because somebody has to be in the
+#  lane AND the 0.20 roll has to come up; catastrophic when it lands.
+#
+#  END TO END, 12 seeds x 60 sim-min of real colonies with the gun handed to a
+#  living colonist whenever nobody is carrying one and every roll after that off
+#  the real seeded stream. Same seeds both arms:
+#
+#  ==========================================  ==========  ==========
+#                                                hairline    corridor
+#  ==========================================  ==========  ==========
+#  shots fired                                         39          40
+#    of which heedless                                  3           9
+#    held (a friendly in the lane)                     14          30
+#  colonists killed by one heedless shot        1:1 2:2     1:5 2:1 4:2 5:1
+#    mean                                            1.67        2.22
+#    MOST EVER KILLED BY ONE SHOT                       2           5
+#  shots that left the colony at <= 2 alive             1           4
+#    at exactly one stickman standing                   0           2
+#  animals killed per fired shot                     1.05        1.40
+#  misfires                                             5           7
+#    that killed anyone but the wielder                 0           0
+#  ==========================================  ==========  ==========
+#
+#  So the weapon now does the thing it was asked for - a line that clears, and
+#  twice in twelve colony-hours a single shot that leaves one stickman standing
+#  - without becoming routine: 31 of 40 shots were the ordinary aimed kind and
+#  killed no colonist at all, and the engagement gate held fire 30 times.
+#  Across all four measurement runs 22 misfires killed 22 people: the wielder,
+#  every time, and nobody else.
+#
+#  Why BFG_DAMAGE is MAX_HEALTH * 9.0 and NOT dragons._devour's * 10.0: through
+#  the 0.9 armour clamp in Stickman.hurt, an unarmoured colonist takes 900 and
+#  dies, leather takes 495 and dies, and DRAGONSCALE takes 90 against 100 health
+#  and walks out of the beam at 10 hp. At 10x the scale wearer takes exactly 100
+#  and the one interaction the armour exists for silently disappears. Anyone
+#  tuning either constant has to check the other.
+#
+#  Why the engagement gate is not squeamishness: measured over 8 colony-hours of
+#  real geometry, 55.5% of shot opportunities have at least one colonist in the
+#  corridor (mean 1.129 in line, mean 1.915 within the blast radius). At
+#  heedless = 1.0 the wielder kills 6.12 of its own colony per hour against a
+#  baseline of 11.75 deaths/hour, which ends every colony inside the hour. At
+#  the chosen 0.20 it is 1.64 friendly deaths per colony-hour of carry, +14%,
+#  and one single-shot colony wipe per 59.7 colony-hours of carry. That survey
+#  also measured mean 1.915 colonists inside the old blast radius; the misfire
+#  no longer damages them, so those are no longer deaths.
+# ===========================================================================
+def _relic_roll(world: Any) -> float | None:
+    """One draw off ``world.relics.roll()``, or None when there is no stream.
+
+    **Every** relic decision in the feature comes from here and from nowhere
+    else. Not ``world.pyrng``: ``behavior.choose_action`` draws from that once
+    per scored candidate, and adding a single inert candidate to it moved mean
+    deaths 11.33 -> 13.17 (+16%) with 0 of 24 seeds matching on any metric. Not
+    ``world.spears._rng``, or a misfire re-phases every spear throw. Not bare
+    ``random`` and never ``hash()`` of a string - this project has shipped that
+    bug seven times.
+
+    No stream means no shot: a BFG only exists because a RelicRegistry put it in
+    somebody's hands, so a world without one cannot legitimately be holding the
+    gun, and inventing a substitute stream here would be the eighth.
+    """
+    fn = getattr(getattr(world, "relics", None), "roll", None)
+    if not callable(fn):
+        return None
+    try:
+        v = float(fn())
+    except Exception:
+        log.debug("relic roll failed", exc_info=True)
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _bfg_ready_at(agent: Any) -> float:
+    try:
+        return float(agent.__dict__.get("_bfg_next", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _bfg_ready(agent: Any, world: Any) -> bool:
+    """True when the gun has cooled.
+
+    Kept off ``attack_cd``, which :func:`_cooldown` clamps to SPEAR_COOLDOWN
+    (1.1 s) - eight times too short for this - and stored as an absolute world
+    time rather than a counter, because nothing ticks between actions. It is
+    transient by choice: it does not ride on Stickman.to_dict (that file belongs
+    to another workstream), so a reload grants one free shot. A 9 s edge on a
+    weapon that fires 3.3 times an hour is not worth an entity field.
+    """
+    return world_now(world) >= _bfg_ready_at(agent)
+
+
+def _bfg_cool(agent: Any, world: Any) -> None:
+    try:
+        agent.__dict__["_bfg_next"] = world_now(world) + float(BFG_COOLDOWN)
+    except Exception:
+        pass
+
+
+def _destroy_bfg(agent: Any) -> None:
+    """The gun comes apart. It does NOT go on the ground.
+
+    Called before the blast damage, always. If the wielder dies still holding
+    it, ``World._reap_dead`` hands the corpse to ``relics.drop_from`` and the
+    one item in the set that can leave the world quietly does not - the next
+    colonist picks the same gun up off the scorch mark. Unequip first, then
+    hurt people.
+
+    This used to say ``from .relics import unequip`` - a module that has never
+    existed under that name - inside a per-call try/except. It raised
+    ImportError every single time, fell through to the by-hand clearing below,
+    and looked like it worked because the by-hand clearing does the same job for
+    the two mirrored fields. It did NOT do ``items.unequip``'s validation, and
+    it hid a wrong import for the life of the feature. See the import block at
+    the head of this file.
+    """
+    try:
+        relic_unequip(agent)
+        return
+    except Exception:
+        log.debug("items.unequip failed; clearing the slots by hand",
+                  exc_info=True)
+    for attr, val in (("weapon", WEAPON_NONE), ("relic", RELIC_NONE)):
+        try:
+            setattr(agent, attr, val)
+        except Exception:
+            pass
+
+
+def _scorch(world: Any, x: float) -> None:
+    """Burn scar where the gun let go. Lazy import - props.py pulls in numpy."""
+    try:
+        from .props import place_scorch                  # noqa: PLC0415
+    except Exception:
+        return
+    try:
+        props = getattr(world, "props", None)
+        terrain = getattr(world, "terrain", None)
+        if props is None or terrain is None:
+            return
+        place_scorch(props, terrain, float(x))
+    except Exception:
+        log.debug("bfg scorch failed", exc_info=True)
+
+
+def _record_beam(world: Any, x0: float, y0: float, x1: float, y1: float, *,
+                 misfire: bool = False) -> None:
+    """Hand render the shot. Transient, capped, self-expiring, unsaved.
+
+    THE BEAM WAS NEVER DRAWN, and this is where it went wrong. This function
+    used to append to ``world.bfg_beams`` with ``"t": world_now(world)`` - an
+    ABSOLUTE world time. ``render/items._draw_beam_record`` reads the same field
+    as an AGE in seconds and discards anything past ``BEAM_LIFE_SEC``. On a
+    world older than a quarter of a second - i.e. every world - the record was
+    born already expired. The gun killed 0.72 colonists a shot and the viewer
+    saw people fall over for no reason at all.
+
+    Two things were wrong and both are fixed by handing the record to
+    ``RelicRegistry.add_beam`` instead of writing it here:
+
+    * ``add_beam`` stamps ``t = 0.0`` and ``RelicRegistry._age_beams`` advances
+      it once a frame off the same clock that ages the relics. Age, not
+      timestamp, and there is now exactly one place that decides which.
+    * ``render._iter_beams`` looks at ``world.relics.beams`` FIRST and only
+      falls back to ``world.bfg_beams``. The registry already owned the list
+      render prefers; sim was writing to the one it checks last.
+
+    No ``world.bfg_beams`` fallback any more, and not for tidiness: a shot only
+    exists at all if :func:`_relic_roll` found ``world.relics.roll``, so a world
+    that reaches here without a registry is unreachable. A hand-written fallback
+    list would be a second ageing rule that nothing ticks - the same class of
+    bug, one layer down.
+    """
+    try:
+        reg = relic_registry_of(world)
+        add = getattr(reg, "add_beam", None)
+        if not callable(add):
+            log.debug("no relic registry to hand the beam to")
+            return
+        add(float(x0), float(y0), float(x1), float(y1),
+            misfire=bool(misfire), corridor=float(BFG_CORRIDOR))
+    except Exception:
+        log.debug("could not record the beam for render", exc_info=True)
+
+
+def _beam_stop(world: Any, x0: float, y0: float, ux: float, uy: float,
+               max_range: float, *, corridor: float = BFG_CORRIDOR) -> float:
+    """How far the beam gets: *max_range*, or the first hillside.
+
+    Sampled every ``_STEP_PX`` exactly as ``throwing.flight_clear`` samples a
+    spear's arc, so the two cannot disagree about where the hill is.
+
+    THE BEAM HAS WIDTH, AND THIS IS WHERE THE CORRIDOR WAS LOSING ITS CROWD.
+    Every other part of the mechanic treats the shot as a lane ``corridor`` px
+    to either side of the axis - :func:`beam_sweep` hits a hitbox that overlaps
+    that band, ``items.add_beam`` carries the number, render draws a stroke that
+    wide. This function alone treated it as a hairline: it returned the first
+    sample where the AXIS met the ground, which cuts the shot off while its
+    entire upper half is still in clear air. A colony sits on rolling terrain,
+    so a shot from a shoulder 20 px up died at the first 20 px rise - and
+    everyone standing past that rise, whose hitboxes the sweep would happily
+    have caught, was simply out of range.
+
+    Blocked now means the ground has risen above the TOP of the corridor, i.e.
+    the hill fills the beam rather than merely touching it. Measured on 381
+    paired shot geometries from twelve real colonies, hairline -> corridor:
+
+    ============================================  ==========  ==========
+                                                    hairline    corridor
+    ============================================  ==========  ==========
+    median reach (of a nominal 420 px)                116 px      248 px
+    shots reaching full range                          15.2%       34.9%
+    mean colonists in the beam                          0.63        0.92
+    shot opportunities with two or more in it           17.1%       23.1%
+    shot opportunities with three or more in it          3.4%        8.1%
+    most ever caught by one line                           4           8
+    ============================================  ==========  ==========
+
+    *corridor* is a keyword because :func:`beam_sweep` passes its own - a sweep
+    asked for a wider lane must get a correspondingly generous stop, or the two
+    halves of one beam disagree about where it ends.
+    """
+    s = 0.0
+    step = max(1.0, float(_BEAM_STEP))
+    reach = max(0.0, float(max_range))
+    slack = max(0.0, float(corridor))
+    while s <= reach:
+        x = x0 + ux * s
+        y = y0 + uy * s
+        if x < 0.0 or x > _EDGE_MAX_X:
+            return s
+        # Screen y grows downward, so `y - slack` is the corridor's upper edge.
+        if y - slack >= _beam_ground_y(world, x):
+            return s
+        s += step
+    return reach
+
+
+def beam_sweep(world: Any, agent: Any, x0: float, y0: float,
+               tx: float, ty: float, *,
+               corridor: float = BFG_CORRIDOR,
+               max_range: float = BFG_RANGE) -> list[tuple[Any, str]]:
+    """Everything a straight beam from (x0,y0) toward (tx,ty) touches.
+
+    Returns ``[(obj, side), ...]`` nearest first, where side is one of
+    ``"animal"``, ``"dragon"``, ``"agent"``. The side tag is why this builds its
+    own candidate list instead of duck-typing the result: an animal and a
+    stickman both have ``hurt()``, and only one of them takes a death *cause*.
+    Guessing wrong there is the difference between a colonist dying properly -
+    grave, chronicle line, counted in ``stats["died"]`` - and a body that the
+    ledger cannot explain.
+
+    *agent* (the wielder) is excluded: the ray starts at their own shoulder, so
+    they are inside the corridor at s = 0 by construction. The misfire is the
+    path that is allowed to hurt them, and it does so explicitly.
+
+    Non-hostile animals are swept like everything else. This is not a targeting
+    system; it is a line.
+
+    The contract names ``throwing.beam_sweep`` as the eventual home for this and
+    that is the right place for it. It is here for now because this lane owns
+    this file and not that one, and because the one requirement that cannot be
+    negotiated - a colonist standing in the beam dies - has to be provable
+    today. When the shared version lands, this should delegate to it *after*
+    confirming it sweeps agents and not only animals.
+    """
+    out: list[tuple[float, int, Any, str]] = []
+    try:
+        dx = float(tx) - float(x0)
+        dy = float(ty) - float(y0)
+        d = math.hypot(dx, dy)
+        if d < 1e-6:
+            return []
+        ux, uy = dx / d, dy / d
+        half = max(1.0, float(corridor))
+        reach = _beam_stop(world, float(x0), float(y0), ux, uy, max_range,
+                           corridor=half)
+        if reach <= 0.0:
+            return []
+
+        cands: list[tuple[Any, str]] = []
+        for a in animals_of(world):
+            if animal_alive(a):
+                cands.append((a, "animal"))
+        for dgn in dragons_of(world):
+            cands.append((dgn, "dragon"))
+        for ag in _alive_agents(world):
+            if ag is agent or getattr(ag, "taken", False):
+                continue
+            if getattr(ag, "inside", None) is not None:
+                continue        # indoors is not in the line, whatever its x
+            cands.append((ag, "agent"))
+
+        n = 0
+        for obj, side in cands:
+            n += 1
+            try:
+                ox = float(getattr(obj, "x", None))    # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+            # The x test FIRST, and the hitbox only for whatever survives it.
+            # ``_beam_box`` reaches ``throwing.clearance``, which does a
+            # ``from .altitude import clearance`` that fails in this checkout -
+            # sim/altitude.py has never existed - and a failed import is a full
+            # sys.path filesystem search every single call. Measured on this
+            # repo's mount that is ~32 ms per lookup. Anything behind the muzzle
+            # or past the terrain stop cannot be hit whatever shape it is, so it
+            # must not pay for one.
+            if abs(ux) < 1e-3:
+                # Straight up or straight down. There is no x to solve for, so
+                # the corridor becomes an x-band and the swept y-span the test.
+                if abs(ox - float(x0)) > half:
+                    continue
+                top, bottom = _beam_box(world, obj)
+                lo = min(float(y0), float(y0) + uy * reach) - half
+                hi = max(float(y0), float(y0) + uy * reach) + half
+                if bottom < lo or top > hi:
+                    continue
+                s = abs(((top + bottom) * 0.5) - float(y0))
+            else:
+                s = (ox - float(x0)) / ux
+                if s < 0.0 or s > reach:
+                    continue
+                top, bottom = _beam_box(world, obj)
+                line_y = float(y0) + uy * s
+                if bottom < line_y - half or top > line_y + half:
+                    continue
+            # n is a stable tiebreaker, exactly as in throw_targets: two targets
+            # at the same distance must not order by object identity, which
+            # differs between a world and its reload.
+            out.append((s, n, obj, side))
+        out.sort(key=lambda t: (t[0], t[1]))
+    except Exception:
+        log.debug("beam_sweep failed", exc_info=True)
+        return []
+    return [(o, side) for _, _, o, side in out]
+
+
+def _beam_ends(agent: Any, world: Any, target: Any) -> tuple[float, float, float, float]:
+    """(x0, y0, tx, ty) for a shot from *agent* at *target*.
+
+    The aim point is ``throwing._aim_y``, the centre of the target's hitbox, and
+    it stays that way. Clamping the aim into the near edge of the box instead -
+    "level the gun, take the flattest line that still connects" - was written
+    and measured against this, on 381 paired shot geometries from twelve real
+    colonies, and it is NOISE: mean colonists in the corridor 0.63 -> 0.66, and
+    the fraction of shots reaching full range actually FELL, 15.2% -> 13.4%,
+    because levelling points a shot at an uphill target *less* steeply and buries
+    it in the slope sooner. The reach problem was real; the aim was not where it
+    lived. See :func:`_beam_stop`.
+    """
+    ax = float(getattr(agent, "x", 0.0))
+    tx = animal_x(target, ax)
+    x0, y0 = launch_point(agent, tx)
+    return (x0, y0, tx, _beam_aim_y(world, target))
+
+
+def _bfg_target(agent: Any, world: Any) -> Any | None:
+    """What this agent should shoot, or None. Scorer and action share it.
+
+    The last gate is the sweep itself rather than a cheaper approximation of it,
+    so a shot is never scored that the terrain would eat - and so the scorer and
+    the trigger can never disagree about what is hittable.
+    """
+    try:
+        ax = float(getattr(agent, "x", 0.0))
+    except (TypeError, ValueError):
+        return None
+    seen = 0
+    for foe in throw_targets(world, ax, BFG_RANGE):
+        if seen >= BFG_SCAN:
+            break
+        try:
+            fx = float(getattr(foe, "x", ax))
+        except (TypeError, ValueError):
+            continue
+        gap = abs(fx - ax)
+        if gap < BFG_MIN_RANGE:
+            continue
+        if animal_leaving(foe):
+            continue
+        if getattr(foe, "hostile", True) is False:
+            continue
+        seen += 1
+        x0, y0, tx, ty = _beam_ends(agent, world, foe)
+        if any(o is foe for o, _ in beam_sweep(world, agent, x0, y0, tx, ty)):
+            return foe
+    return None
+
+
+def _bfg_hurt(world: Any, obj: Any, side: str, by: Any) -> bool:
+    """One target, one hit. True if it died.
+
+    A colonist goes through ``Stickman.hurt(amount, cause)`` so the death runs
+    the ordinary path - armour clamp, ``die()``, the death hooks,
+    ``World._reap_dead``, a grave, ``stats["died"]``. A beam death must be as
+    countable as a wolf's.
+
+    Animals and dragons go through :func:`hurt_animal`, which means a dragon
+    that has not fed takes *nothing*: ``Dragon.hurt`` discards damage while
+    ``sated`` is False. The BFG gets no exemption from the feeding rule and
+    needs no special case to be denied one.
+    """
+    if side == "agent":
+        try:
+            return bool(obj.hurt(BFG_DAMAGE, CAUSE_DISINTEGRATED))
+        except TypeError:
+            try:
+                return bool(obj.hurt(BFG_DAMAGE))
+            except Exception:
+                log.debug("could not disintegrate an agent", exc_info=True)
+                return False
+        except Exception:
+            log.debug("could not disintegrate an agent", exc_info=True)
+            return False
+    killed = hurt_animal(world, obj, BFG_DAMAGE, by=by)
+    if killed:
+        _bump_stat(world, "animals_killed")
+    return killed
+
+
+def _bfg_misfire(agent: Any, world: Any) -> dict[str, Any]:
+    """It comes apart in his hands, and it takes HIM. Nobody else.
+
+    CORRECTED SPEC, in the author's words: *"randomly explodes taking out the
+    stickmen" .. "stickman", just himself .. so its an or situation .. could
+    possibly leave a single stickman*. Two outcomes, not one:
+
+    * a **misfire** is the wielder's own death and nobody else's, and
+    * a **heedless corridor shot** is the one that can wipe most of a colony and
+      leave one person standing. That one is in :func:`_bfg_shoot` and stays
+      exactly as lethal as it was.
+
+    What this used to do: take every animal and every colonist within
+    ``BFG_BLAST_R`` (70 px), which is roughly a hut's width and reliably caught
+    the neighbours. That made the two outcomes the same outcome with a different
+    radius, and it meant a misfire - a *failure* of the weapon - was the thing
+    doing the mass casualties rather than the shot the wielder chose to take.
+
+    ``BFG_BLAST_R`` is deliberately still imported. It is no longer a damage
+    radius, but ``render/items.draw_misfire`` draws the flash at exactly that
+    size and the two should not drift: the light says "70 px of that went up",
+    and it did - it just no longer kills the man standing in it.
+    """
+    ax = float(getattr(agent, "x", 0.0))
+    ay = float(getattr(agent, "y", 0.0))
+    name = _name(agent)
+
+    # FIRST, before anybody can die: see _destroy_bfg.
+    _destroy_bfg(agent)
+    _bump_stat(world, "bfg_misfires")
+    chronicle(world, f"The wyrm-gun comes apart in {name}'s hands.")
+    _scorch(world, ax)
+    # Both ends the wielder's own position: render ignores the endpoint on a
+    # misfire record and draws the flash instead, which is why add_beam's
+    # docstring calls passing it twice "the honest call". Without this the only
+    # thing on screen was a colonist falling over.
+    _record_beam(world, ax, ay, ax, ay, misfire=True)
+
+    dead_friends: list[str] = []
+    if _bfg_hurt(world, agent, "agent", agent):
+        dead_friends.append(name)
+        chronicle(world, f"There is not enough of {name} left to bury.")
+    return {"shot": "misfire", "kills": 0, "friends": dead_friends}
+
+
+def _bfg_shoot(agent: Any, world: Any, target: Any) -> dict[str, Any]:
+    """Pull the trigger. Returns a small summary, for the test and the log."""
+    name = _name(agent)
+
+    # The misfire is rolled BEFORE the ray is computed, so a misfiring shot has
+    # no line at all and cannot be aimed out of.
+    roll = _relic_roll(world)
+    if roll is None:
+        return {"shot": "nostream", "kills": 0, "friends": []}
+    if roll < BFG_MISFIRE:
+        return _bfg_misfire(agent, world)
+
+    x0, y0, tx, ty = _beam_ends(agent, world, target)
+    hits = beam_sweep(world, agent, x0, y0, tx, ty)
+    friends = [o for o, side in hits if side == "agent"]
+    heedless = False
+    if friends:
+        heed = _relic_roll(world)
+        if heed is None or heed >= BFG_HEEDLESS:
+            # Held. It still costs the cooldown: a hold that cost nothing would
+            # be re-scored at 0.96+ on the very next tick and the wielder would
+            # spend its life winding up a shot it never takes.
+            _bfg_cool(agent, world)
+            return {"shot": "held", "kills": 0, "friends": []}
+        heedless = True
+
+    _bfg_cool(agent, world)
+    _bump_stat(world, "bfg_shots")
+    dx, dy = tx - x0, ty - y0
+    d = math.hypot(dx, dy) or 1.0
+    reach = _beam_stop(world, x0, y0, dx / d, dy / d, BFG_RANGE)
+    _record_beam(world, x0, y0, x0 + dx / d * reach, y0 + dy / d * reach)
+    if heedless:
+        # NOT in world.STAT_DEFAULTS, like "animals_killed" and the spear
+        # counters and for the same reason: that dict is another file's, and its
+        # own note says these belong in it whenever its owner next passes
+        # through. Until then both of these are conjured on first use, so every
+        # reader must use .get() - a fresh colony has no key, not a zero.
+        _bump_stat(world, "bfg_heedless")
+        chronicle(world, f"{name} does not wait for the line to clear.")
+    else:
+        chronicle(world, f"{name} looses the wyrm-gun. Nothing on that line is "
+                         f"standing.")
+
+    dead_friends: list[str] = []
+    kills = 0
+    for obj, side in hits:
+        who = _name(obj) if side == "agent" else ""
+        if _bfg_hurt(world, obj, side, agent):
+            if side == "agent":
+                dead_friends.append(who)
+            else:
+                kills += 1
+    if dead_friends:
+        _bump_stat(world, "bfg_friendly_deaths", len(dead_friends))
+        chronicle(world, f"{name}'s shot did not care who was in front of it.")
+        if len(dead_friends) > 1:
+            chronicle(world, f"{len(dead_friends)} of them were in the light.")
+        # The line the user asked for by name, and the only place in the game
+        # that can print it. Counted AFTER the damage, so a wielder who is now
+        # the last one standing counts themselves.
+        if len(_alive_agents(world)) <= 1:
+            chronicle(world, "One stickman is left standing.")
+    if kills:
+        _adjust(agent, "morale", 0.10)
+    return {"shot": "fired", "heedless": heedless,
+            "kills": kills, "friends": dead_friends}
+
+
+def _h_fire_bfg(a: Action, ag: Any, w: Any, dt: float) -> None:
+    if a.phase == "start":
+        if not _bfg(ag) or not _bfg_ready(ag, w):
+            a.failed = True
+            return
+        foe = _bfg_target(ag, w)
+        if foe is None:
+            a.failed = True
+            return
+        a.target = animal_id(foe)
+        if _is_dragon(w, foe):
+            a.data["foe"] = "dragon"
+        a.data["ax"] = animal_x(foe, float(getattr(ag, "x", 0.0)))
+        a.phase = "aim"
+        a.data["wt"] = 0.0
+
+    if a.phase == "aim":
+        # "chop" for the same reason ThrowSpear uses it: actions.POSES is a
+        # closed tuple that render/ switches on, so a new name here would draw
+        # nothing at all.
+        a.pose = "chop"
+        _halt(ag)
+        if not _bfg(ag):
+            a.failed = True             # it came apart, or was taken off them
+            return
+        foe = _current_target(a, w)
+        if foe is None or not animal_alive(foe):
+            foe = _bfg_target(ag, w)
+            if foe is None:
+                a.failed = True
+                return
+            a.target = animal_id(foe)
+            if _is_dragon(w, foe):
+                a.data["foe"] = "dragon"
+            else:
+                a.data.pop("foe", None)
+        fx = animal_x(foe, float(getattr(ag, "x", 0.0)))
+        a.data["ax"] = fx
+        _face(ag, fx - float(getattr(ag, "x", 0.0)))
+        a.data["wt"] = float(a.data.get("wt", 0.0)) + dt
+        if float(a.data["wt"]) < BFG_WINDUP:
+            return
+        a.phase = "fire"
+
+    if a.phase == "fire":
+        foe = _current_target(a, w)
+        if foe is None:
+            a.failed = True
+            return
+        out = _bfg_shoot(ag, w, foe)
+        a.data["shot"] = str(out.get("shot"))
+        a.data["kills"] = int(out.get("kills", 0))
+        _adjust(ag, "fatigue", 0.008)
+        _clear_target(ag)
+        if out.get("shot") == "nostream":
+            # No relic stream means this agent cannot legitimately be holding
+            # the gun. Fail rather than fire blind - see _relic_roll.
+            a.failed = True
+            return
+        a.done = True
+        return
+
+    a.phase = "start"
+
+
+def _c_fire_bfg(a: Action, ag: Any, w: Any) -> None:
+    _clear_target(ag)
+
+
+def score_bfg(agent: Any, world: Any) -> dict[str, float]:
+    """Utility 0..1 for FireBfg. Never raises.
+
+    Always returns the key, and returns it as **exactly 0.0** for everyone who
+    is not holding the gun. That is the compatibility rule, not tidiness:
+    ``behavior.choose_action`` draws ``rng.uniform(0, TIEBREAK)`` off
+    ``world.pyrng`` once per candidate whose score is > 0, so a zero here draws
+    nothing and a colony that has never seen a relic stays bit-identical to the
+    build that shipped before relics existed.
+
+    0.96 + 0.03 * near is the FightAnimal band and is above
+    ``behavior.OVERRIDE_FLOOR`` (0.95) for the reason FightAnimal's comment
+    records: below the floor, the running action collects a HYSTERESIS_BONUS of
+    0.35 and a committed builder effectively outscores anything under it, so
+    nobody ever turns round. Fighting is an interrupt or it does not happen.
+    """
+    out: dict[str, float] = {"FireBfg": 0.0}
+    try:
+        if not _bfg(agent):
+            return out
+        if not getattr(agent, "alive", True) or getattr(agent, "taken", False):
+            return out
+        if getattr(agent, "inside", None) is not None:
+            return out
+        # A child does not fight - the same hard exclusion FightAnimal makes.
+        # With the flee gate reading _combat_capable, a child holding the gun
+        # still runs, which is right.
+        if _role(agent) == "child":
+            return out
+        if _health_frac(agent) < BREAK_OFF_HEALTH:
+            return out          # bleeding out: run, do not stand and aim
+        if not _bfg_ready(agent, world):
+            return out
+        foe = _bfg_target(agent, world)
+        if foe is None:
+            return out
+        ax = float(getattr(agent, "x", 0.0))
+        near = 1.0 - _clamp01(abs(animal_x(foe, ax) - ax) / BFG_RANGE)
+        out["FireBfg"] = min(0.99, _clamp01(0.96 + 0.03 * near))
+    except Exception:
+        log.debug("score_bfg failed", exc_info=True)
+    return out
+
+
+# ===========================================================================
+#  FetchRelic - somebody picks the thing up
+#
+#  The single missing piece. Everything else in the relic feature was written,
+#  tuned and measured against a walk that did not exist: the drop table worked
+#  (18 relics, all five kinds, 12 of 16 colonies), the appetite was measured to
+#  three decimal places, the renderer could draw all five on the ground - and
+#  0 of 18 were ever lifted, because no action existed to lift them. See the
+#  module docstring.
+#
+#  Modelled on RetrieveSpear, which is the same shape and has been in the game
+#  long enough to have had its edges knocked off: walk to a ground object, and
+#  the object may be gone when you arrive because somebody else got there first.
+#  Two differences, both deliberate:
+#
+#  * The claim is RelicRegistry.take(), which removes-then-equips and returns
+#    False for everyone after the first. That is the whole double-claim answer
+#    and it is somebody else's proven code; this file must not grow a second
+#    one. (props.py solved the same problem a different way and paid 691
+#    collision events for it.)
+#  * A failed walk is REMEMBERED. See FETCH_SNUB_SEC - a relic behind a cliff
+#    face is the one thing this action can do that RetrieveSpear cannot get
+#    badly wrong, because a spear's score does not climb with age and a relic's
+#    does.
+# ===========================================================================
+def _snubs(agent: Any) -> dict[int, float]:
+    """This agent's give-up memory, ``{relic id: world time it expires}``.
+
+    In ``__dict__`` rather than as a field, exactly like ``_bfg_next``: it is
+    not worth a save slot, and a grudge that survived a reload would be
+    invisible state nobody could explain. Created lazily so an agent that never
+    fetches anything carries nothing.
+    """
+    try:
+        d = agent.__dict__.get("_relic_snub")
+        if not isinstance(d, dict):
+            d = {}
+            agent.__dict__["_relic_snub"] = d
+        return d
+    except Exception:
+        return {}
+
+
+def _snub(agent: Any, rid: Any, world: Any) -> None:
+    """Leave relic *rid* alone for FETCH_SNUB_SEC. Never raises."""
+    try:
+        if rid is None:
+            return
+        d = _snubs(agent)
+        d[int(rid)] = world_now(world) + FETCH_SNUB_SEC
+        if len(d) > _SNUB_KEEP:
+            # Drop the oldest expiries, not arbitrary keys: the ones about to
+            # lapse anyway are the cheapest to forget.
+            for k in sorted(d, key=lambda k: d[k])[: len(d) - _SNUB_KEEP]:
+                d.pop(k, None)
+    except Exception:
+        log.debug("could not record a fetch snub", exc_info=True)
+
+
+def _snubbed(agent: Any, rid: Any, world: Any) -> bool:
+    try:
+        d = agent.__dict__.get("_relic_snub")
+        if not isinstance(d, dict) or not d:
+            return False
+        until = d.get(int(rid))
+        if until is None:
+            return False
+        if world_now(world) >= float(until):
+            d.pop(int(rid), None)
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _clear_snub(agent: Any, rid: Any) -> None:
+    try:
+        d = agent.__dict__.get("_relic_snub")
+        if isinstance(d, dict):
+            d.pop(int(rid), None)
+    except Exception:
+        pass
+
+
+def _grave_key(gid: Any) -> int:
+    """Snub key for a grave.
+
+    The snub dict is shared between the two relic actions, and relic ids and
+    prop ids are both small positives drawn from separate counters - so a
+    colonist who gave up on relic#3 would also be refusing grave#3. Graves go in
+    negative. ``or 1`` because id 0 has no sign to flip, and a key of 0 would
+    collide with relic#0 (which ``RelicRegistry.add`` never issues, but that is
+    an invariant in another file and this is one character).
+    """
+    try:
+        return -(int(gid) or 1)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _relic_eligible(agent: Any) -> bool:
+    """Can this person carry a relic at all? Shared by both relic actions.
+
+    One slot per agent, so somebody already carrying one is out - and that is
+    also what stops anyone being both impenetrable and holding the gun. Children
+    are out for the same reason ``score_combat`` hard-excludes them from
+    FightAnimal and ThrowSpear: every gear-and-danger behaviour in this game
+    does, and a nine-year-old picking up the wyrm-gun is not a feature.
+    """
+    try:
+        if not getattr(agent, "alive", True) or getattr(agent, "taken", False):
+            return False
+        if getattr(agent, "inside", None) is not None:
+            return False
+        return _role(agent) != "child"
+    except Exception:
+        return False
+
+
+def fetchable_relic(agent: Any, world: Any) -> Any | None:
+    """The relic this agent should go and get, or None. **The only answer.**
+
+    Public, and imported by ``behavior._score_loot``, because the scorer and the
+    maker disagreeing is not a theoretical problem here - it is the exact bug
+    that shipped. behaviour still owns every *number* (the appetite floor, the
+    ageing ceiling, the bystander damper, the danger gate it can see and this
+    file cannot); this owns *which object*, and therefore owns the gates that
+    would make a walk a bad idea.
+
+    Nearest-first, skipping anything this agent has recently failed to reach, so
+    a colonist stuck behind a ledge moves on to the next relic instead of pacing
+    at the wall until it rots. Ties break on id like ``RelicRegistry.nearest``,
+    so the choice is stable across a reload.
+    """
+    try:
+        if not _relic_eligible(agent):
+            return None
+        if relic_worn(agent):
+            return None
+        reg = relic_registry_of(world)
+        if reg is None:
+            return None
+        try:
+            candidates = reg.all()
+        except Exception:
+            return None
+        # Before any animal scan: this runs once per agent per scoring call, and
+        # the overwhelmingly common case is a world with nothing on the ground.
+        if not candidates:
+            return None
+        ax = float(getattr(agent, "x", 0.0))
+        # Nothing hunting where we stand. One query, and it rules out every
+        # relic at once, so it goes outside the loop.
+        if nearest_animal(world, ax, max_dist=FETCH_SAFE_RADIUS) is not None:
+            return None
+        best, best_key = None, None
+        for r in candidates:
+            try:
+                rx = float(getattr(r, "x", ax))
+                rid = int(getattr(r, "id", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            d = abs(rx - ax)
+            if d > FETCH_SEEK:
+                continue
+            if _snubbed(agent, rid, world):
+                continue
+            key = (d, rid)
+            if best_key is not None and key >= best_key:
+                continue
+            # Last and most expensive: is anything standing over it? Below the
+            # distance test on purpose, so the scan only runs for a candidate
+            # that is currently the nearest - and a relic with a wolf on it
+            # falls through to the next one out rather than cancelling the walk.
+            if nearest_animal(world, rx, max_dist=FETCH_SAFE_RADIUS) is not None:
+                continue
+            best, best_key = r, key
+        return best
+    except Exception:
+        log.debug("fetchable_relic failed", exc_info=True)
+        return None
+
+
+def _h_fetch_relic(a: Action, ag: Any, w: Any, dt: float) -> None:
+    reg = relic_registry_of(w)
+    if reg is None:
+        a.failed = True
+        return
+
+    if a.phase == "start":
+        r = fetchable_relic(ag, w)
+        if r is None:
+            a.failed = True
+            return
+        a.target = int(getattr(r, "id", 0) or 0)
+        a.phase = "walk"
+
+    if a.phase == "walk":
+        a.pose = "walk"
+        if relic_worn(ag):
+            # Somebody handed them one, or a save rehydrated mid-walk into an
+            # agent who already has a slot full. Not a failure.
+            _halt(ag)
+            a.done = True
+            return
+        r = reg.get(a.target)
+        if r is None:
+            # Taken, or rotted, while we were walking. Re-acquire rather than
+            # fail: there may well be another one, and a fail here costs the
+            # agent a re-score for nothing.
+            r = fetchable_relic(ag, w)
+            if r is None:
+                _halt(ag)
+                a.failed = True
+                return
+            a.target = int(getattr(r, "id", 0) or 0)
+        rx = float(getattr(r, "x", float(getattr(ag, "x", 0.0))))
+        rem = step_toward(ag, w, rx, dt, arrive=FETCH_ARRIVE)
+        if rem <= FETCH_ARRIVE:
+            a.phase = "take"
+        elif a.t > FETCH_TIMEOUT:
+            # Could not get there. THIS is the branch FETCH_SNUB_SEC exists for
+            # - without it the agent re-scores straight back into the same walk
+            # against the same cliff, and the relic's score is higher than it
+            # was because it has aged.
+            _halt(ag)
+            _snub(ag, a.target, w)
+            a.failed = True
+        return
+
+    if a.phase == "take":
+        _halt(ag)
+        r = reg.get(a.target)
+        # take() removes-then-equips and bumps stats["relics_found"], writes the
+        # chronicle line, and returns False for everybody who arrived second.
+        if r is None or not reg.take(r, ag, world=w):
+            _snub(ag, a.target, w)
+            a.failed = True
+            return
+        _clear_snub(ag, a.target)
+        emit_speech(w, ag, "^")
+        # A dragon's relic is the best thing that happens to a colonist. Same
+        # size as the craft bonuses (0.10 / 0.12), because it is the same kind
+        # of event - you now have a thing you did not have.
+        _adjust(ag, "morale", 0.12)
+        a.done = True
+        return
+
+    a.phase = "start"
+
+
+def _c_fetch_relic(a: Action, ag: Any, w: Any) -> None:
+    """Abandoned mid-walk. Nothing to undo - the relic never left the ground.
+
+    Present so the kind has an entry in ``_CLEANUP`` alongside the others rather
+    than relying on the dict's default, which is the sort of asymmetry that has
+    somebody later assuming a missing entry means something.
+    """
+    _halt(ag)
+
+
+# ===========================================================================
+#  RaiseTheDead - the cairnstone's one use
+#
+#  World.raise_the_dead() had ZERO callers. The cairnstone is the second most
+#  common drop in the table and could never do anything at all: a colonist would
+#  pick it up (once fetching existed) and carry it to their own grave.
+#
+#  The contract is stated in that method's docstring and this is the half of it
+#  that lives here: **consume on True, keep on False.** raise_the_dead has four
+#  separate ways to decline - no name on the stone, the roster at MAX_POP, the
+#  headstone already weathered away, junk state - and a refusal that ate the
+#  item would lose the rarest half of the skeletal's drop table for nothing.
+# ===========================================================================
+def _graves_of(world: Any) -> list[Any]:
+    """Living headstones. Duck-typed: props.py is a sibling, not a dependency."""
+    try:
+        fn = getattr(getattr(world, "props", None), "all_of", None)
+        if not callable(fn):
+            return []
+        return list(fn("grave") or [])
+    except Exception:
+        return []
+
+
+def _grave_named(grave: Any) -> str:
+    """The name on the stone, "" if there is none.
+
+    Checked *before* the walk because ``raise_the_dead`` refuses a nameless
+    headstone - older saves have them, and _reap_dead only started passing the
+    generation through recently. Walking the length of the map to be told no is
+    a worse outcome than never setting off.
+    """
+    try:
+        state = getattr(grave, "state", None)
+        if not isinstance(state, dict):
+            return ""
+        return str(state.get("name") or "").strip()
+    except Exception:
+        return ""
+
+
+def raisable_grave(agent: Any, world: Any) -> Any | None:
+    """The headstone this cairnstone-bearer should walk to, or None.
+
+    Same contract as :func:`fetchable_relic` - public, and the single answer
+    both the scorer and the maker use. The MAX_POP check is duplicated from
+    ``raise_the_dead`` on purpose: it is cheap, and without it the bearer walks
+    to a grave in a full colony, is refused, keeps the stone (correctly), and
+    re-scores straight back into the same walk.
+    """
+    try:
+        if not _relic_eligible(agent):
+            return None
+        if relic_worn(agent) != RELIC_CAIRN:
+            return None
+        # Cheapest first: only the one bearer gets past this line, so every
+        # other agent's scoring call costs two getattrs.
+        graves = _graves_of(world)
+        if not graves:
+            return None
+        try:
+            pop = len(world.population.alive_agents())
+        except Exception:
+            pop = 0
+        if pop >= MAX_POP:
+            return None
+        ax = float(getattr(agent, "x", 0.0))
+        if nearest_animal(world, ax, max_dist=FETCH_SAFE_RADIUS) is not None:
+            return None
+        best, best_key = None, None
+        for g in graves:
+            try:
+                if not getattr(g, "alive", True):
+                    continue
+                if not _grave_named(g):
+                    continue
+                gx = float(getattr(g, "x", ax))
+                gid = int(getattr(g, "id", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            d = abs(gx - ax)
+            if d > RAISE_SEEK:
+                continue
+            if _snubbed(agent, _grave_key(gid), world):
+                continue
+            key = (d, gid)
+            if best_key is not None and key >= best_key:
+                continue
+            if nearest_animal(world, gx, max_dist=FETCH_SAFE_RADIUS) is not None:
+                continue
+            best, best_key = g, key
+        return best
+    except Exception:
+        log.debug("raisable_grave failed", exc_info=True)
+        return None
+
+
+def _grave_by_id(world: Any, gid: Any) -> Any | None:
+    try:
+        want = int(gid)
+    except (TypeError, ValueError):
+        return None
+    for g in _graves_of(world):
+        try:
+            if int(getattr(g, "id", 0) or 0) == want and getattr(g, "alive", True):
+                return g
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _h_raise_dead(a: Action, ag: Any, w: Any, dt: float) -> None:
+    if a.phase == "start":
+        g = raisable_grave(ag, w)
+        if g is None:
+            a.failed = True
+            return
+        a.target = int(getattr(g, "id", 0) or 0)
+        a.phase = "walk"
+
+    if a.phase == "walk":
+        a.pose = "walk"
+        if relic_worn(ag) != RELIC_CAIRN:
+            # Died and dropped it, or a save rehydrated into somebody who is not
+            # carrying the stone any more.
+            _halt(ag)
+            a.failed = True
+            return
+        g = _grave_by_id(w, a.target)
+        if g is None:
+            g = raisable_grave(ag, w)
+            if g is None:
+                _halt(ag)
+                a.failed = True
+                return
+            a.target = int(getattr(g, "id", 0) or 0)
+        gx = float(getattr(g, "x", float(getattr(ag, "x", 0.0))))
+        rem = step_toward(ag, w, gx, dt, arrive=REACH)
+        if rem <= REACH:
+            a.phase = "place"
+            a.data["wt"] = 0.0
+        elif a.t > RAISE_TIMEOUT:
+            _halt(ag)
+            _snub(ag, _grave_key(a.target), w)
+            a.failed = True
+        return
+
+    if a.phase == "place":
+        # A beat of kneeling at the stone. "chop" for the reason ThrowSpear and
+        # FireBfg use it: actions.POSES is a closed tuple render switches on, so
+        # a new name here would draw nothing at all.
+        a.pose = "chop"
+        _halt(ag)
+        g = _grave_by_id(w, a.target)
+        if g is None:
+            a.failed = True
+            return
+        _face(ag, float(getattr(g, "x", 0.0)) - float(getattr(ag, "x", 0.0)))
+        a.data["wt"] = float(a.data.get("wt", 0.0)) + dt
+        if float(a.data["wt"]) < RAISE_PLACE_SEC:
+            return
+
+        fn = getattr(w, "raise_the_dead", None)
+        ok = False
+        if callable(fn):
+            try:
+                ok = bool(fn(g, by=_name(ag)))
+            except TypeError:
+                # The one-argument shape the contract also allows.
+                try:
+                    ok = bool(fn(g))
+                except Exception:
+                    log.debug("raise_the_dead(grave) failed", exc_info=True)
+            except Exception:
+                log.debug("raise_the_dead failed", exc_info=True)
+        if not ok:
+            # KEEP THE STONE. See the header above: four ways to decline and
+            # none of them should cost the item. Snub this grave so the bearer
+            # tries a different one (or gets on with their life) instead of
+            # kneeling at the same refusal every two seconds.
+            _snub(ag, _grave_key(a.target), w)
+            a.failed = True
+            return
+        # SPEND IT. consume() is not unequip(): it bumps stats["relics_used"]
+        # and the stone does not hit the ground, which is the difference between
+        # "the item left the world" and "the item changed hands".
+        relic_consume(w, ag)
+        # "*" is render's "something notable" star. NOT "!", which
+        # stickfigure._GLYPH_ALIASES maps to the alarm bubble - somebody
+        # standing over a headstone with a danger sign over their head reads as
+        # the exact opposite of what just happened.
+        emit_speech(w, ag, "*")
+        _adjust(ag, "morale", 0.20)
+        a.done = True
+        return
+
+    a.phase = "start"
+
+
+def _c_raise_dead(a: Action, ag: Any, w: Any) -> None:
+    _halt(ag)
 
 
 # ===========================================================================
@@ -1524,6 +2982,15 @@ def score_combat(agent: Any, world: Any) -> dict[str, float]:
         "FleeAnimal": 0.0, "FightAnimal": 0.0,
         "CraftSpear": 0.0, "CraftArmour": 0.0,
         "ThrowSpear": 0.0, "RetrieveSpear": 0.0,
+        "FireBfg": 0.0,
+        # Declared here at 0.0 and NEVER raised in this file. behavior.py scores
+        # both after merging this dict and has the last word, because every band
+        # they have to beat or lose to - Celebrate, Mourn, Eat, Sleep,
+        # OVERRIDE_FLOOR, HYSTERESIS_BONUS - is declared over there. They are in
+        # this dict at all so the score dict is the same *shape* whether or not
+        # behaviour got as far as scoring them; see the docstring on
+        # score_throw for why the number of keys matters more than it looks.
+        "FetchRelic": 0.0, "RaiseTheDead": 0.0,
     }
     # Merged here rather than in behavior.py because behavior.score_actions
     # already does `s.update(score_combat(...))`, so folding the throwing keys
@@ -1534,6 +3001,12 @@ def score_combat(agent: Any, world: Any) -> dict[str, float]:
         out.update(score_throw(agent, world))
     except Exception:
         log.debug("score_throw failed", exc_info=True)
+    # Same argument for the gun: merged here, so behavior.py - somebody else's
+    # file - needs no edit at all to learn about it.
+    try:
+        out.update(score_bfg(agent, world))
+    except Exception:
+        log.debug("score_bfg failed", exc_info=True)
     try:
         if not getattr(agent, "alive", True) or getattr(agent, "taken", False):
             return out
@@ -1552,7 +3025,13 @@ def score_combat(agent: Any, world: Any) -> dict[str, float]:
         # ---------------------------------------------------------- flee ----
         if animal is not None and dist <= FLEE_RADIUS:
             close = 1.0 - _clamp01(dist / FLEE_RADIUS)
-            if not armed or role == "child":
+            # _combat_capable, not `armed`. A BFG carrier is not holding a spear
+            # and never will be, so the spear-only predicate reads them as
+            # defenceless and hands them 0.92-1.0 to run - away from every wolf
+            # they could have vaporised, carrying the rarest item in the game
+            # and using it for nothing. This single word is what makes the
+            # weapon exist at all.
+            if not _combat_capable(agent) or role == "child":
                 out["FleeAnimal"] = _clamp01(0.92 + 0.08 * close)
             elif hp < BREAK_OFF_HEALTH:
                 out["FleeAnimal"] = 0.97
@@ -1589,8 +3068,13 @@ def score_combat(agent: Any, world: Any) -> dict[str, float]:
         if role != "child" and not threatened:
             # ``or _paid_up`` so a craft that has already spent its materials
             # does not score itself out of existence - see _paid_up.
-            if not armed and (_can_afford(world, SPEAR_COST)
-                              or _paid_up(agent, "CraftSpear")):
+            # _craft_satisfied, not `not armed`: a BFG carrier must not score a
+            # spear craft that would write over the gun. Identical to `not
+            # armed` for everybody who has never held a relic, so a colony
+            # without one draws exactly the same random numbers as before.
+            if not _craft_satisfied("CraftSpear", agent) \
+                    and (_can_afford(world, SPEAR_COST)
+                         or _paid_up(agent, "CraftSpear")):
                 out["CraftSpear"] = _clamp01(0.55 + 0.32 * fresh)
             if not armoured and (_can_afford(world, ARMOUR_COST)
                                  or _paid_up(agent, "CraftArmour")):
@@ -1637,8 +3121,40 @@ def make_combat_action(kind: str, agent: Any, world: Any) -> Action | None:
             return make_action("FleeAnimal", target=animal_id(animal),
                                pose="panic", fx=animal_x(animal, ax))
 
+        if kind == "FireBfg":
+            if not _bfg(agent) or _role(agent) == "child":
+                return None
+            if not _bfg_ready(agent, world):
+                return None
+            if _health_frac(agent) < BREAK_OFF_HEALTH:
+                return None
+            foe = _bfg_target(agent, world)
+            if foe is None:
+                return None
+            a = make_action("FireBfg", target=animal_id(foe), phase="aim",
+                            pose="chop", ax=animal_x(foe, ax), wt=0.0)
+            if _is_dragon(world, foe):
+                a.data["foe"] = "dragon"
+            return a
+
+        if kind == "FetchRelic":
+            r = fetchable_relic(agent, world)
+            if r is None:
+                return None
+            return make_action("FetchRelic", target=int(getattr(r, "id", 0) or 0),
+                               phase="walk", pose="walk")
+
+        if kind == "RaiseTheDead":
+            g = raisable_grave(agent, world)
+            if g is None:
+                return None
+            return make_action("RaiseTheDead",
+                               target=int(getattr(g, "id", 0) or 0),
+                               phase="walk", pose="walk")
+
         if kind == "CraftSpear":
-            if _armed(agent) or not _can_afford(world, SPEAR_COST):
+            if _craft_satisfied("CraftSpear", agent) \
+                    or not _can_afford(world, SPEAR_COST):
                 return None
             return make_action("CraftSpear", pose="walk")
 
@@ -1690,6 +3206,9 @@ _COMBAT_HANDLERS: dict[str, Callable[[Action, Any, Any, float], None]] = {
     "FleeAnimal": _h_flee_animal,
     "ThrowSpear": _h_throw,
     "RetrieveSpear": _h_retrieve,
+    "FireBfg": _h_fire_bfg,
+    "FetchRelic": _h_fetch_relic,
+    "RaiseTheDead": _h_raise_dead,
 }
 
 _COMBAT_CLEANUP: dict[str, Callable[[Action, Any, Any], None]] = {
@@ -1697,6 +3216,9 @@ _COMBAT_CLEANUP: dict[str, Callable[[Action, Any, Any], None]] = {
     "CraftArmour": _c_craft,
     "FightAnimal": _c_fight,
     "ThrowSpear": _c_throw,
+    "FireBfg": _c_fire_bfg,
+    "FetchRelic": _c_fetch_relic,
+    "RaiseTheDead": _c_raise_dead,
 }
 
 
@@ -1732,6 +3254,22 @@ _register()
 # ===========================================================================
 if __name__ == "__main__":  # pragma: no cover - headless
     import random as _random
+
+    # Fail an absent module FAST, before anything below asks for a hitbox.
+    # ``throwing.clearance`` does ``from .altitude import clearance`` inside a
+    # try/except on EVERY call, and ``sim/altitude.py`` does not exist in this
+    # checkout - the fallback is deliberate and correct. But a failed import is
+    # a full sys.path filesystem search each time, measured at ~32 ms on this
+    # repo's mount, and the rate runs below take ~24000 hitbox lookups: twenty
+    # minutes of stat() calls for a test whose arithmetic takes two seconds.
+    # Priming sys.modules with None is precisely what the import machinery does
+    # for a cached negative result. Guarded on the module genuinely being
+    # absent, so a checkout that grows one is unaffected. Test-harness only -
+    # nothing at module scope does this, and no behaviour changes either way.
+    import importlib.util as _ilu
+    import sys as _sys
+    if _ilu.find_spec("backgrounded.sim.altitude") is None:
+        _sys.modules.setdefault("backgrounded.sim.altitude", None)
 
     from ..constants import RES_FIBRE, RES_STONE, RES_WOOD
     from .entities import Stickman
@@ -2018,6 +3556,403 @@ if __name__ == "__main__":  # pragma: no cover - headless
     assert duel.finished, "stood under a flying dragon swinging"
     assert claim_hides(w2, w2.dragons[0]) == 0, "took a hide off a dragon"
     w2.dragons = []
+
+    # --- the wyrm-gun -------------------------------------------------------
+    from .items import RelicRegistry as _RelicRegistry
+
+    class _Rolls(_RelicRegistry):
+        """A real ``RelicRegistry`` with a scripted ``roll()``.
+
+        Driving the sequence by hand is the only way to test an 8% branch
+        without firing ten thousand shots; the rates themselves are measured
+        further down against a real seeded stream.
+
+        A SUBCLASS and not a duck-typed stub, and that is the whole point:
+        ``items.registry_of`` is an ``isinstance(reg, RelicRegistry)`` check, so
+        a hand-rolled object with the right two methods is invisible to it.
+        :func:`_record_beam` would find no registry, log at DEBUG, and drop the
+        beam on the floor - which is exactly the failure it exists to have
+        fixed, and a stub would have hidden it from this test. Everything except
+        the dice is therefore the real thing: the real ``add_beam``, the real
+        ``beams`` list, the real ``MAX_BEAMS`` cap.
+        """
+
+        def __init__(self, seq: list[float]) -> None:
+            super().__init__(seed=0)
+            self.seq = list(seq)
+            self.n = 0
+
+        def roll(self, lo: float = 0.0, hi: float = 1.0) -> float:
+            v = self.seq[self.n % len(self.seq)]
+            self.n += 1
+            return float(v)
+
+    w3 = _World()
+    gunner = Stickman(id=20, name="Dax", x=300.0, y=600.0)
+    gunner.weapon = WEAPON_BFG
+    gunner.relic = RELIC_BFG
+    w3.agents.append(gunner)
+    near_wolf = _Animal("wolf", 500.0)
+    far_wolf = _Animal("wolf", 560.0)          # further than the target
+    behind = _Animal("bear", 150.0)            # the other way down the line
+    beyond = _Animal("wolf", 300.0 + BFG_RANGE + 60.0)
+    w3.animals.extend([near_wolf, far_wolf, behind, beyond])
+    bystander = Stickman(id=21, name="Eli", x=540.0, y=600.0)     # in the line
+    overhead = Stickman(id=22, name="Fay", x=480.0, y=470.0)      # 130 px up
+    w3.agents.extend([bystander, overhead])
+
+    # THE BEAM HAS WIDTH - the geometry half of Fix 2. _beam_stop used to return
+    # the first sample where the AXIS met the ground, cutting the shot off with
+    # its whole upper half still in clear air, while every other part of the
+    # mechanic treated the shot as a BFG_CORRIDOR-wide lane. On this flat world
+    # a shot from a 20 px shoulder at a wolf's centre 6.5 px up is angled down
+    # and the hairline rule killed it at ~292 px of a nominal 420. The rule is
+    # now "the hill fills the beam", not "the hill touches its axis", which is
+    # +132 px of median reach on real terrain. See _beam_stop.
+    assert _beam_stop(w3, 300.0, 500.0, 1.0, 0.0, BFG_RANGE) == BFG_RANGE
+
+    def _stop_for(corr: float) -> float:
+        sx0, sy0, sx1, sy1 = _beam_ends(gunner, w3, near_wolf)
+        _d = math.hypot(sx1 - sx0, sy1 - sy0) or 1.0
+        return _beam_stop(w3, sx0, sy0, (sx1 - sx0) / _d, (sy1 - sy0) / _d,
+                          BFG_RANGE, corridor=corr)
+
+    _hairline, _lane = _stop_for(0.0), _stop_for(BFG_CORRIDOR)
+    print(f"beam stop, wolf 200 px off: hairline={_hairline:.0f}px  "
+          f"corridor={_lane:.0f}px  (BFG_RANGE {BFG_RANGE:.0f})")
+    assert _hairline < BFG_RANGE * 0.8, ("the hairline rule used to bury it",
+                                         _hairline)
+    assert _lane >= BFG_RANGE - 1e-6, ("the corridor bought no range", _lane)
+    # A wider sweep has to get a correspondingly generous stop, or the two
+    # halves of one beam disagree about where it ends.
+    assert _stop_for(BFG_CORRIDOR * 2.0) >= _lane
+
+    # ...and on a hillside, which is where the change actually pays and where a
+    # colony actually stands. Ground rising 1 px in 10 swallows a hairline beam
+    # from a 20 px shoulder after 200 px; the same beam is BFG_CORRIDOR thick,
+    # so the hill has to climb another 22 px to fill it and the shot carries
+    # twice as far. Everyone standing on that stretch was previously out of
+    # range of a beam whose corridor would happily have caught them.
+    class _Slope:
+        def ground_y(self, x: float) -> float:
+            return 600.0 - max(0.0, (float(x) - 300.0) * 0.1)
+
+        def slope(self, x: float) -> float:
+            return 0.1
+
+    _hill = _World()
+    _hill.terrain = _Slope()
+    _up_hair = _beam_stop(_hill, 300.0, 580.0, 1.0, 0.0, BFG_RANGE, corridor=0.0)
+    _up_lane = _beam_stop(_hill, 300.0, 580.0, 1.0, 0.0, BFG_RANGE)
+    print(f"level beam into a 1-in-10 rise: hairline={_up_hair:.0f}px  "
+          f"corridor={_up_lane:.0f}px")
+    assert 180.0 <= _up_hair <= 210.0, _up_hair
+    assert _up_lane > _up_hair * 1.9, (_up_hair, _up_lane)
+
+    x0, y0, tx, ty = _beam_ends(gunner, w3, near_wolf)
+    swept = beam_sweep(w3, gunner, x0, y0, tx, ty)
+    print("beam sweep:", [(getattr(o, "name", getattr(o, "kind", "?")), s)
+                          for o, s in swept])
+    hit_set = {id(o) for o, _ in swept}
+    assert id(near_wolf) in hit_set and id(far_wolf) in hit_set, "not a line kill"
+    assert id(bystander) in hit_set, "a colonist in the beam was spared"
+    assert id(behind) not in hit_set, "the beam fired backwards"
+    assert id(beyond) not in hit_set, "the beam outranged BFG_RANGE"
+    assert id(overhead) not in hit_set, "the corridor is not a corridor"
+    assert id(gunner) not in hit_set, "the wielder shot themselves in the line"
+
+    # A colonist in the corridor: hold fire unless the heedless roll says
+    # otherwise. 0.5 misses BFG_MISFIRE and misses BFG_HEEDLESS.
+    w3.relics = _Rolls([0.5])
+    out = _bfg_shoot(gunner, w3, near_wolf)
+    print("friendly in the line:", out, "| wolf alive:", near_wolf.alive)
+    assert out["shot"] == "held", out
+    assert near_wolf.alive and bystander.alive, "held fire and shot anyway"
+
+    # ...and heedless: 0.5 (no misfire), then 0.0 (< BFG_HEEDLESS, fire).
+    w3.relics = _Rolls([0.5, 0.0])
+    gunner.__dict__["_bfg_next"] = 0.0
+    out = _bfg_shoot(gunner, w3, near_wolf)
+    print("heedless:", out, "| beams handed to render:", len(w3.relics.beams))
+    assert out["shot"] == "fired" and out["heedless"] is True, out
+    assert not near_wolf.alive and not far_wolf.alive, "the line did not clear"
+    assert not bystander.alive, "a colonist stood in a BFG beam and lived"
+    assert bystander.death_cause == CAUSE_DISINTEGRATED, bystander.death_cause
+    assert out["friends"] == ["Eli"], out
+    assert behind.alive and beyond.alive and overhead.alive, "hit outside the line"
+    assert w3.stats.get("animals_killed") == 2, w3.stats
+    # ...and render was told. Asserted against the RELIC REGISTRY, which is the
+    # list render prefers and the only one _record_beam writes to - there is no
+    # world.bfg_beams any more and there must not be, because a second list
+    # would be a second ageing rule that nothing ticks. Asserting on the old
+    # name is what made `python -m backgrounded.sim.combat_actions` exit 1.
+    assert w3.relics.beams, "render was told nothing about the shot"
+    assert not w3.relics.beams[-1]["misfire"], w3.relics.beams[-1]
+    assert any("did not care who was in front" in ln for ln in w3.lines), w3.lines
+
+    # THE HEADLINE REQUIREMENT: "wipes out all stickmen in the direction that
+    # the bfg9000 was fired ... could possibly leave a single stickman."
+    # Four colonists queued down one line, one heedless shot, one survivor - the
+    # wielder. Measured before the aim was levelled, over 246 forced shots, the
+    # most this weapon had EVER killed was one, and the corridor had never held
+    # two: the beam was angled into the dirt and died a little past the first
+    # target. See _beam_ends.
+    w8 = _World()
+    w8.relics = _Rolls([0.5, 0.0])
+    ace = Stickman(id=50, name="Nyx", x=200.0, y=600.0)
+    ace.weapon, ace.relic = WEAPON_BFG, RELIC_BFG
+    w8.agents.append(ace)
+    w8.agents.extend(Stickman(id=51 + i, name=f"Row{i}",
+                              x=320.0 + i * 60.0, y=600.0) for i in range(4))
+    w8.animals.append(_Animal("wolf", 200.0 + BFG_RANGE - 40.0))
+    out = _bfg_shoot(ace, w8, w8.animals[0])
+    standing = [a.name for a in _alive_agents(w8)]
+    print(f"four in the line: {out} | left standing: {standing}")
+    assert out["shot"] == "fired" and out["heedless"] is True, out
+    assert len(out["friends"]) == 4, out
+    assert standing == ["Nyx"], standing
+    assert w8.stats.get("bfg_friendly_deaths") == 4, w8.stats
+    assert any("were in the light" in ln for ln in w8.lines), w8.lines
+    assert any("One stickman is left standing" in ln for ln in w8.lines), w8.lines
+
+    # Dragonscale walks out of the beam; leather does not. This is the one
+    # interaction BFG_DAMAGE = MAX_HEALTH * 9.0 exists for.
+    w4 = _World()
+    w4.relics = _Rolls([0.5, 0.0])
+    shooter = Stickman(id=23, name="Gil", x=300.0, y=600.0)
+    shooter.weapon = WEAPON_BFG
+    scaled = Stickman(id=24, name="Hana", x=520.0, y=600.0)
+    scaled.armour = 1.0                     # ARMOUR_DRAGONSCALE
+    leathered = Stickman(id=25, name="Ivo", x=560.0, y=600.0)
+    leathered.armour = ARMOUR_LEATHER
+    w4.agents.extend([shooter, scaled, leathered])
+    w4.animals.append(_Animal("wolf", 700.0))
+    _bfg_shoot(shooter, w4, w4.animals[0])
+    print(f"through armour: dragonscale {scaled.health:.0f} hp alive={scaled.alive}"
+          f" | leather {leathered.health:.0f} hp alive={leathered.alive}")
+    assert scaled.alive and abs(scaled.health - 10.0) < 1e-6, scaled.health
+    assert not leathered.alive, "leather survived a BFG beam"
+
+    # THE MISFIRE, AS CORRECTED - EXACTLY ONE DEATH AND IT IS THE WIELDER'S.
+    #
+    # This block used to assert the PRE-CORRECTION spec: a 70 px blast that
+    # killed ``close_friend`` and ``near_beast`` and spared anybody past
+    # ``BFG_BLAST_R``. The author corrected that to wielder-only - "just
+    # himself" - and _bfg_misfire was changed, but the test was not, so it sat
+    # here red, defending the behaviour that had been rejected. A red test
+    # asserting a rejected spec is worse than no test: the obvious way to make
+    # it pass is to put the blast back.
+    #
+    # ``close_friend`` stands 40 px away, well inside the old radius, and the
+    # requirement is now that they LIVE. ``BFG_BLAST_R`` is still imported and
+    # still used - render/items draws the flash at that size - so the number is
+    # kept in the geometry here to prove the light is 70 px wide and the damage
+    # is not. The relic must also be gone BEFORE anybody dies, or a wielder who
+    # kills themselves with it drops it again through World._reap_dead.
+    w5 = _World()
+    w5.relics = _Rolls([0.0])               # < BFG_MISFIRE
+    boom = Stickman(id=26, name="Jed", x=300.0, y=600.0)
+    boom.weapon = WEAPON_BFG
+    boom.relic = RELIC_BFG
+    close_friend = Stickman(id=27, name="Kit", x=340.0, y=600.0)     # 40 px
+    clear_friend = Stickman(id=28, name="Lum", x=300.0 + BFG_BLAST_R + 30.0,
+                            y=600.0)
+    w5.agents.extend([boom, close_friend, clear_friend])
+    near_beast = _Animal("wolf", 330.0)
+    w5.animals.append(near_beast)
+    out = _bfg_shoot(boom, w5, near_beast)
+    print("misfire:", out, f"| wielder alive={boom.alive} weapon={boom.weapon!r} "
+          f"relic={getattr(boom, 'relic', '')!r} "
+          f"| 40px away: {close_friend.name} alive={close_friend.alive}")
+    assert out["shot"] == "misfire", out
+    assert out["friends"] == ["Jed"] and out["kills"] == 0, out
+    assert boom.weapon == WEAPON_NONE and getattr(boom, "relic", "") == RELIC_NONE
+    assert not boom.alive, "the wielder walked away from their own misfire"
+    assert close_friend.alive, "a misfire took the neighbour: that spec was rejected"
+    assert clear_friend.alive, "a misfire took a bystander"
+    assert near_beast.alive, "a misfire is not a shot; it killed an animal"
+    assert [a.name for a in w5.agents if not a.alive] == ["Jed"], \
+        "a misfire is exactly one death and it is the wielder's"
+    assert w5.stats.get("bfg_shots") is None, "a misfire counted as a shot fired"
+    assert w5.stats.get("bfg_misfires") == 1, w5.stats
+    assert w5.relics.beams and w5.relics.beams[-1]["misfire"], w5.relics.beams
+    assert any("comes apart" in ln for ln in w5.lines), w5.lines
+
+    # No relic stream means no shot. There is no fallback RNG anywhere in this
+    # feature - see _relic_roll.
+    w6 = _World()
+    solo = Stickman(id=29, name="Mab", x=300.0, y=600.0)
+    solo.weapon = WEAPON_BFG
+    w6.agents.append(solo)
+    w6.animals.append(_Animal("wolf", 500.0))
+    assert _bfg_shoot(solo, w6, w6.animals[0])["shot"] == "nostream"
+    assert w6.animals[0].alive, "fired without a seeded stream"
+
+    # --- the rates, against a real seeded stream ---------------------------
+    _rng = _random.Random(90210)
+
+    class _RngRolls:
+        def roll(self, lo: float = 0.0, hi: float = 1.0) -> float:
+            return _rng.uniform(lo, hi)
+
+    def _rate_run(with_bystander: bool, n: int) -> dict[str, int]:
+        wr = _World()
+        wr.relics = _RngRolls()
+        g = Stickman(id=30, name="Rue", x=300.0, y=600.0)
+        wr.agents.append(g)
+        beast = _Animal("wolf", 520.0)
+        wr.animals.append(beast)
+        friend = Stickman(id=31, name="Sol", x=600.0, y=600.0)
+        if with_bystander:
+            wr.agents.append(friend)
+        tally: dict[str, int] = {}
+        for _ in range(n):
+            g.alive, g.health = True, MAX_HEALTH
+            g.weapon, g.relic = WEAPON_BFG, RELIC_BFG
+            g.__dict__["_bfg_next"] = 0.0
+            friend.alive, friend.health = True, MAX_HEALTH
+            beast.alive, beast.health = True, beast.max_health
+            shot = _bfg_shoot(g, wr, beast)["shot"]
+            tally[shot] = tally.get(shot, 0) + 1
+        return tally
+
+    N = 4000
+    clear_tally = _rate_run(False, N)
+    mis = clear_tally.get("misfire", 0) / N
+    print(f"clear line, {N} shots: {clear_tally} -> misfire {mis:.3%} "
+          f"(BFG_MISFIRE {BFG_MISFIRE:.0%})")
+    assert 0.06 < mis < 0.10, mis
+    assert clear_tally.get("held", 0) == 0, "held fire with nobody in the way"
+
+    blocked = _rate_run(True, N)
+    fired = blocked.get("fired", 0)
+    held = blocked.get("held", 0)
+    heed = fired / max(1, fired + held)
+    print(f"friendly in the line, {N} shots: {blocked} -> heedless {heed:.3%} "
+          f"(BFG_HEEDLESS {BFG_HEEDLESS:.0%})")
+    assert 0.17 < heed < 0.23, heed
+    assert 0.06 < blocked.get("misfire", 0) / N < 0.10, blocked
+
+    # --- scoring and the flee gate -----------------------------------------
+    w7 = _World()
+    w7.relics = _Rolls([0.5])
+    carrier = Stickman(id=40, name="Nia", x=300.0, y=600.0)
+    carrier.weapon = WEAPON_BFG
+    w7.agents.append(carrier)
+    prowler = _Animal("wolf", 300.0 + FLEE_RADIUS - 20.0)   # inside FLEE_RADIUS
+    w7.animals.append(prowler)
+    sc = score_combat(carrier, w7)
+    print("bfg carrier, wolf at 90px:", {k: round(v, 2) for k, v in sc.items()})
+    assert sc["FleeAnimal"] == 0.0, "the carrier ran from something it can shoot"
+    assert sc["FireBfg"] > 0.95, sc
+    assert sc["FightAnimal"] == 0.0 and sc["ThrowSpear"] == 0.0, \
+        "a bfg carrier tried to use a spear it does not have"
+    # ...but a wounded one still runs, and a child never fights.
+    carrier.health = MAX_HEALTH * 0.2
+    hurt_sc = score_combat(carrier, w7)
+    assert hurt_sc["FireBfg"] == 0.0 and hurt_sc["FleeAnimal"] > 0.9, hurt_sc
+    carrier.health = MAX_HEALTH
+    carrier.role = "child"
+    assert score_combat(carrier, w7)["FireBfg"] == 0.0
+    assert score_combat(carrier, w7)["FleeAnimal"] > 0.9, "a child stood its ground"
+    carrier.role = "gatherer"
+    # An agent with no gun scores exactly 0.0 and therefore draws no tiebreak
+    # from world.pyrng - which is what keeps a relic-free colony bit-identical
+    # to the build that shipped before relics existed.
+    assert score_combat(hunter, w2)["FireBfg"] == 0.0
+
+    # and the whole action end to end, through Action.update
+    act = make_combat_action("FireBfg", carrier, w7)
+    assert act is not None and act.kind == "FireBfg", act
+    w7.relics = _Rolls([0.5, 0.0])
+    for _ in range(int(30 * 6)):
+        act.update(carrier, w7, dt)
+        if act.finished:
+            break
+    print("FireBfg:", act, "| wolf alive:", prowler.alive)
+    assert act.done and act.data.get("shot") == "fired", act.data
+    assert not prowler.alive, "the action never actually fired"
+    assert not _bfg_ready(carrier, w7), "the gun did not cool down"
+
+    # --- CraftSpear must never write over the wyrm-gun ----------------------
+    # ``agent.weapon`` is one slot. A colonist who found the BFG and then
+    # decided to whittle a spear had WEAPON_BFG replaced by WEAPON_SPEAR with
+    # nothing anywhere to notice: relic still read "bfg9000", _bfg() said no,
+    # and the rarest item in the game was gone. Two lines to reproduce, which is
+    # how long it stayed latent - no BFG had ever dropped in natural play.
+    w9 = _World()
+    w9.structures.create("stockpile", 600.0, 600.0, built=True)
+    w9.stockpile.update({RES_WOOD: 20, RES_STONE: 20})
+    keeper = Stickman(id=60, name="Osk", x=560.0, y=600.0)
+    keeper.weapon, keeper.relic = WEAPON_BFG, RELIC_BFG
+    w9.agents.append(keeper)
+    assert _can_afford(w9, SPEAR_COST), "the guard has to be tested with wood in"
+    assert score_combat(keeper, w9)["CraftSpear"] == 0.0, "scored a spear over the gun"
+    assert make_combat_action("CraftSpear", keeper, w9) is None, "built one anyway"
+    # ...and the third door: a save rehydrated mid-craft never passes back
+    # through either of those, so the handler and _craft_apply refuse too.
+    resumed = make_action("CraftSpear", phase="work", wt=CRAFT_SPEAR_TIME + 1.0)
+    resumed.update(keeper, w9, dt)
+    _craft_apply("CraftSpear", keeper)
+    print(f"craft-over-relic: weapon={keeper.weapon!r} relic={getattr(keeper,'relic','')!r}")
+    assert keeper.weapon == WEAPON_BFG and keeper.relic == RELIC_BFG, \
+        "CraftSpear overwrote the wyrm-gun"
+    # RetrieveSpear is the SECOND path to the same slot - constants.py's note on
+    # WEAPON_BFG names both - and it ends in the same bare assignment. A carrier
+    # must not trade the gun for a stick lying in the dirt.
+    w9.spears = SpearRegistry(seed=5)
+    w9.spears.add(Spear(id=1, x=580.0, y=600.0, state=STATE_GROUND))
+    assert w9.spears.on_ground(), "the fixture put no spear on the ground"
+    assert _retrievable_spear(keeper, w9) is None, "walked off to swap the gun"
+    assert score_throw(keeper, w9)["RetrieveSpear"] == 0.0
+    lift = make_action("RetrieveSpear", phase="take", target=1)
+    lift.update(keeper, w9, dt)
+    assert keeper.weapon == WEAPON_BFG, "RetrieveSpear overwrote the wyrm-gun"
+    assert w9.spears.on_ground(), "took the spear and threw it away"
+
+    # An ordinary unarmed colonist is unaffected by either gate: it is
+    # _combat_capable, which is exactly _armed for anybody who has never held a
+    # relic.
+    plain = Stickman(id=61, name="Pell", x=560.0, y=600.0)
+    w9.agents.append(plain)
+    assert score_combat(plain, w9)["CraftSpear"] > 0.0, "broke ordinary crafting"
+    assert make_combat_action("CraftSpear", plain, w9) is not None
+    assert _retrievable_spear(plain, w9) is not None, "broke ordinary retrieval"
+    assert score_throw(plain, w9)["RetrieveSpear"] > 0.0
+
+    # --- a real World: the death has to be a real death ---------------------
+    from .world import World as _World_
+
+    rw = _World_(seed=5)
+    rw.ufo.next_in = 1e9                    # no second event in the books
+    rw.relics = _Rolls([0.5, 0.0])
+    crowd = rw.population.alive_agents()
+    shooter2, victim2 = crowd[0], crowd[1]
+    shooter2.weapon = WEAPON_BFG
+    shooter2.relic = RELIC_BFG
+    for gap in (90.0, 120.0, 150.0, 180.0, -90.0, -120.0, -150.0):
+        victim2.x = _clamp_x(shooter2.x + gap)
+        victim2.y = rw.terrain.ground_y(victim2.x)
+        bx0, by0, btx, bty = _beam_ends(shooter2, rw, victim2)
+        if any(o is victim2 for o, _ in beam_sweep(rw, shooter2, bx0, by0, btx, bty)):
+            break
+    before = rw.reconcile()
+    died_before = rw.stats["died"]
+    assert before["ok"] == 1 and before["residual"] == 0, before
+    out = _bfg_shoot(shooter2, rw, victim2)
+    for _ in range(int(30 * 12)):
+        rw.tick(dt)
+    after = rw.reconcile()
+    graves = [g for g in rw.props.all_of("grave")
+              if str(getattr(g, "state", {}).get("name", "")) == victim2.name]
+    print(f"real world: {out} | {victim2.name} alive={victim2.alive} "
+          f"cause={victim2.death_cause!r} died {died_before}->{rw.stats['died']} "
+          f"graves for them={len(graves)} residual={after['residual']}")
+    assert out["shot"] == "fired", out
+    assert not victim2.alive and victim2.death_cause == CAUSE_DISINTEGRATED
+    assert rw.stats["died"] > died_before, "a beam death went uncounted"
+    assert graves, "a beam death got no grave"
+    assert after["ok"] == 1 and after["residual"] == 0, after
 
     # --- registration / round-trip -----------------------------------------
     for kind in COMBAT_ACTION_KINDS:
