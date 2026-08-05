@@ -5,9 +5,44 @@ Nothing in here may import pygame - `sim/` must stay headless-importable.
 from __future__ import annotations
 
 # ---------------------------------------------------------------- geometry --
+#: How much land exists, in px. Until now this WAS ``RENDER_W``: the world and
+#: the frame were the same object because they had always been the same number,
+#: and 201 uses of ``RENDER_W`` across the codebase silently meant one or the
+#: other. They are now separate. Anything that clamps a position, sites a spawn,
+#: sizes the heightmap or scatters scenery means THIS one.
+WORLD_W = 6400
+
+#: The camera, and the wallpaper image. Deliberately UNCHANGED at 1600x1000:
+#: shell/wallpaper.py resizes the render surface onto the desktop with no aspect
+#: correction, and the user picked this shape over a larger frame for exactly
+#: that reason. Anything drawn - parallax, sky, HUD anchors, screen-space
+#: effects, culling, the letterbox - means THIS one.
 RENDER_W = 1600
 RENDER_H = 1000
 RENDER_SIZE = (RENDER_W, RENDER_H)
+
+#: World px per frame px, i.e. how much more land there is than there used to
+#: be. The single multiplier for anything authored as a count-PER-MAP: prop
+#: scatter, terrain feature cells, landmark carving. NOT for anything authored
+#: per-colonist, per-second or per-frame - multiplying a rate by this puts four
+#: times the events on the map and still shows you the same number of them,
+#: because three quarters of them are off-camera.
+WORLD_SCALE = WORLD_W / RENDER_W          # 4.0
+
+#: Half the camera, in world px. The world is wider than the view, but the view
+#: is always centred on the colony, so ``|x - colony_center()| <= STAGE_HALF``
+#: is "on screen" without sim/ ever learning that a camera exists. This is the
+#: third meaning RENDER_W used to carry and the easiest one to lose: code that
+#: meant "somewhere the player can see" reads identically to code that meant
+#: "somewhere on the map", and on a 1600 px world both were true.
+STAGE_HALF = RENDER_W * 0.5               # 800.0
+
+#: ...and its complement: far enough from the colony that nothing can be seen
+#: there, whatever the camera is doing. Where animals walk in from and leave by,
+#: where a dragon's airborne leg lives, where barricades stand. The 160 px of
+#: slack over STAGE_HALF is the camera's own DEADZONE, so a spawn placed here
+#: cannot pop into view because the camera happened to be mid-ease.
+OFFSTAGE = STAGE_HALF + 160.0             # 960.0
 
 # ------------------------------------------------------------------ timing --
 SIM_HZ = 30                 # fixed sim timestep
@@ -206,7 +241,14 @@ LITTER_DROP_SEC = 200.0
 #: longer reach (the far side of a chasm) would otherwise sit at the cap forever
 #: and stop littering where it actually lives, and the feature would go quiet on
 #: exactly the maps that are most interesting.
-LITTER_MAX = 120
+#:
+#: 120 -> 240 with MAX_POP 10 -> 20. Litter is dropped per-person-per-time, so
+#: twice the roster is twice the drop rate and the old cap would be hit twice as
+#: fast and then pin there - the failure mode the recycling note above describes,
+#: made permanent. Doubled and NOT quadrupled: the wider map does not make
+#: anybody drop more, and the number the cap is defending is the O(n) prop tick,
+#: which is a headcount cost rather than an area one.
+LITTER_MAX = 240
 
 #: Litter does **not** decay. A timer that quietly deleted it would be doing the
 #: colony's job for it: the whole point of the feature is that mess accumulates
@@ -343,7 +385,13 @@ UFO_WRECK_RESPAWN = 2400.0
 #: - the number is allowed to fall, and a colony with food, shelter and morale
 #: grows back on its own. A fixed headcount made every disaster consequence-free.
 MIN_POP = 2                     # below this, newcomers arrive to save the line
-MAX_POP = 10
+#: Raised 10 -> 20. Things that key off this and are worth knowing: the HUD
+#: roster draws one two-line block per living colonist, so a full house is a
+#: 588 px panel (941 px at the default 1.6 HUD scale) against a 1000 px frame -
+#: it fits, with less room than before. POP_PER_HUT means a full colony now
+#: wants roughly twice the huts, and FOOD_PER_HEAD_TO_GROW scales per head, so
+#: the food bar to keep growing rises with the cap rather than staying flat.
+MAX_POP = 20
 POP_BIRTH_COOLDOWN = 95.0       # min seconds between new arrivals
 #: Stored food per existing colonist needed before they will take on another
 #: mouth. Scales with headcount, so growth slows as the colony gets big.
@@ -430,6 +478,30 @@ FARM_TILL_SEC = 6.0         # planting a new crop
 MINE_YIELD_STONE = 2        # stone per mining yield tick
 MINE_YIELD_SEC = 4.0        # seconds of digging per yield
 MINE_SESSION_SEC = 24.0     # how long a miner works one spot before moving on
+
+#: Where a quarry is allowed to be. Mining is not a neutral act: every yield tick
+#: calls Terrain.deform through _dig_divot and lowers the ground it happens on,
+#: and the site used to be simply the NEAREST stone column to whoever decided to
+#: dig - which is to say, under the settlement, because that is where everybody
+#: stands. A colony therefore spent the evening excavating its own floor, and
+#: this is the same mechanism that once cut agents off from ground they needed
+#: (see the crossing director, which exists to build a way back).
+#:
+#: So a quarry is sited AWAY from home and TOWARD an edge. The keep-out is
+#: measured from the colony centre; the edge preference reuses the band the
+#: barricades already think in, so "the edge of the map" means one thing in this
+#: codebase rather than two.
+MINE_KEEP_OUT = 320.0       # px from colony_center() a quarry may not open
+#: How far a miner will walk to reach a legal site. Generous, because the whole
+#: point is to send them out of town, and bounded, because a colony whose stone
+#: is all on the far side of the map should still mine rather than march.
+MINE_MAX_WALK = 900.0
+#: Relative pull of "near an edge" against "close to where I am standing" when
+#: ranking legal columns. Edge dominates - that is the request - but the walk
+#: term is not zero, or two equally good edges would send miners across the whole
+#: map on a coin flip and the colony would watch its quarrymen commute.
+MINE_EDGE_WEIGHT = 1.0
+MINE_WALK_WEIGHT = 0.35
 
 # ------------------------------------------------------------- defense -----
 #: Spiked barricades the colony raises near the world's edges - where animals

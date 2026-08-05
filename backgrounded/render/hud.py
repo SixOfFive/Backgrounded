@@ -1014,6 +1014,85 @@ def _wrap(text: str, max_w: int, size: int) -> list[str]:
 LOG_W = 360
 LOG_LINES = 10
 
+#: Colour for a chronicle entry that is a death or a taking, and one that is a
+#: birth or a homecoming. Everything else stays the ordinary grey - if half the
+#: log is coloured, none of it is emphasis.
+LOG_LOSS = BAD
+LOG_GAIN = GOOD
+
+
+def _template_res(keys) -> "list[Any]":
+    """Regexes matching any rendered form of the named event templates.
+
+    Built from ``sim.names.EVENT_TEMPLATES``, which is the actual source of
+    these lines, rather than from a hand-written keyword list. Keywords looked
+    tempting and are a trap here: "The cold took {name}" is a death and "The
+    lights take hold of {name}" is an abduction, and a matcher keyed on "took"
+    or "take" cannot tell a colonist freezing from the ufo arriving. Deriving
+    from the templates also means a new death line written next year is coloured
+    without anyone remembering this file exists.
+
+    ``_tidy`` capitalises the first letter and adds a full stop, so matching is
+    case-insensitive and unanchored at the end.
+    """
+    import re
+    out = []
+    try:
+        from ..sim.names import EVENT_TEMPLATES
+    except Exception:
+        log.debug("chronicle templates unavailable; log stays monochrome",
+                  exc_info=True)
+        return out
+    for key in keys:
+        for tmpl in EVENT_TEMPLATES.get(key, ()) or ():
+            # {name}/{where}/{cause}/{parent}/{other} -> "something non-empty".
+            pat = re.sub(r"\\\{[a-z_]+\\\}", ".+?", re.escape(str(tmpl)))
+            try:
+                out.append(re.compile(r"^\s*" + pat.rstrip("\\.") , re.I))
+            except re.error:
+                continue
+    return out
+
+
+def _extra_res(patterns) -> "list[Any]":
+    import re
+    return [re.compile(p, re.I) for p in patterns]
+
+
+#: Deaths come from the died_* family. The taking does NOT - ufo.py writes it as
+#: a plain f-string - so it is listed explicitly, and so are the events on the
+#: other side that no template covers: the founding party, the ufo handing
+#: somebody back, and the cairnstone raising one of the dead.
+_LOSS_RES = _template_res([k for k in
+                           ("died", "died_age", "died_cold", "died_disintegrated",
+                            "died_fall", "died_fire", "died_flood", "died_hunger",
+                            "died_lightning", "died_meteor", "died_mudslide",
+                            "died_quake")]) + _extra_res([
+    r"^\s*.+? is taken by the lights",
+])
+_GAIN_RES = _template_res(["born", "arrived"]) + _extra_res([
+    r"^\s*A group of \d+ arrives",
+    r"^\s*The lights give .+? back",
+    r"sets the wyrm's stone on the grave",
+    r"^\s*The wyrm's stone goes down on a grave",
+])
+
+
+def _log_tone(text: str) -> "tuple[int, int, int] | None":
+    """LOG_LOSS, LOG_GAIN, or None for an ordinary line. Never raises."""
+    try:
+        s = str(text)
+        for rx in _LOSS_RES:
+            if rx.search(s):
+                return LOG_LOSS
+        for rx in _GAIN_RES:
+            if rx.search(s):
+                return LOG_GAIN
+    except Exception:
+        pass
+    return None
+
+
 _log_cache: pygame.Surface | None = None
 _log_key: tuple | None = None
 
@@ -1044,13 +1123,18 @@ def draw_log(surf: pygame.Surface, world, n: int = LOG_LINES,
 def _build_log(tail: list) -> "pygame.Surface | None":
     # Strip the "[day N] " stamp the chronicle prepends - the log is tight on
     # width and the day is already implied by order.
-    lines: list[str] = []
+    # (text, tone) per ROW, not per entry: the tone has to survive the wrap or a
+    # death long enough to take two lines would be red on the first and grey on
+    # the second. Classified once per entry, before wrapping, because half a
+    # sentence does not match a template.
+    lines: list[tuple[str, tuple[int, int, int] | None]] = []
     for entry in tail:
         text = str(entry)
         if "] " in text:
             text = text.split("] ", 1)[1]
+        tone = _log_tone(text)
         wrapped = _wrap(text, LOG_W - PAD * 2, 11)
-        lines.extend(wrapped[:2])          # a single event never eats the log
+        lines.extend((w, tone) for w in wrapped[:2])   # one event never eats the log
 
     lines = lines[-(LOG_LINES + 4):]       # cap total rows after wrapping
     if not lines:
@@ -1064,10 +1148,15 @@ def _build_log(tail: list) -> "pygame.Surface | None":
 
     y = PAD
     total = len(lines)
-    for i, ln in enumerate(lines):
-        # Oldest at the top, dimmest; newest at the bottom, brightest.
+    for i, (ln, tone) in enumerate(lines):
+        # Oldest at the top, dimmest; newest at the bottom, brightest. The age
+        # fade multiplies the tone rather than replacing it, so an old death is
+        # a dim red and not a grey line - the colour is what the entry IS, and
+        # the brightness is how recent it is. Those are two different facts and
+        # the log shows both at once.
         f = 0.45 + 0.55 * (i + 1) / total
-        col = (int(DIM[0] * f), int(DIM[1] * f), int(DIM[2] * f))
+        base = tone if tone is not None else DIM
+        col = (int(base[0] * f), int(base[1] * f), int(base[2] * f))
         panel.blit(_text(ln, col, 11), (PAD, y))
         y += row
     return panel

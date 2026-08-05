@@ -236,7 +236,7 @@ except ImportError:                     # pragma: no cover - trivial
     RELIC_NONE = ""
     RELIC_FETCH_RANGE = 520.0
     RELIC_PICKUP_R = 18.0
-    MAX_POP = 10
+    MAX_POP = 20                        # keep in step with constants.MAX_POP
     BFG_RANGE = 420.0
     BFG_MIN_RANGE = 34.0                # == throwing.THROW_MIN_RANGE
     BFG_CORRIDOR = 22.0

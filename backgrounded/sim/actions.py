@@ -33,7 +33,11 @@ from ..constants import (
     MAT_STONE,
     MAX_SLOPE_CLIMB,
     MAX_SLOPE_WALK,
+    MINE_EDGE_WEIGHT,
+    MINE_KEEP_OUT,
+    MINE_MAX_WALK,
     MINE_SESSION_SEC,
+    MINE_WALK_WEIGHT,
     MINE_YIELD_SEC,
     MINE_YIELD_STONE,
     RENDER_H,
@@ -47,6 +51,35 @@ from ..constants import (
     WALK_SPEED,
 )
 from .entities import GROUND_SNAP, STEP_DROP_MAX
+
+# ---------------------------------------------------------------- geometry --
+# RENDER_W used to mean two things at once because the world and the view were
+# the same 1600 px. They are not any more: WORLD_W is how much land exists,
+# RENDER_W is the camera (and the wallpaper image, which does not change size).
+# Almost every RENDER_W in `sim/` meant the world and becomes WORLD_W.
+#
+# The exception is the third meaning, which is why STAGE_HALF/OFFSTAGE exist and
+# why `stage_bounds`/`offstage_x` below are in this module: a fair amount of sim
+# code means "somewhere a viewer can see" or "far enough away that nobody can".
+# `sim/` must not learn that a camera exists - but it does not have to. The
+# camera is RENDER_W wide and centred on the colony, so anything within
+# STAGE_HALF of colony_center() is on screen by construction and anything past
+# OFFSTAGE is off it. Both derive from colony_center() and the seeded stream, so
+# determinism is untouched and no sim -> render dependency is created.
+#
+# The try/except is a landing-order shim, NOT a design: constants.py belongs to
+# another lane this pass, so an unguarded import would make this module
+# unimportable until that lane lands. Drop the guard once constants.py carries
+# these names. The fallbacks are defined exactly ONCE, here - behavior.py imports
+# them back out of this module rather than restating 6400 and drifting from it,
+# which is the failure MAX_POP's duplicate in combat_actions.py already had.
+try:
+    from ..constants import OFFSTAGE, STAGE_HALF, WORLD_SCALE, WORLD_W
+except ImportError:                                       # pragma: no cover
+    WORLD_W = 6400
+    WORLD_SCALE = WORLD_W / RENDER_W                      # 4.0
+    STAGE_HALF = RENDER_W * 0.5                           # 800.0
+    OFFSTAGE = STAGE_HALF + 160.0                         # 960.0
 
 #: Ground drop, in px, that counts as a ledge rather than a slope. Roughly a
 #: body height: below this a stickman steps down, above it they have to climb
@@ -110,6 +143,18 @@ HARVEST_TIME = 1.6          # seconds bent over a ripe crop before it is in hand
 MINE_DIVOT_MAX = 8.0
 MINE_DIVOT_PER = 1.3
 MINE_DIVOT_HALF = 12        # px each side of the dig point the divot spans
+#: px the working face steps along per yield, away from the colony. This is what
+#: makes the excavation a RAMP rather than a shaft: 6 px along for 1.3 px down is
+#: a gradient of about 0.22, comfortably inside MAX_SLOPE_WALK (0.9), so the cut
+#: stays something a laden villager walks out of. Set it much smaller and the
+#: face stops moving and you are digging a well again.
+MINE_FACE_STEP = 6.0
+#: The steepest ground a quarry may leave behind. Below MAX_SLOPE_CLIMB (2.6),
+#: which is where a fall turns lethal, with margin - and deliberately ABOVE
+#: MAX_SLOPE_WALK (0.9), because measuring found the flattest stone column
+#: outside a real settlement already at 1.60 and a walk-limit gate refused to
+#: dig anywhere on the map.
+MINE_SAFE_GRADIENT = 2.0
 SPEECH_SYMBOLS = ("?", "!", "~", "*", "+", "o", "^", "#")
 
 POSES: tuple[str, ...] = (
@@ -151,7 +196,8 @@ def _clamp01(v: float) -> float:
 
 
 def _clamp_x(x: float) -> float:
-    return _clamp(x, 4.0, float(RENDER_W - 4))
+    """Keep an x on the map. WORLD, not view - agents walk off camera all day."""
+    return _clamp(x, 4.0, float(WORLD_W - 4))
 
 
 def rng_of(world: Any) -> random.Random:
@@ -435,7 +481,62 @@ def colony_center(world: Any) -> float:
     ags = alive_agents(world)
     if ags:
         return float(sum(float(getattr(a, "x", 0.0)) for a in ags) / len(ags))
-    return RENDER_W * 0.5
+    # Nobody left to average: the middle of the WORLD, not of the frame. This
+    # is the value stage_bounds/offstage_x fall back to on an empty roster, and
+    # it is also what Camera.follow uses when it has nothing to follow, so the
+    # two agree on where "nowhere in particular" is.
+    return WORLD_W * 0.5
+
+
+def stage_bounds(world: Any) -> tuple[float, float]:
+    """``(lo, hi)`` - the slice of world the camera can be showing right now.
+
+    The camera is RENDER_W wide and centred on the colony, so everything inside
+    ``colony_center() +/- STAGE_HALF`` is on screen BY CONSTRUCTION. That lets
+    sim answer "somewhere a viewer will actually see" without knowing a camera
+    exists.
+
+    Use this for every site that used to be ``uniform(24, RENDER_W - 24)``. Those
+    were written when the world *was* the view; left as ``uniform(24, WORLD_W)``
+    they put three quarters of every lightning strike, meteor and mudslide on
+    empty hillside nobody is looking at, at four times the cost for the same
+    visible event count. Keep the RATE, narrow the SITING.
+
+    Clamped to the map, so a colony camped against x=0 still gets a real span.
+    """
+    c = colony_center(world)
+    lo = _clamp(c - STAGE_HALF, 0.0, float(WORLD_W))
+    hi = _clamp(c + STAGE_HALF, 0.0, float(WORLD_W))
+    if hi - lo < 1.0:               # only reachable if WORLD_W is degenerate
+        return 0.0, float(WORLD_W)
+    return lo, hi
+
+
+def offstage_x(world: Any, side: int, margin: float = 0.0) -> float:
+    """An x on *side* (-1 left, +1 right) that is guaranteed off camera.
+
+    Anything more than OFFSTAGE from the colony cannot be in frame, so this is
+    where things arrive from and leave by: an animal walking in, a dragon
+    spawning, a saucer parking between visits.
+
+    It replaces "the edge of the map", which meant the same thing only while the
+    map was one screen wide. On a 6400 px world the rim is up to 2600 px past
+    the last thing anyone can see - ~76 s of walking at WALK_SPEED, invisible,
+    while the creature holds a spawn slot the whole way.
+
+    *margin* pushes further out again and widens the clamp to match, so callers
+    that want a spawn point genuinely outside the map (dragons fly in) can ask
+    for one without the clamp quietly pulling it back onto the land.
+    """
+    s = 1.0 if (isinstance(side, (int, float)) and float(side) >= 0.0) else -1.0
+    try:
+        m = float(margin)
+        if not math.isfinite(m) or m < 0.0:
+            m = 0.0
+    except (TypeError, ValueError):
+        m = 0.0
+    return _clamp(colony_center(world) + s * (OFFSTAGE + m),
+                  -m, float(WORLD_W) + m)
 
 
 # ------------------------------------------------------------------ props ---
@@ -896,7 +997,7 @@ def _normalise_hazard(h: Any) -> dict[str, Any] | None:
             return None
         d: dict[str, Any] = {
             "kind": kind,
-            "x": float(x) if isinstance(x, (int, float)) else RENDER_W * 0.5,
+            "x": float(x) if isinstance(x, (int, float)) else WORLD_W * 0.5,
             "y": float(get("y", RENDER_H * 0.75) or RENDER_H * 0.75),
             "radius": float(radius) if isinstance(radius, (int, float)) else 70.0,
         }
@@ -1205,7 +1306,10 @@ def _uphill_dir(world: Any, x: float, probe: float = 60.0) -> float:
         return -1.0
     if right < left - 1.0:
         return 1.0
-    return 1.0 if x < RENDER_W * 0.5 else -1.0
+    # Dead flat: break the tie toward the middle of the WORLD rather than of the
+    # frame, so a panicked climb on featureless ground heads inland instead of
+    # off the far rim of a map that is now four screens wide.
+    return 1.0 if x < WORLD_W * 0.5 else -1.0
 
 
 def _work_rate(agent: Any) -> float:
@@ -2848,16 +2952,52 @@ def _h_farm(a: Action, ag: Any, w: Any, dt: float) -> None:
 # ===========================================================================
 #  Mining - a sustained dig (distinct from GatherStone's quick rock-grab)
 # ===========================================================================
-def _nearest_stone_column(world: Any, x: float,
-                          max_dist: float = 460.0) -> float | None:
-    """Nearest MAT_STONE column an agent could stand at and hew, or None.
+def _prop_home_d(prop: Any, home: float) -> float:
+    """Signed px between a prop and the colony centre; 0.0 if unreadable.
 
-    Scans outward from `x` in both directions. Rejects fall-risk cliffs so the
-    miner does not commit to a spot it can only reach by falling off it.
+    0.0 on junk is the conservative answer here: it reads as "this thing is
+    standing in the middle of town", so an unreadable boulder is excluded from
+    quarrying rather than silently dug up next to the huts.
+    """
+    try:
+        return float(getattr(prop, "x", home)) - home
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _quarry_column(world: Any, x: float,
+                   max_dist: float = MINE_MAX_WALK) -> float | None:
+    """The best MAT_STONE column to open a quarry at, or None.
+
+    Replaces a nearest-first scan, which sited every quarry under the
+    settlement: a miner decides to dig while standing in town, the first stone
+    column outward is a few paces away, and _dig_divot then deforms that ground
+    once per yield tick. The colony mined its own floor out.
+
+    Ranks legal columns instead of taking the first. Legal means standable (the
+    old cliff test, unchanged - a miner must not commit to a spot it can only
+    reach by falling off it) and at least MINE_KEEP_OUT from colony_center().
+    Among those, the score prefers a column further OUT - toward the nearer rim
+    of the world - with a smaller term for the walk so two comparable directions
+    do not send miners across the map.
+
+    Falls back, in order: legal sites, then any standable stone inside the walk
+    radius, then None. The fallback is not a nicety - stone gates huts, walls
+    and the whole stone-hut tier, so a map whose only stone lies in the middle
+    of town must still be mineable. It just stops being the default.
     """
     terr = getattr(world, "terrain", None)
     if not callable(getattr(terr, "material_at", None)):
         return None
+    home = colony_center(world)
+    # How far the miner already stands from the nearer rim of the WORLD. The
+    # edge term below is measured as a change against this, not as an absolute
+    # fraction of the map - see the comment at the score, it is the difference
+    # between a term that ranks and one that is silently dead.
+    rim_here = min(max(0.0, float(x)), max(0.0, float(WORLD_W) - float(x)))
+    window = max(1.0, float(max_dist))
+    best: tuple[float, float] | None = None      # (score, x)
+    fallback: tuple[float, float] | None = None  # (walk, x) - nearest legal-ish
     step = 5.0
     d = 0.0
     while d <= max_dist:
@@ -2868,40 +3008,157 @@ def _nearest_stone_column(world: Any, x: float,
                 continue
             if abs(slope_at(world, cx)) > MAX_SLOPE_CLIMB:
                 continue
-            return float(cx)
+            walk = abs(cx - x)
+            if fallback is None or walk < fallback[0]:
+                fallback = (walk, float(cx))
+            if abs(cx - home) < MINE_KEEP_OUT:
+                continue
+            # Both terms are fractions of their own range, so the weights are
+            # comparable numbers rather than an accident of units. Lower wins.
+            #
+            # The edge term is normalised over the REACHABLE WINDOW, not over
+            # half the map, and that is a decision rather than a rename. Written
+            # as `min(cx, W - cx) / (W * 0.5)` it was fine while W was 1600:
+            # half the map (800) and MINE_MAX_WALK (900) were the same size, so
+            # the term swung most of 0..1 across everything a miner could reach.
+            # At WORLD_W = 6400 the denominator is 3200 while the miner can
+            # still only walk 900, so the term varies by at most 0.28 - and for
+            # a colony seated anywhere near mid-map it sits pinned at ~1.0 and
+            # stops ranking anything at all. Quarries would silently revert to
+            # walk-ranked-only, i.e. back to digging the nearest legal column,
+            # which is most of the bug this function exists to fix.
+            #
+            # So: 0.5 at the miner's own feet, 0.0 a full walk further OUT
+            # (toward the nearer world rim), 1.0 a full walk further IN. Same
+            # meaning - "prefer outward" - with its full dynamic range restored
+            # at any map width and at any position on the map. A miner standing
+            # exactly at mid-map gets 0.5 in both directions, which is right:
+            # neither way is more outward, so the walk term decides.
+            edge_frac = _clamp01(
+                0.5 + (min(cx, float(WORLD_W) - cx) - rim_here) / (2.0 * window)
+            )
+            walk_frac = walk / window
+            score = (MINE_EDGE_WEIGHT * edge_frac
+                     + MINE_WALK_WEIGHT * walk_frac)
+            if best is None or score < best[0]:
+                best = (score, float(cx))
         d += step
-    return None
+    if best is not None:
+        return best[1]
+    return fallback[1] if fallback is not None else None
 
 
-def _dig_divot(world: Any, a: "Action", x: float) -> None:
-    """Scoop the quarry a touch deeper - subtle, capped, never a cliff."""
-    cur = float(a.data.get("divot", 0.0))
-    if cur >= MINE_DIVOT_MAX:
-        return
+def _quarry_too_steep(world: Any, x: float, span: float = MINE_DIVOT_HALF) -> bool:
+    """True if cutting at *x* would leave ground nobody can walk out of.
+
+    Measured off the LIVE terrain, every tick, which is the whole point. The
+    previous guard was a per-Action budget in ``a.data["divot"]``, and its
+    docstring promised "never a cliff" - but a.data is born with each Action, so
+    every fresh mining session started a new 8 px allowance AT THE SAME COLUMN.
+    Twenty sessions on one spot is 160 px of shaft. Combined with the old
+    nearest-first siting, which put that spot in the middle of the settlement,
+    a colony reliably excavated a pit in its own front yard and then fell into
+    it. This is that bug: not the depth of one dig, the absence of any memory
+    between digs.
+
+    A gradient test needs no memory. The terrain already knows how steep it is,
+    so however many sessions have come before, the answer is always current.
+
+    The threshold is MINE_SAFE_GRADIENT and NOT MAX_SLOPE_WALK, which was the
+    first attempt and was measured refusing to dig anywhere at all: on a real
+    map the flattest MAT_STONE column outside the settlement already sits at
+    |slope| 1.60, well past the 0.9 walk limit, so a walk-limit gate stops stone
+    production dead. The honest requirement is not "a quarry must be flat" - it
+    is "mining must never CREATE a cliff". 2.0 leaves real headroom to dig on
+    ordinary stone while stopping a clear margin short of MAX_SLOPE_CLIMB (2.6),
+    which is where a fall starts being lethal.
+    """
+    # Swept rather than sampled at three points: the rim is what gets steep and
+    # it does not sit at a fixed offset once cuts start overlapping.
+    step = 2.0
+    probe = -abs(span)
+    while probe <= abs(span):
+        if abs(slope_at(world, x + probe)) > MINE_SAFE_GRADIENT:
+            return True
+        probe += step
+    return False
+
+
+def _dig_divot(world: Any, a: "Action", x: float) -> float:
+    """Cut the quarry face a touch deeper and a touch along. Returns the new x.
+
+    The cut ADVANCES as it deepens, which is both what the shape should be and
+    what makes it safe. Digging straight down at one column is how you get a
+    shaft; stepping the face sideways by MINE_FACE_STEP each time turns the same
+    excavation into a ramp leading down into the workings - a quarry rather than
+    a well, and walkable by construction.
+
+    The step runs AWAY from the colony, so the cut opens outward toward the map
+    edge and the near lip - the side the villagers arrive from - stays the
+    shallow end.
+    """
     terr = getattr(world, "terrain", None)
     fn = getattr(terr, "deform", None)
     if not callable(fn):
-        return
-    dyy = min(MINE_DIVOT_PER, MINE_DIVOT_MAX - cur)
+        return x
+    if _quarry_too_steep(world, x):
+        # Already as deep as this face safely goes. Stop cutting rather than
+        # keep taking stone out of a wall that is about to become a cliff.
+        a.data["spent"] = True
+        return x
+    cur = float(a.data.get("divot", 0.0))
+    dyy = min(MINE_DIVOT_PER, max(0.0, MINE_DIVOT_MAX - cur))
+    if dyy <= 0.0:
+        a.data["spent"] = True
+        return x
+    x0, x1 = int(x - MINE_DIVOT_HALF), int(x + MINE_DIVOT_HALF)
     try:
         # positive dy digs the ground DOWN; a wide bowl keeps the walls gentle.
-        fn(int(x - MINE_DIVOT_HALF), int(x + MINE_DIVOT_HALF), float(dyy), "bowl")
+        fn(x0, x1, float(dyy), "bowl")
+        # ...gentle in the middle. The STEEP part of a bowl is its rim, where the
+        # cut meets ground nobody has touched, and consecutive overlapping bowls
+        # compound that rim into a trench wall. Testing the slope BEFORE digging
+        # bounds where the quarry starts and says nothing about what the cut
+        # leaves behind - measured, that let 30 sessions reach |slope| 4.47, well
+        # past the lethal 2.6. So the cut is PROPOSED and then inspected, and put
+        # back if it went too far. deform is linear in dy, so pushing the same
+        # span up by the same amount is an exact undo.
+        if _quarry_too_steep(world, x, span=MINE_DIVOT_HALF * 3):
+            fn(x0, x1, -float(dyy), "bowl")
+            a.data["spent"] = True
+            return x
         a.data["divot"] = cur + dyy
     except Exception:
         log.debug("_dig_divot failed", exc_info=True)
+        return x
+    away = 1.0 if x >= colony_center(world) else -1.0
+    return _clamp_x(x + away * MINE_FACE_STEP)
 
 
 def _h_mine(a: Action, ag: Any, w: Any, dt: float) -> None:
     if a.phase == "start":
-        b = find_prop(w, ("boulder",), float(ag.x), max_dist=520.0,
-                      claimant=getattr(ag, "id", None))
+        # Boulders get the same keep-out as a ground quarry. It is the digging
+        # that deforms the terrain, not what is being dug - _dig_divot runs in
+        # the dig phase for both sources - so a boulder sitting in the middle of
+        # the settlement is exactly as bad a place to excavate as bare stone
+        # there. Preferred, then any boulder, then ground; the two-pass shape
+        # keeps the old behaviour reachable when a map has no outlying boulder.
+        home = colony_center(w)
+        in_town = [p for p in props_of(w)
+                   if _prop_kind(p) == "boulder"
+                   and abs(_prop_home_d(p, home)) < MINE_KEEP_OUT]
+        b = find_prop(w, ("boulder",), float(ag.x), max_dist=MINE_MAX_WALK,
+                      claimant=getattr(ag, "id", None), exclude=in_town)
+        if b is None:
+            b = find_prop(w, ("boulder",), float(ag.x), max_dist=520.0,
+                          claimant=getattr(ag, "id", None))
         if b is not None:
             a.target = getattr(b, "id", None)
             a.data["mx"] = float(getattr(b, "x", ag.x))
             a.data["src"] = "boulder"
             claim_prop(w, b, ag)      # two miners never share one boulder
         else:
-            sx = _nearest_stone_column(w, float(ag.x))
+            sx = _quarry_column(w, float(ag.x))
             if sx is None:
                 a.failed = True
                 return
@@ -2947,9 +3204,19 @@ def _h_mine(a: Action, ag: Any, w: Any, dt: float) -> None:
         if a.data["yt"] >= MINE_YIELD_SEC / max(0.3, _work_rate(ag)):
             a.data["yt"] = 0.0
             stock_add(w, RES_STONE, MINE_YIELD_STONE)
-            _dig_divot(w, a, mx)
+            # The face moves, so the miner works along it rather than standing in
+            # one spot deepening a shaft. mx is written back so the next swing,
+            # the next divot and the pose all follow the cut.
+            a.data["mx"] = _dig_divot(w, a, mx)
             if rng_of(w).random() < 0.22:
                 chronicle(w, f"{getattr(ag, 'name', 'Someone')} hewed stone from the earth.")
+        # NOTE "spent" stops the CUTTING, not the session. Ending the session
+        # here was the first shape and it was wrong twice over: the miner walked
+        # away after a single yield, and stone output collapsed with it. The
+        # divot is scenery - stock_add above grants the stone whether or not the
+        # ground moved - so a face that cannot safely be cut any deeper is a
+        # perfectly good face to keep working. They hew at it for the usual
+        # session and simply stop making the hole worse.
         if a.data["dig_t"] >= MINE_SESSION_SEC:
             try:
                 ag.mining = False
