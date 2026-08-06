@@ -54,7 +54,6 @@ from ..constants import (
     MAX_SLOPE_CLIMB,
     MAX_SLOPE_WALK,
     RENDER_H,
-    RENDER_W,
     SCENE_ASHFALL,
     SCENE_BLIZZARD,
     SCENE_NIGHT_STORM,
@@ -79,6 +78,7 @@ from ..constants import (
     WALK_SPEED,
     WEAPON_BFG,
     WEAPON_NONE,
+    WORLD_W,
 )
 from .names import (
     ADULT_ROLES,
@@ -104,10 +104,35 @@ __all__ = [
     "AGENT_HEIGHT", "GRAVE_DELAY", "GRAVITY", "Stickman", "Population",
     "color_for_id", "on_death", "clear_death_listeners",
     "morph_scales", "normalise_morph", "roll_morph",
-    "MIN_DRAWN_HEIGHT", "MAX_DRAWN_HEIGHT",
+    "MIN_DRAWN_HEIGHT", "MAX_DRAWN_HEIGHT", "MAX_COUNTER",
     "ROLE_GATHERER", "ROLE_BUILDER", "ROLE_ELDER", "ROLE_CHILD",
     "ROLE_LOOKOUT", "ROLES", "ADULT_ROLES",
 ]
+
+#: The largest value any integer counter read off a SAVE may take.
+#:
+#: ``_i`` is a coercion, not a bound: ``int(1e308)`` is a perfectly good python
+#: int 309 digits long, and every counter in this file used to take it. A save
+#: carrying ``"births": 1e308`` therefore loaded a 309-digit ``births``, which
+#: World._rebase_books then solved the population identity with and wrote
+#: straight into ``stats["returned"]`` - a 309-digit line in the smoke log, a
+#: 309-digit number under the HUD's counter, and unbounded arithmetic anywhere
+#: downstream. Nothing FAILED, which is exactly why the 1,222-case junk sweep
+#: was green: :meth:`Population.from_dict` never raised and ``reconcile`` still
+#: balanced at residual 0, because 1e308 - 1e308 is still 0.
+#:
+#: 1e12 and not something larger, and the number is not arbitrary: World's own
+#: ``stats`` loader already clamps every saved counter to +-1e12, so anything a
+#: rebase derives from ``births`` has to fit in the SAME box or the books stop
+#: surviving a round trip. Clamp ``births`` to 1e15 and the derived
+#: ``stats["died"]`` is saved, re-clamped to 1e12 on the next load, and the
+#: identity that held on the way out no longer holds on the way in. Matching the
+#: two ceilings is what keeps ``reconcile`` at residual 0 across a save/load.
+#:
+#: Vastly above anything the simulation can reach - MAX_POP is 20 and a colony
+#: books a birth every few minutes - so this is invisible to every honest save
+#: and is only ever a bound on a hand-edited or corrupt one.
+MAX_COUNTER = 1_000_000_000_000
 
 # ------------------------------------------------------------------ tuning --
 #: Nominal head-to-heel height of an adult, in world pixels. render/ scales its
@@ -250,8 +275,33 @@ MORALE_LERP_PER_SEC = 0.05               # morale eases toward its target
 DEFAULT_GROUND_Y = RENDER_H * 0.72   # used only when terrain is unavailable
 
 _MAX_DT = 0.1               # clamp: a stalled frame must not teleport anyone
+
+#: The hard walls a body may not walk past. WORLD_W, not RENDER_W: this is "how
+#: much land exists", never "how wide the picture is". It read ``RENDER_W - 1``
+#: for as long as those were the same 1600 px, and on a 6400 px map that literal
+#: was the single line that made the whole wide world a no-op - every agent in
+#: the colony piled up against an invisible wall at x = 1599 and stayed there.
+#:
+#: MEASURED, 14 seeds x 90 sim-min headless, before -> after:
+#:
+#:   * agents' x span, as a fraction of the map: 1284 px (20.1%) -> 3156 px
+#:     (49.3%). Per-seed, the worst case went from 14.8% to 36.1%;
+#:   * seeds ending with somebody standing at exactly x = 1599.0: 13 of 14 -> 0;
+#:   * ``stats["built"]``, i.e. whether the colony can reach its own build
+#:     sites at all: mean 1.43 -> 7.21.
+#:
+#: The build number is the one that shows what this literal really cost. It is
+#: not that the far side of the map was empty; it is that ``behavior`` sites
+#: stakes across the whole WORLD_W and no clamped body could ever walk to one,
+#: so a firepit staked past 1599 was a settlement that never started.
+#:
+#: Every clamp in this module derives from these two, so ``walk_to``, the
+#: step/climb/descend probes, ``_clamp_edges`` and ``from_dict`` all move
+#: together and cannot drift apart. Two more copies of the same literal live in
+#: ``items.py`` and ``throwing.py`` (dropped relics, thrown spears); they are
+#: the same bound and ``tools/smoke.py`` asserts all three agree.
 _EDGE_MIN = 0.0
-_EDGE_MAX = float(RENDER_W - 1)
+_EDGE_MAX = float(WORLD_W - 1)
 
 #: Health at or below this is dead, not "barely alive". See :meth:`Stickman.hurt`
 #: for the soft-lock this exists to close - damage sized to land exactly on zero
@@ -306,6 +356,20 @@ def _i(value: Any, default: int = 0) -> int:
         return int(value)
     except Exception:
         return default
+
+
+def _count(value: Any, default: int = 0, lo: int = 0,
+           hi: int = MAX_COUNTER) -> int:
+    """:func:`_i`, bounded. The coercion every counter off a SAVE goes through.
+
+    Bounds the DEFAULT too, deliberately: several callers pass a value derived
+    from the file (``len(pop.agents)``, ``d["deaths"] - corpses``), and a bound
+    that only applied to the happy path would leave the same hole one argument
+    along. Never raises - it is on the from_dict path. See :data:`MAX_COUNTER`
+    for why the ceiling is 1e12 and not merely "large".
+    """
+    v = _i(value, _i(default, 0))
+    return lo if v < lo else (hi if v > hi else v)
 
 
 def _b(value: Any, default: bool = False) -> bool:
@@ -910,9 +974,20 @@ class Stickman:
         Walks toward ``target_x``, sticks to the terrain surface, climbs steep
         faces (with a slip chance that rises with fatigue and steepness), falls
         under gravity once airborne, dies on an impact faster than
-        ``FALL_LETHAL_SPEED``, and clamps x to the screen. An agent standing on
-        a platform (see :meth:`perch`) does none of that: it stands. Never
-        raises.
+        ``FALL_LETHAL_SPEED``, and clamps x to the LAND - 0 .. WORLD_W-1, which
+        is not the frame and has not been since the world went to 6400 px. Note
+        the ordering that makes that clamp weaker than it looks:
+        ``world._tick_agents`` runs the action and THEN this, so anything an
+        action writes to ``x`` is clamped in the same tick - but ``ufo`` and
+        ``dragons`` tick AFTER the agent loop and write ``x`` themselves, under
+        their own bounds. Those bounds must stay WORLD_W-based to agree with
+        this one - while this clamp said 1599 and theirs said WORLD_W they did
+        not, and a held or carried body ended its tick a little past the wall
+        everybody else was pinned to (measured: 1600.4 to 1638.1).
+
+        An agent standing on a platform (see :meth:`perch`) does none of the
+        walking or falling: it stands - but ``_perch_step`` clamps too, so the
+        edges hold there as well. Never raises.
         """
         try:
             self._physics(_clamp(_f(dt, 0.0), 0.0, _MAX_DT), terrain, rng or _RNG)
@@ -1285,7 +1360,12 @@ class Stickman:
         return True
 
     def _clamp_edges(self) -> None:
-        """The screen edges are the edge of the world. Hard walls, no escape."""
+        """The edges of the LAND are hard walls, no escape.
+
+        Not the edges of the screen - the two stopped being the same thing when
+        WORLD_W grew past RENDER_W. The camera is free to sit anywhere; a body
+        is not, and 0 .. WORLD_W-1 is the whole of what it may occupy.
+        """
         if self.x < _EDGE_MIN:
             self.x = _EDGE_MIN
             if self.vx < 0.0:
@@ -1370,7 +1450,13 @@ class Stickman:
         s = cls()
         if not isinstance(d, dict):
             return s
-        s.id = _i(d.get("id"), 0)
+        # Every integer below comes off a FILE, so every one of them is bounded
+        # (see MAX_COUNTER). ``id`` keeps its sign - a negative id is junk but it
+        # is junk this build already tolerated, and only the magnitude was ever
+        # the hazard: Population.from_dict derives next_id from ``max(a.id + 1)``,
+        # so a 309-digit id here is a 309-digit id on every colonist born after
+        # the load.
+        s.id = _count(d.get("id"), 0, lo=-MAX_COUNTER)
         s.name = _s(d.get("name"), None) or f"Agent{s.id}"
         s.color = _color(d.get("color"), color_for_id(s.id))
         # A morph name from a newer build, a truncated save or a hand edit is
@@ -1387,18 +1473,23 @@ class Stickman:
         s.warmth = _unit(d.get("warmth"), 0.0)
         s.morale = _unit(d.get("morale"), 0.6)
         s.carrying = _s(d.get("carrying"), None)
-        s.carry_qty = max(0, _i(d.get("carry_qty"), 0))
+        s.carry_qty = _count(d.get("carry_qty"), 0)
         role = _s(d.get("role"), ROLE_GATHERER) or ROLE_GATHERER
         s.role = role if is_role(role) else ROLE_GATHERER
-        s.generation = max(0, _i(d.get("generation"), 0))
+        s.generation = _count(d.get("generation"), 0)
         s.holds_candle = _b(d.get("holds_candle"), False)
         s.holds_torch = _b(d.get("holds_torch"), True)
         s.health = _f(d.get("health"), MAX_HEALTH)
         s.weapon = _s(d.get("weapon"), WEAPON_NONE) if "_s" in globals() else str(d.get("weapon") or WEAPON_NONE)
         s.armour = _f(d.get("armour"), ARMOUR_NONE)
         s.attack_cd = _f(d.get("attack_cd"), 0.0)
+        # ``int(float("nan"))` RAISES, and this used to be a bare int(). Inside
+        # Stickman.from_dict that is not a lost field, it is a lost COLONIST:
+        # Population.from_dict catches the exception and skips the whole record.
+        # _count coerces and bounds in one move and cannot raise.
         ta = d.get("target_animal")
-        s.target_animal = int(ta) if isinstance(ta, (int, float)) else None
+        s.target_animal = (_count(ta, 0, lo=-MAX_COUNTER)
+                           if isinstance(ta, (int, float)) else None)
         # The relic slot. Validated against RELIC_KINDS on the way IN, exactly as
         # morph is, so a hand edit or a save from a newer build reads as "carrying
         # nothing" rather than as an item with no behaviour attached and no way to
@@ -1417,12 +1508,14 @@ class Stickman:
             s.armour = max(s.armour, ARMOUR_DRAGONSCALE)
         elif s.relic == RELIC_BFG:
             s.weapon = WEAPON_BFG
-        s.fall_saves = max(0, _i(d.get("fall_saves"), 0))
+        s.fall_saves = _count(d.get("fall_saves"), 0)
         s.taken = _b(d.get("taken"), False)
         s.lift_t = _f(d.get("lift_t"), 0.0)
         s.beamed = _b(d.get("beamed"), False)
+        # Same bare-int() hazard as target_animal above, and the same fix.
         _ins = d.get("inside")
-        s.inside = int(_ins) if isinstance(_ins, (int, float)) else None
+        s.inside = (_count(_ins, 0, lo=-MAX_COUNTER)
+                    if isinstance(_ins, (int, float)) else None)
         # The lease starts fresh on load: whichever action put them up there
         # gets PERCH_LEASE seconds to claim them again, and if the save had no
         # such action the perch simply lapses and sets them down.
@@ -1453,7 +1546,7 @@ class Stickman:
 
         parents = d.get("parent_ids")
         if isinstance(parents, (list, tuple)):
-            s.parent_ids = [_i(p, 0) for p in parents if _i(p, -1) >= 0]
+            s.parent_ids = [_count(p, 0) for p in parents if _i(p, -1) >= 0]
 
         s.on_ground = _b(d.get("on_ground"), True)
         s.climbing = _b(d.get("climbing"), False)
@@ -1745,20 +1838,32 @@ class Population:
         # A save written before used_names existed still must not collide.
         pop.used_names.update(a.name for a in pop.agents)
 
-        pop.next_id = max(1, _i(d.get("next_id"), 1))
+        # EVERY counter below is a number a file claims, so every one of them is
+        # bounded by MAX_COUNTER - see there for why the ceiling is 1e12 and why
+        # an unbounded one was not merely ugly. ``max(0, _i(...))`` bounded them
+        # from BELOW only, which is the half that cannot hurt you.
+        #
+        # The clamps do not disturb reconcile. ``births`` is the only one of
+        # these the identity contains, World._rebase_books solves the identity
+        # for ``died`` given whatever ``births`` turns out to be, and it does
+        # that AFTER this method has returned - so a clamped births is simply a
+        # smaller books, still balanced, still residual 0. Measured across every
+        # counter here at 1e308: ok=1, residual=0, nothing raised.
+        pop.next_id = _count(d.get("next_id"), 1, lo=1)
         for a in pop.agents:
-            pop.next_id = max(pop.next_id, a.id + 1)
-        pop.generation = max(
-            _i(d.get("generation"), 0),
-            max((a.generation for a in pop.agents), default=0),
+            pop.next_id = _count(max(pop.next_id, a.id + 1), 1, lo=1)
+        pop.generation = _count(
+            max(_i(d.get("generation"), 0),
+                max((a.generation for a in pop.agents), default=0)),
+            0,
         )
-        pop.births = max(0, _i(d.get("births"), len(pop.agents)))
+        pop.births = _count(d.get("births"), len(pop.agents))
         corpses = sum(1 for a in pop.agents if not a.alive)
         if "graves_raised" in d:
-            pop.graves_raised = max(0, _i(d.get("graves_raised"), 0))
+            pop.graves_raised = _count(d.get("graves_raised"), 0)
         else:                                 # pre-graves_raised save
-            pop.graves_raised = max(0, _i(d.get("deaths"), 0) - corpses)
-        pop.peak = max(_i(d.get("peak"), 0), pop.alive_count())
+            pop.graves_raised = _count(_i(d.get("deaths"), 0) - corpses, 0)
+        pop.peak = _count(max(_i(d.get("peak"), 0), pop.alive_count()), 0)
         return pop
 
 

@@ -35,7 +35,7 @@ import random
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from ..constants import RENDER_W, SCENE_BLIZZARD, SCENE_NIGHT_STORM
+from ..constants import SCENE_BLIZZARD, SCENE_NIGHT_STORM, WORLD_W
 
 log = logging.getLogger(__name__)
 
@@ -153,7 +153,13 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 
 
 def _clamp_x(x: float) -> float:
-    return _clamp(_f(x, 0.0), 2.0, float(RENDER_W - 2))
+    # WORLD. A vignette's whole horizontal budget is MAX_DRIFT px from where the
+    # agent already stood, so this never decides *where* anything happens - it
+    # only stops a drift from walking off the end of the land. There is no
+    # stage case anywhere in this module for exactly that reason: vignettes are
+    # sited by the agent performing them, and an off-camera colonist scratching
+    # its ear off-camera is correct.
+    return _clamp(_f(x, 0.0), 2.0, float(WORLD_W - 2))
 
 
 def _fallback_rng_of(world: Any) -> random.Random:
@@ -278,7 +284,11 @@ def _terrain_range(world: Any) -> tuple[float, float] | None:
     if not callable(fn):
         return None
     try:
-        ys = [_f(fn(x), 0.0) for x in range(0, RENDER_W, max(1, RENDER_W // 24))]
+        # WORLD, and free: the step is derived from the width, so this is 24
+        # samples on a 1600 px map and 24 samples on a 6400 px one. Anything
+        # narrower would mis-report the terrain's true relief, which is what the
+        # "high ground"/"low ground" vignette tags are scored against.
+        ys = [_f(fn(x), 0.0) for x in range(0, WORLD_W, max(1, WORLD_W // 24))]
     except Exception:
         return None
     ys = [y for y in ys if math.isfinite(y)]
@@ -1082,11 +1092,12 @@ except Exception:                       # pragma: no cover
 if __name__ == "__main__":   # pragma: no cover - headless smoke test
     class _Terrain:
         def __init__(self) -> None:
+            # WORLD_W wide, to match the real Terrain the harness stands in for.
             self.height = [600.0 + 70.0 * math.sin(x / 190.0)
-                           for x in range(RENDER_W)]
+                           for x in range(WORLD_W)]
 
         def ground_y(self, x: float) -> float:
-            i = int(_clamp(x, 0.0, float(RENDER_W - 1)))
+            i = int(_clamp(x, 0.0, float(WORLD_W - 1)))
             return self.height[i]
 
         def slope(self, x: float) -> float:
@@ -1213,7 +1224,10 @@ if __name__ == "__main__":   # pragma: no cover - headless smoke test
     poses: set[str] = set()
     for i in range(500):
         agent = w.agents[i % len(w.agents)]
-        agent.x = rng.uniform(60.0, RENDER_W - 60.0)
+        # Spread over the whole WORLD, not the stage: the point of the sweep is
+        # to land vignettes on every kind of ground the map can produce, and a
+        # stage-width band would only ever exercise one stretch of it.
+        agent.x = rng.uniform(60.0, WORLD_W - 60.0)
         agent.y = w.terrain.ground_y(agent.x)
         agent.fatigue = rng.random()
         agent.hunger = rng.random()
@@ -1243,7 +1257,7 @@ if __name__ == "__main__":   # pragma: no cover - headless smoke test
         assert act.done and not act.failed, (act, act.data)
         assert act.t <= MAX_DUR + 1.5, (act.t, act.data)
         assert abs(agent.x - x0) <= MAX_DRIFT + 0.5, (agent.x - x0, act.data)
-        assert 0.0 <= agent.x <= RENDER_W
+        assert 0.0 <= agent.x <= WORLD_W
         poses.add(act.pose)
         ran += 1
 

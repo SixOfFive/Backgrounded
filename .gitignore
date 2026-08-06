@@ -1,9 +1,24 @@
 # Claude Code local (per-machine) settings
 .claude/settings.local.json
 
+# Deliberately NOT published. This repo is public.
+#   CLAUDE.md names a private Obsidian vault and an internal server address.
+#   docs/shots/scenes.png is a personal capture, not a repo asset.
+# Both were already untracked; they are listed here so that `git add -A` - which
+# this repo needs, because new modules keep arriving - cannot sweep them in.
+CLAUDE.md
+docs/shots/scenes.png
+
+# Test sandboxes. Probe runs point LOCALAPPDATA/USERPROFILE at a scratch dir and
+# have twice left one here, once holding a copy of the desktop wallpaper.
+sb_gen/
+p3_*.json
+p3_*.err
+
 # Python
 __pycache__/
 *.py[cod]
+.ruff_cache/
 .venv/
 build/
 dist/

@@ -19,7 +19,7 @@ from __future__ import annotations
 import random
 from typing import Any, Iterable
 
-from ..constants import CAUSE_DISINTEGRATED, RENDER_W
+from ..constants import CAUSE_DISINTEGRATED, WORLD_W
 
 # --------------------------------------------------------------------- roles --
 ROLE_GATHERER = "gatherer"
@@ -267,20 +267,41 @@ def child_name(
 
 # ------------------------------------------------------------- place words --
 def place_word(x: float | None = None) -> str:
-    """Coarse compass-ish word for a world x coordinate (0..RENDER_W)."""
+    """Coarse compass-ish word for a world x coordinate (0..WORLD_W).
+
+    WORLD, not stage: chronicle lines outlive the camera. "The eastern cliff
+    took Karendo" has to mean the same place when it is read back an hour later
+    from a colony that has since wandered somewhere else, so this normalises
+    against the land and never against where anyone is standing.
+
+    Seven buckets, up from five. On a 1600 px world five words gave a 350 px
+    band and every event in a session got a genuinely different one. At 6400 px
+    the same five give 1400 px bands, and since a settlement lives inside
+    SITE_RANGE - under a tenth of the map - virtually every line it ever
+    generates lands in the *same* bucket and the word stops carrying
+    information. Seven does not fix that (nothing that reads only x can), but it
+    roughly restores the old band width, which is what the phrasing was written
+    against. "westward"/"eastward" rather than "near-western"/"mid-western"
+    because every one of these has to survive being dropped into "the {where}
+    cliff" and "the {where} camp" and still read as English.
+    """
     try:
-        v = float(x) / float(RENDER_W) if x is not None else 0.5
+        v = float(x) / float(WORLD_W) if x is not None else 0.5
     except Exception:
         v = 0.5
     if v != v:                                   # NaN
         v = 0.5
-    if v < 0.16:
+    if v < 0.11:
         return "far western"
-    if v < 0.38:
+    if v < 0.27:
         return "western"
-    if v < 0.62:
+    if v < 0.43:
+        return "westward"
+    if v < 0.57:
         return "central"
-    if v < 0.84:
+    if v < 0.73:
+        return "eastward"
+    if v < 0.89:
         return "eastern"
     return "far eastern"
 
@@ -565,7 +586,7 @@ DEATH_KINDS: dict[str, str] = {
     # table could silently fall out of step with the code that fills it, and the
     # symptom would be soft: the death still happens, the chronicle just quietly
     # goes back to "X was lost to disintegrated." Importing costs nothing, since
-    # this module already imports RENDER_W from the same file.
+    # this module already imports WORLD_W from the same file.
     CAUSE_DISINTEGRATED: "died_disintegrated",
 }
 

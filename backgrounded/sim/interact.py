@@ -16,12 +16,26 @@ import logging
 from typing import Any
 
 from ..constants import (
-    FEED_AMOUNT, GRAB_RADIUS, RENDER_W, RES_FOOD, TOSS_SPEED,
+    FEED_AMOUNT, GRAB_RADIUS, RES_FOOD, TOSS_SPEED,
     TOOL_FEED, TOOL_HAND, TOOL_LIGHTNING, TOOL_METEOR, TOOL_PLANT,
-    TOOL_ROCK, TOOL_SPAWN,
+    TOOL_ROCK, TOOL_SPAWN, WORLD_W,
 )
 
 log = logging.getLogger(__name__)
+
+# Every clamp in this module is WORLD_W, never RENDER_W. What arrives here is
+# already a WORLD x: app.py's `_to_world` adds the camera offset back onto the
+# frame-space pointer before `tools.handle` is reached, so a click on the right
+# edge of a frame parked at cam.x = 4800 comes in as wx ~ 6400.
+#
+# Clamping that to the camera's own width folded the whole gesture back to
+# <= 1594 and reported nothing: a stickman dragged anywhere past the old frame
+# width snapped to x = 1598 and was let go there, and a sapling or a rock placed
+# at the far end of the map appeared beside the colony's old left-hand corner
+# instead. Lightning and meteors escaped it only because `use_tool` hands those
+# straight to `world.events`, which does its own WORLD_W clamp.
+#
+# RENDER_W is the size of the picture. These are places on the ground.
 
 
 # ------------------------------------------------------------------- grab --
@@ -95,7 +109,7 @@ def move_held(world: Any, g: Grab, wx: float, wy: float, t: float) -> None:
     obj = _resolve(world, g)
     if obj is None:
         return
-    wx = max(2.0, min(float(RENDER_W - 2.0), float(wx)))
+    wx = max(2.0, min(float(WORLD_W - 2.0), float(wx)))
     obj.x = wx
     obj.y = float(wy)
     # A short trail is enough to estimate release velocity; keep ~0.15s of it.
@@ -175,7 +189,7 @@ def use_tool(world: Any, tool: str, wx: float, wy: float) -> str | None:
 
 def _plant(world: Any, wx: float) -> str | None:
     t = world.terrain
-    x = max(6.0, min(float(RENDER_W - 6.0), float(wx)))
+    x = max(6.0, min(float(WORLD_W - 6.0), float(wx)))
     p = world.props.spawn("sapling", x, t.ground_y(x), scale=0.3,
                           state={"growth": 0.0})
     return "A sapling is pressed into the earth." if p else None
@@ -183,7 +197,7 @@ def _plant(world: Any, wx: float) -> str | None:
 
 def _drop_rock(world: Any, wx: float) -> str | None:
     t = world.terrain
-    x = max(6.0, min(float(RENDER_W - 6.0), float(wx)))
+    x = max(6.0, min(float(WORLD_W - 6.0), float(wx)))
     p = world.props.spawn("rock", x, t.ground_y(x), scale=0.8)
     return "A rock settles onto the ground." if p else None
 

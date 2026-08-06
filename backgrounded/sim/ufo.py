@@ -104,11 +104,12 @@ from ..constants import (
     MAX_POP as _MAX_POP,
     MAX_HEALTH,
     RENDER_H,
-    RENDER_W,
+    STAGE_HALF,
     UFO_BEAM_SEC,
     UFO_INTERVAL_MAX,
     UFO_INTERVAL_MIN,
     UFO_RETURN_CHANCE,
+    WORLD_W,
 )
 from .entities import Stickman
 
@@ -208,6 +209,16 @@ DAZED_FATIGUE = 0.92
 DAZED_MORALE = 0.06
 DAZED_HUNGER = 0.35                  # minimum hunger on return
 
+#: Px of the WORLD's rim a saucer keeps clear of. It used to be the frame's rim
+#: as well, because they were the same pixel; now that the world is four frames
+#: wide it is only the world's, and the two places that meant "somewhere a
+#: viewer can see" go through :func:`_stage_x` instead.
+#:
+#: The saucer needs far less of this than the dragons or the wildlife do, and
+#: the reason is worth writing down: it enters from ABOVE (SPAWN_Y = -90) and
+#: leaves upward, and there is no vertical camera - RENDER_H is the whole world's
+#: height. Its off-screen approach is therefore off-screen by construction on
+#: every map width, and only the HORIZONTAL sites needed classifying.
 _EDGE_PAD = 26.0
 _MAX_DT = 0.25
 
@@ -215,6 +226,17 @@ _MAX_DT = 0.25
 # ----------------------------------------------------------------- helpers --
 def _clamp(v: float, lo: float, hi: float) -> float:
     return lo if v < lo else (hi if v > hi else v)
+
+
+def _clamp_x(x: Any, default: float | None = None) -> float:
+    """A world x the saucer may occupy: on the map, clear of its rim.
+
+    Written out because eleven sites said ``_clamp(v, _EDGE_PAD, RENDER_W -
+    _EDGE_PAD)`` verbatim, and eleven copies of a bound is eleven chances for
+    one of them to keep meaning the frame after the world stopped being one.
+    """
+    return _clamp(_f(x, WORLD_W * 0.5 if default is None else default),
+                  _EDGE_PAD, WORLD_W - _EDGE_PAD)
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -366,8 +388,45 @@ def _bump(world: Any, key: str) -> None:
         pass
 
 
-def _rand_x(rng: random.Random) -> float:
-    return rng.uniform(_EDGE_PAD, RENDER_W - _EDGE_PAD)
+def _colony_x(world: Any) -> float:
+    """Where the colony is, in world px. Never raises.
+
+    Deferred import: ``actions`` imports ``entities``/``structures`` and
+    ``world`` imports us, so at module scope this is a cycle - the same idiom
+    entities.py:1483 uses. The roster mean is the fallback because it is what
+    ``colony_center`` itself falls back to, and it works on the stub worlds the
+    harness at the bottom of this file drives.
+    """
+    try:
+        from . import actions as _actions            # noqa: PLC0415 - see above
+        c = _f(_actions.colony_center(world), -1.0)
+        if c >= 0.0:
+            return _clamp_x(c)
+    except Exception:
+        log.debug("colony_center unavailable", exc_info=True)
+    crowd = _alive(world)
+    if crowd:
+        return _clamp_x(sum(_f(getattr(a, "x", 0.0)) for a in crowd) / len(crowd))
+    return WORLD_W * 0.5
+
+
+def _stage_x(world: Any, rng: random.Random) -> float:
+    """A random x somewhere a viewer can actually see, in world px.
+
+    Was ``uniform(_EDGE_PAD, RENDER_W - _EDGE_PAD)`` - the whole map, back when
+    the whole map was the frame. Renamed as well as rewritten because the two
+    readings look identical at the call site and only one of them is now right:
+    dropped anywhere in a 6400 px world, a returned abductee lands a mean of
+    1600 px and up to 3000 px from home, off camera, and walks back across the
+    map before anyone sees that they are alive. The stage is the span the camera
+    can be showing, so a delivery into it is a delivery somebody watches.
+    """
+    c = _colony_x(world)
+    lo = _clamp(c - STAGE_HALF + _EDGE_PAD, _EDGE_PAD, WORLD_W - _EDGE_PAD)
+    hi = _clamp(c + STAGE_HALF - _EDGE_PAD, _EDGE_PAD, WORLD_W - _EDGE_PAD)
+    if hi <= lo:                       # only if the map is narrower than a frame
+        return c
+    return rng.uniform(lo, hi)
 
 
 def _relic(agent: Any) -> str:
@@ -491,7 +550,16 @@ class Ufo:
 
         self.active: bool = False
         self.phase: str = PHASE_IDLE
-        self.x: float = RENDER_W * 0.5
+        #: Middle of the map, and it does not matter where: __init__ has no
+        #: world to ask, and _begin() teleports x to hold_x +/- 160..380 px on
+        #: every single visit before anything is drawn or moved. So the saucer
+        #: never flies here from anywhere - the idle x is a placeholder that is
+        #: overwritten, not a hangar it commutes from. (Worth stating outright:
+        #: the obvious wide-world worry is "a saucer parked at world centre
+        #: while the colony is at x=5000 flies 2000 px on every visit", and the
+        #: only reason that is false is this one line's interaction with
+        #: _begin. It is also why nothing here has to re-park it on idle.)
+        self.x: float = WORLD_W * 0.5
         self.y: float = SPAWN_Y
         self.t: float = 0.0
         self.target_id: int | None = None
@@ -580,16 +648,14 @@ class Ufo:
                 return False
             self.returning = False
             self.target_id = _i(getattr(victim, "id", 0), 0)
-            self.hold_x = _clamp(_f(getattr(victim, "x", RENDER_W * 0.5)),
-                                 _EDGE_PAD, RENDER_W - _EDGE_PAD)
+            self.hold_x = _clamp_x(getattr(victim, "x", None))
 
         self.ground_y = _ground_y(world, self.hold_x)
         self.hover_y = self._hover_for(self.ground_y)
         # Come in from off to one side so it crosses the sky rather than
         # dropping out of nowhere.
         side = -1.0 if self._rng.random() < 0.5 else 1.0
-        self.x = _clamp(self.hold_x + side * self._rng.uniform(160.0, 380.0),
-                        _EDGE_PAD, RENDER_W - _EDGE_PAD)
+        self.x = _clamp_x(self.hold_x + side * self._rng.uniform(160.0, 380.0))
         self.y = SPAWN_Y
         self.t = 0.0
         self.phase = PHASE_ARRIVE
@@ -639,11 +705,15 @@ class Ufo:
         crowd = _alive(world)
         if crowd:
             who = crowd[self._rng.randrange(len(crowd))]
-            base = _f(getattr(who, "x", RENDER_W * 0.5), RENDER_W * 0.5)
+            base = _f(getattr(who, "x", WORLD_W * 0.5), WORLD_W * 0.5)
             base += self._rng.uniform(-90.0, 90.0)
         else:
-            base = _rand_x(self._rng)
-        return _clamp(base, _EDGE_PAD, RENDER_W - _EDGE_PAD)
+            # Nobody to put them beside. "Anywhere" used to mean anywhere on
+            # screen, because the map was the screen; on a WORLD_W map it has to
+            # keep meaning that or the one moment the whole return mechanic
+            # exists for happens where nothing is looking. See _stage_x.
+            base = _stage_x(world, self._rng)
+        return _clamp_x(base)
 
     # -- arrive ------------------------------------------------------------
     def _tick_arrive(self, world: Any, dt: float) -> None:
@@ -656,8 +726,7 @@ class Ufo:
                 # They died, or were taken by something else, on the way in.
                 self._go_depart()
                 return
-            self.hold_x = _clamp(_f(getattr(victim, "x", self.hold_x), self.hold_x),
-                                 _EDGE_PAD, RENDER_W - _EDGE_PAD)
+            self.hold_x = _clamp_x(getattr(victim, "x", None), self.hold_x)
 
         self.ground_y = _ground_y(world, self.hold_x)
         self.hover_y = self._hover_for(self.ground_y)
@@ -758,8 +827,8 @@ class Ufo:
         u = _clamp(self.t / max(0.05, WRECK_FALL_SEC), 0.0, 1.0)
         # u*u, not u: it drops, it does not glide down.
         self.y = self.hover_y + (self.ground_y - self.hover_y) * (u * u)
-        self.x = _clamp(self.hold_x + math.sin(self.t * 21.0) * WRECK_TUMBLE
-                        * (1.0 - u), _EDGE_PAD, RENDER_W - _EDGE_PAD)
+        self.x = _clamp_x(self.hold_x + math.sin(self.t * 21.0) * WRECK_TUMBLE
+                          * (1.0 - u))
         if u >= 1.0:
             self._crash(world)
 
@@ -946,7 +1015,7 @@ class Ufo:
             pass
 
         self.ground_y = _ground_y(world, self.hold_x)
-        agent.x = _clamp(self.hold_x, _EDGE_PAD, RENDER_W - _EDGE_PAD)
+        agent.x = _clamp_x(self.hold_x)
         agent.y = self.ground_y
         agent.vx = agent.vy = 0.0
         agent.on_ground = True
@@ -1071,8 +1140,7 @@ class Ufo:
         self.active = True
         self.t += dt
         self.y -= DEPART_SPEED * (1.0 + DEPART_ACCEL * self.t) * dt
-        self.x = _clamp(self.x + math.sin(self.t * 1.7) * 26.0 * dt,
-                        _EDGE_PAD, RENDER_W - _EDGE_PAD)
+        self.x = _clamp_x(self.x + math.sin(self.t * 1.7) * 26.0 * dt)
         if self.y <= DEPART_END_Y or self.t >= DEPART_TIMEOUT:
             self._go_idle()
 
@@ -1142,7 +1210,7 @@ class Ufo:
             agent.vy = 0.0
             agent.climbing = False
             agent.climb_t = 0.0
-            agent.x = _clamp(self.hold_x, 0.0, float(RENDER_W - 1))
+            agent.x = _clamp(self.hold_x, 0.0, float(WORLD_W - 1))
             agent.beamed = True
             agent.pose_override = "fall"
             agent.lift_t = _clamp(_f(lift, 0.0), 0.0, 1.0)
@@ -1300,15 +1368,15 @@ class Ufo:
 
             phase = d.get("phase")
             u.phase = phase if isinstance(phase, str) and phase in PHASES else PHASE_IDLE
-            u.x = _clamp(_f(d.get("x"), RENDER_W * 0.5), -400.0, RENDER_W + 400.0)
+            u.x = _clamp(_f(d.get("x"), WORLD_W * 0.5), -400.0, WORLD_W + 400.0)
             u.y = _clamp(_f(d.get("y"), SPAWN_Y), -600.0, float(RENDER_H))
             u.t = max(0.0, _f(d.get("t"), 0.0))
             u.next_in = max(0.0, _f(d.get("next_in"), u.next_in))
             u.returning = _b(d.get("returning"), False)
             u.hover_y = _clamp(_f(d.get("hover_y"), HOVER_Y_MIN),
                                HOVER_Y_MIN, HOVER_Y_MAX)
-            u.hold_x = _clamp(_f(d.get("hold_x"), RENDER_W * 0.5),
-                              0.0, float(RENDER_W - 1))
+            u.hold_x = _clamp(_f(d.get("hold_x"), WORLD_W * 0.5),
+                              0.0, float(WORLD_W - 1))
             u.ground_y = _clamp(_f(d.get("ground_y"), RENDER_H * 0.72),
                                 0.0, float(RENDER_H))
             u.taken_count = max(0, _i(d.get("taken_count"), 0))

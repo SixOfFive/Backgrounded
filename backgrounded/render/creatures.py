@@ -67,11 +67,11 @@ from ..constants import (
     ARMOUR_LEATHER,
     RELIC_KINDS,
     RENDER_H,
-    RENDER_W,
     UFO_BEAM_SEC,
     WEAPON_SPEAR,
 )
 from . import fx
+from .camera import IDENTITY, Camera
 
 log = logging.getLogger(__name__)
 
@@ -377,8 +377,15 @@ def _iter_animals(world: Any) -> list[Any]:
 # --------------------------------------------------------------------------
 
 
-def draw_animals(surf: pygame.Surface, world: Any, t: float) -> None:
-    """Draw every animal in *world*. Fails soft, per animal and overall."""
+def draw_animals(surf: pygame.Surface, world: Any, t: float, *,
+                 cam: Camera) -> None:
+    """Draw every animal in *world*. Fails soft, per animal and overall.
+
+    *cam* is REQUIRED and has no default: an animal's ``x`` is a world x on a
+    6400 px map and *surf* is a 1600 px frame, so a caller that forgets it puts
+    three quarters of the wildlife off the edge and misplaces the rest. It used
+    to be optional, and every wolf in the game was invisible for it.
+    """
     try:
         animals = _iter_animals(world)
     except Exception:
@@ -392,18 +399,28 @@ def draw_animals(surf: pygame.Surface, world: Any, t: float) -> None:
         pass
     for a in animals:
         try:
-            _draw_animal(surf, a, world, float(t))
+            _draw_animal(surf, a, world, float(t), cam)
         except Exception:
             log.debug("animal draw failed", exc_info=True)
 
 
-def _draw_animal(surf: pygame.Surface, a: Any, world: Any, t: float) -> None:
-    x = fx.attr_num(a, "x", default=math.nan)
+def _draw_animal(surf: pygame.Surface, a: Any, world: Any, t: float,
+                 cam: Camera) -> None:
+    wx = fx.attr_num(a, "x", default=math.nan)
     y = fx.attr_num(a, "y", default=math.nan)
-    if not (math.isfinite(x) and math.isfinite(y)):
+    if not (math.isfinite(wx) and math.isfinite(y)):
         return
-    if x < -80.0 or x > RENDER_W + 80.0 or y < -80.0 or y > RENDER_H + 80.0:
+    # Cull in SCREEN space. The old test compared a world x against RENDER_W,
+    # which on a 6400 px map means "anything past the first quarter of the land
+    # is gone" - and the quarter that survived was drawn at cam.x px off.
+    if not cam.visible(wx, 80.0):
         return
+    if y < -80.0 or y > RENDER_H + 80.0:
+        return
+    # The one conversion. `wx` stays world below, because lighting.light_at
+    # samples the sim's own sources and those live in the world; `x` is screen
+    # and is what every draw call gets.
+    x = cam.sx(wx)
 
     kind = animal_kind_of(a)
     b = BUILDS[kind]
@@ -423,7 +440,7 @@ def _draw_animal(surf: pygame.Surface, a: Any, world: Any, t: float) -> None:
     # Silhouette rule, same as the stickmen: outside every light pool an animal
     # is a shape, not a species. That is the point of feature 36 and it is what
     # makes a wolf at the edge of the candle frightening.
-    lit = _light_at(world, x, y - b.height * 0.5)
+    lit = _light_at(world, wx, y - b.height * 0.5)
     silhouette = lit < _SIL_CUTOFF
     fur: Color = _SIL_COLOR if silhouette else b.fur
     rim: Color = _dim(_SIL_COLOR, 1.8) if silhouette else b.rim
@@ -850,32 +867,37 @@ def _abductee(world: Any, ufo: Any) -> Any:
     return None
 
 
-def draw_ufo(surf: pygame.Surface, world: Any, t: float) -> None:
+def draw_ufo(surf: pygame.Surface, world: Any, t: float, *,
+             cam: Camera) -> None:
     """Draw the saucer, its beam and whoever is inside the beam.
 
     Call this *after* the light composite - the beam is its own light source
     and multiplying it by a night ambient would erase it. Fails soft.
+
+    *cam* is REQUIRED and has no default; the saucer's ``x`` is a world x.
     """
     try:
         ufo = _find_ufo(world)
         if ufo is None:
             return
-        _draw_ufo(surf, ufo, world, float(t))
+        _draw_ufo(surf, ufo, world, float(t), cam)
     except Exception:
         log.debug("ufo draw failed", exc_info=True)
 
 
-def _draw_ufo(surf: pygame.Surface, ufo: Any, world: Any, t: float) -> None:
+def _draw_ufo(surf: pygame.Surface, ufo: Any, world: Any, t: float,
+              cam: Camera) -> None:
     if getattr(ufo, "alive", True) is False or getattr(ufo, "active", True) is False:
         return
     state = _state_of(ufo)
     if state in ("gone", "done", "idle", "off", "none", "waiting"):
         return
 
-    x = fx.attr_num(ufo, "x", default=math.nan)
-    if not math.isfinite(x):
+    wx = fx.attr_num(ufo, "x", default=math.nan)
+    if not math.isfinite(wx):
         return
-    ground = _ground_y(world, x)
+    # World x: ground_y indexes the WORLD_W-long heightmap.
+    ground = _ground_y(world, wx)
     y = fx.attr_num(ufo, "y", default=math.nan)
     if not math.isfinite(y):
         y = ground - 190.0
@@ -885,7 +907,7 @@ def _draw_ufo(surf: pygame.Surface, ufo: Any, world: Any, t: float) -> None:
         r = fx.attr_num(ufo, "radius", "r", "size", default=0.0)
         width = r * 2.0 if r > 4.0 else 54.0
     width = fx.clamp(width, 24.0, 160.0)
-    if x < -width * 2.0 or x > RENDER_W + width * 2.0:
+    if not cam.visible(wx, width * 2.0):
         return
 
     # Wobble. Two incommensurate sines so it never visibly repeats, small
@@ -893,12 +915,14 @@ def _draw_ufo(surf: pygame.Surface, ufo: Any, world: Any, t: float) -> None:
     idp = fx.attr_num(ufo, "id", default=0.0) * 1.7
     wob_y = math.sin(t * 1.9 + idp) * 1.5 + math.sin(t * 0.71 + idp * 0.3) * 0.9
     wob_x = math.sin(t * 0.53 + idp) * 1.8
-    cx, cy = x + wob_x, y + wob_y
+    # The conversion: cx is screen from here down. Only _draw_beam's abductee
+    # needs the world back, and it takes the camera for exactly that.
+    cx, cy = cam.sx(wx) + wob_x, y + wob_y
     tilt_bucket = int(round(math.sin(t * 0.83 + idp) * 2.0))
 
     beam_amt = _beam_strength(ufo, world, state)
     if beam_amt > 0.01:
-        _draw_beam(surf, world, ufo, cx, cy, width, ground, beam_amt, t)
+        _draw_beam(surf, world, ufo, cx, cy, width, ground, beam_amt, t, cam)
 
     body = _saucer_body(int(width), tilt_bucket)
     rect = body.get_rect()
@@ -940,7 +964,10 @@ def _beam_strength(ufo: Any, world: Any, state: str) -> float:
 
 
 def _draw_beam(surf: pygame.Surface, world: Any, ufo: Any, cx: float, cy: float,
-               width: float, ground: float, amt: float, t: float) -> None:
+               width: float, ground: float, amt: float, t: float,
+               cam: Camera) -> None:
+    # *cx* arrives in SCREEN space; *cam* is here only so _draw_abductee can
+    # convert the abductee's own world x, which it has to read off the agent.
     # Clamp the mouth to just off the top of the screen. A saucer that has not
     # finished descending can sit hundreds of pixels above the world, and the
     # cone is baked with numpy - an unclamped height would allocate a surface
@@ -982,11 +1009,12 @@ def _draw_beam(surf: pygame.Surface, world: Any, ufo: Any, cx: float, cy: float,
     fx.blit_light(surf, cx, top + 2.0, width * 0.42,
                   (170, 235, 255), 0.55 * amt, falloff=1.4)
 
-    _draw_abductee(surf, world, ufo, cx, top, ground, t)
+    _draw_abductee(surf, world, ufo, cx, top, ground, t, cam)
 
 
 def _draw_abductee(surf: pygame.Surface, world: Any, ufo: Any,
-                   cx: float, top: float, ground: float, t: float) -> None:
+                   cx: float, top: float, ground: float, t: float,
+                   cam: Camera) -> None:
     """Draw whoever the beam has, at the height ``lift_t`` implies.
 
     ``lift_t`` is *read* here and nowhere written - the sim owns it. If it is
@@ -999,10 +1027,14 @@ def _draw_abductee(surf: pygame.Surface, world: Any, ufo: Any,
     p = fx.clamp(lift / max(0.1, UFO_BEAM_SEC), 0.0, 1.0)
     p = fx.smoothstep(p, 0.0, 1.0)
 
-    ax = fx.attr_num(a, "x", default=cx)
-    gy = _ground_y(world, ax)
+    # World x for the heightmap sample, screen x for the drawing. `cx` is
+    # already screen, so mixing the two in the drift below would slide the
+    # figure by cam.x as it rose.
+    wax = fx.attr_num(a, "x", default=cam.wx(cx))
+    gy = _ground_y(world, wax)
     if not math.isfinite(gy):
         gy = ground
+    ax = cam.sx(wax)
     # Drift toward the beam's axis as they rise, so they end up centred under
     # the saucer rather than clipping through its rim.
     px = ax + (cx - ax) * p
@@ -1342,7 +1374,8 @@ def _iter_mining_agents(world: Any) -> list[Any]:
     return out
 
 
-def draw_mining_dust(surf: pygame.Surface, world: Any, t: float) -> None:
+def draw_mining_dust(surf: pygame.Surface, world: Any, t: float, *,
+                     cam: Camera) -> None:
     """Kick up grey dust and stone chips at the feet of every mining agent.
 
     Reads the sim's soft ``agent.mining`` flag and never writes it. Meant to be
@@ -1351,6 +1384,8 @@ def draw_mining_dust(surf: pygame.Surface, world: Any, t: float) -> None:
     working under a torch throws lit dust, one in the dark throws dust the
     composite swallows to near-black. Cheap - a handful of AA discs per miner,
     no per-pixel work - and fails soft, per miner and overall.
+
+    *cam* is REQUIRED and has no default; a miner's ``x`` is a world x.
     """
     try:
         miners = _iter_mining_agents(world)
@@ -1367,18 +1402,20 @@ def draw_mining_dust(surf: pygame.Surface, world: Any, t: float) -> None:
         return
     for a in miners:
         try:
-            _draw_one_miner_dust(surf, a, tt)
+            _draw_one_miner_dust(surf, a, tt, cam)
         except Exception:
             log.debug("mining dust draw failed", exc_info=True)
 
 
-def _draw_one_miner_dust(surf: pygame.Surface, a: Any, t: float) -> None:
-    x = fx.attr_num(a, "x", default=math.nan)
+def _draw_one_miner_dust(surf: pygame.Surface, a: Any, t: float,
+                         cam: Camera) -> None:
+    wx = fx.attr_num(a, "x", default=math.nan)
     y = fx.attr_num(a, "y", default=math.nan)
-    if not (math.isfinite(x) and math.isfinite(y)):
+    if not (math.isfinite(wx) and math.isfinite(y)):
         return
-    if x < -40.0 or x > RENDER_W + 40.0:
+    if not cam.visible(wx, 40.0):
         return
+    x = cam.sx(wx)          # the one conversion; everything below is screen
     face = fx.attr_num(a, "facing", "vx", default=1.0)
     facing = -1.0 if face < 0.0 else 1.0
     idp = (fx.attr_num(a, "id", default=0.0) * 1.37) % TAU
@@ -1442,10 +1479,21 @@ if __name__ == "__main__":                             # pragma: no cover
     from ..constants import WEAPON_SPEAR as _WS
     from ..sim.world import World
     from .renderer import Renderer
+    from .stickfigure import build_skeleton as _build_sk
+    from .stickfigure import to_screen as _to_screen
 
     world = World(seed=7)
     for _ in range(240):
         world.tick(1.0 / 30.0)
+
+    # Everything below is sited relative to the COLONY, not at absolute
+    # 300-980. The world is 6400 px wide and the camera is wherever the
+    # villagers are, so literal coordinates put the whole cast several
+    # thousand px off the left of the frame and this smoke test measured the
+    # cost of drawing nothing at all.
+    from ..sim.actions import colony_center
+
+    HOME = float(colony_center(world))
 
     # Prefer the real sim objects; fall back to the duck-typed shapes this
     # module actually contracts on, so the smoke test still runs on a tree
@@ -1459,11 +1507,12 @@ if __name__ == "__main__":                             # pragma: no cover
         o.__dict__.update(kw)
         return o
 
-    spec = [(ANIMAL_WOLF, 300.0, {}),
-            (ANIMAL_WOLF, 360.0, {"state": "flee", "fleeing": True, "health": 21.0}),
-            (ANIMAL_BEAR, 520.0, {"state": "attack", "health": 90.0}),
-            (ANIMAL_BOAR, 700.0, {"state": "attack"}),
-            (ANIMAL_BOAR, 780.0, {"health": 0.0})]
+    spec = [(ANIMAL_WOLF, HOME - 340.0, {}),
+            (ANIMAL_WOLF, HOME - 280.0,
+             {"state": "flee", "fleeing": True, "health": 21.0}),
+            (ANIMAL_BEAR, HOME - 120.0, {"state": "attack", "health": 90.0}),
+            (ANIMAL_BOAR, HOME + 60.0, {"state": "attack"}),
+            (ANIMAL_BOAR, HOME + 140.0, {"health": 0.0})]
     try:
         from ..sim.animals import Animal, AnimalRegistry
 
@@ -1487,15 +1536,16 @@ if __name__ == "__main__":                             # pragma: no cover
         saucer = Ufo(seed=2)
         saucer.active = True
         saucer.phase = "beam"
-        saucer.x = saucer.hold_x = 980.0
-        saucer.y = world.terrain.ground_y(980.0) - 210.0
+        saucer.x = saucer.hold_x = HOME + 340.0
+        saucer.y = world.terrain.ground_y(HOME + 340.0) - 210.0
         saucer.t = 1.6
         world.ufo = saucer
         src += " + sim.ufo.Ufo"
     except Exception as exc:                          # pragma: no cover
-        world.ufo = types.SimpleNamespace(id=1, x=980.0,
-                                          y=world.terrain.ground_y(980.0) - 210.0,
-                                          state="beam", beam_t=1.6, radius=28.0)
+        world.ufo = types.SimpleNamespace(
+            id=1, x=HOME + 340.0,
+            y=world.terrain.ground_y(HOME + 340.0) - 210.0,
+            state="beam", beam_t=1.6, radius=28.0)
         src += f" + ufo stand-in ({exc})"
 
     agents = world.population.alive_agents()
@@ -1511,7 +1561,7 @@ if __name__ == "__main__":                             # pragma: no cover
             ag.mining = True            # exercise the mining-dust path
     if agents:
         victim = agents[-1]
-        victim.x = 980.0
+        victim.x = HOME + 340.0
         victim.taken = True
         victim.lift_t = 2.2
         world.ufo.target_id = victim.id
@@ -1521,6 +1571,7 @@ if __name__ == "__main__":                             # pragma: no cover
           f"({', '.join(animal_kind_of(a) for a in drawn)})")
 
     ren = Renderer()
+    ren.camera.snap_to(HOME)
     frames = 300
     t_creatures = 0.0
     t0 = _time.perf_counter()
@@ -1529,14 +1580,36 @@ if __name__ == "__main__":                             # pragma: no cover
         for a in drawn:
             a.anim_t = wt
         scene = ren.draw(world, 1.0 / 60.0)
+        base = pygame.surfarray.array3d(scene).copy() if f == frames - 1 else None
         c0 = _time.perf_counter()
-        draw_animals(scene, world, wt)
+        # The renderer's own camera, so this second pass lands on top of the
+        # one draw() just did rather than 4000 px to the left of it.
+        cam = ren.camera
+        draw_animals(scene, world, wt, cam=cam)
         for ag in world.population.agents:
-            draw_gear(scene, ag, t=wt)
-        draw_mining_dust(scene, world, wt)
-        draw_ufo(scene, world, wt)
+            # draw_gear takes a solved skeleton and is coordinate-space
+            # agnostic; the sk=None branch solves in WORLD space, which is only
+            # right under the identity camera. Convert explicitly here so this
+            # sheet does not quietly become the thing this lane exists to end.
+            draw_gear(scene, ag, _to_screen(_build_sk(ag, wt), -cam.x), t=wt)
+        draw_mining_dust(scene, world, wt, cam=cam)
+        draw_ufo(scene, world, wt, cam=cam)
         t_creatures += _time.perf_counter() - c0
+        if base is not None:
+            _changed = int((base != pygame.surfarray.array3d(scene))
+                           .any(axis=2).sum())
     total = _time.perf_counter() - t0
+    print(f"second pass put {_changed} px on the frame "
+          f"(0 would mean the cast is off camera)")
+    assert _changed > 0, "nothing this module drew landed inside the frame"
+
+    try:
+        draw_animals(scene, world, 0.0)          # type: ignore[call-arg]
+    except TypeError as exc:
+        print("cam is required:", exc)
+    else:
+        raise SystemExit("draw_animals accepted a call with no camera")
+    print("identity camera still available for sheets:", IDENTITY)
 
     out = os.path.join(os.environ.get("TEMP", "."), "creatures_smoke.png")
     pygame.image.save(scene, out)

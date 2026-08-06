@@ -67,19 +67,11 @@ from .entities import GROUND_SNAP, STEP_DROP_MAX
 # OFFSTAGE is off it. Both derive from colony_center() and the seeded stream, so
 # determinism is untouched and no sim -> render dependency is created.
 #
-# The try/except is a landing-order shim, NOT a design: constants.py belongs to
-# another lane this pass, so an unguarded import would make this module
-# unimportable until that lane lands. Drop the guard once constants.py carries
-# these names. The fallbacks are defined exactly ONCE, here - behavior.py imports
-# them back out of this module rather than restating 6400 and drifting from it,
-# which is the failure MAX_POP's duplicate in combat_actions.py already had.
-try:
-    from ..constants import OFFSTAGE, STAGE_HALF, WORLD_SCALE, WORLD_W
-except ImportError:                                       # pragma: no cover
-    WORLD_W = 6400
-    WORLD_SCALE = WORLD_W / RENDER_W                      # 4.0
-    STAGE_HALF = RENDER_W * 0.5                           # 800.0
-    OFFSTAGE = STAGE_HALF + 160.0                         # 960.0
+# The names live in constants.py, not here, and are imported separately from the
+# block above only so this note has somewhere to sit next to the code that reads
+# them. Nothing in `sim/` may hardcode 6400 - a second copy is exactly how the
+# MAX_POP duplicate in combat_actions.py went stale.
+from ..constants import OFFSTAGE, STAGE_HALF, WORLD_W
 
 #: Ground drop, in px, that counts as a ledge rather than a slope. Roughly a
 #: body height: below this a stickman steps down, above it they have to climb
@@ -470,14 +462,42 @@ def nearest_structure(
 
 
 def colony_center(world: Any) -> float:
+    """Where the colony is, in WORLD px. Never raises; always finite.
+
+    Prefers the structure registry's own mean, then the living agents, then the
+    middle of the map.
+
+    The NaN sentinel is load-bearing, and it is a WORLD_W bug rather than a
+    tidy-up. ``StructureRegistry.colony_center`` takes a *default* it returns
+    when it has no buildings to average, and that default is ``RENDER_W * 0.5``.
+    Called bare, an empty registry therefore answers "800" - a real, finite,
+    entirely wrong number that this function used to accept and return. That was
+    invisible while the world was 1600 px wide, because 800 was the middle of it
+    and a colony had to be near the middle. On a 6400 px world a colony that has
+    not yet finished its first building reports its centre as x=800 wherever it
+    actually stands: measured here, four founders seated at x=1600 reported 800,
+    which puts stage_bounds 800 px off, sites the first firepit 788 px from the
+    people building it, and hands the camera the wrong place to look.
+
+    Asking with a NaN default makes "I have nothing" distinguishable from "the
+    mean happens to be 800", so the agents get their turn. A duck-typed registry
+    that will not take the argument falls back to the bare call - it keeps
+    today's behaviour rather than losing the registry entirely.
+    """
     reg = structures_of(world)
     if reg is not None:
+        c: Any = None
         try:
-            c = reg.colony_center()
-            if isinstance(c, (int, float)) and math.isfinite(float(c)):
-                return float(c)
+            c = reg.colony_center(float("nan"))
+        except TypeError:
+            try:
+                c = reg.colony_center()
+            except Exception:
+                c = None
         except Exception:
-            pass
+            c = None
+        if isinstance(c, (int, float)) and math.isfinite(float(c)):
+            return float(c)
     ags = alive_agents(world)
     if ags:
         return float(sum(float(getattr(a, "x", 0.0)) for a in ags) / len(ags))
@@ -486,6 +506,58 @@ def colony_center(world: Any) -> float:
     # it is also what Camera.follow uses when it has nothing to follow, so the
     # two agree on where "nowhere in particular" is.
     return WORLD_W * 0.5
+
+
+#: Structures deliberately placed at the colony's EDGE rather than inside it.
+#: They have to be left out of any "where is the colony" average, because the
+#: whole point of them is to sit a long way from that answer.
+OUTWORK_KINDS = ("barricade",)
+
+
+def settlement_center(world: Any) -> float:
+    """Where the colony *lives*, with its own outworks left out of the average.
+
+    :func:`colony_center` prefers ``StructureRegistry.colony_center``, a mean
+    over every non-grave, non-ruined structure - barricades included. That is
+    right for a settlement whose buildings sit together and wrong for anything
+    that reasons about the colony's EDGE, because a barricade is deliberately
+    about STAGE_HALF out; fold one into the mean and the answer moves by that
+    distance divided by the number of buildings.
+
+    Measured on the lane harness, colony at x=800 on an otherwise empty map: the
+    first barricade goes in at x=4 - correct, 796 px out - the structure mean
+    then drops from 800 to 4, and the SECOND barricade is sited 800 px right of
+    *that*, landing on top of the settlement it was meant to defend while the
+    right approach stays open. Two symmetric barricades cancel out again, which
+    is why this only bites between the first and the second and would survive
+    any test that staked both at once. The same drag pulls MINE_KEEP_OUT off
+    centre, which is how a quarry opens inside the town it is keeping out of:
+    colony at x=178 with barricades at 4 and 974 reports its centre as 489, and
+    the keep-out ring then permits a dig 174 px from the actual settlement.
+
+    :func:`colony_center` is deliberately NOT changed - render/camera.py and the
+    rest of the migration are written against its documented behaviour - so this
+    is the one to reach for when the question is "where do the people live".
+    """
+    reg = structures_of(world)
+    xs: list[float] = []
+    if reg is not None:
+        try:
+            for s in reg:
+                kind = str(getattr(s, "kind", ""))
+                if kind in OUTWORK_KINDS or kind == "grave":
+                    continue
+                if getattr(s, "is_ruined", False):
+                    continue
+                xs.append(float(s.x))
+        except Exception:
+            xs = []
+    if xs:
+        return float(sum(xs) / len(xs))
+    ags = alive_agents(world)
+    if ags:
+        return float(sum(float(getattr(a, "x", 0.0)) for a in ags) / len(ags))
+    return colony_center(world)
 
 
 def stage_bounds(world: Any) -> tuple[float, float]:
@@ -2976,7 +3048,10 @@ def _quarry_column(world: Any, x: float,
 
     Ranks legal columns instead of taking the first. Legal means standable (the
     old cliff test, unchanged - a miner must not commit to a spot it can only
-    reach by falling off it) and at least MINE_KEEP_OUT from colony_center().
+    reach by falling off it) and at least MINE_KEEP_OUT from settlement_center()
+    - the settlement, with the barricades left out, because a keep-out ring
+    measured from a centre that a single outwork has dragged 300 px is a ring
+    round the wrong place. See :func:`settlement_center`.
     Among those, the score prefers a column further OUT - toward the nearer rim
     of the world - with a smaller term for the walk so two comparable directions
     do not send miners across the map.
@@ -2989,7 +3064,7 @@ def _quarry_column(world: Any, x: float,
     terr = getattr(world, "terrain", None)
     if not callable(getattr(terr, "material_at", None)):
         return None
-    home = colony_center(world)
+    home = settlement_center(world)
     # How far the miner already stands from the nearer rim of the WORLD. The
     # edge term below is measured as a change against this, not as an absolute
     # fraction of the map - see the comment at the score, it is the difference

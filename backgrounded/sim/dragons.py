@@ -232,8 +232,10 @@ from ..constants import (
     DRAGON_STATS,
     MAX_DRAGONS_ALIVE,
     MAX_HEALTH,
+    OFFSTAGE,
     RENDER_H,
-    RENDER_W,
+    STAGE_HALF,
+    WORLD_W,
 )
 
 log = logging.getLogger(__name__)
@@ -325,7 +327,8 @@ ENTRY_INSET = 90.0
 #: Px/s of climb or descent on an arrive or leave leg.
 ALT_RATE = 96.0
 
-#: Px above the HIGHEST ground on the map - see :meth:`DragonRegistry._sky_line`
+#: Px above the highest ground the crossing passes over - see
+#: :meth:`DragonRegistry._sky_line`
 #: for why it is not "above the ground beneath", which is what it used to mean.
 FLYOVER_ALT = (300.0, 420.0)
 #: ...and how far inside the top of the frame the crossing is held whatever
@@ -521,8 +524,13 @@ _ARRIVAL_LINES: dict[str, str] = {
     KIND_SKELETAL: "A wyrm of bone turns slow circles above the graves.",
 }
 
+#: The WORLD's rim - the hard clamp on where a dragon may stand, and nothing
+#: else. It used to double as "the edge of the frame" because the world was
+#: exactly one frame wide; on a WORLD_W map those are up to 2400 px apart, and
+#: every use that meant the second one now goes through :func:`_stage_edge`,
+#: :func:`_spawn_x` or :func:`_on_stage`.
 _EDGE_MIN = 0.0
-_EDGE_MAX = float(RENDER_W - 1)
+_EDGE_MAX = float(WORLD_W - 1)
 _MAX_DT = 0.25
 _FALLBACK_STATS: tuple[float, float, float] = (150.0, 60.0, 120.0)
 #: Cap on the replay loop in from_dict. A hand-edited "draws": 1e12 must cost a
@@ -564,6 +572,45 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 
 def _clamp_x(x: Any) -> float:
     return _clamp(_f(x, 0.0), _EDGE_MIN, _EDGE_MAX)
+
+
+# ------------------------------------------------------------------ stage ---
+# ``sim/`` may not look at render's camera. It does not have to: the camera is
+# RENDER_W wide and follows the colony, so a point further than OFFSTAGE from
+# whatever the colony is gathered around is off-camera BY CONSTRUCTION. Every
+# statement in this file that used to say "the frame edge" - and there were
+# several, including the one _tick_arrive's whole design rests on - said it in
+# world coordinates because the world was one frame wide. These three restore
+# the meaning without giving sim/ any knowledge of render/.
+#
+# They take the ANCHOR as a number rather than the world, because a dragon
+# already carries the right anchor: ``d.home_x`` is the colony for a wyvern,
+# quadruped and flyover, the lair for a serpent and the graveyard for the
+# skeletal. ``actions.offstage_x(world, side)`` is the same idea anchored on
+# colony_center(), and is the right call anywhere that has no home_x.
+def _stage_edge(anchor: float, side: int) -> float:
+    """The x on *side* of *anchor* at which a thing becomes visible."""
+    s = 1.0 if side >= 0 else -1.0
+    return _clamp(anchor + s * OFFSTAGE, _EDGE_MIN, _EDGE_MAX)
+
+
+def _spawn_x(anchor: float, side: int) -> float:
+    """Where a dragon appears: SPAWN_MARGIN px beyond the stage edge.
+
+    Deliberately NOT clamped to the land - dragons arrive and leave through the
+    air and are allowed to be outside the map while they do, exactly as they
+    were when they entered at ``-SPAWN_MARGIN``. The clamp that IS here only
+    stops a runaway anchor putting one an absurd distance out.
+    """
+    s = 1.0 if side >= 0 else -1.0
+    return _clamp(anchor + s * (OFFSTAGE + SPAWN_MARGIN),
+                  _EDGE_MIN - OFFSTAGE - SPAWN_MARGIN,
+                  _EDGE_MAX + OFFSTAGE + SPAWN_MARGIN)
+
+
+def _on_stage(anchor: float, x: float, inset: float = 0.0) -> bool:
+    """True once *x* is near enough *anchor* that the camera could show it."""
+    return abs(_f(x, 0.0) - _f(anchor, 0.0)) <= max(0.0, OFFSTAGE - inset)
 
 
 def _approach(cur: float, target: float, rate: float, dt: float) -> float:
@@ -1329,10 +1376,22 @@ class DragonRegistry:
         built = [st for st in _structures(world) if getattr(st, "built", False)]
         if built:
             return _clamp_x(sum(_f(getattr(st, "x", 0.0)) for st in built) / len(built))
-        return RENDER_W * 0.5
+        return WORLD_W * 0.5
 
     def _lair_x(self, world: Any) -> float:
-        """Where the serpent lives: the chasm's midpoint, or the deepest column.
+        """Where the serpent lives: the chasm's midpoint, or the deepest column
+        - both now searched WITHIN SIGHT OF THE COLONY rather than map-wide.
+
+        This is the one place in this file where widening the world silently
+        deleted an event rather than just stretching it. The serpent does not
+        travel: ``_spawn`` puts it at ``home_x`` and ``_tick_surface`` pins it
+        there while it rises. On a 6400 px map the deepest column, or a chasm,
+        is a mean of ~1600 px from the colony and can be 3000 - so the serpent
+        would surface, hunt, starve and submerge without ever entering frame,
+        and the only trace of the whole visit would be two chronicle lines.
+        Searching the stage window keeps the promise the docstring below makes.
+
+        Cost fell with it: the scan is 1600 px of heightmap again, not 6400.
 
         Only 21.2% of maps are chasm-cut (measured, 85 of 400 seeds), so the
         signature entrance - out of the hole the colony has spent the whole run
@@ -1347,10 +1406,18 @@ class DragonRegistry:
         now reports there. The bridge is a road it did not have to earn.
         """
         terrain = getattr(world, "terrain", None)
+        centre = self._colony_x(world)
+        lo = _clamp(centre - STAGE_HALF, _EDGE_MIN, _EDGE_MAX)
+        hi = _clamp(centre + STAGE_HALF, _EDGE_MIN, _EDGE_MAX)
         try:
             ch = getattr(terrain, "chasm", None)
             if isinstance(ch, (tuple, list)) and len(ch) >= 2:
-                return _clamp_x((float(ch[0]) + float(ch[1])) * 0.5)
+                mid = (float(ch[0]) + float(ch[1])) * 0.5
+                # A chasm the colony cannot see is not the chasm the colony has
+                # spent the run bridging, so it does not get the signature
+                # entrance - the deepest visible column below does instead.
+                if lo <= mid <= hi:
+                    return _clamp_x(mid)
         except Exception:
             pass
         try:
@@ -1361,15 +1428,17 @@ class DragonRegistry:
                 # Sampled every 4 px: this runs once per serpent visit and the
                 # extra precision would buy nothing a 156 px animal can tell.
                 step = 4
-                best_i, best_v = 0, -1e30
-                for i in range(0, n, step):
+                i0 = max(0, min(n - 1, int(lo)))
+                i1 = max(i0 + 1, min(n, int(hi) + 1))
+                best_i, best_v = i0, -1e30
+                for i in range(i0, i1, step):
                     v = float(h[i])
                     if v > best_v:
                         best_i, best_v = i, v
                 return _clamp_x(best_i)
         except Exception:
             pass
-        return RENDER_W * 0.5
+        return WORLD_W * 0.5
 
     def _graveyard_x(self, world: Any) -> float | None:
         stones = _graves(world)
@@ -1403,13 +1472,16 @@ class DragonRegistry:
                     return None            # nothing here it wants
                 d.home_x = yard
                 side = -1 if self._rand() < 0.5 else 1
-                d.x = -SPAWN_MARGIN if side < 0 else _EDGE_MAX + SPAWN_MARGIN
+                d.x = _spawn_x(d.home_x, side)
                 d.alt = SKELETAL_SPAWN_ALT
                 d.state = PHASE_ARRIVE
                 d.facing = 1 if side < 0 else -1
             elif kind == KIND_FLYOVER:
+                # home_x FIRST, unlike the pre-camera version: it is now what
+                # the crossing is measured from, not just a field nothing reads.
+                d.home_x = self._colony_x(world)
                 side = -1 if self._rand() < 0.5 else 1
-                d.x = -SPAWN_MARGIN if side < 0 else _EDGE_MAX + SPAWN_MARGIN
+                d.x = _spawn_x(d.home_x, side)
                 # NOT drawn here. _tick_cross authors alt against the sky line
                 # every tick (see there), and the band it uses comes off `id`,
                 # which add() has not handed out yet. The bottom of the band is
@@ -1419,24 +1491,31 @@ class DragonRegistry:
                 d.vx = speed if side < 0 else -speed
                 d.facing = 1 if d.vx >= 0.0 else -1
                 d.state = PHASE_CROSS
-                d.home_x = self._colony_x(world)
             elif kind == KIND_QUADRUPED:
                 d.home_x = self._colony_x(world)
-                # The NEARER edge, unlike every other kind. The others pick a
-                # side at random because crossing the sky is half of what they
-                # are for; this one lands at the frame edge and walks the rest
-                # (its airborne leg has to stay off-screen - see _tick_arrive),
-                # and a far-side spawn spent 40 s of a 150 s siege trudging
-                # across an empty map before it reached anything to wreck.
-                side = -1 if d.home_x <= RENDER_W * 0.5 else 1
-                d.x = -SPAWN_MARGIN if side < 0 else _EDGE_MAX + SPAWN_MARGIN
+                # WAS "the nearer edge of the map", and the reason was that a
+                # far-side spawn spent 40 s of a 150 s siege trudging across an
+                # empty map before it reached anything to wreck. On a 6400 px
+                # world that argument gets four times stronger and the mechanism
+                # stops working: BOTH world edges can be 3000 px away, so there
+                # is no near one and the siege never starts.
+                #
+                # _spawn_x makes the question moot instead of answering it - the
+                # walk is OFFSTAGE + SPAWN_MARGIN whichever side it picks, so
+                # both are "near" and the 40 s finding can never come back. What
+                # is left to choose is the side with room to be off-camera in:
+                # against the map's rim _spawn_x has nowhere to put it and the
+                # airborne leg would happen in frame, which is the one thing
+                # _tick_arrive exists to prevent. So: away from the nearer rim.
+                side = 1 if d.home_x <= WORLD_W * 0.5 else -1
+                d.x = _spawn_x(d.home_x, side)
                 d.alt = self._uni(*QUAD_ALT)
                 d.state = PHASE_ARRIVE
                 d.facing = 1 if side < 0 else -1
             else:                                        # wyvern
                 d.home_x = self._colony_x(world)
                 side = -1 if self._rand() < 0.5 else 1
-                d.x = -SPAWN_MARGIN if side < 0 else _EDGE_MAX + SPAWN_MARGIN
+                d.x = _spawn_x(d.home_x, side)
                 d.alt = WYVERN_SPAWN_ALT
                 d.state = PHASE_ARRIVE
                 d.facing = 1 if side < 0 else -1
@@ -1476,8 +1555,8 @@ class DragonRegistry:
             except Exception:
                 continue
 
-    def _sky_line(self, world: Any, band: float) -> float:
-        """Screen y a flyover holds for its whole crossing, *band* px up.
+    def _sky_line(self, world: Any, band: float, anchor: float) -> float:
+        """World y a flyover holds for its whole crossing, *band* px up.
 
         ``alt`` is px above the ground DIRECTLY BENEATH, so a constant alt over
         broken terrain is not a constant height. Relief runs 400-450 px on the
@@ -1491,14 +1570,22 @@ class DragonRegistry:
 
         Two clamps, and the second one is the interesting one:
 
-        * the reference is the HIGHEST ground on the whole map, not the ground
-          under the animal, so *band* means "px above the tallest thing here" -
-          a strictly stronger claim than the one FLYOVER_ALT was written for;
+        * the reference is the highest ground the CROSSING PASSES OVER, not the
+          ground under the animal, so *band* means "px above the tallest thing
+          here" - a strictly stronger claim than the one FLYOVER_ALT was
+          written for;
         * ...and then the line is held at least ``FLYOVER_SCREEN_MIN_Y`` inside
           the frame, because on the hilliest of those maps a peak at y 407 minus
           a 412 px band is y -5. The herald is the sentence that makes the whole
           tech unlock legible; a herald drawn above the top of the screen is the
           unlock going back to being a line in a log.
+
+        "The crossing" used to be the whole map, because the map was one screen.
+        On a WORLD_W map it is the stage around *anchor* - the span the flyover
+        actually crosses and the only span anyone can see it against. Taking the
+        peak of all 6400 columns would hold the herald above a mountain 3000 px
+        away, which reads as a shape drifting pointlessly high over flat ground,
+        and it would scan four times the array on every tick of the crossing.
 
         Costs no persisted state - the heightmap is already the world's - and
         runs only while a flyover is actually on the map.
@@ -1507,12 +1594,16 @@ class DragonRegistry:
         try:
             h = getattr(getattr(world, "terrain", None), "height", None)
             if h is not None and len(h):
+                n = len(h)
+                i0 = int(_clamp(anchor - OFFSTAGE, 0.0, float(n - 1)))
+                i1 = int(_clamp(anchor + OFFSTAGE, 0.0, float(n - 1))) + 1
+                span = h[i0:i1] if i1 > i0 else h
                 # y grows downward, so the HIGHEST ground is the smallest value.
                 # Every column, not a sample: a 16 px stride missed the true
                 # peak by up to 40 px, and since the clamp below is what catches
                 # that, the miss came back as exactly the sag this is here to
                 # remove.
-                peak = _f(min(float(v) for v in h), RENDER_H * 0.5)
+                peak = _f(min(float(v) for v in span), RENDER_H * 0.5)
         except Exception:
             peak = None
         if peak is None or not math.isfinite(peak):
@@ -1692,8 +1783,9 @@ class DragonRegistry:
         is the arrival line and the morale nudge, both already spent at spawn.
 
         The height is held against :meth:`_sky_line` - the highest ground on the
-        map - rather than against the ground directly beneath, so it draws one
-        straight line across the frame instead of sagging into every valley. It
+        stage it crosses - rather than against the ground directly beneath, so
+        it draws one straight line across the frame instead of sagging into
+        every valley. It
         is the one kind whose ``alt`` is re-derived rather than authored, which
         is the honest way round for a thing whose whole job is to be
         unmistakably out of reach: ``alt`` then reports the real, larger gap
@@ -1702,8 +1794,13 @@ class DragonRegistry:
         d.x += d.vx * dt
         d.facing = 1 if d.vx >= 0.0 else -1
         band = _band(d, FLYOVER_ALT)
-        d.alt = _ground_y(world, d.x) - self._sky_line(world, band)
-        if d.x < -SPAWN_MARGIN - 60.0 or d.x > _EDGE_MAX + SPAWN_MARGIN + 60.0:
+        d.alt = _ground_y(world, d.x) - self._sky_line(world, band, d.home_x)
+        # Crossed, when it is a spawn-margin past the far stage edge. Measured
+        # against home_x rather than the map, or a herald that spawned near the
+        # colony would have to fly up to 5000 px of empty world before it was
+        # allowed to stop existing - two full minutes at FLYOVER_SPEED, holding
+        # a MAX_DRAGONS_ALIVE slot and blocking every later visit.
+        if abs(d.x - d.home_x) > OFFSTAGE + SPAWN_MARGIN + 60.0:
             self._enter(d, PHASE_IDLE)
 
     def _tick_arrive(self, world: Any, d: Dragon, dt: float) -> None:
@@ -1723,17 +1820,17 @@ class DragonRegistry:
         d.facing = 1 if target_x >= d.x else -1
 
         if d.kind == KIND_QUADRUPED:
-            on_screen = _EDGE_MIN <= d.x <= _EDGE_MAX
+            on_screen = _on_stage(d.home_x, d.x)
             if d.alt > 0.0 or not on_screen:
                 # Still airborne, therefore still off-screen. Distance left to
-                # the frame edge is the time left to be in the air; the descent
+                # the stage edge is the time left to be in the air; the descent
                 # rate is recomputed every tick so it cannot overshoot however
                 # SPAWN_MARGIN or the speeds are retuned.
                 d.x += (d.speed if d.facing > 0 else -d.speed) * dt
-                edge = _EDGE_MIN if d.facing > 0 else _EDGE_MAX
+                edge = _stage_edge(d.home_x, -1 if d.facing > 0 else 1)
                 gap = abs(edge - d.x)
                 t_left = gap / max(1e-3, d.speed)
-                if t_left <= dt or gap <= 4.0 or (_EDGE_MIN <= d.x <= _EDGE_MAX):
+                if t_left <= dt or gap <= 4.0 or _on_stage(d.home_x, d.x):
                     d.alt = 0.0
                 else:
                     d.alt = max(0.0, d.alt - (d.alt / t_left) * dt)
@@ -1751,7 +1848,7 @@ class DragonRegistry:
         cruise = self._cruise(d)
         d.alt = _approach(d.alt, cruise, ALT_RATE, dt)
 
-        inside = ENTRY_INSET <= d.x <= _EDGE_MAX - ENTRY_INSET
+        inside = _on_stage(d.home_x, d.x, ENTRY_INSET)
         if inside and abs(d.alt - cruise) <= 6.0:
             self._enter(d, PHASE_HUNT)
 
@@ -2047,28 +2144,49 @@ class DragonRegistry:
                 self._enter(d, PHASE_IDLE)
             return
 
-        # Aim PAST the despawn line, not at the frame edge. Aiming at the edge
+        # Aim PAST the despawn line, not at the stage edge. Aiming at the edge
         # itself made the exit oscillate on the rim forever: one tick outside
         # flips the "which side am I on" test, the next tick flips it back, and
         # the dragon hovered at x=1601 for the rest of the run without ever
         # reaching the despawn threshold at edge + SPAWN_MARGIN. Measured: a
         # wyvern that had already fed and left sat there for 400 s of a 400 s
         # test, so PHASE_IDLE was a state the machine could not reach.
-        going_right = d.x >= RENDER_W * 0.5
-        out_x = (_EDGE_MAX + SPAWN_MARGIN + 40.0) if going_right \
-            else (-SPAWN_MARGIN - 40.0)
+        #
+        # "Which side am I on" is now measured against home_x, not the middle of
+        # the map. A dragon that fed at x=5200 was "left of centre" and so flew
+        # 5200 px WEST to leave, straight back across the colony it had just
+        # finished with and then 4000 px of empty land, at 96 px/s: 54 s of a
+        # visit whose whole point was over, blocking the next one for all of it.
+        side = 1 if d.x >= d.home_x else -1
+        going_right = side > 0
+        out_x = _spawn_x(d.home_x, side) + side * 40.0
         d.facing = 1 if going_right else -1
         step = (d.speed if going_right else -d.speed) * dt
 
         if d.kind == KIND_QUADRUPED:
             # Walks out the way it walked in, and only starts climbing once it
-            # is off the frame - see _tick_arrive for why the airborne leg has
-            # to stay off-screen. The inner bound is deliberately strict:
-            # _walk() clamps x into [0, RENDER_W-1], so a quadruped left on the
-            # walking branch at the last column can never step past it.
-            if _EDGE_MIN + 1.0 < d.x < _EDGE_MAX - 1.0:
+            # is off the stage - see _tick_arrive for why the airborne leg has
+            # to stay off-screen.
+            #
+            # THE INSET IS LOAD-BEARING, and leaving it out cost a debugging
+            # session: with the test at `<= OFFSTAGE` and the walk target AT
+            # OFFSTAGE, the quadruped walked to |x - home| == 960.0 exactly,
+            # where the test is still true and _walk's own "gap < 0.5, stop"
+            # fires - so it stood there for the remaining 250 s of every run and
+            # PHASE_IDLE became unreachable. Measured on seeds 11/23/37, all
+            # three identical: stuck at 960.0. It is the same shape as the
+            # oscillation the comment above records, and the same cure - the
+            # target must be strictly past the test, never equal to it.
+            #
+            # The world-rim bound is kept and is NOT redundant: _walk() clamps x
+            # into [0, WORLD_W-1], so a colony seated within OFFSTAGE of the
+            # map's rim would walk to that rim and never get off stage at all.
+            # Either test failing hands it to the airborne branch, which is
+            # unclamped and therefore always terminates.
+            if (_on_stage(d.home_x, d.x, 1.0)
+                    and _EDGE_MIN + 1.0 < d.x < _EDGE_MAX - 1.0):
                 d.alt = 0.0
-                self._walk(world, d, _EDGE_MAX if going_right else _EDGE_MIN,
+                self._walk(world, d, _stage_edge(d.home_x, side),
                            dt, QUAD_WALK * 2.2)
                 self._drag(world, d)
                 return
@@ -2157,7 +2275,7 @@ class DragonRegistry:
             agent.vy = 0.0
             agent.climbing = False
             agent.climb_t = 0.0
-            agent.x = _clamp(d.x, 0.0, float(RENDER_W - 1))
+            agent.x = _clamp_x(d.x)
             agent.pose_override = "fall"
         except Exception:
             log.debug("could not hold an agent", exc_info=True)
@@ -2445,8 +2563,22 @@ if __name__ == "__main__":   # pragma: no cover - headless, drives a real World
         w.dragons = reg
         # Give it something to want: a couple of graves for the skeletal, a
         # finished hut for the quadruped to raze.
-        w.props.add_grave(RENDER_W * 0.45, w.terrain.ground_y(RENDER_W * 0.45), "Ana")
-        w.props.add_grave(RENDER_W * 0.52, w.terrain.ground_y(RENDER_W * 0.52), "Bo")
+        # Beside the colony, not at a fixed fraction of the map: on a WORLD_W
+        # world a grave at 0.45*W can be 3000 px from anybody, and the skeletal
+        # would spend the whole 400 s flying to a graveyard nobody can see.
+        cx = reg._colony_x(w)
+        for dx, who in ((-40.0, "Ana"), (+30.0, "Bo")):
+            gx = _clamp_x(cx + dx)
+            w.props.add_grave(gx, w.terrain.ground_y(gx), who)
+        # ...and a FINISHED hut, which this docstring has always claimed to
+        # provide and never did. It used to get one for free because a colony
+        # reliably finished something inside 400 s; it does not any more (a
+        # freshly seeded world builds one firepit and never completes it), so
+        # PHASE_RAZE became unreachable for a reason that has nothing to do with
+        # dragons. Planting the hut here makes this bench test the razing state
+        # machine instead of testing the colony's economy through it.
+        hx = _clamp_x(cx + 90.0)
+        w.structures.create("hut", hx, w.terrain.ground_y(hx), built=True)
         seen: set[str] = set()
         alts: list[float] = []
         windows: dict[int, list[float]] = {}
@@ -2565,6 +2697,13 @@ if __name__ == "__main__":   # pragma: no cover - headless, drives a real World
     # arrive and leave legs have nothing correct to draw. The sim's answer is
     # to spend the whole airborne leg outside the frame; this is the assertion
     # that keeps it true if anyone retunes SPAWN_MARGIN or the speeds.
+    #
+    # "On screen" is _on_stage, not the map bounds. It USED to be the map bounds
+    # and the two were the same thing; on a WORLD_W world they are not, and the
+    # world-bounds version of this check reported 111 px of altitude in frame
+    # for a quadruped that was in fact 1178 px away and invisible. A test that
+    # can only pass on a map exactly one screen wide is not testing the rule the
+    # comment above states.
     w = World(seed=11)
     reg = DragonRegistry(seed=11)
     w.dragons = reg
@@ -2573,7 +2712,7 @@ if __name__ == "__main__":   # pragma: no cover - headless, drives a real World
     for _ in range(int(260.0 / DT)):
         w.tick(DT)                           # drives reg - see drive() above
         for g in reg.all():
-            if _EDGE_MIN <= g.x <= _EDGE_MAX:
+            if _on_stage(g.home_x, g.x):
                 worst_on_screen = max(worst_on_screen, g.alt)
     print(f"  highest a quadruped ever got while on screen: "
           f"{worst_on_screen:.2f} px")

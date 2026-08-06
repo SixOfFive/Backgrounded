@@ -44,6 +44,7 @@ from ..constants import (
     SCENE_VOLCANO,
     SCENE_WILDFIRE,
 )
+from .camera import IDENTITY, Camera
 from .fx import (
     attr_num,
     blit_batch,
@@ -933,15 +934,32 @@ def draw_sky(surf: pygame.Surface, scene: str, world_time: float,
 
 
 def _ridge_profile(seed: int, layer: int, w: int) -> np.ndarray:
-    """Deterministic 0..1 ridge profile via summed sines (no noise library)."""
+    """Deterministic 0..1 ridge profile via summed sines (no noise library).
+
+    Every octave frequency is a whole number of cycles across *w*, which makes
+    the profile TILE SEAMLESSLY - ``prof[w-1]`` and ``prof[0]`` are one sampling
+    step apart instead of arbitrarily far apart. That matters now and did not
+    before: a parallax layer scrolls at a fraction of the camera's speed, so it
+    runs out of ridge long before the camera runs out of world and has to be
+    blitted twice, wrapped. With the old fractional frequencies (0.7, 1.449,
+    3.00...) the wrap put a vertical cliff in the skyline every 1600 px of
+    layer travel, which reads as a rendering fault rather than as terrain.
+
+    Frequencies are forced strictly increasing after rounding, or the first two
+    octaves of the far layer would both land on 1 cycle and the layer would
+    lose an octave of detail to the rounding.
+    """
     rng = np.random.default_rng((int(seed) & 0xFFFFFF) * 977 + layer * 7919)
     xs = np.arange(w, dtype=np.float32) / float(max(1, w))
     prof = np.zeros(w, dtype=np.float32)
     amp = 1.0
     total = 0.0
     freq = 0.7 + 0.5 * layer
+    used = 0
     for _ in range(5):
-        prof += amp * np.sin((xs * freq + float(rng.random())) * math.tau)
+        k = max(used + 1, int(round(freq)))
+        used = k
+        prof += amp * np.sin((xs * k + float(rng.random())) * math.tau)
         total += amp
         amp *= 0.56
         freq *= 2.07
@@ -951,15 +969,31 @@ def _ridge_profile(seed: int, layer: int, w: int) -> np.ndarray:
 
 RIDGE_LAYERS = 3
 
+#: How fast each ridge layer scrolls relative to the camera, back to front.
+#: These are the whole reason the parallax pass exists on a wide world: at 0.0
+#: (which is what a fixed blit is) the ridges are a painted card the colony
+#: slides across, and the 4x map reads as a bug. Kept well under 1.0 so the
+#: ridges stay behind the terrain - the terrain itself scrolls at 1.0 - and
+#: spread wide enough (nearly 4x between front and back) that the depth is
+#: legible at walking pace rather than only during a snap.
+PARALLAX_FACTORS: tuple[float, ...] = (0.06, 0.12, 0.22)
 
-def _ridge_composite(seed: int, scene: str, tone: int, w: int,
-                     h: int) -> tuple[pygame.Surface, int]:
-    """Bake all ridge layers into one cropped surface plus its y offset.
 
-    Compositing at bake time means the per-frame cost is a single blit of a
-    half-height surface instead of three full-screen alpha blits.
+def _ridge_layer(seed: int, scene: str, tone: int, layer: int, w: int,
+                 h: int) -> tuple[pygame.Surface, int]:
+    """Bake ONE ridge layer into a cropped surface plus its y offset.
+
+    This used to bake all three into a single surface, so the per-frame cost
+    was one blit instead of three - which was the right trade while every layer
+    sat at the same fixed x. It is not available any more: parallax means the
+    three layers move at three different speeds, and you cannot slide three
+    speeds out of one bitmap. The cost is measured in the module's __main__.
+
+    Cropped to its own crest rather than to the deepest of the three, so the
+    far layers - which sit highest and would otherwise carry ~130 px of dead
+    transparent rows each - stay as small as they can be.
     """
-    key = (int(seed) & 0xFFFFFF, scene, tone, w, h)
+    key = (int(seed) & 0xFFFFFF, scene, tone, layer, w, h)
     hit = _RIDGE_CACHE.get(key)
     if hit is not None:
         return hit
@@ -967,56 +1001,79 @@ def _ridge_composite(seed: int, scene: str, tone: int, w: int,
     base = _SCENE_RIDGE.get(scene, _SCENE_RIDGE[SCENE_CLEAR])
     shade = 0.25 + 0.75 * (tone / 8.0)
     comp = pygame.Surface((w, h), pygame.SRCALPHA)
-    top_y = h
     step = max(4, w // 180)
 
-    for layer in range(RIDGE_LAYERS):
-        prof = _ridge_profile(seed, layer, w)
-        top = h * (0.50 + 0.055 * layer)
-        amp = h * (0.13 - 0.030 * layer)
-        haze = 1.0 - 0.30 * (2 - layer)           # far layers pick up sky haze
-        far = 0.42 + 0.29 * layer                 # near layers darker
-        col = (
-            int(clamp(base[0] * shade * far + 8 * haze, 0, 255)),
-            int(clamp(base[1] * shade * far + 9 * haze, 0, 255)),
-            int(clamp(base[2] * shade * far + 12 * haze, 0, 255)),
-        )
-        crest: list[tuple[int, int]] = []
-        for x in range(0, w, step):
-            crest.append((x, int(top - amp * prof[x])))
-        crest.append((w - 1, int(top - amp * prof[w - 1])))
-        top_y = min(top_y, min(p[1] for p in crest))
-        poly = crest + [(w - 1, h), (0, h)]
-        try:
-            pygame.draw.polygon(comp, (*col, 255), poly)
-        except Exception:
-            comp.fill((*col, 255), pygame.Rect(0, int(top), w, h - int(top)))
-        # subtle rim light along the crest so ridges read in near-darkness
-        rim = (
-            min(255, col[0] + 26 + 10 * layer),
-            min(255, col[1] + 30 + 10 * layer),
-            min(255, col[2] + 38 + 12 * layer),
-        )
-        try:
-            pygame.draw.lines(comp, (*rim, 150), False, crest, 1)
-        except Exception:
-            pass
+    prof = _ridge_profile(seed, layer, w)
+    top = h * (0.50 + 0.055 * layer)
+    amp = h * (0.13 - 0.030 * layer)
+    haze = 1.0 - 0.30 * (2 - layer)               # far layers pick up sky haze
+    far = 0.42 + 0.29 * layer                     # near layers darker
+    col = (
+        int(clamp(base[0] * shade * far + 8 * haze, 0, 255)),
+        int(clamp(base[1] * shade * far + 9 * haze, 0, 255)),
+        int(clamp(base[2] * shade * far + 12 * haze, 0, 255)),
+    )
+    crest: list[tuple[int, int]] = []
+    for x in range(0, w, step):
+        crest.append((x, int(top - amp * prof[x])))
+    crest.append((w - 1, int(top - amp * prof[w - 1])))
+    top_y = min(p[1] for p in crest)
+    poly = crest + [(w - 1, h), (0, h)]
+    try:
+        pygame.draw.polygon(comp, (*col, 255), poly)
+    except Exception:
+        comp.fill((*col, 255), pygame.Rect(0, int(top), w, h - int(top)))
+    # subtle rim light along the crest so ridges read in near-darkness
+    rim = (
+        min(255, col[0] + 26 + 10 * layer),
+        min(255, col[1] + 30 + 10 * layer),
+        min(255, col[2] + 38 + 12 * layer),
+    )
+    try:
+        pygame.draw.lines(comp, (*rim, 150), False, crest, 1)
+    except Exception:
+        pass
 
     top_y = max(0, min(h - 1, top_y - 2))
     cropped = comp.subsurface(pygame.Rect(0, top_y, w, h - top_y)).copy()
     result = (cropped, top_y)
-    if len(_RIDGE_CACHE) > 24:
+    # Three entries per (seed, scene, tone) now rather than one, and the tone
+    # walks all 8 buckets over a day, so the old ceiling of 24 would have
+    # thrown the whole set away every few minutes of dusk.
+    if len(_RIDGE_CACHE) > 72:
         _RIDGE_CACHE.clear()
     _RIDGE_CACHE[key] = result
     return result
 
 
 def draw_parallax(surf: pygame.Surface, terrain_seed: int, scene: str,
-                  lighting: Any = None, world_time: float | None = None) -> None:
+                  lighting: Any = None, world_time: float | None = None,
+                  *, cam: Camera) -> None:
     """Paint layer 2: three ridge silhouettes, darker and lower with depth.
 
     Shapes are generated once from *terrain_seed* and cached; the ambient level
-    only selects one of 8 tone buckets, so this stays a single blit per frame.
+    only selects one of 8 tone buckets, so the per-frame work is blits only.
+
+    VIEW SPACE, and that is the point. The ridges are not in the world - they
+    are the illusion of distance behind it - so they must NOT scroll with the
+    camera at 1:1. They scroll at PARALLAX_FACTORS, i.e. between a sixteenth
+    and a fifth of the terrain's speed, which is what turns a 4x world into
+    something with depth instead of a backdrop sliding past on rails.
+
+    Each layer is drawn twice, wrapped modulo its own width, because a layer
+    moving at 0.22 of the camera has covered only 1056 px by the time the
+    camera has crossed the whole 4800 px of travel - it runs out of ridge
+    otherwise and leaves bare sky. ``_ridge_profile`` is tiled-seamless
+    precisely so this wrap is invisible.
+
+    *cam* is REQUIRED, with no IDENTITY default. It used to have one, and that
+    is the shape of defect that made every stickman invisible once: a call site
+    that forgets the camera then draws a plausible picture that is quietly wrong
+    - here, a skyline pinned to world x 0 while the terrain scrolls past it -
+    and nothing raises, nothing logs, and it ships. A contact sheet that really
+    does want world == frame says so by passing ``cam=IDENTITY`` at the call
+    site; see camera._IdentityCamera.
+
     Never raises.
     """
     try:
@@ -1027,8 +1084,22 @@ def draw_parallax(surf: pygame.Surface, terrain_seed: int, scene: str,
             seed = int(terrain_seed)
         except (TypeError, ValueError):
             seed = 0
-        ridges, y = _ridge_composite(seed, scene, tone, w, h)
-        surf.blit(ridges, (0, y))
+        try:
+            cx = float(cam.x)
+        except (AttributeError, TypeError, ValueError):
+            cx = 0.0
+        for layer in range(RIDGE_LAYERS):
+            ridge, y = _ridge_layer(seed, scene, tone, layer, w, h)
+            factor = PARALLAX_FACTORS[layer] if layer < len(PARALLAX_FACTORS) else 0.0
+            # Integer, and taken modulo the layer width: a fractional blit
+            # offset resamples the whole ridge every frame, which on the 4 Hz
+            # wallpaper path shimmers exactly the way a fractional cam.x does.
+            off = int(cx * factor) % w if w > 0 else 0
+            if off:
+                surf.blit(ridge, (-off, y))
+                surf.blit(ridge, (w - off, y))
+            else:
+                surf.blit(ridge, (0, y))
     except Exception:
         return
 
@@ -1083,7 +1154,7 @@ if __name__ == "__main__":  # pragma: no cover - smoke test
     ev, li = _Ev(), _Li()
     for sc in (SCENE_NIGHT_STORM, SCENE_CLEAR, SCENE_WILDFIRE, SCENE_BLIZZARD):
         draw_sky(scene_surf, sc, 300.0, ev, li)
-        draw_parallax(scene_surf, 12345, sc, li, 300.0)
+        draw_parallax(scene_surf, 12345, sc, li, 300.0, cam=IDENTITY)
 
     for label, base in (("night", 60.0), ("dawn", DAY_LENGTH_SEC * 0.235),
                         ("noon", DAY_LENGTH_SEC * 0.5), ("dusk", DAY_LENGTH_SEC * 0.775)):
@@ -1093,9 +1164,31 @@ if __name__ == "__main__":  # pragma: no cover - smoke test
         for i in range(frames):
             wt = base + i / 60.0
             draw_sky(scene_surf, SCENE_CLEAR, wt, ev, li)
-            draw_parallax(scene_surf, 12345, SCENE_CLEAR, li, wt)
+            draw_parallax(scene_surf, 12345, SCENE_CLEAR, li, wt, cam=IDENTITY)
         dt = (time.perf_counter() - t0) / frames
         print(f"sky+parallax {label:5s}: {dt * 1000:.2f} ms/frame")
+
+    # Parallax on its own, still and scrolling, so the cost of going from one
+    # composited blit to three wrapped layers is on the record rather than
+    # assumed.
+    cam = Camera()
+    for label, pan in (("parked", 0.0), ("scrolling", 3.0)):
+        cam.x = 0.0
+        draw_parallax(scene_surf, 12345, SCENE_CLEAR, li, 300.0, cam=cam)
+        t0 = time.perf_counter()
+        for _ in range(240):
+            cam.x = (cam.x + pan) % 4801
+            draw_parallax(scene_surf, 12345, SCENE_CLEAR, li, 300.0, cam=cam)
+        print(f"parallax {label:9s}: {(time.perf_counter() - t0) / 240 * 1000:.2f} ms/frame")
+
+    # The wrap seam: profile[0] and profile[w-1] must be one sampling step
+    # apart, or every 1600 px of layer travel puts a cliff in the skyline.
+    for layer in range(RIDGE_LAYERS):
+        p = _ridge_profile(12345, layer, RENDER_W)
+        d_seam = abs(float(p[0]) - float(p[-1]))
+        d_typ = float(np.abs(np.diff(p)).max())
+        print(f"ridge layer {layer}: seam step {d_seam:.5f} vs worst "
+              f"interior step {d_typ:.5f}")
     print("caches:", cache_stats())
 
     try:
@@ -1103,7 +1196,7 @@ if __name__ == "__main__":  # pragma: no cover - smoke test
         for name, wt in (("night", 0.0), ("dawn", DAY_LENGTH_SEC * 0.25),
                          ("noon", DAY_LENGTH_SEC * 0.5), ("dusk", DAY_LENGTH_SEC * 0.78)):
             draw_sky(scene_surf, SCENE_CLEAR, wt, ev, li)
-            draw_parallax(scene_surf, 12345, SCENE_CLEAR, li, wt)
+            draw_parallax(scene_surf, 12345, SCENE_CLEAR, li, wt, cam=IDENTITY)
             pygame.image.save(scene_surf, str(CAPTURE_DIR / f"sky_{name}.png"))
         print("wrote sky_*.png to", CAPTURE_DIR)
     except Exception as exc:

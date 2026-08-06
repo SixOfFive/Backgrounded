@@ -150,9 +150,10 @@ from typing import Any, Callable, Sequence
 import numpy as np
 import pygame
 
-from ..constants import RENDER_H, RENDER_W, UFO_WRECK_FALL_SEC
+from ..constants import RENDER_H, UFO_WRECK_FALL_SEC
 from ..sim.entities import AGENT_HEIGHT
 from . import fx
+from .camera import IDENTITY, Camera
 
 log = logging.getLogger(__name__)
 
@@ -812,8 +813,17 @@ def _relic_fade(relic: Any) -> float:
     return out
 
 
-def _relic_place(relic: Any, world: Any) -> tuple[str, float, float, float] | None:
-    """``(kind, x, ground_y, lean)`` for a relic, or None if it is not drawable.
+def _relic_place(relic: Any, world: Any,
+                 cam: Camera) -> tuple[str, float, float, float] | None:
+    """``(kind, world_x, ground_y, lean)`` for a relic, or None if undrawable.
+
+    The x that comes back is a WORLD x - both callers need it that way, one to
+    sample ``lighting.light_at`` and one to phase the halo - so the conversion
+    belongs at each draw call and not here. What *is* done here is the cull,
+    and it is done in screen space through *cam*: the old test compared a world
+    x against RENDER_W, so a relic lying anywhere past x = 1640 on a 6400 px
+    map was discarded outright, and one lying before it was drawn cam.x px from
+    where it actually lay.
 
     The lean is derived from the persisted id - deliberately not from a random
     stream, for the two reasons render/throwing.py records for planted spears:
@@ -827,14 +837,17 @@ def _relic_place(relic: Any, world: Any) -> tuple[str, float, float, float] | No
     y = _num(relic, "y", default=math.nan)
     if not (math.isfinite(x) and math.isfinite(y)):
         return None
-    if x < -_CULL or x > RENDER_W + _CULL or y < -_CULL or y > RENDER_H + _CULL:
+    if not cam.visible(x, _CULL):
+        return None
+    if y < -_CULL or y > RENDER_H + _CULL:
         return None
     gy = _ground_y(world, x, y) if world is not None else y
     idp = (_num(relic, "id", default=0.0) * 0.9137) % TAU
     return (kind, x, gy, math.sin(idp))
 
 
-def draw_relics(surf: pygame.Surface, world: Any, t: float = 0.0) -> None:
+def draw_relics(surf: pygame.Surface, world: Any, t: float = 0.0, *,
+                cam: Camera) -> None:
     """Every relic lying in *world*, lit by the scene like a spear is.
 
     Draw at step 7, before the light composite. *t* is accepted and ignored:
@@ -842,6 +855,11 @@ def draw_relics(surf: pygame.Surface, world: Any, t: float = 0.0) -> None:
     relics hold still. The animated half is in :func:`draw_relic_fx`.
 
     Fails soft, per relic and overall - this is a frame path.
+
+    *cam* is REQUIRED and has no default: a relic's ``x`` is a world x, and a
+    relic drawn at world coordinates on a 1600 px frame is simply not on it.
+    Pass ``camera.IDENTITY`` on a contact sheet, where the two spaces really do
+    coincide.
     """
     try:
         relics = _iter_relics(world)
@@ -852,17 +870,19 @@ def draw_relics(surf: pygame.Surface, world: Any, t: float = 0.0) -> None:
         return
     for r in relics:
         try:
-            place = _relic_place(r, world)
+            place = _relic_place(r, world, cam)
             if place is None:
                 continue
-            kind, x, gy, lean = place
+            kind, wx, gy, lean = place
             # Sample the light where the object is, not at the contact point:
             # a relic is 11 px tall and half of it can be inside a torch pool
             # while its footprint is not. creatures._draw_animal samples the
-            # middle of the body for the same reason.
-            flat = (_SIL_COLOR if _light_at(world, x, gy - _UNIT * 0.3) < _SIL_CUTOFF
+            # middle of the body for the same reason. WORLD x here - the sim's
+            # light sources live in the world.
+            flat = (_SIL_COLOR if _light_at(world, wx, gy - _UNIT * 0.3) < _SIL_CUTOFF
                     else None)
-            draw_relic(surf, kind, x, gy, flat=flat, fade=_relic_fade(r), lean=lean)
+            draw_relic(surf, kind, cam.sx(wx), gy, flat=flat,
+                       fade=_relic_fade(r), lean=lean)
         except Exception:
             log.debug("relic draw failed", exc_info=True)
 
@@ -914,7 +934,8 @@ def _draw_halo(surf: pygame.Surface, kind: str, x: float, y: float,
     _disc(surf, mote, (mx, my), max(1.0, _UNIT * 0.09 * (1.0 - v * 0.5)))
 
 
-def draw_relic_fx(surf: pygame.Surface, world: Any, t: float = 0.0) -> None:
+def draw_relic_fx(surf: pygame.Surface, world: Any, t: float = 0.0, *,
+                  cam: Camera) -> None:
     """Everything self-lit: relic halos, BFG discharges, the wrecked saucer.
 
     Draw *after* the light composite, next to ``creatures.draw_ufo``. One entry
@@ -925,6 +946,8 @@ def draw_relic_fx(surf: pygame.Surface, world: Any, t: float = 0.0) -> None:
 
     Each of the three guards itself, so a junk beam record cannot cost the
     halos and a saucer mid-explosion cannot cost the relics.
+
+    *cam* is REQUIRED and has no default; all three are placed off a world x.
     """
     t = float(t)
     try:
@@ -933,12 +956,12 @@ def draw_relic_fx(surf: pygame.Surface, world: Any, t: float = 0.0) -> None:
         relics = []
     for r in relics:
         try:
-            place = _relic_place(r, world)
+            place = _relic_place(r, world, cam)
             if place is None:
                 continue
-            kind, x, gy, lean = place
+            kind, wx, gy, lean = place
             idp = (_num(r, "id", default=0.0) * 0.9137) % TAU
-            _draw_halo(surf, kind, x, gy, t, idp, _relic_fade(r))
+            _draw_halo(surf, kind, cam.sx(wx), gy, t, idp, _relic_fade(r))
         except Exception:
             log.debug("relic halo failed", exc_info=True)
 
@@ -954,12 +977,12 @@ def draw_relic_fx(surf: pygame.Surface, world: Any, t: float = 0.0) -> None:
         now = _world_now(world, t)
         for b, absolute in beams:
             try:
-                _draw_beam_record(surf, world, b, now, absolute)
+                _draw_beam_record(surf, world, b, now, absolute, cam=cam)
             except Exception:
                 log.debug("bfg beam draw failed", exc_info=True)
 
     try:
-        draw_wreck(surf, world, t)
+        draw_wreck(surf, world, t, cam=cam)
     except Exception:
         log.debug("wreck fx failed", exc_info=True)
 
@@ -1168,7 +1191,8 @@ _MISFIRE_GLOW = 2.4
 
 
 def draw_misfire(surf: pygame.Surface, x: float, y: float, u: float = 0.0, *,
-                 radius: float = _MISFIRE_R) -> None:
+                 radius: float = _MISFIRE_R,
+                 phase_x: float | None = None) -> None:
     """The wyrm-gun coming apart in the wielder's hands, and taking only him.
 
     Deliberately *not* a beam with a short range: a misfire has no line, so the
@@ -1199,10 +1223,12 @@ def draw_misfire(surf: pygame.Surface, x: float, y: float, u: float = 0.0, *,
         pass
     # Six fittings thrown clear. Fixed angles phased off the muzzle x, so this
     # is a pure function of the record: render owns no seeded stream, and a
-    # shard set re-rolled per frame is a sparkler rather than one event. Gold,
+    # shard set re-rolled per frame is a sparkler rather than one event.
+    # *phase_x* overrides which x seeds them - the sim path passes the WORLD x,
+    # so a panning camera does not re-roll the shards mid-explosion. Gold,
     # because that is the gun's own trim colour - the pieces have to be
     # recognisable as having come off the object in his hands.
-    ph = (float(x) * 0.137) % TAU
+    ph = (float(x if phase_x is None else phase_x) * 0.137) % TAU
     for k in range(6):
         a = ph + k * TAU / 6.0 + 0.19 * math.sin(ph * 3.0 + k)
         r0 = r * (0.22 + 0.48 * grow)
@@ -1222,8 +1248,22 @@ def draw_misfire(surf: pygame.Surface, x: float, y: float, u: float = 0.0, *,
 
 
 def _draw_beam_record(surf: pygame.Surface, world: Any, rec: Any,
-                      now: float = 0.0, absolute: bool = False) -> None:
+                      now: float = 0.0, absolute: bool = False,
+                      *, cam: Camera) -> None:
     """Draw one shot record from the sim.
+
+    Both ends of a shot are world xs - the muzzle is a villager and the far end
+    is whatever stopped it - so both are converted before they reach
+    :func:`draw_beam`, which like :func:`draw_misfire` is a screen-space
+    primitive a contact sheet can call with no sim object behind it.
+
+    ``cam`` carried ``= IDENTITY`` until now - the last cam default left in
+    render/, and a direct contradiction of what :class:`_IdentityCamera`'s
+    docstring promises about omitting one. Latent only because the sole caller
+    passes it; a second caller that forgot would have drawn both ends of a beam
+    at world coordinates on a 1600 px frame, silently, which is the exact
+    failure that docstring exists to prevent. Keyword-only, no default, like
+    every other entry point here.
 
     *absolute* is :func:`_iter_beams`'s verdict on what ``rec["t"]`` means and
     *now* the world clock to measure it against; see that function for why the
@@ -1256,13 +1296,15 @@ def _draw_beam_record(surf: pygame.Surface, world: Any, rec: Any,
         # (see _MISFIRE_R), so its drawn size is set by the man and not by a
         # blast radius - and a producer that still writes BFG_BLAST_R = 70 into
         # the record would otherwise put the old lie straight back on screen.
-        draw_misfire(surf, x0, y0, u)
+        # phase_x is the WORLD x on purpose: seeded off the screen x, the six
+        # fittings would re-roll their angles as the camera eased past.
+        draw_misfire(surf, cam.sx(x0), y0, u, phase_x=x0)
         return
     x1 = _num(rec, "x1", "tx", default=math.nan)
     y1 = _num(rec, "y1", "ty", default=math.nan)
     if not (math.isfinite(x1) and math.isfinite(y1)):
         return
-    draw_beam(surf, x0, y0, x1, y1, u,
+    draw_beam(surf, cam.sx(x0), y0, cam.sx(x1), y1, u,
               corridor=_num(rec, "corridor", default=BFG_CORRIDOR))
 
 
@@ -1273,7 +1315,8 @@ _WRECK_FIRE: Color = (255, 196, 120)
 _WRECK_SMOKE: Color = (58, 62, 70)
 
 
-def draw_wreck(surf: pygame.Surface, world: Any, t: float = 0.0) -> None:
+def draw_wreck(surf: pygame.Surface, world: Any, t: float = 0.0, *,
+               cam: Camera) -> None:
     """The saucer coming apart over an amulet bearer.
 
     Drives entirely off the saucer's own state - ``phase == "wreck"`` (or a
@@ -1283,6 +1326,8 @@ def draw_wreck(surf: pygame.Surface, world: Any, t: float = 0.0) -> None:
     already draws the saucer at whatever ``y`` says, and "wreck" is not in its
     list of phases to skip, so the fall arrives for free and this module only
     has to set it on fire.
+
+    *cam* is REQUIRED and has no default; the saucer's ``x`` is a world x.
     """
     ufo = _find_ufo(world)
     if ufo is None:
@@ -1290,15 +1335,18 @@ def draw_wreck(surf: pygame.Surface, world: Any, t: float = 0.0) -> None:
     state = _state_of(ufo)
     if "wreck" not in state and not bool(getattr(ufo, "wrecked", False)):
         return
-    x = fx.attr_num(ufo, "x", default=math.nan)
+    wx = fx.attr_num(ufo, "x", default=math.nan)
     y = fx.attr_num(ufo, "y", default=math.nan)
-    if not (math.isfinite(x) and math.isfinite(y)):
+    if not (math.isfinite(wx) and math.isfinite(y)):
         return
     width = fx.clamp(fx.attr_num(ufo, "width", "w", default=54.0), 24.0, 160.0)
     ph = fx.attr_num(ufo, "t", default=0.0)
     fall = fx.clamp(ph / max(0.2, UFO_WRECK_FALL_SEC), 0.0, 1.0)
     idp = (fx.attr_num(ufo, "id", default=0.0) * 1.7) % TAU
-    ground = _ground_y(world, x, y + 100.0)
+    ground = _ground_y(world, wx, y + 100.0)    # world x: heightmap index
+    if not cam.visible(wx, width * 3.0):
+        return
+    x = cam.sx(wx)                  # the one conversion; screen space below
 
     # 1. the detonation. Front-loaded and short: this is the frame the player
     # has to catch out of the corner of their eye, so it is the brightest thing
@@ -1990,6 +2038,11 @@ if __name__ == "__main__":                             # pragma: no cover
     from ..sim.entities import Population
     from .stickfigure import Skeleton, build_skeleton, draw_stickman
 
+    # A contact sheet is one of the two places that genuinely means
+    # 'world coordinates are screen coordinates'. It says so, explicitly,
+    # rather than relying on a default that would hide a forgotten camera.
+    CAM = IDENTITY
+
     BG = (26, 28, 34)
     DIRT = (58, 48, 40)
 
@@ -2071,7 +2124,8 @@ if __name__ == "__main__":                             # pragma: no cover
                 a.speech = ""
                 sk = build_skeleton(a, 1.35)
                 if k == 1.0:
-                    draw_stickman(sheet, a, 1.35, _SIL_COLOR if is_flat else None)
+                    draw_stickman(sheet, a, 1.35,
+                                  _SIL_COLOR if is_flat else None, cam=CAM)
                 else:
                     # A real half-size figure, drawn bone by bone. Shrinking a
                     # 1.0x cell with smoothscale would measure the scaler and
@@ -2086,7 +2140,8 @@ if __name__ == "__main__":                             # pragma: no cover
                 if not is_flat:
                     draw_relic_fx(sheet, types.SimpleNamespace(
                         relics=types.SimpleNamespace(relics=[types.SimpleNamespace(
-                            id=c * 3 + 1, kind=kind, x=cx, y=gy, age=0.0)])), 1.35)
+                            id=c * 3 + 1, kind=kind, x=cx, y=gy, age=0.0)])),
+                        1.35, cam=CAM)
             if r == 0:
                 label(kind, c * CW + 4, CH - 16, (120, 126, 138))
 
@@ -2103,7 +2158,7 @@ if __name__ == "__main__":                             # pragma: no cover
             shooter.carrying, shooter.carry_qty = None, 0
             shooter.holds_candle = shooter.holds_torch = False
             shooter.speech = ""
-            draw_stickman(sheet, shooter, 1.35)
+            draw_stickman(sheet, shooter, 1.35, cam=CAM)
             draw_worn(sheet, shooter, None, 1.35, kind=RELIC_BFG)
         draw_beam(sheet, ox, base + 76, ox + 150, base + 44, u)
     # The misfire, with a NEIGHBOUR standing one body-width away who must
@@ -2119,7 +2174,7 @@ if __name__ == "__main__":                             # pragma: no cover
         who.speech = ""
         if mu:
             who.weapon, who.relic = RELIC_BFG, RELIC_BFG
-        draw_stickman(sheet, who, 1.35)
+        draw_stickman(sheet, who, 1.35, cam=CAM)
         if mu:
             draw_worn(sheet, who, None, 1.35, kind=RELIC_BFG)
     draw_misfire(sheet, 628, base + 76, 0.45)
@@ -2136,8 +2191,8 @@ if __name__ == "__main__":                             # pragma: no cover
         _wworld = types.SimpleNamespace(
             ufo=_wr,
             terrain=types.SimpleNamespace(ground_y=lambda _x: base + 90.0))
-        draw_ufo(sheet, _wworld, 1.35)
-        draw_wreck(sheet, _wworld, 1.35)
+        draw_ufo(sheet, _wworld, 1.35, cam=CAM)
+        draw_wreck(sheet, _wworld, 1.35, cam=CAM)
 
     # ---------------------------------------------- the beam's two clocks --
     # The regression cell. Every one of these goes through draw_relic_fx and a
@@ -2167,7 +2222,7 @@ if __name__ == "__main__":                             # pragma: no cover
         else:
             _bw = types.SimpleNamespace(
                 world_time=wt, relics=types.SimpleNamespace(beams=[_rec]))
-        draw_relic_fx(sheet, _bw, wt)
+        draw_relic_fx(sheet, _bw, wt, cam=CAM)
 
     out = os.path.join(os.environ.get("TEMP", "."), "relics_sheet.png")
     pygame.image.save(sheet, out)
@@ -2181,12 +2236,21 @@ if __name__ == "__main__":                             # pragma: no cover
                  types.SimpleNamespace(relics=types.SimpleNamespace(
                      relics=[None, 7, "relic", types.SimpleNamespace(x="?", y=1.0),
                              types.SimpleNamespace(kind="nope", x=1.0, y=1.0)]))):
-        draw_relics(sheet, junk, 0.0)
-        draw_relic_fx(sheet, junk, 0.0)
+        draw_relics(sheet, junk, 0.0, cam=CAM)
+        draw_relic_fx(sheet, junk, 0.0, cam=CAM)
     draw_worn(sheet, _Bare(), None, 0.0)
     draw_worn(sheet, _Bare(), types.SimpleNamespace(hip=(1, 1)), 0.0, kind=RELIC_SCALE)
     draw_beam(sheet, 0.0, 0.0, 0.0, 0.0, 0.5)
     draw_relic(sheet, "not-a-relic", 10, 10)
+    # The camera is not optional, and this is the assertion that keeps it that
+    # way: a forgotten cam has to be a TypeError on the first frame, not a
+    # picture that is quietly drawn 4000 px off the side of itself.
+    try:
+        draw_relics(sheet, _Bare(), 0.0)                # type: ignore[call-arg]
+    except TypeError as _exc:
+        print("cam is required:", _exc)
+    else:
+        raise SystemExit("draw_relics accepted a call with no camera")
     print("fail-soft OK")
 
     # ----------------------------------------------------------------- cost --
@@ -2199,11 +2263,11 @@ if __name__ == "__main__":                             # pragma: no cover
     def cost(world, n: int = 400) -> tuple[float, float]:
         t0 = _time.perf_counter()
         for i in range(n):
-            draw_relics(sheet, world, i * 0.01)
+            draw_relics(sheet, world, i * 0.01, cam=CAM)
         a = (_time.perf_counter() - t0) * 1e6 / n
         t0 = _time.perf_counter()
         for i in range(n):
-            draw_relic_fx(sheet, world, i * 0.01)
+            draw_relic_fx(sheet, world, i * 0.01, cam=CAM)
         return a, (_time.perf_counter() - t0) * 1e6 / n
 
     e1, e2 = cost(empty)
@@ -2215,7 +2279,7 @@ if __name__ == "__main__":                             # pragma: no cover
         beams=[{"x0": 200.0, "y0": 300.0, "x1": 600.0, "y1": 260.0, "t": 0.1}]))
     t0 = _time.perf_counter()
     for i in range(200):
-        draw_relic_fx(sheet, beam_world, i * 0.01)
+        draw_relic_fx(sheet, beam_world, i * 0.01, cam=CAM)
     print(f"      one beam {((_time.perf_counter() - t0) * 1e6 / 200):.2f} us/frame, "
           f"caches {cache_stats()}")
     pygame.quit()

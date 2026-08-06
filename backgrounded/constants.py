@@ -440,7 +440,20 @@ HUT_STORE_WEIGHT = 0.45
 #: bare and starving, so population can actually range instead of collapsing.
 REGROW_BASE = 1.0               # multiplier at MIN_POP
 REGROW_PER_HEAD = 0.22          # added per colonist above MIN_POP
-REGROW_MAX = 3.0
+#: The cap, and it was sized to the OLD roster and nothing else.
+#: ``world.regrowth_factor`` is ``min(REGROW_MAX, 1 + (n - MIN_POP) * 0.22)``,
+#: which saturates at n = 2 + 3.0/0.22 = 11.09 - i.e. from the eleventh colonist
+#: upward the wild recovers no faster however many mouths there are. At the old
+#: MAX_POP of 10 that cap was never reached and the curve was linear over the
+#: whole range; at MAX_POP 20 the top half of the roster is flat while the
+#: foraging load still rises 82%, which is exactly the starvation spiral the
+#: comment above says this exists to prevent.
+#: 5.0 = 1 + 0.22*18, i.e. the same straight line extended to the new cap rather
+#: than a new number. The 4x map hands the colony 4x the standing stock and
+#: partially masks the shortfall, which is why this would otherwise be missed.
+#: NOTE: props.py:77 carries a duplicate fallback ``_REGROW_MAX = 3.0`` used only
+#: if this import fails; it wants the same value.
+REGROW_MAX = 5.0
 
 # --------------------------------------------------------- player tools ----
 #: The left-mouse tool palette, shown top-left in the preview. The player picks
@@ -751,11 +764,15 @@ DRAGON_GORGE_SEC = 12.0
 #: defences finally has a trap that does what the player asked it to do.
 DRAGON_SIEGE_SEC = 150.0
 #: Seconds between headstones a skeletal takes, and how many it takes before it
-#: goes. MAX_GRAVES is 10 (world.py), so four is a visible bite out of a
-#: resource the player has watched accumulate all run - and it costs no lives
-#: and no buildings, which is the whole point of that kind.
+#: goes. Sized as "a visible bite out of a resource the player has watched
+#: accumulate all run" - it costs no lives and no buildings, which is the whole
+#: point of that kind. That bite was 4 of MAX_GRAVES 10 = 40%; MAX_GRAVES is now
+#: 20 (twice the roster means twice the funerals), which would have quietly
+#: halved the event to a 20% nibble. 8 keeps the fraction, and the SEC stays 12
+#: so the visit is longer rather than faster - the scouring is meant to be
+#: something you watch happen and can interrupt, not a burst.
 DRAGON_SCOUR_SEC = 12.0
-DRAGON_SCOUR_MAX = 4
+DRAGON_SCOUR_MAX = 8
 
 #: Px. Anything a grounded quadruped comes this close to is eaten.
 DRAGON_MAW_REACH = 30.0

@@ -124,8 +124,9 @@ from typing import Any, Callable, Sequence
 
 import pygame
 
-from ..constants import RENDER_H, RENDER_W
+from ..constants import RENDER_H
 from . import fx
+from .camera import Camera
 
 log = logging.getLogger(__name__)
 
@@ -2500,7 +2501,8 @@ def draw_dragon(surf: pygame.Surface, x: float, y: float, t: float, *,
         log.debug("dragon draw failed (%s)", kind, exc_info=True)
 
 
-def draw_one(surf: pygame.Surface, world: Any, d: Any, t: float) -> None:
+def draw_one(surf: pygame.Surface, world: Any, d: Any, t: float, *,
+             cam: Camera) -> None:
     """Draw one *sim* dragon: the entry point per dragon.
 
     Reads ``kind``, ``x``, ``alt``, ``facing``, ``state``, ``id``, ``health``,
@@ -2511,14 +2513,22 @@ def draw_one(surf: pygame.Surface, world: Any, d: Any, t: float) -> None:
     concerned: ``y = ground_y(x) - alt`` for four of the five, and
     ``y = ground_y(x)`` for the quadruped, whose origin is already the ground
     under its feet.
+
+    *cam* is REQUIRED and has no default. ``d.x`` is a world x on a 6400 px map
+    against a 1600 px frame; without the conversion a dragon is drawn off the
+    edge for three quarters of its flight and cam.x px out of place for the
+    rest. A forgotten camera has to be a TypeError, not a missing monster.
     """
     kind = dragon_kind_of(d)
     state = str(getattr(d, "state", "") or "").lower()
     if state in _OFF_STATES:
         return
 
-    x = fx.attr_num(d, "x", default=math.nan)
-    if not math.isfinite(x) or x < -_CULL or x > RENDER_W + _CULL:
+    wx = fx.attr_num(d, "x", default=math.nan)
+    # Cull in SCREEN space: `wx < RENDER_W + _CULL` threw away everything past
+    # the first quarter of the map, which is where dragons spend most of a
+    # flyover.
+    if not math.isfinite(wx) or not cam.visible(wx, _CULL):
         return
     alt = fx.attr_num(d, "alt", default=0.0)
 
@@ -2527,7 +2537,7 @@ def draw_one(surf: pygame.Surface, world: Any, d: Any, t: float) -> None:
     # pins it to the ground for its whole visit and the sim is expected to keep
     # the arrive and leave legs off the frame edge, which is what the animals
     # already do. The alternative was a visibly wrong pose 100 px up.
-    ground = _ground_y(world, x)
+    ground = _ground_y(world, wx)        # world x: indexes the heightmap
     y = ground if kind == KIND_QUADRUPED else ground - alt
     if y < -_CULL or y > RENDER_H + _CULL:
         return
@@ -2550,7 +2560,7 @@ def draw_one(surf: pygame.Surface, world: Any, d: Any, t: float) -> None:
     # so anything more than a torch radius off the ground is flat by
     # definition - which for the flyover at alt 300-420 is every frame it is
     # ever on screen.
-    lit = _light_at(world, x, y - top * 0.45)
+    lit = _light_at(world, wx, y - top * 0.45)   # world x: sim light sources
     flat: Color | None = _SIL_COLOR if lit < _SIL_CUTOFF else None
 
     # Break the lockstep. Two dragons on screen at once is not a thing the sim
@@ -2561,9 +2571,12 @@ def draw_one(surf: pygame.Surface, world: Any, d: Any, t: float) -> None:
         anim = t
     anim += (fx.attr_num(d, "id", default=0.0) * 0.6180339) % 4.0
 
-    draw_dragon(surf, x, y, anim, kind=kind, scale=scale, flat=flat,
+    # The one conversion, as late as possible so every sim query above it read
+    # a world x and every draw below it reads a screen x.
+    sx = cam.sx(wx)
+    draw_dragon(surf, sx, y, anim, kind=kind, scale=scale, flat=flat,
                 facing=facing)
-    _health_pip(surf, d, kind, x, y - top - 7.0, 0.35 if flat else 1.0)
+    _health_pip(surf, d, kind, sx, y - top - 7.0, 0.35 if flat else 1.0)
 
 
 def _health_pip(surf: pygame.Surface, d: Any, kind: str, cx: float, cy: float,
@@ -2636,12 +2649,15 @@ def _iter_dragons(world: Any) -> list[Any]:
         return []
 
 
-def draw_dragons(surf: pygame.Surface, world: Any, t: float) -> None:
+def draw_dragons(surf: pygame.Surface, world: Any, t: float, *,
+                 cam: Camera) -> None:
     """Draw every dragon in *world*. Fails soft, per dragon and overall.
 
     Call this **after** the light composite, beside ``creatures.draw_ufo``: a
     dragon at altitude is above every light source, and a night composite would
     multiply it into a black smear on black.
+
+    *cam* is REQUIRED and has no default - see :func:`draw_one`.
     """
     try:
         dragons = _iter_dragons(world)
@@ -2667,6 +2683,6 @@ def draw_dragons(surf: pygame.Surface, world: Any, t: float) -> None:
         tf = 0.0
     for d in dragons:
         try:
-            draw_one(surf, world, d, tf)
+            draw_one(surf, world, d, tf, cam=cam)
         except Exception:
             log.debug("dragon draw failed", exc_info=True)

@@ -23,13 +23,15 @@ from ..constants import (
     HUT_TIER_DWELL_SEC, HUT_TIER_MORALE,
     MAX_POP, MIN_POP, MORALE_TO_GROW, MORPH_LABELS,
     POP_BIRTH_COOLDOWN, POP_PER_HUT,
-    REGROW_MAX, REGROW_PER_HEAD, RENDER_H, RENDER_W,
+    REGROW_MAX, REGROW_PER_HEAD, RENDER_H,
     RES_COOKED, RES_FOOD, RES_STONE, RES_WOOD, SAVE_VERSION,
     SCENE_LABELS, SCENE_NIGHT_STORM, SCENE_ROTATE_SEC, SCENES,
+    STAGE_HALF,
     TORCH_COLOR, TORCH_FLICKER, TORCH_INTENSITY, TORCH_RADIUS,
+    WORLD_SCALE, WORLD_W,
 )
 from . import behavior, names
-from .actions import sweep_claims
+from .actions import stage_bounds, sweep_claims
 from .animals import AnimalRegistry
 from .dragons import DragonRegistry
 from .items import RelicRegistry
@@ -49,7 +51,39 @@ CHRONICLE_MAX = 400
 #: How many headstones stay standing. Older ones weather away. Graves were
 #: permanent, so a long run turned the map into a cemetery - 35 of them after
 #: 25 minutes, on a world 1280px wide.
-MAX_GRAVES = 10
+#:
+#: 10 -> 20 with MAX_POP 10 -> 20. This is driven by the ROSTER, not by the map:
+#: twice the colonists is twice the funerals over the same run, and a cemetery
+#: that recycles twice as fast erases names the player still remembers. The 4x
+#: map is a secondary argument (they spread further so they read as less of a
+#: cemetery) but not the reason. Knock-on recorded at constants.DRAGON_SCOUR_MAX,
+#: which is sized as a fraction of this.
+MAX_GRAVES = 20
+
+#: Scenery per map, and therefore a count that MUST scale with the map: on a
+#: 6400 px world the old {tree 14, rock 8, bush 10, boulder 3} is a quarter of
+#: the density it was tuned at, and since foraging is the colony's food supply
+#: that is not "a sparser look", it is a starving colony.
+#:
+#: One constant because there used to be two identical literals - __init__ and
+#: randomise_terrain - and a duplicated tuning number is a number that drifts.
+#: (props.DEFAULT_COUNTS is a THIRD copy, used only when scatter() is called
+#: with counts=None, which no gameplay path does; it wants the same x4 and is
+#: flagged for whoever owns props.py.)
+SCATTER_COUNTS: dict[str, int] = {
+    kind: int(round(n * WORLD_SCALE))
+    for kind, n in (("tree", 14), ("rock", 8), ("bush", 10), ("boulder", 3))
+}
+
+#: How far founders scatter around their landing seat, px. The colony arrives as
+#: a GROUP - it always did, but on a 1600 px world "uniform(0.2W, 0.8W)" was a
+#: 960 px spread that a walker crosses in half a minute, so they converged
+#: anyway and nobody noticed the spread was doing the work. At WORLD_W that same
+#: expression is 3840 px: four strangers who never meet, no colony, no
+#: structures, and colony_center() a mean over noise - which then presents as a
+#: broken camera and gets debugged in the wrong place. Pick one seat, stand them
+#: around it, and the old emergent behaviour is now the explicit rule.
+FOUNDER_SCATTER = 120.0
 
 #: Seconds a corpse lies there before _reap_dead raises its headstone and books
 #: the death. Named because from_dict has to reason about the same threshold:
@@ -145,6 +179,24 @@ def _finite(value: Any, default: float, lo: float, hi: float) -> float:
     return lo if f < lo else (hi if f > hi else f)
 
 
+def _int(value: Any, default: int, lo: int, hi: int) -> int:
+    """A whole number in ``[lo, hi]`` from anything at all, never raising.
+
+    :func:`_finite`'s companion, for the fields :meth:`World.from_dict` needs
+    as ints, and it exists because the bare ``int()`` calls it replaces were
+    every bit as fragile as the bare ``float()`` calls above them. ``int()``
+    raises on a string, on ``None``, on a list, on a dict, on NaN (ValueError)
+    and on both infinities (OverflowError) - and each of those was reachable
+    from one hand-edited scalar in a save file, which persist.load_world reads
+    as corruption and QUARANTINES. Routing through :func:`_finite` first makes
+    the conversion total, and the clamp then keeps the value inside the range
+    the field is actually allowed to hold: ``seed`` in particular must be a
+    NON-NEGATIVE int or ``np.random.default_rng`` raises ValueError, which is
+    the one case here that junk-typing alone would not have caught.
+    """
+    return int(_finite(value, float(default), lo=float(lo), hi=float(hi)))
+
+
 class World:
     """Everything that persists across a restart."""
 
@@ -159,7 +211,7 @@ class World:
         self.terrain: Terrain = Terrain.generate(self.seed, style=self._pick_style())
         self.props: PropRegistry = scatter(
             self.terrain, self.rng,
-            {"tree": 14, "rock": 8, "bush": 10, "boulder": 3},
+            dict(SCATTER_COUNTS),
         )
         self.structures: StructureRegistry = StructureRegistry()
         self.population: Population = Population()
@@ -227,7 +279,11 @@ class World:
         """
         self.auto_scene_rotate: bool = True     # flip scene every SCENE_ROTATE_SEC
         self.stockpile: dict[str, int] = {r: 0 for r in ALL_RESOURCES}
-        self.build_queue: list[str] = []
+        # list[dict], NOT list[str]. behavior._publish writes whole job records
+        # here - see _queue_of, which types it list[dict[str, Any]] - and this
+        # annotation said ``list[str]`` for long enough to mislead a defensive
+        # filter in from_dict into dropping every real entry on load.
+        self.build_queue: list[dict[str, Any]] = []
         self.chronicle: deque[str] = deque(maxlen=CHRONICLE_MAX)
         self.stats: dict[str, int] = dict(STAT_DEFAULTS)
 
@@ -283,10 +339,55 @@ class World:
     def _pick_style(self) -> str:
         return str(self.rng.choice(["hills", "cliffs", "plateau", "chasm", "valley"]))
 
+    def _landing_seat(self) -> float:
+        """One x for a whole group to arrive on.
+
+        Kept a full STAGE_HALF in from each rim so the camera, which is
+        RENDER_W wide and centred on them, has world on both sides and does not
+        open the run already clamped against an edge.
+
+        Rejects seats in the chasm. This did not need saying while the group
+        spread over 960 px of a 1600 px world - somebody always landed on a rim.
+        A single seat plus FOUNDER_SCATTER is 240 px wide, narrower than a cut
+        plus its walls, so the whole colony can now start on the chasm floor
+        with unclimbable rock on both sides: not a bad opening, a dead one. Rare
+        (a cut is ~120 px of 4800 eligible, on the one style in five that has
+        one) which is exactly why it would ship.
+        """
+        lo = float(STAGE_HALF)
+        hi = float(WORLD_W) - float(STAGE_HALF)
+        if hi <= lo:                       # only if WORLD_W ever shrank to <= RENDER_W
+            return float(WORLD_W) * 0.5
+        seat = float(self.rng.uniform(lo, hi))
+        try:
+            gap = self.terrain.chasm
+            if gap:
+                # Half the walls plus the scatter plus a walker's room. Bounded
+                # retries, then take what we have: a guaranteed-terminating loop
+                # matters more here than a perfect seat, and the fallback is only
+                # as bad as the behaviour this method replaced.
+                pad = 200.0 + FOUNDER_SCATTER
+                for _ in range(8):
+                    if not (gap[0] - pad < seat < gap[1] + pad):
+                        break
+                    seat = float(self.rng.uniform(lo, hi))
+        except Exception:
+            pass
+        return seat
+
+    def _place(self, agent: Any, x: float) -> None:
+        """Stand an agent on the ground at x, with nothing left over from before."""
+        agent.x = float(min(max(x, 8.0), float(WORLD_W) - 8.0))
+        agent.y = self.terrain.ground_y(agent.x)
+        agent.vx = agent.vy = 0.0
+        agent.on_ground = True
+
     def _seed_population(self, n: int = 4) -> None:
         used: set[str] = set()
+        seat = self._landing_seat()
         for i in range(n):
-            x = float(self.rng.uniform(RENDER_W * 0.2, RENDER_W * 0.8))
+            x = float(seat + self.rng.uniform(-FOUNDER_SCATTER, FOUNDER_SCATTER))
+            x = min(max(x, 8.0), float(WORLD_W) - 8.0)
             s = self.population.spawn(
                 x=x,
                 y=self.terrain.ground_y(x),
@@ -620,15 +721,20 @@ class World:
             self.seed = int(self.pyrng.randrange(1 << 30))
             self.rng = np.random.default_rng(self.seed)
             self.terrain = Terrain.generate(self.seed, style=self._pick_style())
-            self.props = scatter(self.terrain, self.rng,
-                                 {"tree": 14, "rock": 8, "bush": 10, "boulder": 3})
+            self.props = scatter(self.terrain, self.rng, dict(SCATTER_COUNTS))
             self.structures = StructureRegistry()
             self.build_queue = []
+            # One seat for the whole colony, same rule as the founders. They
+            # wake up somewhere new *together*: scattering them over 0.15-0.85
+            # of a 6400 px world is 5440 px of separation and the colony that
+            # was supposed to carry over does not survive the move.
+            #
+            # This is also the single case Camera.SNAP_DIST exists for - every
+            # agent relocates in one frame, and easing a camera across 5000 px
+            # at 220 px/s would crawl for 25 seconds.
+            seat = self._landing_seat()
             for a in self.population.agents:
-                a.x = float(self.rng.uniform(RENDER_W * 0.15, RENDER_W * 0.85))
-                a.y = self.terrain.ground_y(a.x)
-                a.vx = a.vy = 0.0
-                a.on_ground = True
+                self._place(a, seat + self.rng.uniform(-FOUNDER_SCATTER, FOUNDER_SCATTER))
                 # Every structure went with the old landscape, including the
                 # watchtower somebody was standing on: leaving the perch set
                 # would hold him at the height of a tower that no longer exists.
@@ -651,7 +757,11 @@ class World:
         gen = self.population.generation + 1
         self.population.generation = gen
         self.stats["generations"] = max(self.stats["generations"], gen)
-        x = float(self.rng.uniform(RENDER_W * 0.1, RENDER_W * 0.9))
+        # A newcomer joins a colony that already exists, so they arrive where it
+        # can be seen happening: uniform(0.1W, 0.9W) meant "somewhere on screen"
+        # when the world was one screen, and would now drop a replacement up to
+        # 3000 px from anyone, walking in unwatched for a minute and a half.
+        x = float(self.rng.uniform(*stage_bounds(self)))
         s = self.population.spawn(
             x=x, y=self.terrain.ground_y(x),
             rng=self.pyrng,
@@ -737,8 +847,11 @@ class World:
             # attempt into a log file nobody is watching, forever. Junk should
             # decline quietly, not shout.
             gen = int(_finite(state.get("generation"), 1.0, lo=0.0, hi=1e6)) or 1
+            # The grave's own x, wherever on the LAND it stands - a raising puts
+            # the colonist back where they were buried, which is the point of
+            # the item. Bounds check only.
             x = _finite(getattr(grave, "x", None), -1.0,
-                        lo=0.0, hi=float(RENDER_W))
+                        lo=0.0, hi=float(WORLD_W))
             if x < 0.0:
                 return False
             if not dead_name:
@@ -794,7 +907,10 @@ class World:
         if len(self.population.alive_agents()) >= MAX_POP:
             return "The land is already full."
         used = {a.name for a in self.population.agents}
-        gx = float(max(RENDER_W * 0.03, min(RENDER_W * 0.97, x)))
+        # The player clicked here, so this is a plain WORLD clamp and stays one:
+        # narrowing it to the stage would move a deliberate spawn away from the
+        # spot that was pointed at.
+        gx = float(max(WORLD_W * 0.03, min(WORLD_W * 0.97, x)))
         s = self.population.spawn(
             x=gx, y=self.terrain.ground_y(gx),
             rng=self.pyrng,
@@ -1189,11 +1305,29 @@ class World:
         """Defensive load: any missing or malformed section falls back to a
         freshly generated equivalent rather than raising."""
         w = cls.__new__(cls)
-        w.seed = int(d.get("seed", random.randrange(1 << 30)))
+        # THE PLAIN SCALARS ARE COERCED, NOT TRUSTED - see _int. These four
+        # lines used to be bare int()/float() calls sitting right beside the
+        # carefully guarded sections below them, and they were the whole of the
+        # docstring's promise being broken: eight distinct junk values across
+        # these fields raised out of from_dict, and persist.load_world reads any
+        # exception as a corrupt save and QUARANTINES it. One junk scalar in a
+        # hand-edited file therefore did not cost the field, it cost the colony.
+        #
+        # The ranges are the ones each field is actually allowed to hold rather
+        # than decoration. `seed` must land in [0, 2**32) because
+        # np.random.default_rng REJECTS a negative seed - `"seed": -1` raised
+        # ValueError("expected non-negative integer") straight out of the line
+        # below, which is a failure no amount of type-checking would have found.
+        # world_time and tick_count are monotone counters, so a negative one is
+        # meaningless and clamps to zero; their ceilings sit well inside the
+        # range a float can hold an integer exactly (2**53), because _finite
+        # goes through float on the way.
+        w.seed = _int(d.get("seed"), random.randrange(1 << 30),
+                      lo=0, hi=(1 << 32) - 1)
         w.rng = np.random.default_rng(w.seed)
         w.pyrng = random.Random(w.seed ^ 0x5EED)
-        w.world_time = float(d.get("world_time", 0.0))
-        w.tick_count = int(d.get("tick_count", 0))
+        w.world_time = _finite(d.get("world_time"), 0.0, lo=0.0, hi=1e12)
+        w.tick_count = _int(d.get("tick_count"), 0, lo=0, hi=1_000_000_000_000)
         # Every colony-level default, in one call shared with __init__, so a
         # field can no longer exist on a fresh world and be missing on a loaded
         # one. See _init_colony_state for what that cost last time. Saved values
@@ -1315,11 +1449,62 @@ class World:
                             raw, seed=w.seed ^ 0x2E11),
                         lambda: RelicRegistry(seed=w.seed ^ 0x2E11))
 
+        # The three plain containers, on the same terms as the scalars above and
+        # for the same reason. ``or {}`` / ``or []`` only ever rescued the FALSY
+        # junk - None, 0, "" - and left every truthy shape to raise: a
+        # "stockpile" that is a string or a number died on .items()
+        # (AttributeError), and a "build_queue" or "chronicle" that is a number
+        # died on the iteration (TypeError). A container that is the right shape
+        # but carries junk INSIDE it was unguarded too, and that is the half the
+        # top-level junk sweep cannot see: ``{"wood": "banana"}`` is a perfectly
+        # ordinary-looking dict whose int() raised eleven different ways.
+        #
+        # So each one is normalised to its container type, then filtered element
+        # by element. A bad element is DROPPED rather than defaulted: an unknown
+        # resource is not a resource, a non-string build order names no
+        # structure, and a non-string chronicle line would raise again the first
+        # time the HUD tried to draw it.
         w.stockpile = {r: 0 for r in ALL_RESOURCES}
-        w.stockpile.update({k: int(v) for k, v in
-                            (d.get("stockpile") or {}).items() if k in ALL_RESOURCES})
-        w.build_queue = list(d.get("build_queue") or [])
-        w.chronicle = deque(d.get("chronicle") or [], maxlen=CHRONICLE_MAX)
+        raw_stock = d.get("stockpile")
+        if not isinstance(raw_stock, dict):
+            if raw_stock:
+                log.warning("save section 'stockpile' was %s, not a mapping; "
+                            "resources reset to zero", type(raw_stock).__name__)
+            raw_stock = {}
+        for k, v in raw_stock.items():
+            # A non-string key cannot match a resource name, so the membership
+            # test also does the type check.
+            if k in ALL_RESOURCES:
+                w.stockpile[k] = _int(v, 0, lo=0, hi=1_000_000_000)
+
+        raw_queue = d.get("build_queue")
+        if not isinstance(raw_queue, (list, tuple)):
+            if raw_queue:
+                log.warning("save section 'build_queue' was %s, not a list; "
+                            "the queue starts empty",
+                            type(raw_queue).__name__)
+            raw_queue = ()
+        # dict, not str. The queue holds whole job records - behavior._publish
+        # writes them and _queue_of reads them back as list[dict[str, Any]] -
+        # and the ``list[str]`` annotation this field carried until now is
+        # exactly how a first cut of this filter came to drop every genuine
+        # entry on load while the junk sweep stayed green, because junk is what
+        # it was looking for. The round-trip check is what caught it.
+        #
+        # Filtering at all is still right: the old ``list(...)`` accepted a bare
+        # string by iterating it, so ``"hut"`` quietly became three
+        # one-character build orders, and any non-record element reaches
+        # behavior.py as something it will try to read keys off.
+        w.build_queue = [k for k in raw_queue if isinstance(k, dict)]
+
+        raw_chron = d.get("chronicle")
+        if not isinstance(raw_chron, (list, tuple)):
+            if raw_chron:
+                log.warning("save section 'chronicle' was %s, not a list; "
+                            "the log starts empty", type(raw_chron).__name__)
+            raw_chron = ()
+        w.chronicle = deque((s for s in raw_chron if isinstance(s, str)),
+                            maxlen=CHRONICLE_MAX)
         # Defaults first, saved values over the top: a save written before
         # "abducted"/"returned" existed simply keeps them at zero instead of
         # loading a stats dict that KeyErrors the moment anything reads them.
@@ -1410,4 +1595,163 @@ class World:
         if not w.population.alive_agents():
             log.info("loaded world had no survivors; seeding a new group")
             w._seed_population()
+
+        # The roster cap, enforced on the way IN as well as at spawn. Before
+        # _rebase_books, so the books are re-derived from the roster this leaves
+        # behind rather than from the one the file claimed.
+        w._clamp_roster()
+
+        # LAST, because it needs the final roster: after any _seed_population
+        # above, and after the burial re-flag loop that decides which corpses
+        # are still pending. See _rebase_books for why a load is the one moment
+        # the books can legitimately be rewritten.
+        w._rebase_books()
         return w
+
+    def _clamp_roster(self) -> None:
+        """Hold the loaded roster to MAX_POP living, once, at load time.
+
+        MAX_POP was enforced at the spawn choke point and nowhere else, so it
+        bounded everything the SIMULATION can do and nothing a FILE can claim.
+        Measured on the shipped tree: a save whose ``population.agents`` list was
+        hand-inflated to 2000 records loaded 2000 living colonists against a
+        MAX_POP of 20, reconcile ok=1 residual 0, no exception and no warning -
+        an impossible world, imported without a murmur, by the one method in
+        this file that is the project's trust boundary.
+
+        Nothing in the running sim can reach here (``_spawn_replacement``
+        returns early at the cap and the ufo re-checks it before handing anyone
+        back), so on every honest save this is a no-op that logs nothing. It is
+        for the hand-edited file, the half-written one, and the save from some
+        future build with a different cap.
+
+        WHAT HAPPENS TO THE SURPLUS, and why:
+
+        * They are removed from the roster, not killed. A death raises a grave,
+          fires the death hooks and lands in ``stats["died"]`` forever - so
+          "clamping" by killing 1980 fabricated people would write 1980 deaths
+          into a colony's permanent record for a headcount it never had. The
+          surplus did not die here; as far as this build is concerned they were
+          never here at all.
+        * ``births`` comes down by exactly as many as were dropped, which is
+          what keeps :meth:`reconcile` balanced WITHOUT inventing anything.
+          Leaving births alone would hand _rebase_books a slack of 1980 with
+          nowhere to put it but ``died``, which is the same fabrication by a
+          longer route. Floored at zero; if the file's births cannot cover the
+          drop, _rebase_books credits the remainder as returns, as it does for
+          any other under-counted roster.
+        * The survivors are the FIRST MAX_POP in save order. ``Population``
+          appends on spawn and pops on removal, so the saved order is arrival
+          order and the head of it is the longest-standing colonists - the only
+          evidence a file offers about who belongs. It is also deterministic,
+          which matters more than the choice itself: two processes loading the
+          same save must keep the same people.
+        * ``peak`` is clamped too. It is a high-water mark of ``alive_count``
+          and the running sim cannot push it past MAX_POP either, so a peak read
+          off an impossible roster is impossible in the same way.
+
+        The DEAD are left alone. MAX_POP caps the living; corpses awaiting
+        burial are already counted as deaths, and dropping them here would
+        delete graves the books have already paid for.
+
+        Never raises: it is called from ``from_dict``.
+        """
+        try:
+            alive = [a for a in self.population.agents if a.alive]
+            surplus = len(alive) - MAX_POP
+            if surplus <= 0:
+                return
+            doomed = {id(a) for a in alive[MAX_POP:]}
+            # Slice assignment, not rebinding: the roster is a list somebody
+            # else may already be holding a reference to, and swapping the
+            # attribute would leave them looking at the impossible one.
+            self.population.agents[:] = [a for a in self.population.agents
+                                         if id(a) not in doomed]
+            births = int(getattr(self.population, "births", 0))
+            self.population.births = max(0, births - surplus)
+            self.population.peak = max(
+                min(int(getattr(self.population, "peak", 0)), MAX_POP),
+                len(self.population.alive_agents()),
+            )
+            log.warning("save carried %d living colonists against MAX_POP %d; "
+                        "dropped the %d most recent and rebased births %d -> %d",
+                        len(alive), MAX_POP, surplus, births,
+                        self.population.births)
+        except Exception:
+            log.debug("could not clamp the loaded roster", exc_info=True)
+
+    def _rebase_books(self) -> None:
+        """Make the population books add up again, once, at load time.
+
+        :meth:`reconcile`'s identity - ``births + returned - deaths - abducted
+        - alive == 0`` - holds continuously in a running world, but a LOAD can
+        hand it two halves that describe different histories, and then it is
+        non-zero from the first tick through no fault of the simulation.
+
+        The two halves are not equally trustworthy, and that asymmetry is the
+        whole fix. ``births`` and ``alive`` are STRUCTURAL: they are read off
+        the roster, which is a thing you can count. ``died``, ``abducted`` and
+        ``returned`` are bare tallies carried in ``stats``. So when the halves
+        disagree, the roster wins and the tallies are re-derived from it.
+
+        Both directions were measured on a genuine seed-314 save:
+
+        * an unreadable or absent ``population`` section falls back to a fresh
+          ``Population``, which then seeds a new group - but ``stats`` still
+          remembers the 5 deaths and 2 abductions of the roster that is now
+          gone. Residual -7.
+        * an unreadable or absent ``stats`` section resets the tallies to their
+          defaults while the roster keeps all 19 births and 12 survivors.
+          Residual +5 - and here the rebase does better than damage control,
+          because ``died`` is the only free variable in the identity and
+          solving for it recovers the true 5.
+
+        ``slack`` is what the roster says must be accounted for; ``abducted`` is
+        honoured as far as it will fit (the ufo's own record is the better
+        evidence for it) and everything left is death, which is the only term
+        with nowhere else to go.
+
+        THIS RUNS ON THE LOAD PATH AND NOWHERE ELSE, and it warns when it
+        changes anything. That distinction is load-bearing: reconcile exists to
+        catch population drift during a session, and a rebase on the tick path
+        would silently absorb exactly the drift it is watching for. On an honest
+        save the arithmetic is a no-op - the identity already held when the save
+        was written, so it re-derives the values the save carries and logs
+        nothing.
+
+        Never raises: it is called from ``from_dict``.
+        """
+        try:
+            alive = len(self.population.alive_agents())
+            births = int(getattr(self.population, "births", 0))
+            # The same "dead but not yet buried" term deaths_ever adds, counted
+            # the same way, so the two agree by construction.
+            pending = sum(1 for a in self.population.agents
+                          if not a.alive and not a.__dict__.get("_buried"))
+            returned = max(0, int(self.stats.get("returned", 0)))
+            abducted = max(0, int(self.stats.get("abducted", 0)))
+        except Exception:
+            log.debug("could not rebase the population books", exc_info=True)
+            return
+
+        slack = births + returned - alive - pending
+        if slack < 0:
+            # More people standing there than the counters can explain. The
+            # roster is the half that can be counted, so the shortfall is
+            # credited as returns rather than argued with - and `returned` is
+            # the right home for it because it is the only term that ADDS
+            # people who were not born here.
+            returned -= slack
+            slack = 0
+        abducted = min(abducted, slack)
+        died = slack - abducted
+
+        before = (self.stats.get("died"), self.stats.get("abducted"),
+                  self.stats.get("returned"))
+        after = (died, abducted, returned)
+        if before != after:
+            log.warning("population books did not balance on load; rebased "
+                        "(died, abducted, returned) %r -> %r", before, after)
+        self.stats["died"] = died
+        self.stats["abducted"] = abducted
+        self.stats["returned"] = returned

@@ -51,6 +51,39 @@ which is what stops ten mouths from stripping the world and starving.
 Nothing *destructive* is scaled - fire spread, burn-out, tree falls, boulders
 and scorch fading all run at their own fixed rate regardless of headcount.
 Call shapes without a world (``reg.tick(terrain, rng, dt)``) simply use 1.0.
+
+Regrowth is local
+-----------------
+A map-wide count against a map-wide target only describes the colony's
+neighbourhood while the map IS the neighbourhood.  On a 6400 px world it stopped
+being one, and the map could sit at 39.6 bushes out of 40 while the settlement
+had one within reach of anybody.  So :func:`_regrow` counts and reseeds per
+BAND: :data:`REGROW_BAND_W` of map, each with its own target taken from what
+:func:`scatter` actually put there, and short bands with a colonist in them
+(:data:`REGROW_REACH`) get first refusal.  Two ceilings hold - no band above its
+own target, no map above the sum of them - so recovery moves to where the
+harvesting is without the far map gaining a single prop it did not start with.
+
+...and a target is a count per MAP
+----------------------------------
+Which makes it a density only alongside the width it was counted for, so the
+registry records that too (:attr:`PropRegistry.world_w`).  A save written on a
+1600 px world says {tree 14, bush 10, rock 8} and means the same land as a
+6400 px world saying {56, 40, 32}; loaded verbatim onto the wider map it means
+a quarter of it, for ever, because those ceilings above hold perfectly.
+:func:`migrate_world_width` is the one-shot that rescales the numbers and plants
+the difference on the land the terrain migration just generated.
+
+It decides the old width off EVIDENCE, in a fixed order, and the order is the
+point.  The width persist.py counted off the save's own base64 beats the
+``world_w`` the registry claims - they can only disagree when one of them is a
+hand-edit, and the payload is the one the land was restored from.  Absent both,
+the registry is still not mute: ``band_targets`` row lengths and the mere
+ABSENCE of ``world_w`` (a field every build since the widening writes) each date
+the save, and :func:`_inference_is_safe` fences what may be done with either.
+Calling it twice is safe, and the thing that makes it safe is
+:attr:`PropRegistry._width_settled` - a flag no file can set - rather than any
+number a save carries.
 """
 from __future__ import annotations
 
@@ -96,6 +129,7 @@ __all__ = [
     "drop_litter",
     "litter_count",
     "growth_factor",
+    "migrate_world_width",
     "KINDS",
     "FLAMMABLE",
     "DEFAULT_COUNTS",
@@ -195,6 +229,109 @@ REGROW_KINDS: tuple[tuple[str, float], ...] = (
 #: enough to break a deadlock; the probabilistic top-up carries it the rest of
 #: the way back to the scatter target.
 RESOURCE_FLOOR = 1
+
+# -- where the regrowth actually goes -----------------------------------------
+# A map-wide count against a map-wide target is a density check only while the
+# map and the colony's reach are the same object. At WORLD_W they are not, and
+# the difference is not cosmetic: measured over 60 sim-min on 14 seeds, bushes
+# within 800 px of the settlement fell 9.8 -> 1.1 while the map-wide count held
+# at 39.6 against a target of 40, so ``have >= target`` was true on every check
+# and _regrow never fired once. The colony stood in a desert holding a receipt
+# for a forest. Stone (rocks only) and fibre (bushes only) have no other source,
+# so gross production per colonist-hour came in at 54% / 55% of the 1600 px
+# control and the hut chain stalled two huts short of the population cap.
+#
+# The counts are therefore taken per BAND - a fixed slice of the map - against a
+# per-band target, and the reseed is placed inside the band it was counted for.
+# Bands are geography, not colony state: nothing here knows where "home" is, so
+# a colony that splits, walks away or is teleported by randomise_terrain simply
+# takes its neighbourhood with it (see :func:`_reach_bands`).
+#: One band, in world px. 400 gives 16 bands at WORLD_W and 4 at 1600, and sits
+#: well inside a colonist's 720 px harvest reach so "the band that is short" and
+#: "the ground they are stripping" are the same place.
+REGROW_BAND_W = 400.0
+#: How far either side of a colonist counts as their neighbourhood. Deliberately
+#: ``actions.find_prop``'s default ``max_dist``: the land that is allowed to
+#: regrow for them is exactly the land they are allowed to harvest from.
+REGROW_REACH = 720.0
+#: Bands tried per check before giving up. A band can be legitimately
+#: unplantable (all cliff, all pond, or packed with props of another kind), and
+#: with one try the deficit there would block the whole kind for that check.
+REGROW_BAND_TRIES = 3
+
+# -- the day the map got wider ------------------------------------------------
+# ``targets`` is a count PER MAP. A save written on a 1600 px world carries
+# {tree 14, bush 10, rock 8}, which is the right DENSITY there and a quarter of
+# it once Terrain._restore_saved_band has grown the land to WORLD_W. Nothing
+# rescaled it, so an upgraded colony inherited three ceilings at once: no props
+# at all on the 4800 px of new ground, a map-wide regrow ceiling still set to
+# the old total, and - because _ensure_band_targets even-splits a map-wide
+# target over every band - a home band whose target fell from "all ten bushes"
+# to zero or one. Measured over 60 sim-min on five genuine 1600 px saves,
+# harvestables per 1000 px came in at bush 1.1-1.6 / tree 0.2-2.2 / rock
+# 1.1-1.3 against a fresh wide world's 3.8-6.3 / 5.3-7.7 / 3.9-5.0, and no
+# amount of playing could ever close that: the ceiling was the save's.
+#
+# :func:`migrate_world_width` rescales the targets by the width ratio and plants
+# the shortfall on the NEW GROUND ONLY, at load, once.
+
+#: Clearance kept between anything the migration plants and the restored
+#: settlement, px. Half of the widest structure (a bridge, 90) plus the widest
+#: prop spacing (a tree, 30), rounded up - so a hut standing hard against the
+#: old map's rim cannot end up with a tree in its doorway. A bridge's stamped
+#: ``state["span"]`` is honoured on top of this, because a deck is much wider
+#: than the structure's own footprint.
+MIGRATE_CLEAR = 72.0
+
+#: Densest a rescaled target may be: one prop of a kind per this many px of map.
+#: The ratio is taken from a width the save asserts, and a hand-edited save
+#: claiming a 16 px world would otherwise ask for a 400x rescale - i.e. a
+#: startup that never finishes, which is the same class of bug as the one
+#: persist.py's non-dict guard fixes. At WORLD_W this caps each kind at 128,
+#: comfortably above the 56/40/32 a fresh wide world is scattered with.
+MIGRATE_MIN_GAP = 50.0
+
+#: Hard ceiling on how many props ONE migration may plant, for the same reason.
+#: A genuine 1600 -> 6400 upgrade plants ~96.
+MIGRATE_MAX_PLACE = 400
+
+#: The map width every save written before :attr:`PropRegistry.world_w` existed
+#: was authored for.
+#:
+#: NOT a tuning number - a fact about this project's own save history, and the
+#: last resort of :func:`_infer_authored_width`. ``world_w`` was added by the
+#: widening itself, and :meth:`PropRegistry.to_dict` has written it
+#: unconditionally ever since, so a save that does not carry it was written by a
+#: build from BEFORE the widening, and every such build had ``WORLD_W = 1600``.
+#: A registry that remembers no width is therefore a 1600 px registry, not an
+#: unknowable one - which is the whole of what ``0.0`` was previously read as.
+#:
+#: The inference is still fenced (see :func:`_inference_is_safe`), because a
+#: hand-edited save can strip the field off a wide registry and that is the one
+#: case the reasoning above does not cover. If WORLD_W ever moves again this
+#: constant does not: saves written at 6400 all carry ``world_w``, so they never
+#: reach the inference at all.
+LEGACY_WORLD_W = 1600.0
+
+#: How well stocked a registry must be before an INFERRED width is believed, as
+#: a fraction of its own map-wide targets.
+#:
+#: This is the fence around the dangerous branch. The case that must never be
+#: rescaled is a genuinely WIDE registry that a hand-edit has stripped of both
+#: ``world_w`` and ``band_targets`` and whose far bands play has emptied - guess
+#: "narrow" there and a healthy target of 56 trees becomes 224. Such a registry
+#: fails one of the two fences by construction: either something of its is still
+#: standing out past :data:`LEGACY_WORLD_W` (the extent fence), or it has been
+#: stripped so hard that what remains is far below the targets it declares (this
+#: one). It cannot pass both, because passing both would mean holding half of a
+#: WIDE map's worth of harvestables inside a QUARTER of the map - roughly twice
+#: the density :func:`scatter`'s own spacing rules will place, and four times a
+#: fresh map's. A genuine narrow save passes both comfortably: it holds ~80-100%
+#: of its targets and every prop it has is inside the old rim.
+#:
+#: When either fence trips the migration does nothing at all, which is the
+#: behaviour this build already had. Refusing to guess is always available.
+MIGRATE_MIN_STOCK = 0.5
 
 #: Hard ceiling on the recovery multiplier, whatever a caller hands us.  Keeps
 #: a bad ``regrowth_factor`` (or a future constant change) from turning the map
@@ -491,6 +628,47 @@ class PropRegistry:
         self._fallback_rng: np.random.Generator | None = None
         #: Vegetation density to reseed back toward, set by :func:`scatter`.
         self.targets: dict[str, int] = {}
+        #: The same target broken down per :data:`REGROW_BAND_W` band, so
+        #: "enough trees" is a question about a place rather than about a total.
+        #: Written by :func:`scatter` from what it actually placed, which makes
+        #: the sum of a row the genesis count and therefore a hard ceiling: the
+        #: map can recover to the map it started with and to nothing denser.
+        self.band_targets: dict[str, list[int]] = {}
+        #: The map width :func:`scatter` authored this registry for, in world
+        #: px; 0.0 means "no idea", which is every save written before the field
+        #: existed. ``targets`` is a count PER MAP, so it is only a density
+        #: alongside this number - and when the two disagree with the terrain
+        #: that is actually loaded, :func:`migrate_world_width` is what settles
+        #: it. Persisted (additively - SAVE_VERSION is untouched) so that the
+        #: next time WORLD_W moves, the migration is an exact fact off the save
+        #: rather than an inference about it.
+        self.world_w: float = 0.0
+        #: Has :func:`_migrate_width` already had its say about this registry in
+        #: THIS PROCESS? Runtime state, never serialised - and that is the whole
+        #: point of it.
+        #:
+        #: The idempotence guard used to be ``world_w == terrain.W``, which is a
+        #: fact a SAVE can assert. A payload of 1600 columns whose ``world_w``
+        #: read 6400 therefore returned at the first line of the migration and
+        #: was left completely unmigrated - the one value at which the claim and
+        #: the payload can disagree was the one value where the claim won. A flag
+        #: that only this process can set cannot be forged by a file, so the
+        #: payload is free to win (see :func:`_migrate_width`) while a second
+        #: call carrying the same fact still cannot rescale 56 into 224.
+        self._width_settled: bool = False
+        #: Did this registry come off a SAVE? Set by :meth:`from_dict` and by
+        #: nothing else, runtime-only, never serialised.
+        #:
+        #: The width inference (:func:`_infer_authored_width`) reasons about save
+        #: provenance - "no ``world_w`` means a build older than the widening" -
+        #: and that reasoning says nothing whatever about a registry a test or a
+        #: vignette assembled by hand. Those also have ``world_w == 0.0`` and
+        #: (via _ensure_targets) targets that exactly match their own few props,
+        #: so they would sail through both fences and have three trees rescaled
+        #: into twelve plus 4800 px of fill, on the first tick, in a harness that
+        #: asked for none of it. A scattered registry is exempt for the same
+        #: reason from the other direction: scatter knows its width outright.
+        self._from_save: bool = False
         self._regrow_t: float = 0.0
         #: Last recovery multiplier applied, for debugging/inspection only.
         #: Derived from the World every tick, so it is not persisted.
@@ -704,9 +882,25 @@ class PropRegistry:
     # -- persistence -------------------------------------------------------
 
     def to_dict(self) -> dict:
+        # ``band_targets`` is additive: SAVE_VERSION is untouched, a save written
+        # without it loads through the fallback in from_dict, and a save written
+        # with it is ignored by anything that does not look for it.
+        bands: dict[str, list[int]] = {}
+        try:
+            for k, row in (self.band_targets or {}).items():
+                if isinstance(row, (list, tuple)):
+                    bands[str(k)] = [max(0, _i(v, 0)) for v in row]
+        except Exception:  # pragma: no cover - band_targets is ours
+            bands = {}
         return {
             "next_id": int(self.next_id),
             "targets": {str(k): int(v) for k, v in self.targets.items()},
+            "band_targets": bands,
+            # Additive, on the same terms as band_targets above: an older build
+            # ignores a key it does not look for, and a save without it loads
+            # as 0.0 - "no idea" - which is exactly what every save written
+            # before the world was widened honestly is.
+            "world_w": float(_f(self.world_w, 0.0)),
             "props": [p.to_dict() for p in self._props.values()],
         }
 
@@ -747,6 +941,34 @@ class PropRegistry:
                 KIND_ROCK: counts.get(KIND_ROCK, 0),
             }
             reg.targets = {k: v for k, v in reg.targets.items() if v > 0}
+
+        # Per-band targets. Absent on every save written before regrowth learned
+        # about distance, and on those _ensure_band_targets falls back to an
+        # even split of ``targets`` - which is the density scatter was asked for
+        # anyway, just without the memory of where the dice actually landed.
+        raw_b = d.get("band_targets")
+        bands: dict[str, list[int]] = {}
+        if isinstance(raw_b, dict):
+            for k, row in raw_b.items():
+                if not isinstance(row, (list, tuple)) or not row:
+                    continue
+                try:
+                    bands[str(k)] = [max(0, _i(v, 0)) for v in row]
+                except Exception:
+                    continue
+        reg.band_targets = bands
+
+        # The map these targets were counted for. Absent on every save written
+        # before the world was widened, and 0.0 then means "cannot tell from
+        # here" rather than "zero px wide" - persist.load_world hands the true
+        # width in from the terrain payload on that path. Coerced and sanity
+        # checked because from_dict must never raise and a junk width would
+        # otherwise reach migrate_world_width as a scale factor.
+        ww = _f(d.get("world_w"), 0.0)
+        reg.world_w = ww if (math.isfinite(ww) and 0.0 < ww < 1e7) else 0.0
+        # ...and that this registry is a SAVE, which is the only provenance the
+        # width inference is entitled to reason from. See _from_save.
+        reg._from_save = True
         return reg
 
 
@@ -1122,7 +1344,7 @@ def tick_props(
     except Exception:
         pass
     try:
-        _regrow(reg, terrain, rng, step, events, grow)
+        _regrow(reg, terrain, rng, step, events, grow, world)
     except Exception:
         pass
     # Littering is driven from here rather than from the agent loop because this
@@ -1336,6 +1558,163 @@ def _ensure_targets(reg: PropRegistry) -> None:
         pass
 
 
+def _band_count(w: float) -> int:
+    """How many :data:`REGROW_BAND_W` bands a map of width ``w`` splits into."""
+    try:
+        n = int(round(_f(w, 0.0) / max(1.0, REGROW_BAND_W)))
+    except (TypeError, ValueError):  # pragma: no cover
+        return 1
+    return max(1, n)
+
+
+def _band_of(x: float, w: float, nb: int) -> int:
+    """Which band ``x`` falls in.  Clamped, so an out-of-bounds prop still lands
+    somewhere rather than raising on a per-tick path."""
+    if nb <= 1:
+        return 0
+    bw = max(1e-6, _f(w, 1.0) / nb)
+    return int(min(nb - 1, max(0, int(_f(x, 0.0) // bw))))
+
+
+def _band_profile(reg: PropRegistry, w: float, nb: int, kind: str) -> list[int]:
+    """:func:`_usable_count` broken down by band - one pass over the registry.
+
+    Same definition of "usable" as :func:`_usable_count`, and it has to stay
+    that way: a fallen tree is not a tree and a sapling is one on its way up, so
+    the profile and the total must not disagree about what they are counting.
+    """
+    out = [0] * nb
+    for p in reg._props.values():
+        if not p.alive:
+            continue
+        k = p.kind
+        if kind == KIND_TREE:
+            if k == KIND_TREE:
+                if p.state.get("fallen"):
+                    continue
+            elif k != KIND_SAPLING:
+                continue
+        elif k != kind:
+            continue
+        out[_band_of(p.x, w, nb)] += 1
+    return out
+
+
+def _even_split(total: int, nb: int) -> list[int]:
+    """``total`` shared over ``nb`` bands, summing to exactly ``total``.
+
+    Rounding the cumulative fraction rather than the share is what makes the sum
+    exact: 40 over 16 bands is 2,3,2,3,... and not sixteen 2.5s rounded to 2 (a
+    map four bushes short) or to 3 (a map eight bushes over its own target).
+    No rng - the split has to be identical in every process that loads the save.
+    """
+    if nb <= 0:
+        return []
+    t = max(0, _i(total, 0))
+    prev = 0
+    out: list[int] = []
+    for b in range(nb):
+        cur = int(round(t * (b + 1) / float(nb)))
+        out.append(max(0, cur - prev))
+        prev = cur
+    return out
+
+
+def _ensure_band_targets(reg: PropRegistry, nb: int) -> dict[str, list[int]]:
+    """The per-band target rows, rebuilt if they are missing or the wrong shape.
+
+    A row survives only if it is the right length for this map AND sums to no
+    more than the map-wide target - which a row this module wrote always does,
+    because :func:`scatter` builds it from props it placed and it never places
+    more than it was asked for. Anything else - a save from before band targets
+    existed, a save from a different WORLD_W, a registry a test built by hand, a
+    hand-edited save asking for a billion bushes in one band - falls back to an
+    even split of the map-wide target. Without that sum test the fallback is a
+    hole straight through both ceilings: ``[10**9] * 16`` clamped per entry is
+    still sixteen times the map's whole allowance.
+    """
+    rows = getattr(reg, "band_targets", None)
+    if not isinstance(rows, dict):
+        rows = {}
+    targets = getattr(reg, "targets", None) or {}
+    out: dict[str, list[int]] = {}
+    for kind in (KIND_TREE, KIND_BUSH, KIND_ROCK):
+        t = _i(targets.get(kind), 0)
+        if t <= 0:
+            continue
+        row = rows.get(kind)
+        if (isinstance(row, list) and len(row) == nb
+                and all(isinstance(v, int) and 0 <= v <= t for v in row)
+                and sum(row) <= t):
+            out[kind] = list(row)
+        else:
+            out[kind] = _even_split(t, nb)
+    reg.band_targets = out
+    return out
+
+
+def _colonist_xs(world: object) -> list[float]:
+    """Where the colonists actually are, in world px.
+
+    Deliberately the people and not ``settlement_center``: the question this
+    answers is "which ground is being stripped", and a hunting party 600 px out
+    is stripping ground the settlement's mean says nothing about. It also means
+    a colony that splits in two has two neighbourhoods and both of them recover,
+    with no special case anywhere for the splitting.
+
+    Duck-typed and total, like :func:`growth_factor`: sim/ ticks props with all
+    sorts of stand-ins (the module self-test, vignette harnesses, a half-built
+    World) and an empty list simply means "no local claim on the map", which
+    falls back to the plain deficit-driven behaviour.
+    """
+    if world is None:
+        return []
+    out: list[float] = []
+    try:
+        seq: object = None
+        pop = getattr(world, "population", None)
+        fn = getattr(pop, "alive_agents", None)
+        if callable(fn):
+            seq = fn()
+        if seq is None:
+            seq = getattr(world, "agents", None)
+        for a in (seq or ()):  # type: ignore[union-attr]
+            if not getattr(a, "alive", True):
+                continue
+            x = _f(getattr(a, "x", None), float("nan"))
+            if math.isfinite(x):
+                out.append(x)
+            if len(out) >= 64:
+                break
+    except Exception:
+        return []
+    return out
+
+
+def _reach_bands(xs: list[float], w: float, nb: int) -> set[int]:
+    """Every band within :data:`REGROW_REACH` of somebody."""
+    near: set[int] = set()
+    for x in xs:
+        lo = _band_of(x - REGROW_REACH, w, nb)
+        hi = _band_of(x + REGROW_REACH, w, nb)
+        near.update(range(lo, hi + 1))
+    return near
+
+
+def _pick_band(rng: np.random.Generator, cand: list[int], weight: list[int]) -> int:
+    """One band from ``cand``, drawn in proportion to how short it is."""
+    total = float(sum(max(0, v) for v in weight))
+    if total <= 0.0:
+        return cand[0]
+    r = float(rng.random()) * total
+    acc = 0.0
+    for b, wt in zip(cand, weight):
+        acc += max(0, wt)
+        if r < acc:
+            return b
+    return cand[-1]
+
+
 def _regrow(
     reg: PropRegistry,
     terrain: "Terrain",
@@ -1343,18 +1722,53 @@ def _regrow(
     dt: float,
     events: list[dict],
     grow: float = 1.0,
+    world: object = None,
 ) -> None:
-    """Slowly reseed vegetation back toward the density scatter() was asked for.
+    """Slowly reseed vegetation back where scatter() put it and the colony took it.
 
-    Only ever tops *up* to the target, so this cannot run away; a world that is
-    already green does nothing but a cheap counter check.  ``grow`` is the
-    colony's recovery multiplier: a stripped map comes back about three times
-    faster for ten colonists than for two.  Silent by design - the events are
-    for the stats counters, not the chronicle.
+    Two ceilings, and both have to hold or the far map quietly thickens:
+
+    * no BAND may pass its own target, so nowhere on the map ends up denser than
+      the day it was made, and
+    * the map-wide usable count may not pass the sum of those targets, which is
+      exactly what :func:`scatter` placed.
+
+    Between them, this only ever tops *up*: a world that is already green does
+    nothing but a band count.  ``grow`` is the colony's recovery multiplier, so
+    a stripped map comes back about three times faster for ten colonists than
+    for two.  Silent by design - the events are for the stats counters, not the
+    chronicle.
     """
     _ensure_targets(reg)
     targets = getattr(reg, "targets", None)
     if not targets:
+        return
+    try:
+        w = float(terrain.W)
+    except Exception:
+        return
+    if not (w > 0.0):
+        return
+    nb = _band_count(w)
+    # The net under a save the load path did not migrate - a caller that went
+    # straight to World.from_dict, or a build that loaded it before persist.py
+    # learned to pass the width in. Caught here, once, before
+    # _ensure_band_targets even-splits a target that is still a quarter of what
+    # this map is worth.
+    #
+    # The guard used to be ``0.0 < world_w < w - 1.0``, and it never fired on
+    # the only saves that need it. ``world_w`` is 0.0 on every save written
+    # before the field existed - which is every save older than the widening,
+    # i.e. every save that IS narrow - and 0.0 fails a ``0.0 <`` test. So the
+    # mitigation this net was claimed to be excluded, exactly, the population it
+    # was for: measured, a genuine 1600 px save through World.from_dict was
+    # still {tree 14, bush 10, rock 8} after a tick, and after ten thousand.
+    # _migrate_width now owns the whole decision (including "no idea") and this
+    # asks it once per registry.
+    if not bool(getattr(reg, "_width_settled", False)):
+        _migrate_width(reg, terrain, world)
+    band_targets = _ensure_band_targets(reg, nb)
+    if not band_targets:
         return
     reg._regrow_t = _f(getattr(reg, "_regrow_t", 0.0), 0.0) + dt
     if reg._regrow_t < REGROW_CHECK_SEC:
@@ -1365,12 +1779,25 @@ def _regrow(
     if factor <= 0.0:
         return
 
+    # One list of positions for all three kinds - the people do not move between
+    # the tree pass and the rock pass.
+    crowd = _colonist_xs(world)
+    near = _reach_bands(crowd, w, nb)
+
     for kind, gap in REGROW_KINDS:
-        target = _i(targets.get(kind), 0)
-        if target <= 0:
+        rows = band_targets.get(kind)
+        if not rows:
             continue
-        have = _usable_count(reg, kind)
-        if have >= target:
+        prof = _band_profile(reg, w, nb, kind)
+        have = sum(prof)
+        # The map-wide ceiling. For bush and rock nothing but this function adds
+        # to a band, so this can only bite when a row came from the even-split
+        # fallback and some band happens to sit above its share; it is here so
+        # that path cannot inflate the map either.
+        if have >= sum(rows):
+            continue
+        short = [b for b in range(nb) if prof[b] < rows[b]]
+        if not short:
             continue
 
         # Hard floor: if the map holds none of this resource, reseed at once and
@@ -1382,27 +1809,47 @@ def _regrow(
             if float(rng.random()) > min(1.0, elapsed * factor / max(gap, 1e-3)):
                 continue
 
-        x = _regrow_site(reg, terrain, rng, kind)
-        if x is None and forced:
-            x = _guaranteed_site(reg, terrain, rng)   # the floor must not fail
-        if x is None:
-            continue
-        p = _reseed(reg, terrain, rng, kind, x, mature=forced)
-        if p is not None:
-            events.append(_ev("prop_regrown", p, target=kind))
+        # Short bands somebody is standing in outrank short bands nobody has
+        # been near for an hour, which is the whole point: the reseed lands
+        # where the harvesting is. With nobody on the map (a test stub, an
+        # extinct colony) every short band is a candidate and this degrades to
+        # the plain deficit-weighted draw.
+        cand = [b for b in short if b in near] or short
+        placed = False
+        for _ in range(min(REGROW_BAND_TRIES, len(cand))):
+            b = _pick_band(rng, cand, [rows[i] - prof[i] for i in cand])
+            x = _regrow_site(reg, terrain, rng, kind, band=(b, nb, w))
+            if x is None:
+                cand = [c for c in cand if c != b]      # unplantable - try another
+                if not cand:
+                    break
+                continue
+            p = _reseed(reg, terrain, rng, kind, x, mature=forced)
+            if p is not None:
+                events.append(_ev("prop_regrown", p, target=kind))
+            placed = True
+            break
+        if not placed and forced:
+            # The floor must not fail, whatever the bands say.
+            x = _guaranteed_site(reg, terrain, rng, crowd)
+            if x is not None:
+                p = _reseed(reg, terrain, rng, kind, x, mature=True)
+                if p is not None:
+                    events.append(_ev("prop_regrown", p, target=kind))
 
 
 def _usable_count(reg: PropRegistry, kind: str) -> int:
-    """Sources of `kind` a colonist could actually harvest right now.
+    """Sources of `kind` a colonist could actually harvest right now, map-wide.
 
     A fallen tree, a mined-out rock or a dead bush does not count - and a
     sapling counts toward trees because it is one on its way up.
+
+    Implemented as :func:`_band_profile` over a single band covering everything,
+    so the map-wide answer and the per-band answer cannot drift apart about what
+    "usable" means. They did not, when this was a second copy of the same three
+    rules, but a definition kept in two places is a definition waiting to.
     """
-    if kind == KIND_TREE:
-        trees = sum(1 for p in reg.all_of(KIND_TREE)
-                    if p.alive and not p.state.get("fallen"))
-        return trees + len(reg.all_of(KIND_SAPLING))
-    return sum(1 for p in reg.all_of(kind) if p.alive)
+    return _band_profile(reg, 1.0, 1, kind)[0]
 
 
 def _reseed(reg: PropRegistry, terrain: "Terrain", rng: np.random.Generator,
@@ -1428,19 +1875,33 @@ def _reseed(reg: PropRegistry, terrain: "Terrain", rng: np.random.Generator,
 
 
 def _guaranteed_site(reg: PropRegistry, terrain: "Terrain",
-                     rng: np.random.Generator) -> float | None:
+                     rng: np.random.Generator,
+                     crowd: list[float] | tuple[float, ...] = ()) -> float | None:
     """A placement that relaxes spacing so the resource floor can never fail.
 
     _regrow_site respects spacing and can legitimately find nowhere; but the
     floor exists precisely to rescue a bare map, so when it triggers we fall
     back to any non-cliff, non-submerged column, spacing be damned.
+
+    ``crowd`` is where the colonists are. The floor is a deadlock-breaker - the
+    map holds no rock at all and nobody can make stone - so putting the rescue
+    5000 px from the only people who need it breaks the deadlock on paper and
+    not in the colony. With nobody on the map it draws from the whole width as
+    it always did.
     """
     try:
         w = int(terrain.W)
     except Exception:
         return None
+    anchor: float | None = None
+    if crowd:
+        anchor = _f(crowd[int(rng.integers(0, len(crowd)))], 0.0)
+    lo, hi = 8, max(9, w - 8)
+    if anchor is not None:
+        lo = int(max(8, min(w - 9, anchor - REGROW_REACH)))
+        hi = int(max(lo + 1, min(w - 8, anchor + REGROW_REACH)))
     for _ in range(64):
-        xi = int(rng.integers(8, max(9, w - 8)))
+        xi = int(rng.integers(lo, hi))
         try:
             if terrain.is_cliff(xi):
                 continue
@@ -1451,14 +1912,48 @@ def _guaranteed_site(reg: PropRegistry, terrain: "Terrain",
 
 
 def _regrow_site(
-    reg: PropRegistry, terrain: "Terrain", rng: np.random.Generator, kind: str
+    reg: PropRegistry, terrain: "Terrain", rng: np.random.Generator, kind: str,
+    band: tuple[int, int, float] | None = None,
+    span: tuple[float, float] | None = None,
+    avoid: Callable[[float], bool] | None = None,
 ) -> float | None:
-    """A free, gently sloped, non-submerged column to reseed into."""
+    """A free, gently sloped, non-submerged column to reseed into.
+
+    ``band`` is ``(index, count, map_width)`` and confines the draw to that
+    slice.  It is not an optimisation, it is the point: drawing uniformly across
+    6400 px put roughly three quarters of every reseed somewhere no colonist
+    goes, so even the checks that did fire mostly grew a bush for nobody.
+
+    ``span`` is the same restriction stated directly as ``(lo, hi)`` in world
+    px, for a caller that wants part of a band - :func:`_fill_new_ground` asks
+    only for the slice of a band that is NEW land.  ``avoid`` is a second veto
+    on top of the terrain's, used there to keep the migration's props off the
+    restored settlement.  Both default to the behaviour that was here.
+    """
     try:
         w = int(terrain.W)
         mat = terrain.material
     except Exception:
         return None
+    lo, hi = 6, max(7, w - 6)
+    if band is not None:
+        bi, nb, bw_total = band
+        bw = max(1.0, _f(bw_total, float(w)) / max(1, nb))
+        lo = int(max(6, min(w - 7, bi * bw)))
+        hi = int(max(lo + 1, min(w - 6, (bi + 1) * bw)))
+    if span is not None:
+        lo = int(max(6, min(w - 7, _f(span[0], 6.0))))
+        hi = int(max(lo + 1, min(w - 6, _f(span[1], float(w)))))
+    # Spacing only ever rejects a neighbour within ~33 px (the widest
+    # cross-kind rule), so gather the candidates once instead of walking the
+    # whole registry on each of REGROW_TRIES draws.
+    mid = 0.5 * (lo + hi)
+    span = 0.5 * (hi - lo) + 96.0
+    neighbours = [
+        p for p in reg._props.values()
+        if p.alive and p.kind not in (KIND_SCORCH, KIND_WATER)
+        and abs(p.x - mid) <= span
+    ]
     # Ash counts as fertile: burnt ground is exactly what needs to come back.
     soils = (MAT_GRASS, MAT_DIRT, MAT_ASH) if kind == KIND_TREE else (
         MAT_GRASS, MAT_DIRT, MAT_SAND, MAT_ASH
@@ -1470,7 +1965,7 @@ def _regrow_site(
         for p in reg.all_of(KIND_WATER)
     ]
     for _ in range(REGROW_TRIES):
-        xi = int(rng.integers(6, max(7, w - 6)))
+        xi = int(rng.integers(lo, hi))
         if int(mat[xi]) not in soils:
             continue
         if abs(terrain.slope(float(xi))) > limit:
@@ -1484,19 +1979,510 @@ def _regrow_site(
             pass
         if any(a - 6 <= xi <= b + 6 for a, b in ponds):
             continue
-        near = False
-        for other in reg._props.values():
-            if not other.alive or other.kind in (KIND_SCORCH, KIND_WATER):
-                continue
+        if avoid is not None:
+            try:
+                if bool(avoid(float(xi))):
+                    continue
+            except Exception:
+                pass
+        crowded = False
+        for other in neighbours:
             need = spacing if other.kind == kind else _CROSS_KIND * max(
                 spacing, _MIN_SPACING.get(other.kind, 20.0)
             )
             if abs(other.x - xi) < need:
-                near = True
+                crowded = True
                 break
-        if not near:
+        if not crowded:
             return float(xi)
     return None
+
+
+# ------------------------------------------------- widening an old save --
+
+
+def migrate_world_width(world: object, saved_w: float | None = None) -> dict:
+    """Bring a registry authored for a NARROWER map up to this one's density.
+
+    Call it on load with the width the SAVE actually carries - the number of
+    terrain columns in the payload, which is the same thing
+    :meth:`Terrain.from_dict` restores the band from.  That number WINS over
+    anything the registry claims about itself; see :func:`_migrate_width`.
+    ``None`` means "I do not know", and then the registry's own persisted
+    :attr:`PropRegistry.world_w` is used if it has one, and failing that
+    :func:`_infer_authored_width` reads the provenance off the registry itself.
+    If none of the three can answer, nothing happens.
+
+    Safe to call more than once - :attr:`PropRegistry._width_settled`, not any
+    saved number, is what guarantees that.
+
+    Three things change, and only for a save that is genuinely narrower:
+
+    * ``targets`` is rescaled by the width ratio, so the map-wide regrow
+      ceiling stops being a quarter of what this map is worth, and the even
+      split :func:`_ensure_band_targets` makes of it stops starving the home
+      bands;
+    * the shortfall is planted on the NEW GROUND, at load, once; and
+    * the boulder count comes up to the new width off its own census - the map's
+      one standing hazard, and the one kind that never regrows.  Ponds and
+      decorative saplings are deliberately NOT planted; :func:`_fill_boulders`
+      is where that decision is written down.
+
+    Planted at load rather than left to :func:`_regrow`, deliberately.  Regrow
+    is a top-up of a few props a minute that prefers bands with a colonist in
+    them, and after this migration the colonists are all standing in the old
+    band - which is already at its target - so the new land would fill from the
+    fallback branch at roughly one prop per REGROW_*_SEC for an hour of sim
+    time, while the player watches a colony next to 4800 px of bare ground it
+    can see the far end of.  The land the terrain migration generated is meant
+    to have always been there; scenery that fades in over an hour says
+    otherwise.  The cost of doing it at once is that placement has to respect
+    the settlement it is arriving next to, which is what ``avoid`` below is.
+
+    Never raises - it is called from the load path, where an exception costs a
+    colony.  Returns a small report for the caller to log.
+    """
+    return _migrate_width(getattr(world, "props", None),
+                          getattr(world, "terrain", None), world, saved_w)
+
+
+def _prop_extent(reg: PropRegistry) -> float:
+    """The right-hand edge of the ground this registry actually occupies, px.
+
+    EVERY prop counts, alive or not and of every kind - a felled trunk, a
+    mined-out rock, a headstone, a pond. The question this answers is "how wide
+    was the map these things were put on", and a dead prop is every bit as much
+    evidence of that as a live one. Deliberately not restricted to the
+    harvestables: the kinds play never removes (water, boulders, graves) are the
+    strongest evidence there is that a registry is wider than it looks.
+    """
+    mx = 0.0
+    try:
+        for p in reg._props.values():
+            x = _f(getattr(p, "x", 0.0), 0.0)
+            if x > mx:
+                mx = x
+    except Exception:  # pragma: no cover - _props is ours
+        return 0.0
+    return mx
+
+
+def _inference_is_safe(reg: PropRegistry, cand: float, w: float) -> bool:
+    """Two fences an INFERRED authored width has to clear. Never raises.
+
+    Only inferences are fenced. A width the caller counted off the payload, or
+    one the save recorded in ``world_w``, is a fact and is used as it stands;
+    these are for the branch that is reasoning from circumstantial evidence, and
+    the thing they exist to stop is a wide registry being mistaken for a narrow
+    one and having a healthy target of 56 trees rescaled to 224.
+
+    1. EXTENT. Nothing the registry holds may stand beyond the width being
+       claimed. One boulder at x=5000 is proof the map was never 1600 px wide,
+       and it is proof play cannot erase - nothing in the sim removes a boulder,
+       a pond or a grave.
+    2. STOCK. What is standing must be at least :data:`MIGRATE_MIN_STOCK` of the
+       registry's own map-wide targets. ``targets`` is the one number play never
+       touches, so a registry far below its own targets has been STRIPPED - and
+       a stripped map is exactly the case where the extent fence has been
+       emptied of its evidence rather than never having had any.
+
+    Together they are not two heuristics but one argument: to pass both, a
+    registry would have to hold half of a wide map's targets inside a quarter of
+    a wide map, which is denser than :func:`scatter` will place.
+    """
+    try:
+        if not (math.isfinite(cand) and REGROW_BAND_W <= cand < w - 1.0):
+            return False
+        if _prop_extent(reg) > cand:
+            return False                       # something stands past the rim
+        targets = getattr(reg, "targets", None) or {}
+        want = sum(max(0, _i(v, 0)) for v in targets.values())
+        if want <= 0:
+            return False
+        have = sum(_usable_count(reg, k) for k, _gap in REGROW_KINDS)
+        if have < MIGRATE_MIN_STOCK * want:
+            return False                       # stripped; it cannot testify
+    except Exception:
+        return False
+    return True
+
+
+def _infer_authored_width(reg: PropRegistry, w: float) -> float:
+    """The width a registry was authored for, when it does not remember one.
+
+    ``world_w == 0.0`` was read as "unknowable" and the migration simply
+    declined - which is correct for the number itself and wrong about the
+    registry, because two other things in it still know. Tried in order of how
+    directly each one was recorded:
+
+    1. ``band_targets``. :func:`scatter` writes one row per
+       :data:`REGROW_BAND_W` band OF THE MAP IT WAS SCATTERING, so the row
+       LENGTH is that map's band count and the width follows. It is written
+       from what scatter placed, is refused by :func:`_ensure_band_targets` the
+       moment it is the wrong shape for the current map, and - crucially - is a
+       target rather than a census, so wiping a band's props does not shorten
+       its row. All present rows must agree, or it is not evidence.
+    2. :data:`LEGACY_WORLD_W`. Absent ``world_w`` means a save older than the
+       widening, and every such save is 1600 px. See that constant.
+
+    Returns 0.0 for "still cannot tell", which is the caller's do-nothing.
+    Whatever comes back is put through :func:`_inference_is_safe` before it is
+    allowed to move a single target. Never raises.
+
+    Only ever runs on a registry that came off a save (see
+    :attr:`PropRegistry._from_save`); everything below is an argument about how
+    saves were written, and a hand-assembled registry is not one.
+    """
+    if not bool(getattr(reg, "_from_save", False)):
+        return 0.0
+    try:
+        rows = getattr(reg, "band_targets", None)
+        if isinstance(rows, dict) and rows:
+            lens = {len(r) for r in rows.values()
+                    if isinstance(r, (list, tuple)) and r}
+            if len(lens) == 1:
+                cand = float(lens.pop()) * REGROW_BAND_W
+                # Whatever the rows say is the answer, believed or refused.
+                # Falling through to LEGACY_WORLD_W after a row length has
+                # already spoken would be guessing OVER evidence, and the case
+                # it would reach is a wide registry whose rows say 6400 - the
+                # one this must never rescale.
+                return cand if _inference_is_safe(reg, cand, w) else 0.0
+    except Exception:
+        pass
+    return LEGACY_WORLD_W if _inference_is_safe(reg, LEGACY_WORLD_W, w) else 0.0
+
+
+def _migrate_width(reg: object, terrain: object, world: object,
+                   saved_w: float | None = None) -> dict:
+    report: dict = {"saved_w": 0.0, "world_w": 0.0, "targets": {}, "placed": {}}
+    try:
+        if not isinstance(reg, PropRegistry):
+            return report
+        try:
+            w = float(terrain.W)  # type: ignore[union-attr]
+        except Exception:
+            return report
+        if not (math.isfinite(w) and w > 0.0):
+            return report
+        report["world_w"] = w
+
+        # Idempotence, and it is the FLAG that provides it rather than the
+        # saved ``world_w``. See PropRegistry._width_settled: a file can claim
+        # a width, so a file could suppress the migration, and at exactly one
+        # value - ``world_w`` equal to this map's width while the payload is a
+        # quarter of it - suppressing it was silent and total. This flag is set
+        # by scatter and by the bottom of this function and by nothing else, so
+        # a second call cannot rescale twice while a first call can always run.
+        if bool(getattr(reg, "_width_settled", False)):
+            report["saved_w"] = _f(getattr(reg, "world_w", 0.0), 0.0) or w
+            return report
+
+        # THE PAYLOAD WINS. persist.load_world counts the save's terrain columns
+        # off the base64 - the same count Terrain.from_dict restored the land
+        # from - so when the caller supplies one it describes the LAND that is
+        # actually under these props, and reg.world_w is only ever a claim about
+        # it. Consulted first, and no longer after an early return that the
+        # claim controlled.
+        old = _f(saved_w, 0.0) if saved_w is not None else 0.0
+        if not (math.isfinite(old) and old > 0.0):
+            old = _f(getattr(reg, "world_w", 0.0), 0.0)
+        if not (math.isfinite(old) and old > 0.0):
+            # No fact available from either. There is still evidence inside the
+            # registry itself, and declining to look at it is what left
+            # World.from_dict-without-persist permanently at a quarter density.
+            old = _infer_authored_width(reg, w)
+        if not (math.isfinite(old) and old > 0.0):
+            # Genuinely cannot tell, and nothing about this registry's
+            # provenance will change later in the session - so settle it rather
+            # than re-deciding on every tick of _regrow.
+            reg._width_settled = True
+            return report                      # cannot tell; do nothing
+        report["saved_w"] = old
+        if abs(old - w) < 1.0:
+            reg.world_w = w                    # already this map; just record it
+            reg._width_settled = True
+            return report
+
+        _ensure_targets(reg)
+        scale = w / old
+        cap = max(1, int(w / MIGRATE_MIN_GAP))
+        new_t: dict[str, int] = {}
+        for k, v in (getattr(reg, "targets", None) or {}).items():
+            t = _i(v, 0)
+            if t > 0:
+                new_t[str(k)] = max(1, min(cap, int(round(t * scale))))
+        if new_t:
+            reg.targets = new_t
+        report["targets"] = dict(reg.targets)
+
+        # The saved rows describe a map that no longer exists - four bands
+        # where there are now sixteen - so they are dropped rather than
+        # stretched. _ensure_band_targets then even-splits the RESCALED target,
+        # which is the genesis density of a fresh wide world and is also what
+        # the old band's own four bands add back up to (14 trees over bands
+        # 0-3). The alternative, recording what the fill actually managed to
+        # place, would freeze a band that happens to be all cliff at whatever
+        # this one attempt got.
+        reg.band_targets = {}
+        reg.world_w = w
+        # Settled before the planting, not after: _fill_new_ground is the one
+        # part of this that can be interrupted (its own budget, a terrain that
+        # refuses every site), and a registry whose TARGETS have already been
+        # rescaled must never be handed back to this function for a second
+        # rescale. A half-planted map is a map the ordinary regrowth tops up; a
+        # doubly-rescaled one is 224 trees.
+        reg._width_settled = True
+        if old >= w:
+            return report                      # the map SHRANK: nothing to plant
+        report["placed"] = _fill_new_ground(reg, terrain, world, old, w)
+    except Exception:
+        return report
+    return report
+
+
+def _migration_rng(reg: PropRegistry, world: object) -> np.random.Generator:
+    """The stream the migration plants from.
+
+    Derived from the World's seed through the registry's own fallback rule, so
+    two SEPARATE processes loading the same save plant the same forest - which
+    ``np.random.default_rng()`` with no argument would not, and that is a bug
+    this file has already been bitten by once (see _fallback_seed). Offset off
+    the world's own stream so the migration does not march in lockstep with it,
+    the same trick World.__init__ uses for every registry it seeds.
+    """
+    try:
+        seed = int(reg._fallback_seed(world)) & 0xFFFFFFFF
+    except Exception:  # pragma: no cover - _fallback_seed is total
+        seed = 0
+    return np.random.default_rng((seed ^ 0x1D1EA5) & 0xFFFFFFFF)
+
+
+def _settlement_guard(world: object) -> Callable[[float], bool] | None:
+    """A veto over every column the restored settlement occupies.
+
+    Duck-typed and total, like :func:`_colonist_xs`: sim/ hands this module all
+    sorts of stand-ins and "no structures" simply means no veto.
+
+    The colony's whole SPAN is vetoed, not just each building's own footprint.
+    A wall is a structure with gaps between it and the next one, and dropping a
+    tree into one of those gaps is "inside the colony walls" by any reading a
+    player would give it. Everything the migration plants is beyond the old
+    map's rim anyway, so in practice this only bites for a settlement standing
+    hard against it - which is precisely the case that would be visible.
+    """
+    spans: list[tuple[float, float]] = []
+    lo_all = float("inf")
+    hi_all = float("-inf")
+    try:
+        sreg = getattr(world, "structures", None)
+        fn = getattr(sreg, "all", None)
+        seq = fn() if callable(fn) else (sreg or ())
+        for s in (seq or ()):
+            x = _f(getattr(s, "x", None), float("nan"))
+            if not math.isfinite(x):
+                continue
+            a = b = x
+            st = getattr(s, "state", None)
+            if isinstance(st, dict):
+                sp = st.get("span")
+                if isinstance(sp, (list, tuple)) and len(sp) == 2:
+                    a = min(a, _f(sp[0], x))
+                    b = max(b, _f(sp[1], x))
+            spans.append((a - MIGRATE_CLEAR, b + MIGRATE_CLEAR))
+            lo_all = min(lo_all, a)
+            hi_all = max(hi_all, b)
+    except Exception:
+        return None
+    if not spans:
+        return None
+    spans.append((lo_all - MIGRATE_CLEAR, hi_all + MIGRATE_CLEAR))
+
+    def blocked(x: float) -> bool:
+        return any(a <= x <= b for a, b in spans)
+
+    return blocked
+
+
+def _fill_new_ground(reg: PropRegistry, terrain: "Terrain", world: object,
+                     old: float, w: float) -> dict[str, int]:
+    """Plant the rescaled per-band shortfall, on the new land only.
+
+    Per band and not map-wide, so the new ground comes out at the same density
+    everywhere rather than in one clump; and ``want`` is measured against what
+    the band already HOLDS, so the band straddling the join keeps the props the
+    save restored into it and only makes up the difference.
+
+    Reseeded through :func:`_regrow_site` and :func:`_reseed` rather than
+    through a second copy of :func:`scatter`'s placement rules, so there is one
+    definition of where a new prop may stand: this is the regrowth that would
+    have happened over the next hour, done at once. ``mature=True`` for the same
+    reason - the new land is meant to read as land that was always there, and
+    forty saplings would read as scrub for the four minutes they took to grow.
+    """
+    out: dict[str, int] = {}
+    rng = _migration_rng(reg, world)
+    nb = _band_count(w)
+    bw = w / max(1, nb)
+    rows = _ensure_band_targets(reg, nb)
+    guard = _settlement_guard(world)
+    budget = MIGRATE_MAX_PLACE
+    for kind, _gap in REGROW_KINDS:
+        row = rows.get(kind)
+        if not row:
+            continue
+        prof = _band_profile(reg, w, nb, kind)
+        placed = 0
+        for b in range(nb):
+            lo = max(float(old), b * bw)
+            hi = min(w, (b + 1) * bw)
+            if hi - lo < 12.0:
+                continue                       # this band is (all) old ground
+            want = _i(row[b], 0) - _i(prof[b], 0)
+            while want > 0 and budget > 0:
+                x = _regrow_site(reg, terrain, rng, kind,
+                                 span=(lo, hi), avoid=guard)
+                if x is None:
+                    break                      # nowhere plantable left in it
+                if _reseed(reg, terrain, rng, kind, x, mature=True) is None:
+                    break
+                want -= 1
+                budget -= 1
+                placed += 1
+        out[kind] = placed
+    out[KIND_BOULDER] = _fill_boulders(reg, terrain, rng, guard, old, w,
+                                       max(0, budget))
+    return out
+
+
+def _boulder_site(reg: PropRegistry, terrain: "Terrain",
+                  rng: np.random.Generator, lo: float, hi: float,
+                  avoid: Callable[[float], bool] | None) -> float | None:
+    """A column a boulder can sit on, in ``[lo, hi)``.  ``None`` if there is none.
+
+    Separate from :func:`_regrow_site` because a boulder wants the OPPOSITE
+    ground: that function refuses anything steeper than 0.85 (nothing grows on a
+    scree face) and a boulder needs a slope to have come to rest on. The window
+    is :func:`scatter`'s own - ideally 0.32..1.4, relaxed to 0.2..2.2 - tried in
+    the same two passes, so a boulder the migration plants stands where scatter
+    would have put one and not on a lawn.
+
+    Not folded into ``_regrow_site`` as a ``kind`` branch on purpose: that
+    function is on the per-tick regrow path for three kinds that all want gentle
+    ground, and widening its contract for one kind that never regrows would put
+    a boulder-shaped special case in front of every reseed the colony ever does.
+    """
+    try:
+        w = int(terrain.W)
+    except Exception:
+        return None
+    a = int(max(6, min(w - 7, _f(lo, 6.0))))
+    b = int(max(a + 1, min(w - 6, _f(hi, float(w)))))
+    spacing = _MIN_SPACING.get(KIND_BOULDER, 60.0)
+    neighbours = [p for p in reg._props.values()
+                  if p.alive and p.kind not in (KIND_SCORCH, KIND_WATER)]
+    ponds = [(_f(p.state.get("x0"), 0.0), _f(p.state.get("x1"), 0.0))
+             for p in reg.all_of(KIND_WATER)]
+    for slo, shi, tries in ((0.32, 1.4, 60), (0.2, 2.2, 40)):
+        for _ in range(tries):
+            xi = int(rng.integers(a, b))
+            try:
+                s = abs(float(terrain.slope(float(xi))))
+            except Exception:
+                continue
+            if not (slo <= s <= shi):
+                continue
+            if any(p0 - 6 <= xi <= p1 + 6 for p0, p1 in ponds):
+                continue
+            if avoid is not None:
+                try:
+                    if bool(avoid(float(xi))):
+                        continue
+                except Exception:
+                    pass
+            crowded = False
+            for other in neighbours:
+                need = spacing if other.kind == KIND_BOULDER else _CROSS_KIND * max(
+                    spacing, _MIN_SPACING.get(other.kind, 20.0))
+                if abs(other.x - xi) < need:
+                    crowded = True
+                    break
+            if not crowded:
+                return float(xi)
+    return None
+
+
+def _fill_boulders(reg: PropRegistry, terrain: "Terrain",
+                   rng: np.random.Generator,
+                   avoid: Callable[[float], bool] | None,
+                   old: float, w: float, budget: int) -> int:
+    """Bring the boulder count up to the new map's width, on the new land only.
+
+    WHY BOULDERS AND NOT THE OTHER TWO KINDS THE MIGRATION SKIPS:
+
+    * A boulder is the map's one standing HAZARD, and it was the one real
+      density gap left. Measured on a genuine 1600 px save: an upgraded world
+      carried 3 boulders against a fresh wide world's 8-12, and - unlike a tree
+      - a boulder never regrows, so that gap was permanent. 4800 px of new
+      ground with nothing on it that can ever roll is not "land that was always
+      there", which is the whole promise of this migration.
+    * Ponds are NOT planted, and that is a decision rather than an oversight.
+      Water is not a placement, it is a terrain EDIT - scatter picks a basin out
+      of ``find_basins`` and repaints the shoreline to MAT_SAND - and doing that
+      at load, after Terrain.from_dict has settled the land and the structures
+      have been restored onto it, is a different and much larger change than
+      putting a prop on the ground. The gap is also small: ``water`` is one of
+      the two counts world.py never scaled by WORLD_SCALE, so a FRESH 6400 px
+      world is scattered with 2 ponds, exactly as a 1600 px one was. Upgraded
+      worlds run 1-2. Whether a 6400 px map should have more than two ponds is a
+      question about SCATTER_COUNTS, not about this function.
+    * Saplings are not planted for the reason ``mature=True`` exists two
+      functions up: the new land must read as old land, and scrub does not. The
+      scattered saplings are decoration on top of the tree target, ``sapling``
+      is the other count world.py never scaled, and upgraded and fresh worlds
+      both carry 3 - there is no gap to close.
+
+    HOW MANY. From the registry's own census, scaled by the same width ratio the
+    targets are - no new tuning number, and nothing to drift. That census is
+    exact rather than an estimate: nothing in the sim removes a boulder (fire
+    does not burn one, and ``_tick_boulder``'s damage pass excludes its own
+    kind), so what is standing IS what scatter placed on the old map.
+
+    Planted at rest, like every other boulder in a freshly scattered world -
+    ``nudge`` is what starts one rolling and the load path is not an earthquake.
+    """
+    try:
+        have = sum(1 for p in reg._props.values()
+                   if p.alive and p.kind == KIND_BOULDER)
+        if have <= 0 or old <= 0.0 or w <= old:
+            return 0
+        want = int(round(have * (w / old))) - have
+        cap = max(0, int((w - old) / max(1.0, _MIN_SPACING.get(KIND_BOULDER, 60.0))))
+        want = max(0, min(want, cap, int(budget)))
+        placed = 0
+        nb = _band_count(w)
+        bw = w / max(1, nb)
+        # Spread over the new bands rather than drawn from the whole span, for
+        # the same reason the harvestables are: one draw across 4800 px clumps.
+        bands = [b for b in range(nb) if min(w, (b + 1) * bw) - max(old, b * bw) >= 12.0]
+        if not bands:
+            return 0
+        while placed < want:
+            b = bands[placed % len(bands)]
+            lo = max(float(old), b * bw)
+            hi = min(w, (b + 1) * bw)
+            x = _boulder_site(reg, terrain, rng, lo, hi, avoid)
+            if x is None:
+                # This band has no face to rest on; try the whole new strip once
+                # before giving the kind up entirely.
+                x = _boulder_site(reg, terrain, rng, float(old), w, avoid)
+                if x is None:
+                    break
+            _spawn_on_ground(reg, terrain, rng, KIND_BOULDER, x)
+            placed += 1
+        return placed
+    except Exception:
+        return 0
 
 
 def _tick_crop(p: Prop, dt: float, grow: float = 1.0) -> None:
@@ -1651,6 +2637,39 @@ def scatter(
         lambda i: int(mat[i]) == MAT_STONE or slope_col[i] >= 0.45,
         lambda i: slope_col[i] <= 2.0,
     )
+    # Remember not just how much was placed but WHERE, band by band. This is the
+    # map's own genesis density, and _regrow treats it as a ceiling per band, so
+    # a colony can strip its own hillside bare and get that hillside back
+    # without the far map ever gaining a single prop it did not start with.
+    #
+    # Trees are counted WITHOUT the scattered saplings even though
+    # _usable_count and _band_profile both count a sapling as a tree on its way
+    # up. The row has to sum to no more than reg.targets[kind] or
+    # _ensure_band_targets will (rightly) refuse it as corrupt on the next load,
+    # and want[sapling] is not in targets. The effect is the pre-existing one:
+    # a map that starts 56 trees + 3 saplings against a target of 56 does not
+    # reseed a tree until it is genuinely short of trees.
+    nb = _band_count(float(w))
+    reg.band_targets = {}
+    for k in (KIND_TREE, KIND_BUSH, KIND_ROCK):
+        if want.get(k, 0) <= 0:
+            continue
+        row = [0] * nb
+        for p in reg._props.values():
+            if p.alive and p.kind == k:
+                row[_band_of(p.x, float(w), nb)] += 1
+        reg.band_targets[k] = row
+    # ...and WHICH MAP those counts are a density of. Recorded here because
+    # this is the only place that knows both numbers at once, and persisted so
+    # that the next time WORLD_W moves, migrate_world_width reads the old width
+    # as a fact off the save instead of being told it by a caller who guessed.
+    reg.world_w = float(w)
+    # Authored for this map by construction, so there is nothing for the
+    # migration to settle and no reason to let it look. Without this the first
+    # _regrow tick of every fresh world would run the evidence ladder once -
+    # harmless, and it would conclude "already this map", but a fresh world has
+    # no business anywhere near an inference about old saves.
+    reg._width_settled = True
     return reg
 
 

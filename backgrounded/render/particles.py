@@ -10,6 +10,21 @@ anywhere in ``update`` or ``draw``.
 
 Read-only with respect to the simulation: ``update`` samples ``terrain`` for
 ground collisions and reads wind off the event system, and writes to neither.
+
+COORDINATE SPACE - the one thing to get right in this file, because both
+answers are correct and they are correct about different lines:
+
+* particle ``x`` is WORLD space. ``_ground_heights`` indexes the terrain
+  profile by it, so embers, dust, splash and settled snow have to scroll with
+  the hillside they landed on or rain falls through hills.
+* every SPAWN RANGE and the CULL are VIEW space. Weather seeded across all
+  ``WORLD_W`` would put three quarters of the pool off camera and thin the
+  visible rain to a quarter of what it is now, at four times the cost.
+
+So the pool is world-space and the *window* it is kept inside follows the
+camera. ``view_x`` carries that window; ``draw`` subtracts it from the whole x
+array in one vectorised op, never per particle - a ``cam.sx()`` call across a
+3000-element pool is a Python-level loop on the frame path.
 """
 from __future__ import annotations
 
@@ -19,7 +34,8 @@ from typing import Any, Sequence
 import numpy as np
 import pygame
 
-from ..constants import RENDER_H, RENDER_W
+from ..constants import RENDER_H, RENDER_W, WORLD_W
+from .camera import IDENTITY, Camera
 from .fx import attr_num, blit_batch, clamp, radial_light_surface
 
 Color = tuple[int, int, int]
@@ -89,6 +105,12 @@ _SIZE_LEVELS = 7
 # renderer can say ``emit("rain", 40, wind=ev.wind)`` and get a full curtain of
 # rain instead of a column at screen centre. Each entry is (x, y, vx, vy) as a
 # scalar or an inclusive (lo, hi) range.
+#
+# The x entries are VIEW-RELATIVE and stay expressed in RENDER_W: they are
+# offsets from the left edge of the frame, and emit() adds ``view_x`` to turn
+# them into the world coordinates the pool actually stores. Scaling them to
+# WORLD_W is the reflex and is wrong - it emits four times the weather and
+# shows you a quarter of it.
 _SPAWN_DEFAULTS: tuple[tuple[Any, Any, Any, Any], ...] = (
     ((-60.0, RENDER_W + 60.0), (-40.0, -4.0), (-30.0, 30.0), (520.0, 760.0)),   # rain
     ((-40.0, RENDER_W + 40.0), (-30.0, -2.0), (-12.0, 12.0), (26.0, 62.0)),     # snow
@@ -181,9 +203,17 @@ class ParticleSystem:
 
     Typical use per frame::
 
-        ps.emit("rain", 40, x=(0, RENDER_W), y=-8, vy=(520, 700))
-        ps.update(dt, terrain, events)
-        ps.draw(surface)
+        ps.view_x = cam.x
+        ps.emit("rain", 40, x=(cam.x, cam.x + RENDER_W), y=-8, vy=(520, 700))
+        ps.update(dt, terrain, events, cam=cam)
+        ps.draw(surface, cam=cam)
+
+    ``cam`` is required on both calls and has no default. Particle x is WORLD
+    space and the surface is one 1600 px frame of a 6400 px world, so a call
+    that omitted it would emit into, and draw, the leftmost quarter of the map
+    wherever the camera actually was - a plausible-looking empty sky rather than
+    an error. See camera._IdentityCamera for why that class of default was
+    removed everywhere.
 
     Nothing here touches simulation state. ``update`` reads ``terrain`` (for
     ``ground_y`` / ``height``) and ``events`` (for ``wind``) and mutates only
@@ -193,7 +223,7 @@ class ParticleSystem:
     __slots__ = (
         "capacity", "n", "t", "x", "y", "vx", "vy", "life", "life0",
         "size", "kind", "color_idx", "phase", "flags", "_rng", "_ground",
-        "_ground_key",
+        "_ground_key", "view_x",
     )
 
     def __init__(self, capacity: int = CAPACITY, seed: int = 7) -> None:
@@ -201,6 +231,14 @@ class ParticleSystem:
         self.capacity: int = cap
         self.n: int = 0
         self.t: float = 0.0
+        #: World x of the left edge of the frame - the window weather is seeded
+        #: into and culled against. A plain attribute rather than a `cam`
+        #: parameter on emit() because emit() is called from a dozen places
+        #: with a dozen signatures and its x is, and stays, WORLD space; only
+        #: the *defaults* need to know where the camera is. update() keeps it
+        #: in step, and the renderer sets it before its emit pass because that
+        #: pass runs first.
+        self.view_x: float = 0.0
         self.x = np.zeros(cap, np.float32)
         self.y = np.zeros(cap, np.float32)
         self.vx = np.zeros(cap, np.float32)
@@ -309,7 +347,17 @@ class ParticleSystem:
                     wind = 0.0
 
             dx, dy, dvx, dvy = _SPAWN_DEFAULTS[kid]
-            self.x[sl] = self._spread(_pick(kw, "x", dx), count, 0.0)
+            # x stays WORLD space whoever supplies it. A caller that names an x
+            # is naming a thing in the world - a firepit, a burning tree, a
+            # lava front - and gets it through untouched. A caller that omits
+            # one wanted "across the frame", which is now a window somewhere in
+            # a 6400 px world rather than the whole map, so the view-relative
+            # default is slid onto the camera here.
+            xk = kw.get("x")
+            if xk is None:
+                self.x[sl] = self._spread(dx, count, 0.0) + np.float32(self.view_x)
+            else:
+                self.x[sl] = self._spread(xk, count, 0.0)
             self.y[sl] = self._spread(_pick(kw, "y", dy), count, 0.0)
             vx = self._spread(_pick(kw, "vx", dvx), count, 0.0)
             vy = self._spread(_pick(kw, "vy", dvy), count, 0.0)
@@ -364,7 +412,14 @@ class ParticleSystem:
 
     def _ground_heights(self, terrain: Any, xs: np.ndarray) -> np.ndarray:
         """Vectorised ground y for each x. Works off ``terrain.surface()`` when
-        present, otherwise samples ``ground_y`` at 96 points and interpolates."""
+        present, otherwise samples ``ground_y`` at 96 points and interpolates.
+
+        WORLD_W wide and indexed by world x, not by screen x. That is 25 KB for
+        the whole map, which is cheaper than any windowed alternative and means
+        a settled snowflake keeps sitting on the hill it landed on when the
+        camera moves - rebuilding a view-sized profile every time cam.x changed
+        would re-key this cache on every frame the camera is easing.
+        """
         if terrain is None:
             return np.full(xs.shape, RENDER_H * 0.78, np.float32)
         prof = self._ground
@@ -374,7 +429,7 @@ class ParticleSystem:
         # first frame - and rain that keeps falling through a finished deck is
         # exactly what that stale cache looks like on screen.
         key = (id(terrain), int(getattr(terrain, "epoch", 0)))
-        if prof is None or self._ground_key != key or prof.shape[0] != RENDER_W:
+        if prof is None or self._ground_key != key or prof.shape[0] != WORLD_W:
             prof = None
             # surface(), not height: a finished bridge or ladder is an overlay
             # on top of the raw heightmap, and weather has to land on the deck
@@ -391,24 +446,36 @@ class ParticleSystem:
             if h is None:
                 h = getattr(terrain, "height", None)
             if isinstance(h, np.ndarray) and h.ndim == 1 and h.size >= 2:
-                if h.size == RENDER_W:
+                if h.size == WORLD_W:
                     prof = h.astype(np.float32, copy=False)
                 else:
-                    src = np.linspace(0.0, RENDER_W - 1.0, h.size, dtype=np.float32)
-                    dst = np.arange(RENDER_W, dtype=np.float32)
+                    # A heightmap of some other width gets stretched across the
+                    # world rather than left short. This is the path an old
+                    # 1600-wide save takes if it ever reaches here before
+                    # Terrain.from_dict has regenerated it: a stretched map is
+                    # wrong, but weather landing on the right *shape* four
+                    # times too wide reads far better than every drop falling
+                    # through the ground beyond x=1600.
+                    src = np.linspace(0.0, WORLD_W - 1.0, h.size, dtype=np.float32)
+                    dst = np.arange(WORLD_W, dtype=np.float32)
                     prof = np.interp(dst, src, h.astype(np.float32)).astype(np.float32)
             else:
                 fn = getattr(terrain, "ground_y", None)
                 if callable(fn):
-                    sx = np.linspace(0.0, RENDER_W - 1.0, 96, dtype=np.float32)
+                    # 96 samples spanned 1600 px; over WORLD_W that is one
+                    # every 67 px, which turns a cliff into a ramp. Kept
+                    # proportional to the map instead - it is a one-off cost
+                    # paid on a cache miss, not per frame.
+                    n_s = int(96 * max(1, WORLD_W // RENDER_W))
+                    sx = np.linspace(0.0, WORLD_W - 1.0, n_s, dtype=np.float32)
                     try:
                         sy = np.array([float(fn(float(v))) for v in sx], np.float32)
-                        prof = np.interp(np.arange(RENDER_W, dtype=np.float32),
+                        prof = np.interp(np.arange(WORLD_W, dtype=np.float32),
                                          sx, sy).astype(np.float32)
                     except Exception:
                         prof = None
             if prof is None:
-                prof = np.full(RENDER_W, RENDER_H * 0.78, np.float32)
+                prof = np.full(WORLD_W, RENDER_H * 0.78, np.float32)
             self._ground = prof
             self._ground_key = key
         idx = np.clip(xs.astype(np.int32), 0, prof.shape[0] - 1)
@@ -421,9 +488,22 @@ class ParticleSystem:
 
     # ------------------------------------------------------------- update --
 
-    def update(self, dt: float, terrain: Any = None, events: Any = None) -> None:
-        """Advance every particle. Never raises."""
+    def update(self, dt: float, terrain: Any = None, events: Any = None,
+               *, cam: Camera) -> None:
+        """Advance every particle. Never raises.
+
+        *cam* is where the frame is, and it does exactly two things here: it
+        sets ``view_x`` (so the next emit pass seeds into the right window) and
+        it moves the cull. Physics is untouched by it - a particle's x is world
+        space and stays so.
+
+        Required, no IDENTITY default: an omission would silently pin ``view_x``
+        to 0 and cull five sixths of the map's weather out of existence, which
+        looks like a clear day rather than like a bug. Pass ``cam=IDENTITY``
+        explicitly on a harness where world really is frame.
+        """
         try:
+            self.view_x = float(cam.x)
             step = clamp(float(dt), 0.0, 0.1)
             if step <= 0.0 or self.n <= 0:
                 self.t += max(0.0, float(dt) if np.isfinite(dt) else 0.0)
@@ -511,8 +591,15 @@ class ParticleSystem:
                 self.y[sl] = np.where(ff, np.minimum(self.y[sl], gy - 6.0), self.y[sl])
 
             # --------------------------------------------------- cull & pack --
+            # The cull is VIEW space, not world space: a particle that has
+            # scrolled out of frame is gone even though it is still well inside
+            # the map. That is what keeps the pool spent on what is on screen -
+            # culling at 0/WORLD_W instead would let a curtain of rain sit in
+            # the far east of the map holding slots the visible weather needs.
+            vlo = self.view_x - 60.0
+            vhi = self.view_x + RENDER_W + 60.0
             alive = (self.life[sl] > 0.0)
-            alive &= (self.x[sl] > -60.0) & (self.x[sl] < RENDER_W + 60.0)
+            alive &= (self.x[sl] > vlo) & (self.x[sl] < vhi)
             alive &= (self.y[sl] > -200.0) & (self.y[sl] < RENDER_H + 60.0)
             keep = int(np.count_nonzero(alive))
             if keep != n:
@@ -536,13 +623,21 @@ class ParticleSystem:
 
     # --------------------------------------------------------------- draw --
 
-    def draw(self, surf: pygame.Surface, layer: str | None = None) -> None:
+    def draw(self, surf: pygame.Surface, layer: str | None = None,
+             *, cam: Camera) -> None:
         """Render particles. Two batched blit calls plus streak lines.
 
         *layer* selects a depth band so the renderer can straddle the terrain:
         ``"back"`` draws only distant weather (pipeline layer 3, behind the
         terrain), ``"front"`` draws everything else (layers 8-9), and ``None``
         draws the lot. Distant particles are dimmed for aerial perspective.
+
+        The world -> screen conversion is the single ``- cam.x`` below, applied
+        to the whole array at once. Everything after it is screen space, which
+        is why ``_draw_streaks`` needs no camera of its own. Deliberately NOT
+        ``cam.sx()`` per particle: this runs over up to CAPACITY elements every
+        frame and a method call each would be the most expensive line in the
+        renderer.
 
         Read-only; never raises.
         """
@@ -552,7 +647,7 @@ class ParticleSystem:
                 return
             sl = slice(0, n)
             kind = self.kind[sl].astype(np.int32)
-            x = self.x[sl]
+            x = self.x[sl] - np.float32(cam.x)
             y = self.y[sl]
             life = self.life[sl]
             life0 = np.maximum(self.life0[sl], 1e-3)
@@ -729,26 +824,35 @@ def _nearest_palette(color: Sequence[int]) -> int:
 # --------------------------------------------------------------------------
 
 
+# ``width`` stays RENDER_W in all three: it is how wide the *curtain* is, which
+# is a property of the frame and not of the map. ``origin`` is the world x of
+# the frame's left edge - pass ``cam.x`` (or leave it at 0.0, which is the
+# harness case where the world and the frame are still the same thing).
+
+
 def emit_rainfall(ps: ParticleSystem, n: int, wind: float = 0.0,
-                  width: int = RENDER_W) -> int:
+                  width: int = RENDER_W, origin: float = 0.0) -> int:
     """A frame's worth of rain entering from the top edge."""
-    return ps.emit(K_RAIN, n, x=(-60.0, float(width) + 60.0), y=(-40.0, -4.0),
+    return ps.emit(K_RAIN, n, x=(origin - 60.0, origin + float(width) + 60.0),
+                   y=(-40.0, -4.0),
                    vx=(wind * 120.0 - 30.0, wind * 120.0 + 30.0), vy=(520.0, 760.0),
                    size=1.0, life=(1.4, 2.6))
 
 
 def emit_snowfall(ps: ParticleSystem, n: int, wind: float = 0.0,
-                  width: int = RENDER_W) -> int:
+                  width: int = RENDER_W, origin: float = 0.0) -> int:
     """A frame's worth of snow."""
-    return ps.emit(K_SNOW, n, x=(-40.0, float(width) + 40.0), y=(-30.0, -2.0),
+    return ps.emit(K_SNOW, n, x=(origin - 40.0, origin + float(width) + 40.0),
+                   y=(-30.0, -2.0),
                    vx=(wind * 30.0 - 12.0, wind * 30.0 + 12.0), vy=(26.0, 62.0),
                    size=(1.0, 2.8), life=(9.0, 18.0))
 
 
 def emit_ashfall(ps: ParticleSystem, n: int, wind: float = 0.0,
-                 width: int = RENDER_W) -> int:
+                 width: int = RENDER_W, origin: float = 0.0) -> int:
     """Slow grey volcanic ash."""
-    return ps.emit(K_ASH, n, x=(-40.0, float(width) + 40.0), y=(-30.0, -2.0),
+    return ps.emit(K_ASH, n, x=(origin - 40.0, origin + float(width) + 40.0),
+                   y=(-30.0, -2.0),
                    vx=(wind * 24.0 - 8.0, wind * 24.0 + 8.0), vy=(14.0, 38.0),
                    size=(1.0, 2.2), life=(12.0, 24.0))
 
@@ -801,37 +905,51 @@ if __name__ == "__main__":  # pragma: no cover - smoke test
     pygame.init()
 
     class _Terrain:
-        height = (np.full(RENDER_W, RENDER_H * 0.74, np.float32)
-                  + 40.0 * np.sin(np.arange(RENDER_W) / 180.0).astype(np.float32))
+        # WORLD_W wide, like the real thing: the profile is indexed by world x.
+        height = (np.full(WORLD_W, RENDER_H * 0.74, np.float32)
+                  + 40.0 * np.sin(np.arange(WORLD_W) / 180.0).astype(np.float32))
 
         def ground_y(self, x: float) -> float:
-            return float(self.height[int(clamp(x, 0, RENDER_W - 1))])
+            return float(self.height[int(clamp(x, 0, WORLD_W - 1))])
 
     class _Events:
         wind = 0.7
 
     ps = ParticleSystem()
     terrain, events = _Terrain(), _Events()
+    # ...but the surface is RENDER_W, because that is the frame. The whole
+    # point of this harness is that those two numbers now differ.
     surf = pygame.Surface((RENDER_W, RENDER_H))
+    cam = Camera()
 
     frames = 300
     t0 = time.perf_counter()
     for i in range(frames):
-        emit_rainfall(ps, 26, wind=0.7)
-        emit_snowfall(ps, 4, wind=0.7)
-        emit_ashfall(ps, 3)
-        emit_fire(ps, 420.0, RENDER_H * 0.72, 1.4)
+        # Park the camera deep in the map for the second half of the run: if
+        # the view-relative spawn or the view-space cull were wrong, the pool
+        # would empty out the moment cam.x left zero.
+        cam.nudge(14.0) if i > 120 else None
+        ps.view_x = cam.x
+        emit_rainfall(ps, 26, wind=0.7, origin=cam.x)
+        emit_snowfall(ps, 4, wind=0.7, origin=cam.x)
+        emit_ashfall(ps, 3, origin=cam.x)
+        emit_fire(ps, cam.x + 420.0, RENDER_H * 0.72, 1.4)
         if i % 30 == 0:
-            emit_impact_dust(ps, 800.0, RENDER_H * 0.72, 1.5)
-            emit_sparks(ps, 640.0, RENDER_H * 0.5, 14)
+            emit_impact_dust(ps, cam.x + 800.0, RENDER_H * 0.72, 1.5)
+            emit_sparks(ps, cam.x + 640.0, RENDER_H * 0.5, 14)
         if i == 0:
             emit_fireflies(ps, 40, (100.0, 1100.0), (400.0, 560.0))
-        ps.update(1.0 / 60.0, terrain, events)
+        ps.update(1.0 / 60.0, terrain, events, cam=cam)
         surf.fill((10, 12, 20))
-        ps.draw(surf)
+        ps.draw(surf, cam=cam)
     dt = (time.perf_counter() - t0) / frames
     print(f"particles: {len(ps)} live, {dt * 1000:.2f} ms/frame (update+draw), "
           f"caches={cache_stats()}")
+    if len(ps):
+        wx = ps.x[:len(ps)]
+        print(f"cam.x={cam.x:.0f}  world x span {wx.min():.0f}..{wx.max():.0f} "
+              f"-> screen {wx.min() - cam.x:.0f}..{wx.max() - cam.x:.0f} "
+              f"(must sit inside -60..{RENDER_W + 60})")
 
     round_trip = ParticleSystem.from_dict(ps.to_dict())
     print("round trip capacity:", round_trip.capacity,

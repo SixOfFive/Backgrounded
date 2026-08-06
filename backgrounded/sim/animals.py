@@ -6,8 +6,10 @@ importable and runnable headless; the smoke test at the bottom drives a real
 
 What an incursion is
 --------------------
-Every ``ANIMAL_SPAWN_MIN..MAX`` seconds a pack tries to arrive from a screen
-edge - wolves in threes, bears and boar alone, per ``ANIMAL_STATS``. They walk
+Every ``ANIMAL_SPAWN_MIN..MAX`` seconds a pack tries to arrive from just past
+the edge of frame - wolves in threes, bears and boar alone, per
+``ANIMAL_STATS``; see :func:`_offstage_x` for why that is a colony-relative
+distance and not the rim of the map any more. They walk
 the terrain surface toward whoever is nearest, bite for ``dps`` while in reach,
 break off wounded, and give up after ``ANIMAL_LEAVE_SEC``. Kill one and the
 camp gets its hide, which is what leather armour is made of - so surviving an
@@ -90,10 +92,11 @@ from ..constants import (
     ANIMAL_SPAWN_MIN,
     ANIMAL_STATS,
     ANIMAL_WOLF,
+    OFFSTAGE,
     RELIC_SCALE,
-    RENDER_W,
     RES_HIDE,
     SCENE_CLEAR,
+    WORLD_W,
 )
 
 log = logging.getLogger(__name__)
@@ -159,15 +162,20 @@ CLIMB_RATE = 150.0
 MIN_STEP_FRAC = 0.12
 #: Default radius for :meth:`AnimalRegistry.danger_at`.
 DANGER_RADIUS = 110.0
-#: Px from the screen edge counted as "arrived" / "gone".
+#: Px past the stage edge counted as "arrived" / "gone". See :func:`_offstage_x`
+#: for what the stage edge is now that it is no longer the edge of the map.
 EDGE_MARGIN = 2.0
 #: Retry gap when a spawn attempt is declined (wrong time of day, world full).
 SPAWN_RETRY_SEC = 20.0
 #: Spacing between pack members as they come over the edge.
 PACK_SPACING = 16.0
 
+#: The WORLD's rim - a hard clamp on where an animal may stand, nothing else.
+#: It used to double as "the edge of the screen" because the two were the same
+#: pixel; they are not any more, and every use that meant the second one now
+#: goes through :func:`_offstage_x`.
 _EDGE_MIN = 0.0
-_EDGE_MAX = float(RENDER_W - 1)
+_EDGE_MAX = float(WORLD_W - 1)
 _MAX_DT = 0.25
 _FALLBACK_STATS: tuple[float, float, float, int, int] = (60.0, 8.0, 44.0, 1, 1)
 
@@ -308,6 +316,59 @@ def _agents(world: Any) -> list[Any]:
         return [a for a in (pop or ()) if getattr(a, "alive", False)]
     except Exception:
         return []
+
+
+def _colony_x(world: Any) -> float:
+    """Where the colony is, in world px. The anchor the stage hangs off.
+
+    Prefers ``actions.colony_center`` so every subsystem agrees on one answer,
+    and the import is deferred to call time because ``actions`` imports
+    ``entities``/``structures`` and ``world`` imports us - the same idiom
+    entities.py:1483 uses for exactly this cycle. The mean of the living roster
+    is the fallback, because it is what colony_center itself falls back to and
+    it works on the stub worlds the smoke tests drive.
+    """
+    try:
+        from . import actions as _actions            # noqa: PLC0415 - see above
+        c = _f(_actions.colony_center(world), -1.0)
+        if c >= 0.0:
+            return _clamp_x(c)
+    except Exception:
+        log.debug("colony_center unavailable", exc_info=True)
+    crowd = _agents(world)
+    if crowd:
+        return _clamp_x(sum(_f(getattr(a, "x", 0.0)) for a in crowd) / len(crowd))
+    return WORLD_W * 0.5
+
+
+def _offstage_x(centre: float, side: int, margin: float = 0.0) -> float:
+    """The x an animal enters from, or leaves by, on *side* of *centre*.
+
+    THE POINT OF THIS FUNCTION. ``sim/`` may not look at render's camera, and
+    does not have to: the camera is RENDER_W wide and follows the colony, so
+    anything further than OFFSTAGE from the colony is off-camera by
+    construction. That is what "the screen edge" meant in this file when the
+    world was exactly one frame wide, and this is how it stays true now that it
+    is four.
+
+    Left alone as the world rim, a wolf entering at x=0 on a 6400 px map can be
+    5000 px from anybody - a 113 s walk at 44 px/s - and it holds one of only
+    ANIMAL_MAX_ALIVE slots for the whole of it, invisible. Exiting was the same
+    bug in reverse: measured below, an animal at x=3000 leaving to the "nearer
+    screen edge" walked 3000 px of dead time before it despawned.
+
+    The clamp is to the WORLD, so a colony seated within a stage-width of the
+    map's rim gets an entry at the rim instead - closer than we would like, and
+    the honest alternative (never spawning on that side) is worse.
+
+    ``actions.offstage_x(world, side)`` is the same function anchored on the
+    world instead of on a number. This one takes the centre already computed
+    because ``_exit_step`` runs per animal per tick and would otherwise pay for
+    a fresh ``colony_center()`` on every one of them.
+    """
+    s = 1.0 if side >= 0 else -1.0
+    return _clamp(centre + s * (OFFSTAGE + max(0.0, margin)),
+                  _EDGE_MIN, _EDGE_MAX)
 
 
 def _agent_by_id(world: Any, aid: int | None) -> Any:
@@ -784,10 +845,20 @@ class AnimalRegistry:
         kind: str | None = None,
         edge: int | None = None,
     ) -> list[Animal]:
-        """Bring a pack in over a screen edge. Returns what actually arrived.
+        """Bring a pack in over a stage edge. Returns what actually arrived.
 
         Pack size comes from ``ANIMAL_STATS`` - wolves in threes, bears and
         boar alone - trimmed to whatever room ``ANIMAL_MAX_ALIVE`` leaves.
+
+        NEAR-CAMERA, NOT WORLD-EDGE, and that was the decision this migration
+        turned on. The world is four frames wide now; entering at x=0 or
+        x=WORLD_W-1 would have put a wolf up to 5000 px from the colony, out of
+        frame, walking for two minutes before the incursion could start - and
+        holding one of four spawn slots while it did. ``_offstage_x`` puts the
+        arrival OFFSTAGE px from the colony instead: just outside the camera, so
+        the pack still walks in from the dark rather than materialising in
+        frame, and still reaches somebody in the same handful of seconds it
+        always did. The look is unchanged; only the map got bigger.
         """
         try:
             pre = self.count()
@@ -800,12 +871,15 @@ class AnimalRegistry:
             n = max(1, min(pack, room))
             side = edge if edge in (-1, 1) else (-1 if _rand(rng) < 0.5 else 1)
 
+            centre = _colony_x(world)
+            edge_x = _offstage_x(centre, side)
+
             born: list[Animal] = []
             for i in range(n):
-                if side < 0:
-                    x = _clamp_x(EDGE_MARGIN + i * PACK_SPACING)
-                else:
-                    x = _clamp_x(_EDGE_MAX - EDGE_MARGIN - i * PACK_SPACING)
+                # Each member a little further IN than the last, exactly as the
+                # world-edge version spaced them: the pack strings out along the
+                # approach instead of stacking on one column.
+                x = _clamp_x(edge_x - side * (EDGE_MARGIN + i * PACK_SPACING))
                 a = Animal(
                     kind=k,
                     x=x,
@@ -1058,7 +1132,17 @@ class AnimalRegistry:
         self._enter(a, STATE_APPROACH)
 
     def _exit_step(self, world: Any, a: Animal, dt: float) -> None:
-        """Flee or leave: head for the nearer screen edge, then despawn."""
+        """Flee or leave: head off the near side of the stage, then despawn.
+
+        "The nearer screen edge" was one pixel from "the nearer world edge"
+        until the world got four times wider than the frame. Left as the world
+        rim it is dead time nobody sees: an animal breaking off at x=3000 walks
+        3200 px to reach x=6399, ~73 s at a wolf's 44 px/s, holding one of
+        ANIMAL_MAX_ALIVE slots and off-camera for all but the first second of
+        it. It now leaves the way it came - OFFSTAGE px from the colony, i.e.
+        just past the edge of frame - which is the same handful of seconds it
+        took before the map grew.
+        """
         if a.state == STATE_FLEE:
             a.fleeing = True
         if a.feed_t > 0.0:
@@ -1067,7 +1151,9 @@ class AnimalRegistry:
             a.vx = 0.0
             self._stick(world, a)
             return
-        edge = _EDGE_MIN if a.x < RENDER_W * 0.5 else _EDGE_MAX
+        centre = _colony_x(world)
+        side = 1 if a.x >= centre else -1
+        edge = _offstage_x(centre, side)
         if a.state == STATE_FLEE:
             hurt = _clamp(a.health_frac / max(1e-6, FLEE_HEALTH), 0.0, 1.0)
             scale = FLEE_SPEED_HURT + (FLEE_SPEED_FRESH - FLEE_SPEED_HURT) * hurt
@@ -1075,7 +1161,15 @@ class AnimalRegistry:
             scale = 1.0
         speed = a.speed * scale
         self._walk(world, a, edge, dt, speed)
-        if a.x <= EDGE_MARGIN or a.x >= _EDGE_MAX - EDGE_MARGIN:
+        # Two despawn tests, and the second one is not redundant. _offstage_x
+        # clamps to the world, so a colony seated within OFFSTAGE of the map's
+        # rim gets an exit target AT the rim - and then |a.x - centre| never
+        # reaches OFFSTAGE and the animal would pace the last column forever.
+        # The world-edge test is what closes that, and it is the only case where
+        # the old rim rule is still the right one.
+        if abs(a.x - centre) >= OFFSTAGE - EDGE_MARGIN:
+            self.remove(a)
+        elif a.x <= _EDGE_MIN + EDGE_MARGIN or a.x >= _EDGE_MAX - EDGE_MARGIN:
             self.remove(a)
 
     # -- targeting --------------------------------------------------------

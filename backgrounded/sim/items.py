@@ -94,7 +94,7 @@ from ..constants import (
     ARMOUR_DRAGONSCALE, ARMOUR_NONE, DRAGON_QUADRUPED, DRAGON_SERPENT,
     DRAGON_SKELETAL, DRAGON_WYVERN, MAX_RELICS, RELIC_AMULET, RELIC_BFG,
     RELIC_BOOTS, RELIC_CAIRN, RELIC_DECAY_SEC, RELIC_FETCH_RANGE,
-    RELIC_KINDS, RELIC_NONE, RELIC_SCALE, RENDER_W, WEAPON_BFG, WEAPON_NONE,
+    RELIC_KINDS, RELIC_NONE, RELIC_SCALE, WEAPON_BFG, WEAPON_NONE, WORLD_W,
 )
 
 log = logging.getLogger(__name__)
@@ -327,8 +327,16 @@ _MIRROR_ARMOUR = RELIC_SCALE
 _MIRROR_WEAPON = RELIC_BFG
 
 # ---------------------------------------------------------------- limits ----
+#: Where a relic on the ground is allowed to lie: anywhere there is LAND. It is
+#: WORLD_W and not RENDER_W because a dragon dies where it dies, and on a 6400 px
+#: map that is routinely thousands of px east of x = 1599. Clamping the drop to
+#: the camera's width did not lose the relic - it FALSIFIED it: the item stopped
+#: marking the place the dragon fell and silently reappeared on one particular
+#: column, so a kill made at 4000 px left its reward 2400 px away with nothing to
+#: say it had moved. RELIC_FETCH_RANGE is measured from the item, so the errand
+#: it generates was wrong by the same amount.
 _EDGE_MIN = 0.0
-_EDGE_MAX = float(RENDER_W - 1)
+_EDGE_MAX = float(WORLD_W - 1)
 _MAX_DT = 0.25
 #: Cap on the replay loop in :meth:`RelicRegistry.from_dict`. A hand-edited
 #: ``"draws": 1e12`` must cost a fraction of a second, not the session. Same

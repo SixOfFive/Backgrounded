@@ -56,7 +56,6 @@ from ..constants import (
     MAT_SNOW,
     MAT_STONE,
     RENDER_H,
-    RENDER_W,
     SCENE_ASHFALL,
     SCENE_AURORA,
     SCENE_BLIZZARD,
@@ -73,7 +72,14 @@ from ..constants import (
     SCENE_VOLCANO,
     SCENE_WILDFIRE,
     SCENES,
+    STAGE_HALF,
+    WORLD_W,
 )
+# stage_bounds is the whole reason this module can keep its per-second rates on
+# a map four times wider than the camera: see _stage() below. actions imports
+# only constants/entities/structures, none of which import events, so this
+# cannot close a cycle - and world.py already imports events, not the reverse.
+from .actions import stage_bounds as _stage_bounds
 from .lighting import LIGHTNING_COLOR, METEOR_COLOR, daylight_factor, is_night
 # props and structures own what burns; see _FLAMMABLE below. Both are leaves -
 # neither imports events (nor lighting), so this cannot close a cycle.
@@ -640,6 +646,57 @@ def _fnum(v: Any, default: float = 0.0) -> float:
     return f
 
 
+def _stage(world: Any) -> tuple[float, float]:
+    """``(lo, hi)`` of the strip a viewer can actually see, in world px.
+
+    This is the single most important line in the whole 1600 -> 6400 migration
+    as far as this file is concerned. Every scene here fires on a *rate*:
+    STRIKE_MIN/MAX (4-12 s), METEOR_MIN/MAX (1.6-5 s), FIRE_RELIGHT (70-140 s),
+    HEAT_IGNITE (190-380 s). Those rates were tuned against a world that was
+    exactly one screen wide, so "one bolt every 8 seconds" and "one bolt every 8
+    seconds *that you see*" were the same sentence. They are not any more.
+
+    Tried and rejected: scaling the rates by WORLD_SCALE. That puts four times
+    the disasters on the map, costs four times as much, and shows the viewer the
+    same number of them, because three quarters land on hillside nobody is
+    looking at. Keep the rate; narrow the siting. The file already argues for
+    exactly this - DIRECT_HIT_CHANCE aims bolts at a victim, MUDSLIDE_AIM_CHANCE
+    is 0.85, the quake epicentre picks a person 70% of the time, and every one
+    of those was added because "a scene whose every event lands on empty
+    hillside is a screen saver" (see _start_tremor). A 4x map made that failure
+    four times as likely; this is the same fix applied to the other 30%.
+
+    Guarded like everything else in this module: a stub world with no colony and
+    no roster still gets a real span back rather than an exception on the tick
+    path. The fallback matches actions.colony_center()'s own default so the two
+    agree on where "nowhere in particular" is.
+    """
+    try:
+        lo, hi = _stage_bounds(world)
+        lo, hi = float(lo), float(hi)
+        if hi - lo >= 1.0 and lo == lo and hi == hi:
+            return lo, hi
+    except Exception:
+        log.debug("stage_bounds failed", exc_info=True)
+    return WORLD_W * 0.5 - STAGE_HALF, WORLD_W * 0.5 + STAGE_HALF
+
+
+def _stage_inset(world: Any, pad: float) -> tuple[float, float]:
+    """:func:`_stage` pulled *pad* px in from both ends, never inverted.
+
+    The call sites this replaces all read ``uniform(40.0, RENDER_W - 40.0)``:
+    the inset kept an event off the very rim of the world so its blast radius
+    had somewhere to land. That reason survives the migration unchanged, it just
+    now applies to the edge of the *stage* rather than the edge of the map.
+    """
+    lo, hi = _stage(world)
+    p = max(0.0, _fnum(pad, 0.0))
+    if hi - lo <= 2.0 * p:              # stage narrower than the inset wants
+        mid = (lo + hi) * 0.5
+        return mid, mid
+    return lo + p, hi - p
+
+
 def _approach(cur: float, target: float, rate: float, dt: float) -> float:
     step = rate * dt
     if cur < target:
@@ -896,7 +953,10 @@ def _panic(world: Any, agent: Any, target_x: float, duration: float,
     try:
         cur = _fnum(getattr(agent, "panic", 0.0), 0.0)
         agent.panic = max(cur, float(duration))
-        agent.panic_target_x = _clamp(float(target_x), 6.0, RENDER_W - 6.0)
+        # WORLD, not stage: a panic target is somewhere a person runs *to*, and
+        # running off the edge of the camera is fine - running off the edge of
+        # the land is not. Callers already pick targets relative to the agent.
+        agent.panic_target_x = _clamp(float(target_x), 6.0, WORLD_W - 6.0)
         agent.panic_reason = reason
     except Exception:
         pass
@@ -1006,7 +1066,7 @@ def _clean_fissure(d: dict[str, Any]) -> dict[str, Any]:
     target = _clamp(_fnum(d.get("target"), half * QUAKE_FISSURE_ASPECT),
                     0.0, QUAKE_FISSURE_DEPTH_MAX)
     return {
-        "x": _clamp(_fnum(d.get("x"), RENDER_W * 0.5), 0.0, float(RENDER_W)),
+        "x": _clamp(_fnum(d.get("x"), WORLD_W * 0.5), 0.0, float(WORLD_W)),
         "half": half,
         "depth": _clamp(_fnum(d.get("depth"), 0.0), 0.0, target),
         "target": target,
@@ -1027,7 +1087,7 @@ def _clean_lava(d: dict[str, Any]) -> dict[str, Any]:
     cap = _clamp(_fnum(d.get("max"), LAVA_HALF_MAX), 0.0, LAVA_HALF_MAX)
     half = _clamp(_fnum(d.get("half"), 0.0), 0.0, cap)
     return {
-        "x": _clamp(_fnum(d.get("x"), RENDER_W * 0.5), 0.0, float(RENDER_W)),
+        "x": _clamp(_fnum(d.get("x"), WORLD_W * 0.5), 0.0, float(WORLD_W)),
         "half": half,
         "max": cap,
         "hot": _clamp(_fnum(d.get("hot"), 0.0)),
@@ -1368,7 +1428,11 @@ class EventSystem:
 
     def _fire(self, world: Any, kind: str, ev: dict[str, Any]) -> None:
         if kind == "ignite":
-            x = _fnum(ev.get("x"), self._rng.uniform(0, RENDER_W))
+            # An "ignite" with no x is "something catches, somewhere". STAGE:
+            # the whole point of the event is that a viewer watches it take
+            # hold, and _nearest_flammable's 400 px reach is short enough that
+            # a world-wide draw would usually find nothing and silently no-op.
+            x = _fnum(ev.get("x"), self._rng.uniform(*_stage(world)))
             p = _nearest_flammable(world, x, 400.0)
             if p is not None and _ignite(world, p):
                 _chronicle(world, "Flames take hold in the brush.")
@@ -1481,7 +1545,10 @@ class EventSystem:
         """A lightning bolt at a chosen x. The player's Lightning tool calls
         this; it is the aimed sibling of the scene's random _lightning_strike."""
         try:
-            x = max(24.0, min(float(RENDER_W - 24.0), float(x)))
+            # WORLD: the player clicked somewhere. app.py has already mapped the
+            # click back through the camera into a world x, so this clamp only
+            # has to keep the bolt on the land.
+            x = max(24.0, min(float(WORLD_W - 24.0), float(x)))
             gy = _ground_y(world, x)
             self.strikes.append({
                 "x": float(x), "t": 0.0,
@@ -1501,14 +1568,18 @@ class EventSystem:
     def meteor_at(self, world: Any, x: float) -> None:
         """A meteor impact at a chosen x. The player's Meteor tool calls this."""
         try:
-            x = max(8.0, min(float(RENDER_W - 8.0), float(x)))
+            x = max(8.0, min(float(WORLD_W - 8.0), float(x)))   # aimed: WORLD
             self._meteor_impact(world, x, _ground_y(world, x))
         except Exception:
             log.debug("meteor_at failed", exc_info=True)
 
     def _lightning_strike(self, world: Any) -> None:
         direct = self._rng.random() < DIRECT_HIT_CHANCE
-        x = self._rng.uniform(24.0, RENDER_W - 24.0)
+        # STAGE. STRIKE_MIN/MAX is a per-second rate, so widening this draw to
+        # WORLD_W would not give the viewer more lightning - it would give them
+        # a quarter as much, at the same cost, with the rest flashing over
+        # hillside 3 km away. The rate stays; the siting narrows.
+        x = self._rng.uniform(*_stage_inset(world, 24.0))
 
         # A "direct" strike has to actually aim. Rolling a uniform x across
         # 1280px and then killing only within 25px meant a direct hit landed on
@@ -1516,19 +1587,25 @@ class EventSystem:
         # struck and feature 29 never once fired. So: pick a victim and strike
         # near them - but the jitter has to stay inside DIRECT_KILL_RADIUS or
         # the aim is a lie. At the old +/-34px against a 25px radius roughly one
-        # aimed bolt in three still landed too wide to hurt anyone. The final
-        # re-clamp keeps a bolt aimed at somebody hugging the screen edge from
-        # being shoved back out of its own kill radius.
+        # aimed bolt in three still landed too wide to hurt anyone.
+        #
+        # Both re-clamps below are WORLD, deliberately, and this is the one
+        # place in the file where stage-clamping would be an outright bug: the
+        # victim's x is wherever the victim is, and pulling the bolt back onto
+        # the stage would shove it out of its own kill radius - exactly the
+        # failure the second clamp was written to prevent. A colonist standing
+        # past the stage edge is rare (they are inside SITE_RANGE nearly always)
+        # but "rare" is how this class of bug survives.
         if direct:
             crowd = [a for a in _agents(world) if getattr(a, "alive", False)]
             if crowd:
                 victim = crowd[self._rng.randrange(len(crowd))]
                 vx = _fnum(getattr(victim, "x", x), x)
                 x = vx + self._rng.uniform(-DIRECT_AIM_JITTER, DIRECT_AIM_JITTER)
-                x = max(24.0, min(RENDER_W - 24.0, x))
+                x = max(24.0, min(WORLD_W - 24.0, x))
                 if abs(x - vx) > DIRECT_KILL_RADIUS:
                     x = vx + math.copysign(DIRECT_KILL_RADIUS * 0.5, x - vx)
-                    x = max(0.0, min(float(RENDER_W - 1), x))
+                    x = max(0.0, min(float(WORLD_W - 1), x))
         gy = _ground_y(world, x)
         self.strikes.append({
             "x": float(x), "t": 0.0,
@@ -1757,12 +1834,15 @@ class EventSystem:
         # saver. It is safe to aim here in a way it is not there, because
         # nothing this method does can kill - the worst outcome is a cracked hut
         # and a scar somebody has to walk round.
-        epi = self._rng.uniform(60.0, RENDER_W - 60.0)
+        # STAGE for the unaimed 30%, WORLD for the clamp on the aimed 70%: the
+        # first is "somewhere in shot", the second must not drag an epicentre
+        # off the person it was just aimed at.
+        epi = self._rng.uniform(*_stage_inset(world, 60.0))
         crowd = _agents(world)
         if crowd and self._rng.random() < 0.7:
             who = crowd[self._rng.randrange(len(crowd))]
             epi = _clamp(_fnum(getattr(who, "x", epi), epi)
-                         + self._rng.uniform(-120.0, 120.0), 60.0, RENDER_W - 60.0)
+                         + self._rng.uniform(-120.0, 120.0), 60.0, WORLD_W - 60.0)
 
         if mag < QUAKE_BIG_MAG:
             self._shake_props(world, epi, mag * 0.45)
@@ -1803,8 +1883,10 @@ class EventSystem:
         if len(self.fissures) >= QUAKE_FISSURE_MAX:
             return False
         half = self._rng.uniform(QUAKE_FISSURE_HALF_MIN, QUAKE_FISSURE_HALF_MAX)
+        # WORLD: *x* arrives already sited (stage-drawn or aimed at a person);
+        # all this clamp does is keep the scar's full width on the land.
         cx = _clamp(x + self._rng.uniform(-90.0, 90.0),
-                    half + 10.0, RENDER_W - half - 10.0)
+                    half + 10.0, WORLD_W - half - 10.0)
         for f in self.fissures:
             if abs(_fnum(f.get("x"), -1e9) - cx) < QUAKE_FISSURE_GAP:
                 return False                    # would merge into a trench
@@ -1938,8 +2020,15 @@ class EventSystem:
         self.next_ignite -= dt
         if not burning and self.next_ignite <= 0.0:
             self.next_ignite = self._rng.uniform(FIRE_RELIGHT_MIN, FIRE_RELIGHT_MAX)
-            x = self._rng.uniform(40.0, RENDER_W - 40.0)
-            p = _nearest_flammable(world, x, RENDER_W)
+            x = self._rng.uniform(*_stage_inset(world, 40.0))
+            # The reach keeps its old NUMBER (1600 px) and loses its old
+            # meaning. It used to be spelled RENDER_W and read "search the whole
+            # map"; written as the stage width it reads "search anywhere in
+            # shot", which is what the contrast with the drought's short 240 px
+            # reach was always about. Taking it to WORLD_W instead would let a
+            # relight pick a tree 3 km away and burn it where nobody is looking,
+            # which is the same scene as no wildfire at all.
+            p = _nearest_flammable(world, x, STAGE_HALF * 2.0)
             if p is not None and _ignite(world, p):
                 _chronicle(world, "A wildfire catches in the dry brush.")
         if burning:
@@ -2118,7 +2207,8 @@ class EventSystem:
     def _pick_slide_span(self, world: Any) -> None:
         width = self._rng.uniform(MUDSLIDE_SPAN_MIN, MUDSLIDE_SPAN_MAX)
         h = _height(world)
-        x0 = self._rng.uniform(0.0, max(1.0, RENDER_W - width))
+        lo, hi = _stage(world)
+        x0 = self._rng.uniform(lo, max(lo + 1.0, hi - width))
         crowd = _agents(world)
         if crowd and self._rng.random() < MUDSLIDE_AIM_CHANCE:
             # Always sliding the steepest face means mostly sliding empty
@@ -2126,26 +2216,42 @@ class EventSystem:
             # slope that goes is one somebody is standing on. They still get
             # the full MUDSLIDE_WARN of rumble to walk off it.
             who = crowd[self._rng.randrange(len(crowd))]
-            cx = _fnum(getattr(who, "x", RENDER_W * 0.5), RENDER_W * 0.5)
+            cx = _fnum(getattr(who, "x", None), (lo + hi) * 0.5)
             cx += self._rng.uniform(-width * 0.25, width * 0.25)
+            # WORLD clamps: the span is already anchored on a person, so these
+            # only have to keep it on the land.
             self.slide_x0 = float(_clamp(cx - width * 0.5, 0.0,
-                                         max(0.0, RENDER_W - width)))
-            self.slide_x1 = float(min(RENDER_W, self.slide_x0 + width))
+                                         max(0.0, WORLD_W - width)))
+            self.slide_x1 = float(min(WORLD_W, self.slide_x0 + width))
             return
         if h is not None and h.size > 16:
-            grad = np.gradient(h.astype(np.float32))
-            win = max(8, int(width) // 8)
-            kern = np.ones(win, dtype=np.float32) / float(win)
-            smooth = np.convolve(np.abs(grad), kern, mode="same")
-            lo = int(width * 0.5)
-            hi = max(lo + 1, int(h.size - width * 0.5))
-            centre = int(np.argmax(smooth[lo:hi])) + lo
             # Pure argmax picks the same face every cycle, so a long scene slid
-            # the one slope over and over. Wander off it a little.
-            centre += int(self._rng.uniform(-width, width))
-            x0 = _clamp(centre - width * 0.5, 0.0, max(0.0, RENDER_W - width))
+            # the one slope over and over. Wander off it a little. Drawn here
+            # rather than after the scan so the seeded stream does not depend on
+            # whether the stage window turned out wide enough to scan.
+            jitter = int(self._rng.uniform(-width, width))
+            # STAGE-WINDOWED SCAN. This used to run over the whole heightmap,
+            # because the whole heightmap was the stage. Left alone on a 6400 px
+            # map it finds the single steepest face in the *world*, which is off
+            # camera roughly three times in four: MUDSLIDE_WARN seconds of
+            # rumble, a quake, a chronicle line, and a buried hillside nobody
+            # ever saw. The aimed branch above escapes this because it anchors
+            # on a person; the unaimed 1 - MUDSLIDE_AIM_CHANCE does not.
+            # Slicing also drops the convolve from 6400 columns to ~1600.
+            a = int(_clamp(lo, 0.0, float(h.size - 2)))
+            b = int(_clamp(hi, float(a + 2), float(h.size)))
+            win_h = h[a:b]
+            if win_h.size > 16:
+                grad = np.gradient(win_h.astype(np.float32))
+                win = max(8, int(width) // 8)
+                kern = np.ones(win, dtype=np.float32) / float(win)
+                smooth = np.convolve(np.abs(grad), kern, mode="same")
+                j0 = int(min(width * 0.5, float(smooth.size - 1)))
+                j1 = max(j0 + 1, int(smooth.size - width * 0.5))
+                centre = a + j0 + int(np.argmax(smooth[j0:j1])) + jitter
+                x0 = _clamp(centre - width * 0.5, 0.0, max(0.0, WORLD_W - width))
         self.slide_x0 = float(x0)
-        self.slide_x1 = float(min(RENDER_W, x0 + width))
+        self.slide_x1 = float(min(WORLD_W, x0 + width))
 
     def _warn_slide(self, world: Any) -> None:
         """Rumble phase: get anyone standing *on* the span moving.
@@ -2502,10 +2608,11 @@ class EventSystem:
             return                      # not dry enough yet; the brush will not take
         if self._burning_props(world):
             return                      # something is already alight; let it run
-        x = self._rng.uniform(40.0, RENDER_W - 40.0)
-        # A short reach, unlike the wildfire's map-wide search: a drought fire
-        # starts where the brush happens to be, not wherever the map's last
-        # flammable thing is standing.
+        x = self._rng.uniform(*_stage_inset(world, 40.0))
+        # A short reach, unlike the wildfire's stage-wide search: a drought fire
+        # starts where the brush happens to be, not wherever the last flammable
+        # thing in shot is standing. HEAT_IGNITE_MIN/MAX is per-second, so the
+        # draw above narrows and the interval does not.
         p = _nearest_flammable(world, x, 240.0)
         if p is not None and _ignite(world, p):
             _chronicle(world, "Dry brush catches alight in the heat.")
@@ -2626,7 +2733,11 @@ class EventSystem:
         h = _height(world)
         if h is not None:
             return float(int(np.argmin(h)))
-        return 20.0 if ax > RENDER_W * 0.5 else RENDER_W - 20.0
+        # Last resort, and only reachable on a world with no heightmap at all
+        # (a stub in a test): "run to the far end". WORLD, because with no
+        # terrain there is no high ground to prefer and no reason to stop at the
+        # stage edge - and in the real game this line never executes.
+        return 20.0 if ax > WORLD_W * 0.5 else WORLD_W - 20.0
 
     # ======================================================= scene: meteor ==
     def _scene_meteor(self, world: Any, dt: float) -> None:
@@ -2645,7 +2756,10 @@ class EventSystem:
 
     def _spawn_meteor(self, world: Any) -> None:
         impact = self._rng.random() < METEOR_IMPACT_CHANCE
-        x1 = self._rng.uniform(40.0, RENDER_W - 40.0)
+        # STAGE. METEOR_MIN/MAX is 1.6-5 s - the densest rate in the file - so
+        # this is where a world-wide draw would hurt most: four times the rocks
+        # simulated, the same one or two on screen.
+        x1 = self._rng.uniform(*_stage_inset(world, 40.0))
         drift = self._rng.uniform(180.0, 420.0) * (1 if self._rng.random() < 0.5 else -1)
         x0 = x1 - drift
         y0 = -self._rng.uniform(40.0, 220.0)
@@ -2717,8 +2831,14 @@ class EventSystem:
         out: list[dict[str, Any]] = []
         level = self.water_level
         if level is not None:
-            out.append({"kind": "flood", "x": RENDER_W * 0.5, "y": float(level),
-                        "water_y": float(level), "radius": float(RENDER_W)})
+            # WORLD, both of them. A flood is a waterline, not a place: every
+            # column below `level` is under it, so the hazard has to cover the
+            # map or agents outside the disc simply would not flee. Narrowing
+            # this to the stage would be the one hazard bug that kills people -
+            # a colonist who walks off-stage into deep water gets no FleeFrom
+            # score at all and drowns without ever trying to move.
+            out.append({"kind": "flood", "x": WORLD_W * 0.5, "y": float(level),
+                        "water_y": float(level), "radius": float(WORLD_W)})
         if self.scene == SCENE_MUDSLIDE and self.slide_phase in ("warn", "slide"):
             x0, x1 = self.slide_x0, self.slide_x1
             if x1 - x0 >= 8.0:
@@ -2727,7 +2847,7 @@ class EventSystem:
         for m in self.meteors:
             if not isinstance(m, dict) or not m.get("impact") or m.get("done"):
                 continue
-            out.append({"kind": "meteor", "x": _fnum(m.get("x1"), RENDER_W * 0.5),
+            out.append({"kind": "meteor", "x": _fnum(m.get("x1"), WORLD_W * 0.5),
                         "y": _fnum(m.get("y1"), RENDER_H * 0.7),
                         "radius": METEOR_WARN_R})
         # A scar is only frightening while the ground is actually moving. Once
@@ -2738,7 +2858,7 @@ class EventSystem:
             for f in self.fissures:
                 if not isinstance(f, dict):
                     continue
-                out.append({"kind": "quake", "x": _fnum(f.get("x"), RENDER_W * 0.5),
+                out.append({"kind": "quake", "x": _fnum(f.get("x"), WORLD_W * 0.5),
                             "y": _fnum(f.get("y"), RENDER_H * 0.7),
                             "radius": QUAKE_HAZARD_R + _fnum(f.get("half"), 0.0)})
         # Lava, in *any* scene - not just the volcano. A flow left cooling by the
@@ -2755,7 +2875,7 @@ class EventSystem:
             if hot < LAVA_LETHAL_HEAT:
                 continue
             reach = max(0.0, _fnum(f.get("half"), 0.0) * hot)
-            out.append({"kind": "lava", "x": _fnum(f.get("x"), RENDER_W * 0.5),
+            out.append({"kind": "lava", "x": _fnum(f.get("x"), WORLD_W * 0.5),
                         "y": _fnum(f.get("y"), RENDER_H * 0.7),
                         "radius": reach + LAVA_HAZARD_PAD})
         return out
@@ -2887,7 +3007,24 @@ class EventSystem:
         against, which is what a stub world in a test looks like.
         """
         h = _height(world)
-        lo, hi = 140.0, float(RENDER_W) - 140.0
+        # STAGE, and this one is not a rename - it is a repair. The scoring
+        # below only makes sense over a span comparable to LAVA_VENT_CLEAR
+        # (520 px) and LAVA_HALF_MAX + LAVA_HAZARD_PAD (205 px). Handed
+        # 140..6260 instead of 140..1460, both terms invert:
+        #   * the distance credit saturates at 520 px, so every candidate past
+        #     that scores identically on the term that was supposed to choose;
+        #   * _orphan_width is measured to the far edge, and on a 6400 px map it
+        #     is only zero within 205 px of the rim - so the -3.2/px penalty
+        #     dominates everything and pins the vent to whichever map edge the
+        #     colony is furthest from, ~2600 px away and permanently off camera.
+        # Measured, colony at x=3200, 400 draws of the 8-candidate search:
+        #   naive WORLD_W rename : 400/400 vents off camera, mean 2717 px from
+        #                          home, worst 3059 px
+        #   stage-scoped (this)  :   0/400 off camera, mean  582 px, worst 660
+        # 582 px is also the shape the scene was tuned for - just past
+        # LAVA_VENT_CLEAR, so the distance term is satisfied and the height and
+        # orphan terms decide, which is what they were written to do.
+        lo, hi = _stage_inset(world, 140.0)
         home = self._colony_x(world)
         best_x, best_score = (lo + hi) * 0.5, -1e18
         for _ in range(LAVA_VENT_TRIES):
@@ -2908,25 +3045,32 @@ class EventSystem:
                 gap = abs(x - _fnum(other.get("x"), x))
                 if gap < LAVA_VENT_SPLIT:
                     score -= (LAVA_VENT_SPLIT - gap) * 4.0
-            score -= self._orphan_width(x, home) * LAVA_ORPHAN_WEIGHT
+            score -= self._orphan_width(x, home, lo, hi) * LAVA_ORPHAN_WEIGHT
             if score > best_score:
                 best_x, best_score = x, score
         return best_x
 
     @staticmethod
-    def _orphan_width(x: float, home: float) -> float:
+    def _orphan_width(x: float, home: float, lo: float, hi: float) -> float:
         """Width of the strip a flow at *x* would cut off from *home*, in px.
 
         Measured at the front's full extent (half-width plus the hazard pad the
         AI actually flees), because the question is not how wide the lava is now
         but how wide the wall gets before it stops growing. Zero means the front
-        reaches the map edge on its far side, so there is nowhere behind it to be
-        stranded - which is the shape this scene wants.
+        reaches the end of the span on its far side, so there is nowhere behind
+        it to be stranded - which is the shape this scene wants.
+
+        *lo*/*hi* used to be implicit: they were 0 and RENDER_W, because the
+        world was one screen wide and "the edge of the map" and "the edge of
+        what anyone will ever walk to" were the same number. They are now the
+        stage edges, passed in. Against the world rim on a 6400 px map this
+        term stops discriminating - see _pick_vent - and it is the strongest
+        term in the score, so it takes the whole decision with it.
         """
         reach = LAVA_HALF_MAX + LAVA_HAZARD_PAD
         if x <= home:                       # colony to the right: pocket is left
-            return max(0.0, (x - reach) - 0.0)
-        return max(0.0, float(RENDER_W) - (x + reach))
+            return max(0.0, (x - reach) - float(lo))
+        return max(0.0, float(hi) - (x + reach))
 
     @staticmethod
     def _colony_x(world: Any) -> float:
@@ -2936,7 +3080,7 @@ class EventSystem:
             xs = [x for x in xs if x == x]
             if xs:
                 return sum(xs) / len(xs)
-        return RENDER_W * 0.5
+        return WORLD_W * 0.5
 
     def _lava_step(self, world: Any, dt: float) -> None:
         """Advance, cool and repaint every flow, then burn whoever is in one.
@@ -3104,7 +3248,7 @@ class EventSystem:
         ``paint`` may only move when the map has actually been written.
         """
         try:
-            x = _fnum(f.get("x"), RENDER_W * 0.5)
+            x = _fnum(f.get("x"), WORLD_W * 0.5)
             live = max(0.0, _fnum(f.get("half"), 0.0) * _clamp(_fnum(f.get("hot"), 0.0)))
             painted = max(0.0, _fnum(f.get("paint"), 0.0))
             if live > 0.5:
@@ -3136,7 +3280,7 @@ class EventSystem:
             hot = _clamp(_fnum(f.get("hot"), 0.0))
             if hot < LAVA_LETHAL_HEAT:
                 continue                # crusted over; it glows but it cannot burn
-            x = _fnum(f.get("x"), RENDER_W * 0.5)
+            x = _fnum(f.get("x"), WORLD_W * 0.5)
             live = max(0.0, _fnum(f.get("half"), 0.0) * hot)
             n = int(min(float(LAVA_SAMPLE_MAX), live * 2.0 / LAVA_SAMPLE_STEP + 1.0))
             if n <= 1:
@@ -3172,7 +3316,11 @@ class EventSystem:
         if not own:
             self.add_shake(6.0 if self.quake_t > 0.6 else 3.0)
         if self._rng.random() < dt * 0.35 and not own:
-            x = self._rng.uniform(30.0, RENDER_W - 30.0)
+            # STAGE: a 6-16 px divot is far too small to notice unless it lands
+            # in shot, and this fires on a per-second roll during any borrowed
+            # quake. Scattering them across 6400 px would leave the ground in
+            # front of the viewer visibly untouched by an earthquake.
+            x = self._rng.uniform(*_stage_inset(world, 30.0))
             w = self._rng.uniform(6.0, 16.0)
             _deform(world, x - w, x + w, self._rng.uniform(4.0, 11.0))
             _paint(world, x - w, x + w, MAT_DIRT)
@@ -3481,12 +3629,15 @@ if __name__ == "__main__":                                  # pragma: no cover
 
     class _T:
         def __init__(self) -> None:
-            self.height = np.full(RENDER_W, RENDER_H * 0.7, dtype=np.float32)
-            self.height += (np.sin(np.arange(RENDER_W) / 90.0) * 60.0).astype(np.float32)
-            self.material = np.zeros(RENDER_W, dtype=np.uint8)
+            # WORLD: this stub stands in for sim.terrain.Terrain, whose arrays
+            # are WORLD_W wide. A RENDER_W-wide stub would index out of range
+            # the moment a stage-sited event landed past x=1600.
+            self.height = np.full(WORLD_W, RENDER_H * 0.7, dtype=np.float32)
+            self.height += (np.sin(np.arange(WORLD_W) / 90.0) * 60.0).astype(np.float32)
+            self.material = np.zeros(WORLD_W, dtype=np.uint8)
 
         def ground_y(self, x: float) -> float:
-            return float(self.height[int(max(0, min(RENDER_W - 1, x)))])
+            return float(self.height[int(max(0, min(WORLD_W - 1, x)))])
 
     class _A:
         def __init__(self, i: int, x: float, y: float) -> None:

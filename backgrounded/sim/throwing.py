@@ -93,7 +93,7 @@ import zlib
 from dataclasses import dataclass
 from typing import Any, Iterator
 
-from ..constants import RENDER_W, WEAPON_NONE, WEAPON_SPEAR
+from ..constants import WEAPON_NONE, WEAPON_SPEAR, WORLD_W
 from .entities import GRAVITY as _FALL_GRAVITY
 
 log = logging.getLogger(__name__)
@@ -195,8 +195,16 @@ _AIRBORNE_EPS = 6.0
 #: the path every 4 px costs three checks a frame for at most twelve spears.
 _STEP_PX = 4.0
 _MAX_DT = 0.25
+#: The ends of the LAND, which is where a spear stops - not the ends of the
+#: picture. WORLD_W rather than RENDER_W, and the difference is not cosmetic:
+#: ``_step`` treats ``x <= _EDGE_MIN or x >= _EDGE_MAX`` as "it has reached the
+#: far side of the world" and LANDS the spear on the spot. With the old literal
+#: that wall sat at x = 1599, so on a 6400 px map any throw made from there or
+#: east of it grounded itself the instant it left the hand, whatever it had been
+#: aimed at - and the colony was pinned at exactly 1599 by the matching bug in
+#: entities.py, so this was every throw those colonies ever made eastward.
 _EDGE_MIN = 0.0
-_EDGE_MAX = float(RENDER_W - 1)
+_EDGE_MAX = float(WORLD_W - 1)
 
 
 # ------------------------------------------------------------- coercions --

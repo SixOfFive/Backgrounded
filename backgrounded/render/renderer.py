@@ -4,6 +4,17 @@ Strictly read-only with respect to simulation state. The layer order here is
 the one defined in docs/ARCHITECTURE.md section 4 and the light composite at
 step 10 is the whole visual thesis: draw the world lit, then multiply it down
 to near-black, then add light back from candles, fires and lightning.
+
+THE CAMERA LIVES HERE. The world is WORLD_W (6400) px of land and the frame is
+RENDER_W (1600) px of picture, so a sim x is no longer a screen x. ``draw``
+calls ``self.camera.follow`` as its first statement and every pass below reads
+``self.camera``; the private ``_draw_*`` methods gained no parameters for it.
+
+The rule for each pass is: convert exactly ONCE, at the line where a sim x is
+first read, and treat everything downstream as screen space. Where a method
+also has to *index the heightmap* it does that in world space first (the array
+is WORLD_W long) and converts afterwards - ``_lava_flows`` and ``_draw_crossing``
+are the two places both halves appear in the same function.
 """
 from __future__ import annotations
 
@@ -14,8 +25,9 @@ import numpy as np
 import pygame
 
 from ..constants import (
-    BONFIRE_DRAW_SCALE, MATERIAL_COLORS, MAT_GRASS, RENDER_H, RENDER_SIZE,
-    RENDER_W, SCENE_BLIZZARD, SCENE_FLOOD, SCENE_SANDSTORM, SCENE_WILDFIRE,
+    BONFIRE_DRAW_SCALE, MATERIAL_COLORS, MAT_GRASS, MAT_LAVA, RENDER_H,
+    RENDER_SIZE, RENDER_W, SCENE_BLIZZARD, SCENE_FLOOD, SCENE_SANDSTORM,
+    SCENE_WILDFIRE, WORLD_W,
 )
 from ..sim.structures import (
     BONFIRE_FADE_UNITS, BONFIRE_RAMP_SEC, CROSSING_KINDS,
@@ -24,10 +36,70 @@ from . import creatures, dragons as dragon_art, fx, hud, sky
 from . import items as relic_art
 from . import throwing as spear_art
 from .atlas import Atlas
+from .camera import Camera
 from .particles import ParticleSystem
 from .stickfigure import draw_stickman
 
 log = logging.getLogger(__name__)
+
+# There used to be a `_takes_cam` probe and a `Renderer._art` wrapper here that
+# passed `cam=` only to the entry points whose signature already accepted one,
+# and called the rest exactly as before. It was written so the lanes of the
+# wide-world change could land in any order, on the theory that a module drawn
+# at world coordinates is a visible bug rather than a lost frame.
+#
+# That theory was wrong, and it is the single most expensive line of reasoning
+# in this project's history. Ten of the eleven sim-entity entry points never
+# grew the parameter; the shim called every one of them the old way, silently;
+# they drew every stickman, animal, dragon, spear and relic off the right-hand
+# edge of a 1600 px frame; and six independent lanes then measured their own
+# patched trees and reported that the wide world worked. The frame that came
+# back had name plates floating over empty ground - the plates being the one
+# thing that went through camera.sx - and nothing whatsoever underneath them.
+#
+# So the shim is gone and `cam` is a REQUIRED keyword-only parameter on all
+# eleven. A caller that forgets now raises TypeError on the first frame it is
+# on, which is the loudest and cheapest possible way to be told. Nothing in
+# this file may reintroduce a "call it the old way if it does not take one"
+# branch; if a future entry point genuinely has no camera, it passes
+# camera.IDENTITY and says so at the call site.
+
+#: Largest magnitude, in px, that this file will hand to a pygame Rect.
+#:
+#: A Rect holds a C int. ``int(1e308)`` is a perfectly good Python int and a
+#: TypeError the moment it is assigned to one - so a save carrying ONE huge but
+#: finite coordinate used to kill the frame loop, and app.py's shutdown then
+#: wrote the same world back, which made it permanent: every launch after that
+#: died the same way, with no console and no window under run.pyw. persist.py
+#: cannot catch this; ``_f`` there tests FINITENESS, and 1e308 is finite.
+#:
+#: 2**20 is 1,048,576 px: 164 times the width of the world and 1049 times the
+#: height of the frame, so no coordinate any part of this program can legitimately
+#: produce is anywhere near it and the clamp is invisible in every real frame.
+#: It is also small enough that Rect's own internal arithmetic (a midbottom
+#: assignment subtracts half a sprite width; a blit computes a clip) stays far
+#: inside a 32-bit int. Anything past it is off screen by six orders of
+#: magnitude, so pinning it to the limit and letting pygame clip draws exactly
+#: what drawing it "properly" would have: nothing.
+RECT_LIMIT: int = 1 << 20
+
+
+def _ri(v: float) -> int:
+    """A coordinate off sim state, as an int a pygame Rect can actually hold.
+
+    THE conversion point. Every ``int(...)`` in this file that feeds a Rect, a
+    blit destination or a surface size goes through here instead, which is why
+    there is no per-entity try/except on the hot path: the clamp costs a
+    comparison pair where the bare ``int()`` already was.
+
+    Deliberately branch-free via min/max rather than an ``if``, because the
+    NaN case falls out for free: ``max(-L, nan)`` is ``-L`` (the comparison is
+    False, so max keeps what it has), and the result is then a fixed number
+    rather than the ValueError ``int(nan)`` raises. inf clamps to the limit,
+    -inf to its negative, and every real coordinate passes through untouched.
+    """
+    return int(min(RECT_LIMIT, max(-RECT_LIMIT, v)))
+
 
 # Below this local light level an agent is drawn as a silhouette rather than
 # in its identity colour. Feature 36.
@@ -74,8 +146,108 @@ LAVA_EMBERS_PER_SEC = 26.0
 #: actually is, coarse enough that a 190 px chasm costs ~24 points, not 190.
 CROSSING_SAMPLE_PX = 8.0
 
+#: How much slack a cull gets, in px. Half a sprite's width, near enough: the
+#: widest thing drawn from a single anchor point is a grown hut at ~110 px and
+#: a mature tree at ~120, so 160 keeps every one of them from popping in at the
+#: frame edge while still throwing away the ~75% of a 6400 px world that is not
+#: being looked at.
+CULL_PAD = 160.0
+#: Agents get less, because a stickman is 21 px wide - but its name plate is
+#: not, and the plate is anchored to the body.
+AGENT_CULL_PAD = 120.0
+
 
 class Renderer:
+    #: Width of one cached terrain strip, in px.
+    #:
+    #: Re-measured on this tree rather than inherited, by forcing one strip to
+    #: rebuild 40 times at each width (mean / p95, ms):
+    #:
+    #:     800 px  3.04 / 4.01      1600 px  5.06 / 6.09
+    #:    3200 px 12.05 / 12.60     6400 px 26.65 / 30.21
+    #:
+    #: So a full-width rebuild is 26.65 ms - 1.6 frames at 60 Hz - on a path
+    #: that fires on EVERY quarry divot and every quake scar. The 26.65 that
+    #: stood here for the full rebuild reproduces exactly; the 2.56 quoted for
+    #: an 800 px chunk does not, and is really 3.04, so the per-chunk figures
+    #: below are the measured ones and the old 5.31-at-1600 is now 5.06.
+    #:
+    #: Blitting was never the problem (a 6400-wide alpha surface onto the 1600
+    #: scene measured 0.634 ms/frame against 0.571 for a 1600-wide one; pygame
+    #: clips). So the fix is to rebuild less, not to blit less: 8 chunks, a
+    #: per-chunk damage test, and only the 2-3 that intersect the frame are
+    #: ever built or blitted. 800 keeps the worst hitch inside a 60 Hz frame,
+    #: which 1600 (5.06 ms, p95 6.09) does not.
+    TERRAIN_CHUNK: int = 800
+
+    #: How far a column of ground may move before its strip is redrawn, in px.
+    #:
+    #: This number is the whole of the cache's second life. The test used to be
+    #: an exact float sum over the strip, and three scenes - blizzard, volcano
+    #: and sandstorm - settle snow or ash onto EVERY column at ~0.0018 px a
+    #: tick. That is invisible (a fiftieth of a pixel a second) and it moved an
+    #: 800-column sum by ~1.4 every frame, so the fingerprint never matched,
+    #: every visible strip was rebuilt every frame, and the cache had a 0% hit
+    #: rate in exactly the scenes that cost the most to draw. Measured before
+    #: this: 3.00 rebuilds/frame in all three, 0.00 in clear.
+    #:
+    #: Rounding the sum does not fix it - the drift outruns any rounding you
+    #: would accept - and neither does rounding per column: with 800 columns
+    #: drifting together, ~1.4 of them cross a rounding boundary every frame
+    #: whatever the quantum. The test has to be *per column against the ground
+    #: as it was drawn*, which is what this is: keep the height slice the strip
+    #: was built from and rebuild when any column has moved half a pixel from
+    #: it. A settling scene then redraws about every 280 ticks (~9 s), which is
+    #: precisely when the accumulated drift becomes a pixel you could see, and
+    #: a 30 px quarry divot still trips it on the very next frame.
+    #:
+    #: Half a pixel and not one: the rim highlight is a 2 px line drawn on the
+    #: contour, and at a 1.0 px threshold a slope that crept just under it
+    #: showed a visible step against the strip next door when that one did
+    #: rebuild for its own reasons.
+    TERRAIN_TOL: float = 0.5
+
+    #: How long a strip may hold a stale MATERIAL trickle, in seconds.
+    #:
+    #: The height tolerance above kills the settling drift outright (measured
+    #: after it: 0 height-dirty strip-frames in all three scenes). What is left
+    #: is the other half of the same weather: snow, ash and sand are *painted*
+    #: a column or two at a time, and a changed material is a changed colour,
+    #: so it cannot be given a tolerance the way a sub-pixel height can. It can
+    #: be given a clock. Measured over 120 frames of each scene, the trickle is
+    #: 1-3 columns per dirty strip - i.e. paying 3.04 ms to recolour 16 px of
+    #: band - and that is worth batching.
+    #:
+    #: So material-only damage waits: a strip refreshes at most every half
+    #: second, which is 15 frames on the preview and two on the 4 Hz wallpaper
+    #: path. Anything that is not a trickle jumps the queue - see
+    #: :meth:`_chunk_damage`, where moved ground, lava and a wide change are
+    #: all urgent - so a quarry divot, a quake scar and a lava front are drawn
+    #: on the very next frame exactly as before.
+    #:
+    #: Half a second and not two: this is the delay before a newly white column
+    #: of ground turns white, and at 0.5 s the snow line reads as advancing
+    #: while at 2 s it reads as stepping.
+    CHUNK_REFRESH_SEC: float = 0.5
+
+    #: Columns of changed material that make a repaint urgent rather than
+    #: deferrable. One or two is weather; sixteen is something that happened.
+    CHUNK_MAT_URGENT: int = 16
+
+    #: Chunks kept either side of the visible span. Everything else is dropped.
+    #:
+    #: The cache never evicted: pan across the map once and all 8 strips stay
+    #: resident forever, measured at 13.31 MiB of Surfaces in a process that is
+    #: meant to sit behind a wallpaper all day. One chunk of margin is what the
+    #: camera can actually reach before the next frame - MAX_SPEED is 220 px/s,
+    #: so at 4 Hz on the wallpaper path a strip one chunk out is at most one
+    #: frame away from being needed, and evicting it would trade 3.04 ms of
+    #: rebuild for ~1.6 MiB. Two chunks of margin saves nothing more; zero
+    #: margin makes every pan direction cost a rebuild at the frame edge.
+    #: Measured after a full pan across the map: 8/8 strips and 13.31 MiB
+    #: resident before this, 3/8 and 4.89 MiB after.
+    CHUNK_KEEP: int = 1
+
     def __init__(self) -> None:
         self.scene = pygame.Surface(RENDER_SIZE).convert()
         self.out = pygame.Surface(RENDER_SIZE).convert()
@@ -98,11 +270,37 @@ class Renderer:
         except Exception:
             log.debug("could not read show_activity from config", exc_info=True)
             self.show_activity = True
-        self._terrain_cache: pygame.Surface | None = None
-        self._terrain_fingerprint: tuple | None = None
+        #: Where the frame sits on the world. The Renderer owns the only real
+        #: Camera in the process; nothing in sim/ can see it.
+        self.camera = Camera()
+        #: cam.x baked into the frame draw() last returned. app.py needs this
+        #: and not self.camera.x to turn a click back into a world x: the user
+        #: clicked the picture they were looking at, which is last frame's.
+        self.camera_x_presented: float = 0.0
+        # One drawn strip per TERRAIN_CHUNK px of world, each with a snapshot
+        # of the ground it was drawn from, so a divot dug at x=5100 rebuilds
+        # 800 px and not 6400 - and so a scene that settles snow onto every
+        # column does not rebuild anything at all until it has settled half a
+        # pixel of it. See TERRAIN_TOL.
+        self._chunk_cache: list[tuple[pygame.Surface, int] | None] = []
+        #: Per chunk: ``(height_slice_copy, material_slice_copy)`` as of the
+        #: last build, or None. Copies, not views - a view aliases the live
+        #: heightmap and compares equal to itself forever.
+        self._chunk_fp: list[tuple[np.ndarray, np.ndarray] | None] = []
+        #: Value of ``self._clock`` when each strip was last built, so a
+        #: deferred repaint can be given a deadline. See CHUNK_REFRESH_SEC.
+        self._chunk_t: list[float] = []
+        #: Seconds of drawn time. Accumulated from ``draw``'s own dt rather
+        #: than read off a wall clock, so a paused or stepped renderer defers
+        #: repaints by the time the *picture* has been up for.
+        self._clock: float = 0.0
         # Label plates already placed this frame, so two villagers standing on
         # top of each other do not stack their status text into a smear.
         self._label_rects: list[pygame.Rect] = []
+        #: Frames drawn. A DIAGNOSTIC, and nothing in this file may animate off
+        #: it: `self._frame % 3` was the lava smoke puff's rate until it was
+        #: found to be a frame-rate dial rather than a time one. Anything that
+        #: moves takes dt (or world_time); see :meth:`_emit_weather`.
         self._frame = 0
         # Last screen-shake offset baked into the returned frame, so draw_hud
         # can match it on the wallpaper path.
@@ -110,10 +308,60 @@ class Renderer:
         # (disabled subsystem names, hud scale, rendered plate) - see
         # _fault_banner. The scale is part of the key, not just the content.
         self._fault_plate: tuple[tuple[str, ...], float, pygame.Surface] | None = None
+        #: pass name -> how many times it has raised. See :meth:`_pass`.
+        self._pass_faults: dict[str, int] = {}
+        #: Per-emitter leftover fraction of a particle. See :meth:`_emit_weather`.
+        #: Rebuilt every frame from the emitters that actually ran, so a firepit
+        #: that goes out or a prop that finishes burning takes its entry with it.
+        self._emit_acc: dict[object, float] = {}
+
+    # --------------------------------------------------------------- guard --
+    def _pass(self, name: str, fn, *a, **kw) -> None:
+        """Run one draw pass. A pass that raises costs the pass, not the frame.
+
+        Half the passes in :meth:`draw` were already wrapped like this and half
+        were bare, and the bare ones are how a single poisoned coordinate in a
+        save file used to end the process: the exception left draw(), left
+        App._frame, ended App.run's loop, and _shutdown then wrote the same
+        world back to disk, so the next launch did it again - permanently, with
+        no console and no window under run.pyw.
+
+        The clamp at :func:`_ri` is the real fix for coordinates and this is the
+        floor underneath it: whatever else a pass finds to raise on, the other
+        eleven still draw and the app is still running to be told about it.
+
+        It is a per-PASS guard and deliberately not a per-entity one - there are
+        a dozen calls a frame here against ~150 props and ~20 structures, so the
+        cost is a function call per pass and nothing at all per entity.
+
+        Logged loudly once and then counted, because these run at 60 Hz for
+        hours: a pass that fails every frame would otherwise write 216,000 stack
+        traces an hour into a log file in %LOCALAPPDATA%.
+        """
+        try:
+            fn(*a, **kw)
+        except Exception:
+            n = self._pass_faults.get(name, 0) + 1
+            self._pass_faults[name] = n
+            if n == 1:
+                log.exception("render pass %r failed; the rest of the frame is "
+                              "still being drawn", name)
+            elif n % 1800 == 0:
+                log.warning("render pass %r has now failed %d times", name, n)
 
     # ------------------------------------------------------------- public --
     def draw(self, world, dt: float) -> pygame.Surface:
+        # First statement, before anything reads a coordinate: every pass below
+        # converts through self.camera, and they must all agree on where it is.
+        self.camera.follow(world, dt)
         self._frame += 1
+        # Clamped the way Camera.follow clamps its own step: a 20-second stall
+        # (a laptop coming out of sleep) must not retire every deferred repaint
+        # at once and hand back a frame with three chunk rebuilds in it.
+        try:
+            self._clock += min(0.25, max(0.0, float(dt)))
+        except (TypeError, ValueError):
+            pass
         s = self.scene
         ev = world.events
 
@@ -125,28 +373,39 @@ class Renderer:
         lava = self._lava_flows(world)
 
         try:
+            # The emit pass runs before update(), so the particle system is
+            # told where the frame is first: weather with no explicit x is
+            # seeded across the VIEW, and at cam.x = 3200 that is a different
+            # 1600 px of world than it was at startup.
+            self.particles.view_x = self.camera.x
             self._emit_weather(world, dt, lava)
-            self.particles.update(dt, world.terrain, ev)
+            self.particles.update(dt, world.terrain, ev, cam=self.camera)
         except Exception:
             log.exception("particle update failed")
 
-        # 1-2. sky and parallax ridges
-        sky.draw_sky(s, ev.scene, world.world_time, ev, world.lighting)
-        sky.draw_parallax(s, world.seed, ev.scene, world.lighting)
+        # 1-2. sky, then the parallax ridges. Both view space - the sky is not
+        # in the world at all, and the ridges scroll at a fraction of the
+        # camera rather than with it, which is what "parallax" means and what
+        # stops a 4x world reading as a backdrop sliding past on rails.
+        self._pass("sky", sky.draw_sky, s, ev.scene, world.world_time, ev,
+                   world.lighting)
+        self._pass("parallax", sky.draw_parallax, s, world.seed, ev.scene,
+                   world.lighting, cam=self.camera)
 
         # 3. distant weather
-        self.particles.draw(s, layer="back")
+        self._pass("weather_back", self.particles.draw, s, layer="back",
+                   cam=self.camera)
 
         # 4. terrain, then the scars an earthquake has torn in it. The scars go
         # here and not later because they are *ground*: they must sit under
         # everything that stands on the terrain, and the light composite must
         # dim them along with the rest of the world.
-        s.blit(self._terrain_surface(world.terrain), (0, 0))
-        self._draw_fissures(s, world)
+        self._pass("terrain", self._blit_terrain, s, world.terrain)
+        self._pass("fissures", self._draw_fissures, s, world)
 
         # 5-6. props then structures, painter-ordered by x for a little depth
-        self._draw_props(s, world)
-        self._draw_structures(s, world)
+        self._pass("props", self._draw_props, s, world)
+        self._pass("structures", self._draw_structures, s, world)
 
         # 6b. the one dragon that stands in the colony rather than over it.
         # Inside the light composite, and before the agents - see
@@ -154,9 +413,9 @@ class Renderer:
         self._draw_dragons(s, world, grounded=True)
 
         # 7. agents, then the wildlife among them
-        self._draw_agents(s, world)
+        self._pass("agents", self._draw_agents, s, world)
         try:
-            creatures.draw_animals(s, world, world.world_time)
+            creatures.draw_animals(s, world, world.world_time, cam=self.camera)
         except Exception:
             log.exception("animal draw failed")
         # Thrown spears, immediately after the bodies. sim/throwing.py has
@@ -173,7 +432,7 @@ class Renderer:
         # than before, because a shaft is 25 px long and 2 px wide and any body
         # it were drawn behind would simply eat it.
         try:
-            spear_art.draw_spears(s, world, world.world_time)
+            spear_art.draw_spears(s, world, world.world_time, cam=self.camera)
         except Exception:
             log.exception("spear draw failed")
         # Relics lying in the dirt, immediately after the spears and for the
@@ -188,23 +447,25 @@ class Renderer:
         # the body drawn here is a dark smudge in the middle of its own pool of
         # light until that second pass puts the glow back on top.
         try:
-            relic_art.draw_relics(s, world, world.world_time)
+            relic_art.draw_relics(s, world, world.world_time, cam=self.camera)
         except Exception:
             log.exception("relic draw failed")
         try:
-            creatures.draw_mining_dust(s, world, world.world_time)
+            creatures.draw_mining_dust(s, world, world.world_time,
+                                       cam=self.camera)
         except Exception:
             log.exception("mining dust draw failed")
 
         # 8-9. near weather and particles
-        self.particles.draw(s, layer="front")
+        self._pass("weather_front", self.particles.draw, s, layer="front",
+                   cam=self.camera)
 
         # flood water sits above the terrain but below the light pass
         if getattr(ev, "water_level", None):
-            self._draw_water(s, world, ev.water_level)
+            self._pass("water", self._draw_water, s, world, ev.water_level)
 
         # 10. the light composite
-        self._composite_light(s, world, lava)
+        self._pass("light", self._composite_light, s, world, lava)
 
         # Lava, immediately after it. The terrain pass has already painted the
         # flat MAT_LAVA band under everything, which is right - it is ground -
@@ -213,20 +474,23 @@ class Renderer:
         # of the lit world, which is what makes it the brightest thing on screen
         # instead of a dark orange stripe.
         if lava:
-            fx.draw_lava_flow(s, lava, world.world_time)
+            self._pass("lava", fx.draw_lava_flow, s, lava, world.world_time)
 
         # Heat haze over the ground, after the composite because it displaces
         # what you can *see* - lit pixels, not the world's own geometry - and
         # before the UFO, the lightning and the HUD, none of which are things
         # the air between you and the ground is in front of.
-        heat = float(getattr(ev, "heat", 0.0) or 0.0)
+        try:
+            heat = float(getattr(ev, "heat", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            heat = 0.0
         if heat > 0.02:
             self._draw_heat_shimmer(s, world, heat)
 
         # The saucer sits above the light pass: its beam is its own light and
         # should not be multiplied down into the night.
         try:
-            creatures.draw_ufo(s, world, world.world_time)
+            creatures.draw_ufo(s, world, world.world_time, cam=self.camera)
         except Exception:
             log.exception("ufo draw failed")
 
@@ -245,7 +509,7 @@ class Renderer:
         # the halo is 25x the ink of the object it sits on - at 13 px across, a
         # relic is found by its light and not by its silhouette.
         try:
-            relic_art.draw_relic_fx(s, world, world.world_time)
+            relic_art.draw_relic_fx(s, world, world.world_time, cam=self.camera)
         except Exception:
             log.exception("relic fx draw failed")
 
@@ -269,22 +533,28 @@ class Renderer:
         self._draw_dragons(s, world, grounded=False)
 
         # 11. lightning geometry, then vignette
-        self._draw_lightning(s, world)
-        fx.draw_vignette(s)
+        self._pass("lightning", self._draw_lightning, s, world)
+        self._pass("vignette", fx.draw_vignette, s)
 
         # The eclipse's horizon ring, for the same reason and at the same layer
         # as the fog wash: it is light coming in under the shadow from outside
         # it, not part of the lit world, so the light composite must not have a
         # say in it. Above the vignette so the corners keep their glow.
-        ecl = float(getattr(ev, "eclipse", 0.0) or 0.0)
+        try:
+            ecl = float(getattr(ev, "eclipse", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            ecl = 0.0
         if ecl > 0.02:
-            fx.draw_eclipse_twilight(s, ecl)
+            self._pass("eclipse", fx.draw_eclipse_twilight, s, min(1.0, ecl))
 
         # The haze wash sits above the whole lit world (so it dims it rather
         # than being multiplied away), but below the HUD, which must stay
         # readable. Density and colour both come off the sim: the scene decides
         # whether this is a grey fog or a tan sandstorm, not the renderer.
-        fog = float(getattr(ev, "fog", 0.0) or 0.0)
+        try:
+            fog = float(getattr(ev, "fog", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            fog = 0.0
         if fog > 0.02:
             # Hand it the daylight level too, or the wash - being painted over
             # the finished frame - becomes the one part of the scene the
@@ -293,8 +563,8 @@ class Renderer:
                 dl = sky.daylight(sky.day_phase(world.world_time, world.lighting))
             except Exception:
                 dl = 1.0
-            fx.draw_fog_overlay(s, fog, world.world_time,
-                                getattr(ev, "fog_color", None), dl)
+            self._pass("fog", fx.draw_fog_overlay, s, min(1.0, fog),
+                       world.world_time, getattr(ev, "fog_color", None), dl)
 
         # 12. the HUD used to be blitted here, after the light composite so it
         # stays readable in a black scene. It is drawn by :meth:`draw_hud`
@@ -305,11 +575,28 @@ class Renderer:
         # ordering that keeps this to a single render.
 
         # screen shake: blit the composed scene at an offset
-        dx, dy = ev.shake_offset() if hasattr(ev, "shake_offset") else (0, 0)
+        try:
+            dx, dy = ev.shake_offset() if hasattr(ev, "shake_offset") else (0, 0)
+        except Exception:
+            log.debug("shake offset failed", exc_info=True)
+            dx, dy = 0, 0
         # Remembered so draw_hud can re-apply it on the wallpaper path. The HUD
         # was drawn before this blit and therefore shook with the world; that is
         # the wallpaper's long-standing look and is preserved deliberately.
-        self._shake = (int(dx), int(dy))
+        #
+        # Clamped through _ri like every other coordinate: shake_offset is
+        # events.shake_amp times a sine, and a save carrying shake_amp = 1e308
+        # made the blit two lines down raise "invalid destination position for
+        # blit" - the same permanent-brick as a poisoned prop, reached by a
+        # channel that is not a position at all.
+        self._shake = (_ri(dx), _ri(dy))
+        dx, dy = self._shake
+        # Last statement, after everything that could still have moved the
+        # camera: this is the cam.x that is baked into the surface being
+        # returned, and app.py turns a click on THAT picture back into a world
+        # x with it. Reading self.camera.x at click time would be a frame
+        # ahead of what the user was looking at.
+        self.camera_x_presented = self.camera.x
         if dx or dy:
             self.out.fill((0, 0, 0))
             self.out.blit(s, (int(dx), int(dy)))
@@ -354,7 +641,8 @@ class Renderer:
             plate = self._fault_banner(world)
             if plate is not None:
                 r = plate.get_rect()
-                r.midtop = (surf.get_width() // 2 + int(off[0]), 12 + int(off[1]))
+                r.midtop = (surf.get_width() // 2 + _ri(off[0]),
+                            12 + _ri(off[1]))
                 surf.blit(plate, r)
         except Exception:
             log.debug("hud draw failed", exc_info=True)
@@ -415,55 +703,235 @@ class Renderer:
         return plate
 
     # ------------------------------------------------------------ terrain --
-    def _terrain_surface(self, terrain) -> pygame.Surface:
-        """Terrain only changes on deformation, so cache the drawn surface and
-        rebuild only when a cheap fingerprint of the heightmap moves."""
-        fp = (float(terrain.height[::64].sum()), int(terrain.material[::64].sum()))
-        if self._terrain_cache is not None and fp == self._terrain_fingerprint:
-            return self._terrain_cache
+    def _blit_terrain(self, s: pygame.Surface, terrain) -> None:
+        """Paint the 2-3 cached terrain strips that intersect the frame.
 
-        surf = pygame.Surface(RENDER_SIZE, pygame.SRCALPHA)
-        h = terrain.height
-        mats = terrain.material
+        This used to be one full-width surface, rebuilt whole whenever a cheap
+        fingerprint of the heightmap moved. At WORLD_W that rebuild measured
+        26.65 ms - 1.6 frames at 60 Hz - and it fires on every quarry divot,
+        every quake scar and every meteor crater, i.e. constantly and always
+        during the busiest moment on screen. Chunking makes the rebuild local
+        to the damage: digging a hole at x=5100 redraws 800 px, not 6400.
 
-        # Solid body: one polygon down to the bottom of the screen.
-        pts = [(0, RENDER_H)]
-        pts += [(x, float(h[x])) for x in range(RENDER_W)]
-        pts += [(RENDER_W - 1, RENDER_H)]
-        pygame.draw.polygon(surf, (38, 34, 32), pts)
+        The strips are blitted at ``-cam.x``, which is why ``Camera.follow``
+        rounds: a fractional offset makes pygame resample the entire background
+        every frame, and on the 4 Hz wallpaper path that crawl is the single
+        most visible artefact this renderer can produce.
+        """
+        try:
+            h = terrain.height
+            n = int(h.shape[0])
+            if n <= 0:
+                return
+            chunk = max(64, int(self.TERRAIN_CHUNK))
+            count = (n + chunk - 1) // chunk
+            if (len(self._chunk_cache) != count or len(self._chunk_fp) != count
+                    or len(self._chunk_t) != count):
+                # Width changed under us - a regenerated world, or a save from
+                # before the map got wider. Drop the lot rather than trying to
+                # reconcile strips against a different heightmap.
+                #
+                # All three lengths are tested, not just the cache's: they are
+                # parallel arrays and the two that are not the cache are read
+                # by index off the cache's bounds, so a desync would be an
+                # IndexError on the frame path rather than a stale strip.
+                self._chunk_cache = [None] * count
+                self._chunk_fp = [None] * count
+                self._chunk_t = [0.0] * count
+            cx = int(self.camera.x)
+            i0 = max(0, cx // chunk)
+            i1 = min(count - 1, (cx + RENDER_W - 1) // chunk)
+            for i in range(i0, i1 + 1):
+                hit = self._terrain_chunk(terrain, i)
+                if hit is not None:
+                    strip, top = hit
+                    s.blit(strip, (i * chunk - cx, top))
+            self._evict_chunks(i0, i1, count)
+        except Exception:
+            log.exception("terrain blit failed")
 
-        # Surface band coloured per material, drawn as a run-length set of
-        # rects rather than 1280 individual lines.
-        band = 16
-        x = 0
-        while x < RENDER_W:
-            m = int(mats[x])
-            x2 = x
-            while x2 < RENDER_W and int(mats[x2]) == m:
-                x2 += 1
-            col = MATERIAL_COLORS.get(m, MATERIAL_COLORS[MAT_GRASS])
-            # Both edges of the band follow the contour. Closing the polygon on
-            # two corner points instead - which is what this did - only draws a
-            # band where the run is flat: over a hill it fills the whole wedge
-            # between the skyline and a straight line joining the run's ends.
-            # It was invisible while every material was a muted earth tone
-            # against a near-black body, and became a lit orange tent the first
-            # time a volcanic flow painted a 300 px run of MAT_LAVA across a
-            # ridge. Two points per column rather than one, on a surface that is
-            # cached until the heightmap moves.
-            seg = [(xi, float(h[xi])) for xi in range(x, x2)]
-            seg += [(xi, float(h[xi]) + band) for xi in range(x2 - 1, x - 1, -1)]
-            if len(seg) > 2:
-                pygame.draw.polygon(surf, col, seg)
-            x = x2
+    def _evict_chunks(self, i0: int, i1: int, count: int) -> None:
+        """Drop every cached strip more than CHUNK_KEEP chunks off screen.
 
-        # Rim highlight so the silhouette still reads in near-darkness.
-        rim = [(xi, float(h[xi])) for xi in range(RENDER_W)]
-        pygame.draw.lines(surf, (96, 104, 96), False, rim, 2)
+        Without this the cache is write-only: pan the length of the map once
+        and all 8 strips stay resident for the rest of the session, measured at
+        13.31 MiB of Surfaces. That is not a leak in the sense of growing
+        without bound - it is bounded by the map - but this process is a
+        wallpaper that runs all day, and holding 13 MiB of pictures of ground
+        nobody is looking at is exactly the kind of thing that gets an ambient
+        app killed by a memory-pressure reaper.
 
-        self._terrain_cache = surf.convert_alpha()
-        self._terrain_fingerprint = fp
-        return self._terrain_cache
+        Cheap enough to run unconditionally: `count` is 8.
+        """
+        lo = max(0, i0 - self.CHUNK_KEEP)
+        hi = min(count - 1, i1 + self.CHUNK_KEEP)
+        for j in range(count):
+            if lo <= j <= hi:
+                continue
+            if j < len(self._chunk_cache) and self._chunk_cache[j] is not None:
+                self._chunk_cache[j] = None
+                if j < len(self._chunk_fp):
+                    self._chunk_fp[j] = None
+                if j < len(self._chunk_t):
+                    self._chunk_t[j] = 0.0
+
+    def _terrain_chunk(self, terrain,
+                       i: int) -> "tuple[pygame.Surface, int] | None":
+        """The drawn strip for chunk *i*, rebuilt only if its own ground moved.
+
+        "Moved" is :meth:`_chunk_damage`'s verdict and not a fingerprint
+        comparison. It was a fingerprint - first a ``[::64]`` stride, which was
+        25 samples across the whole map and stepped straight over a 30 px
+        quarry divot, then an exact float sum over the strip, which caught the
+        divot and also caught the ~0.0018 px/tick of settling that blizzard,
+        volcano and sandstorm apply to every column, so those three scenes
+        rebuilt every visible strip every frame forever. Both failures are the
+        same mistake: one number cannot answer both "did anything change" and
+        "did anything change enough to see".
+
+        Geometry is drawn one column PAST each end and left to pygame's clip.
+        The alternative - a padded surface with overlapping blits - double-
+        blends the rim highlight at every seam, which shows up as a brighter
+        vertical tick every 800 px. Abutting strips with clipped overdraw have
+        no seam at all.
+
+        Returns ``(surface, top_y)``: the strip is cropped to its own skyline
+        rather than being full height. A full-height strip is ~65% empty sky,
+        and the blit is per-frame while the crop is per-rebuild - measured, the
+        three visible strips cost 0.94 ms/frame uncropped against 0.31 cropped,
+        which is most of the difference between this and the single full-width
+        blit it replaced.
+        """
+        try:
+            h = terrain.height
+            mats = terrain.material
+            n = int(h.shape[0])
+            chunk = max(64, int(self.TERRAIN_CHUNK))
+            x0 = i * chunk
+            x1 = min(n, x0 + chunk)
+            if x0 >= x1:
+                return None
+            if (i < len(self._chunk_cache) and i < len(self._chunk_t)
+                    and self._chunk_cache[i] is not None):
+                dmg = self._chunk_damage(i, h, mats, x0, x1)
+                if dmg == 0:
+                    return self._chunk_cache[i]
+                if (dmg == 1 and
+                        self._clock - self._chunk_t[i] < self.CHUNK_REFRESH_SEC):
+                    # A column or two of settled weather, and the strip was
+                    # redrawn recently. Keep showing the one we have.
+                    return self._chunk_cache[i]
+
+            lo = max(0, x0 - 1)
+            hi = min(n, x1 + 1)
+            # 4 px of headroom for the 2 px rim line and its own rounding.
+            top = int(max(0, min(RENDER_H - 1, math.floor(float(h[lo:hi].min())) - 4)))
+            surf = pygame.Surface((x1 - x0, RENDER_H - top), pygame.SRCALPHA)
+            bottom = RENDER_H - top
+
+            # Solid body: one polygon down to the bottom of the screen.
+            pts = [(lo - x0, bottom)]
+            pts += [(x - x0, float(h[x]) - top) for x in range(lo, hi)]
+            pts += [(hi - 1 - x0, bottom)]
+            pygame.draw.polygon(surf, (38, 34, 32), pts)
+
+            # Surface band coloured per material, drawn as a run-length set of
+            # rects rather than one line per column.
+            band = 16
+            x = lo
+            while x < hi:
+                m = int(mats[x])
+                x2 = x
+                while x2 < hi and int(mats[x2]) == m:
+                    x2 += 1
+                col = MATERIAL_COLORS.get(m, MATERIAL_COLORS[MAT_GRASS])
+                # Both edges of the band follow the contour. Closing the polygon
+                # on two corner points instead - which is what this did - only
+                # draws a band where the run is flat: over a hill it fills the
+                # whole wedge between the skyline and a straight line joining
+                # the run's ends. It was invisible while every material was a
+                # muted earth tone against a near-black body, and became a lit
+                # orange tent the first time a volcanic flow painted a 300 px
+                # run of MAT_LAVA across a ridge. Two points per column rather
+                # than one, on a strip that is cached until this strip moves.
+                #
+                # A run cut by the strip edge is fine: the geometry is per
+                # column on both edges, so the visible half of a run is drawn
+                # exactly where it would have been as part of the whole.
+                seg = [(xi - x0, float(h[xi]) - top) for xi in range(x, x2)]
+                seg += [(xi - x0, float(h[xi]) + band - top)
+                        for xi in range(x2 - 1, x - 1, -1)]
+                if len(seg) > 2:
+                    pygame.draw.polygon(surf, col, seg)
+                x = x2
+
+            # Rim highlight so the silhouette still reads in near-darkness.
+            rim = [(xi - x0, float(h[xi]) - top) for xi in range(lo, hi)]
+            if len(rim) > 1:
+                pygame.draw.lines(surf, (96, 104, 96), False, rim, 2)
+
+            out = (surf.convert_alpha(), top)
+            if i < len(self._chunk_cache):
+                self._chunk_cache[i] = out
+                # Copies. A view would alias the live heightmap, compare equal
+                # to itself forever, and the strip would never be rebuilt - the
+                # exact opposite failure to the one being fixed here, and a far
+                # quieter one.
+                self._chunk_fp[i] = (h[x0:x1].copy(), mats[x0:x1].copy())
+                if i < len(self._chunk_t):
+                    self._chunk_t[i] = self._clock
+            return out
+        except Exception:
+            log.exception("terrain chunk %s build failed", i)
+            return None
+
+    def _chunk_damage(self, i: int, h, mats, x0: int, x1: int) -> int:
+        """How badly chunk *i*'s ground differs from the strip drawn for it.
+
+        ``0`` nothing worth drawing, ``1`` a deferrable trickle, ``2`` urgent.
+
+        The whole point of TERRAIN_TOL, and the reason this is a per-column
+        test and not a sum: one number cannot tell 800 columns drifting 0.0018
+        px apart from one column dropping 1.4 px, and the first of those is
+        three scenes' worth of settling snow while the second is a shovel.
+
+        Materials get no *tolerance* - they are discrete and a change is always
+        a change of colour - but they do get a queue. Three cases jump it:
+
+        * moved ground, because that is a divot or a scar and it arrives with a
+          villager standing in it;
+        * MAT_LAVA appearing or leaving, because a flow paints colour across a
+          ridge while moving no height at all, and a late lava front is the one
+          stale repaint anybody would actually see;
+        * a wide change (CHUNK_MAT_URGENT columns), because that is not weather.
+
+        Answers ``2`` on anything it cannot make sense of, so a shape mismatch
+        or a junk array costs a rebuild rather than a stale picture.
+        """
+        snap = self._chunk_fp[i] if i < len(self._chunk_fp) else None
+        if snap is None:
+            return 2
+        try:
+            hs, ms = snap
+            if hs.shape[0] != x1 - x0 or ms.shape[0] != x1 - x0:
+                return 2
+            # float subtraction over 800 elements: ~3 us, against the 3.04 ms
+            # rebuild it is deciding about.
+            if float(np.abs(h[x0:x1] - hs).max()) >= self.TERRAIN_TOL:
+                return 2
+            now = mats[x0:x1]
+            diff = now != ms
+            n = int(diff.sum())
+            if n == 0:
+                return 0
+            if n >= self.CHUNK_MAT_URGENT:
+                return 2
+            if bool(((now == MAT_LAVA) | (ms == MAT_LAVA))[diff].any()):
+                return 2
+            return 1
+        except Exception:
+            log.debug("chunk %s damage test failed", i, exc_info=True)
+            return 2
 
     def _draw_fissures(self, s: pygame.Surface, world) -> None:
         """Darken the gaps the earthquake tore open. A no-op in every other
@@ -477,25 +945,46 @@ class Renderer:
         fissures = getattr(world.events, "fissures", None)
         if not fissures:
             return
+        cam = self.camera
         cracks: list[tuple[float, float, float, float, int]] = []
         for f in list(fissures):
             try:
+                # Bounded on the way in, for the same reason every coordinate
+                # in this file is: half and depth are not positions but they
+                # become geometry, and fx builds a polygon out of them.
                 depth = float(f.get("depth", 0.0))
-                if depth < 2.0:
-                    continue            # not open enough to read as a hole yet
+                if not depth >= 2.0:    # not open enough to read as a hole yet
+                    continue            # (and `not >=` so NaN is skipped too)
+                depth = min(float(RENDER_H), depth)
+                half = min(float(WORLD_W), max(0.0, float(f.get("half", 12.0))))
                 x = float(f["x"])
-                cracks.append((x, world.terrain.ground_y(x),
-                               float(f.get("half", 12.0)) * 1.05, depth,
-                               int(f.get("seed", 1))))
+                # Sampled in world space (ground_y indexes the heightmap), then
+                # handed to fx in screen space - fx primitives take screen
+                # coords and always did.
+                if not cam.visible(x, half + 8.0):
+                    continue
+                cracks.append((cam.sx(x), world.terrain.ground_y(x),
+                               half * 1.05, depth, int(f.get("seed", 1))))
             except Exception:
                 continue
-        fx.draw_fissures(s, cracks)
+        try:
+            fx.draw_fissures(s, cracks)
+        except Exception:
+            log.debug("fissure draw failed", exc_info=True)
 
     # -------------------------------------------------------------- props --
     def _draw_props(self, s: pygame.Surface, world) -> None:
-        for p in sorted(world.props.all(), key=lambda p: p.y):
-            if not p.alive:
-                continue
+        # Cull BEFORE the sort, not inside the loop. The scatter is 4x denser
+        # than it was (143 props on a fresh map) and litter caps at 240, so on
+        # a bad frame this was sorting ~400 objects to draw the ~100 that are
+        # actually in the 1600 px frame. pygame would have clipped the rest
+        # correctly - this is purely the cost of sorting and blitting a world's
+        # worth of scenery to show a screen's worth.
+        cam = self.camera
+        visible = [p for p in world.props.all()
+                   if p.alive and cam.visible(p.x, CULL_PAD)]
+        for p in sorted(visible, key=lambda p: p.y):
+            px = cam.sx(p.x)
             # Litter is drawn here rather than baked into the atlas: it is four
             # 9x6 px silhouettes with no stages, no variants worth baking and no
             # growth ladder, and the atlas would answer with its 2x2 transparent
@@ -504,7 +993,7 @@ class Renderer:
             if p.kind == "litter":
                 try:
                     st = p.state if isinstance(p.state, dict) else {}
-                    fx.draw_litter(s, p.x, p.y, int(st.get("shape", 0) or 0),
+                    fx.draw_litter(s, px, p.y, int(st.get("shape", 0) or 0),
                                    bool(p.variant & 1))
                 except Exception:
                     pass
@@ -519,11 +1008,17 @@ class Renderer:
                 ang = float(p.state.get("fall_angle", 0.0))
                 spr = pygame.transform.rotate(spr, -ang * 57.2958)
             r = spr.get_rect()
-            r.midbottom = (int(p.x), int(p.y) + 2)
+            r.midbottom = (_ri(px), _ri(p.y) + 2)
             s.blit(spr, r)
 
     def _draw_structures(self, s: pygame.Surface, world) -> None:
-        for st in sorted(world.structures.all(), key=lambda st: st.y):
+        cam = self.camera
+        # Crossings are span-shaped and can be far wider than CULL_PAD, so they
+        # are exempted from the point cull and clipped by _draw_crossing's own
+        # span test instead. Everything else is a sprite on a single anchor.
+        visible = [st for st in world.structures.all()
+                   if st.kind in CROSSING_KINDS or cam.visible(st.x, CULL_PAD)]
+        for st in sorted(visible, key=lambda st: st.y):
             # Bridges and ladders are span-shaped, not sprite-shaped: how big
             # they are is a property of the gap, not of the kind. They are
             # drawn from the terrain's own surface so the planking lands
@@ -562,7 +1057,7 @@ class Renderer:
             if spr is None:
                 continue
             r = spr.get_rect()
-            r.midbottom = (int(st.x), int(st.y) + 2)
+            r.midbottom = (_ri(cam.sx(st.x)), _ri(st.y) + 2)
             s.blit(spr, r)
             if blaze:
                 self._draw_bonfire(s, world, st)
@@ -594,7 +1089,7 @@ class Renderer:
             k = max(0.2, min(1.0, age / BONFIRE_RAMP_SEC)
                     * max(0.3, min(1.0, left / BONFIRE_FADE_UNITS)))
             w = float(st.spec.width) * BONFIRE_DRAW_SCALE
-            fx.draw_bonfire(s, float(st.x), float(st.y) + 1.0,
+            fx.draw_bonfire(s, self.camera.sx(st.x), float(st.y) + 1.0,
                             w * 0.7, w * 1.15, float(world.world_time), k)
         except Exception:
             log.debug("bonfire draw failed for #%s", getattr(st, "id", "?"),
@@ -619,10 +1114,19 @@ class Renderer:
             span = st.crossing_span()
             if span is None:
                 return
+            cam = self.camera
             x0, x1 = span
-            x0 = max(0.0, min(float(x0), RENDER_W - 1.0))
-            x1 = max(0.0, min(float(x1), RENDER_W - 1.0))
+            # WORLD clamps: these index the heightmap. Clamping to RENDER_W
+            # here - which is what this line said when the world was 1600 px
+            # wide - would drag every crossing east of x=1600 back to the map's
+            # left edge and paint it there.
+            x0 = max(0.0, min(float(x0), WORLD_W - 1.0))
+            x1 = max(0.0, min(float(x1), WORLD_W - 1.0))
             if x1 - x0 < 4.0:
+                return
+            # Off-frame entirely: the span cull the point cull in
+            # _draw_structures deliberately skipped for this kind.
+            if cam.sx(x1) < -CULL_PAD or cam.sx(x0) > RENDER_W + CULL_PAD:
                 return
             ruined = bool(st.is_ruined)
             prog = 1.0 if st.built else float(st.completion())
@@ -630,8 +1134,8 @@ class Renderer:
             if st.kind == "ladder":
                 fx.draw_ladder(
                     s,
-                    (x0, terrain.ground_y(x0)),
-                    (x1, terrain.ground_y(x1)),
+                    (cam.sx(x0), terrain.ground_y(x0)),
+                    (cam.sx(x1), terrain.ground_y(x1)),
                     progress=prog,
                     ruined=ruined,
                 )
@@ -643,12 +1147,15 @@ class Renderer:
             n = max(2, min(64, int((x1 - x0) / CROSSING_SAMPLE_PX) + 1))
             xs = [x0 + (x1 - x0) * i / (n - 1) for i in range(n)]
             standing = bool(st.built) and not ruined
+            # xs are world; the deck's y comes from the world heightmap and its
+            # x goes to fx in screen space.
             if standing:
-                deck = [(x, terrain.ground_y(x)) for x in xs]
+                deck = [(cam.sx(x), terrain.ground_y(x)) for x in xs]
             else:
-                deck = [(x, float(st.y)) for x in xs]
+                deck = [(cam.sx(x), float(st.y)) for x in xs]
             h = terrain.height
-            ground = [float(h[int(max(0, min(RENDER_W - 1, x)))]) for x in xs]
+            n_h = int(h.shape[0]) - 1
+            ground = [float(h[int(max(0, min(n_h, x)))]) for x in xs]
             fx.draw_bridge(s, deck, ground, progress=prog, ruined=ruined)
         except Exception:
             log.debug("crossing draw failed for %s#%s", st.kind, st.id, exc_info=True)
@@ -783,13 +1290,14 @@ class Renderer:
             try:
                 if (dragon_art.dragon_kind_of(d) == want) is not grounded:
                     continue
-                dragon_art.draw_one(s, world, d, t)
+                dragon_art.draw_one(s, world, d, t, cam=self.camera)
             except Exception:
                 log.debug("dragon draw failed", exc_info=True)
 
     # ------------------------------------------------------------- agents --
     def _draw_agents(self, s: pygame.Surface, world) -> None:
         lighting = world.lighting
+        cam = self.camera
         self._label_rects.clear()
         for a in world.population.agents:
             if not a.alive and a.dead_t > 2.0:
@@ -798,13 +1306,21 @@ class Renderer:
             # the doorstep. _draw_occupancy marks the hut instead.
             if getattr(a, "inside", None) is not None and a.alive:
                 continue
+            # The camera follows the densest cluster, so on a split colony this
+            # is a real saving rather than a theoretical one: the half across
+            # the chasm costs nothing to not draw.
+            if not cam.visible(a.x, AGENT_CULL_PAD):
+                continue
             try:
+                # WORLD coords: lighting.light_at samples the sim's own light
+                # sources, which live in the world like everything else in sim/.
                 lit = lighting.light_at(a.x, a.y)
             except Exception:
                 lit = 1.0
             silhouette = SILHOUETTE_COLOR if lit < SILHOUETTE_CUTOFF else None
             try:
-                draw_stickman(s, a, world.world_time, alpha_color=silhouette)
+                draw_stickman(s, a, world.world_time, silhouette,
+                              cam=self.camera)
             except Exception:
                 log.exception("stickman draw failed for %s", getattr(a, "name", "?"))
             if (self.show_names or self.show_activity) and a.alive:
@@ -838,8 +1354,12 @@ class Renderer:
             width = max(p.get_width() for p in plates)
             height = sum(p.get_height() for p in plates) + gap * (len(plates) - 1)
             block = pygame.Rect(0, 0, width, height)
-            # AGENT_HEIGHT above the feet, plus clearance for the speech bubble
-            block.midbottom = (int(a.x), int(a.y) - 32)
+            # AGENT_HEIGHT above the feet, plus clearance for the speech bubble.
+            # The ONE conversion in this method: everything below - the two
+            # RENDER_W clamps, _avoid_overlap, the stored rect - is screen
+            # space, and the clamps only keep a plate on screen because the
+            # block was anchored off cam.sx(a.x) rather than off a.x.
+            block.midbottom = (_ri(self.camera.sx(a.x)), _ri(a.y) - 32)
             if a.speech:
                 block.top -= 10
             block.left = max(1, min(block.left, RENDER_W - block.width - 1))
@@ -897,6 +1417,7 @@ class Renderer:
             flows = getattr(world.events, "lava", None)
             if not flows:
                 return out
+            cam = self.camera
             ground = world.terrain.ground_y
             for f in list(flows):
                 try:
@@ -909,8 +1430,12 @@ class Renderer:
                     pts = []
                     for i in range(n):
                         x = cx - live + 2.0 * live * (i / (n - 1))
-                        x = max(0.0, min(float(RENDER_W - 1), x))
-                        pts.append((x, ground(x) + 1.0))
+                        # WORLD clamp - x is about to index the heightmap
+                        # through ground_y - then converted, because both
+                        # consumers of this list (fx.draw_lava_flow and the
+                        # lightmap in _composite_light) are screen space.
+                        x = max(0.0, min(float(WORLD_W - 1), x))
+                        pts.append((cam.sx(x), ground(x) + 1.0))
                     out.append((pts, heat))
                 except Exception:
                     continue
@@ -949,7 +1474,11 @@ class Renderer:
             if spr is None:
                 continue
             r = spr.get_rect()
-            r.center = (int(src.x), int(src.y))
+            # The lightmap is a frame-sized surface, so a light source's world
+            # x has to be converted like everything else. Not culled: a source
+            # just off the left edge still spills 190 px of glow into the
+            # frame, and pygame clips the blit for free.
+            r.center = (_ri(self.camera.sx(src.x)), _ri(src.y))
             lm.blit(spr, r, special_flags=pygame.BLEND_RGB_ADD)
 
         # A flow is a light source the size of a street, and it belongs in the
@@ -968,7 +1497,7 @@ class Renderer:
                 except Exception:
                     break
                 r = spr.get_rect()
-                r.center = (int(pts[i][0]), int(pts[i][1]))
+                r.center = (_ri(pts[i][0]), _ri(pts[i][1]))
                 lm.blit(spr, r, special_flags=pygame.BLEND_RGB_ADD)
 
         s.blit(lm, (0, 0), special_flags=pygame.BLEND_RGB_MULT)
@@ -977,10 +1506,16 @@ class Renderer:
         strikes = getattr(world.events, "strikes", None)
         if not strikes:
             return
+        cam = self.camera
         for st in list(strikes):
             try:
+                # The bolt is generated straight in screen space: it is a
+                # jagged line between two points and has nothing to sample off
+                # the world. ground_y came off the heightmap in sim/ and is a
+                # y, which the camera does not touch.
+                bx = cam.sx(float(st["x"]))
                 bolt = fx.make_lightning_bolt(
-                    st["x"], -20.0, st["x"], st["ground_y"], st["seed"])
+                    bx, -20.0, bx, st["ground_y"], st["seed"])
                 fx.draw_lightning(s, bolt, st["t"], 0.5)
             except Exception:
                 continue
@@ -999,9 +1534,19 @@ class Renderer:
         far more than the effect is.
         """
         try:
+            # Only the ground that is ON SCREEN sets the band. Taking the min
+            # and max over the whole WORLD_W heightmap would size the effect
+            # off a cliff 4000 px away that nobody can see, and on a map with
+            # real relief that pins the band at SHIMMER_MAX_H permanently -
+            # i.e. the height of the shimmer would stop tracking the ground it
+            # is supposed to be boiling.
             h = world.terrain.height
-            y0 = int(float(np.min(h))) - SHIMMER_RISE
-            y1 = int(float(np.max(h))) + SHIMMER_BELOW
+            n = int(h.shape[0])
+            lo = max(0, min(n - 1, int(self.camera.x)))
+            hi = max(lo + 1, min(n, lo + RENDER_W))
+            win = h[lo:hi]
+            y0 = int(float(np.min(win))) - SHIMMER_RISE
+            y1 = int(float(np.max(win))) + SHIMMER_BELOW
             y0 = max(0, y0)
             y1 = min(RENDER_H, y1)
             if y1 - y0 > SHIMMER_MAX_H:
@@ -1016,73 +1561,158 @@ class Renderer:
             log.debug("heat shimmer failed", exc_info=True)
 
     def _draw_water(self, s: pygame.Surface, world, level: float) -> None:
-        if level >= RENDER_H:
+        """The flood surface, from ``events.water_level`` down to the frame edge.
+
+        ``level`` is a sim number that is about to become a SURFACE SIZE, which
+        is the one thing here worse than a bad Rect: ``RENDER_H - level`` at
+        level = -1e308 asks pygame for a 1600 x 10^308 surface. The clamp is the
+        same one every coordinate in this file gets, and then the level is
+        pinned into the frame - water above the top edge is simply a full frame
+        of water, which is what an unclamped draw would have shown anyway.
+        """
+        lv = _ri(level)
+        if lv >= RENDER_H:
             return
-        h = int(RENDER_H - level)
-        water = pygame.Surface((RENDER_W, h), pygame.SRCALPHA)
+        lv = max(0, lv)
+        water = pygame.Surface((RENDER_W, RENDER_H - lv), pygame.SRCALPHA)
         water.fill((30, 70, 120, 150))
-        s.blit(water, (0, int(level)))
-        pygame.draw.line(s, (120, 170, 220), (0, int(level)), (RENDER_W, int(level)), 2)
+        s.blit(water, (0, lv))
+        pygame.draw.line(s, (120, 170, 220), (0, lv), (RENDER_W, lv), 2)
 
     # ------------------------------------------------------------ weather --
     def _emit_weather(self, world, dt: float,
                       lava: list[tuple[list[tuple[float, float]], float]] | None = None) -> None:
+        """Seed this frame's weather and fire particles, at a rate PER SECOND.
+
+        Every count in here used to be per FRAME, and that is the whole of a
+        measured bug: freeze the world and call ``draw(world, 0.0)`` sixty times
+        and all sixty frames differ from the first, because a firepit spawns one
+        ember and the night spawns one firefly on every call whether or not any
+        time has passed. The pool grew by exactly one particle per frame with
+        dt = 0 - the signature this was found by - and with it suppressed the
+        residual is 0 differing frames out of 60, at cam.x 0 and at 3200.
+
+        The visible consequence is not the frozen case, it is the moving one:
+        the density of fire and snow was a function of how fast the machine
+        happened to be compositing. A firepit threw 60 embers a second at 60 fps
+        and 25 at 25 fps, so a busy desktop quietly put the fires out. The two
+        emitters below that already knew this - ``_emit_grit`` and
+        ``_emit_lava_sparks``, whose docstrings both spell out that a per-frame
+        count would put sixteen times as many particles in the preview as on the
+        wallpaper path - were right, and the rest of this method was not.
+
+        The rates are the old per-frame counts times 60, so the look at 60 fps
+        is the one that was there before, to the particle; anywhere else it is
+        now the same look rather than a thinner one.
+
+        ``_rate`` carries the leftover fraction between frames rather than
+        rounding it away, which is what makes a 60/s emitter still emit at 240
+        fps (0.25 of a particle a frame, one every fourth) instead of truncating
+        to nothing - the failure mode ``rain`` still has and is left with,
+        because it is already dt-driven and changing what light rain looks like
+        is not this change's business.
+
+        The accumulator dict is rebuilt each frame from the keys that were
+        actually used, so it holds exactly the live emitters - it cannot grow
+        with the number of firepits that have ever existed.
+        """
         ev = world.events
         scene = ev.scene
-        if lava:
-            self._emit_lava_sparks(lava, dt)
-        if getattr(ev, "rain", 0) > 0.01:
-            self.particles.emit("rain", int(90 * ev.rain * dt * 60 / 60),
-                                wind=ev.wind)
-        if getattr(ev, "snow", 0) > 0.01:
-            self.particles.emit("snow", int(40 * ev.snow), wind=ev.wind)
-        if getattr(ev, "ash", 0) > 0.01:
-            self.particles.emit("ash", int(25 * ev.ash), wind=ev.wind)
-        if scene == SCENE_SANDSTORM:
-            self._emit_grit(ev, dt)
-        if scene == SCENE_WILDFIRE or world.props.burning():
-            for p in world.props.burning():
-                self.particles.emit("ember", 2, x=p.x, y=p.y - 10)
-                self.particles.emit("smoke", 1, x=p.x, y=p.y - 24)
-        for st in world.structures.all():
-            if not st.state.get("lit"):
-                continue
-            # A bonfire throws a column of sparks rather than a firepit's single
-            # ember. It shares the pool's "ember" budget with burning props on
-            # purpose - a wildfire and a bonfire at once should compete for the
-            # same 500 particles, not double them.
-            if getattr(st, "bonfire_active", False):
-                self.particles.emit("ember", 5, x=(st.x - 13.0, st.x + 13.0),
-                                    y=(st.y - 30.0, st.y - 12.0),
-                                    vy=(-150.0, -55.0), life=(0.9, 2.4))
-                self.particles.emit("smoke", 2, x=(st.x - 9.0, st.x + 9.0),
-                                    y=st.y - 44.0)
-            else:
-                self.particles.emit("ember", 1, x=st.x, y=st.y - 8)
-        if not world.is_night:
-            return
-        if scene not in (SCENE_BLIZZARD, SCENE_FLOOD) and getattr(ev, "rain", 0) < 0.1:
-            self.particles.emit("firefly", 1)
+        try:
+            step = min(0.25, max(0.0, float(dt)))
+        except (TypeError, ValueError):
+            step = 0.0
+        prev, acc = self._emit_acc, {}
 
-    def _emit_lava_sparks(self, lava, dt: float) -> None:
+        def rate(key, per_sec: float) -> int:
+            """How many particles *key* has earned this frame.
+
+            The bound is not tuning, it is the same lesson as _ri: ``ev.snow``
+            comes off a save, ``2400.0 * 1e308`` is ``inf``, and ``int(inf)``
+            raises OverflowError - which the per-frame counts this replaced did
+            not, because they went straight to emit() and were capped there. A
+            rate this file computes must not be a new way to lose the frame.
+            Everything real is under 3000/s and the pool's own per-kind cap is
+            1400, so the ceiling is unreachable by anything legitimate.
+            """
+            v = prev.get(key, 0.0) + per_sec * step
+            if not 0.0 <= v <= 100000.0:          # NaN, inf, or a poisoned channel
+                v = 100000.0 if v > 0.0 else 0.0
+            n = int(v)
+            acc[key] = v - n
+            return n
+
+        try:
+            if lava:
+                self._emit_lava_sparks(lava, step, rate)
+            if getattr(ev, "rain", 0) > 0.01:
+                self.particles.emit("rain", int(90 * ev.rain * step),
+                                    wind=ev.wind)
+            if getattr(ev, "snow", 0) > 0.01:
+                self.particles.emit("snow", rate("snow", 2400.0 * ev.snow),
+                                    wind=ev.wind)
+            if getattr(ev, "ash", 0) > 0.01:
+                self.particles.emit("ash", rate("ash", 1500.0 * ev.ash),
+                                    wind=ev.wind)
+            if scene == SCENE_SANDSTORM:
+                self._emit_grit(ev, step)
+            if scene == SCENE_WILDFIRE or world.props.burning():
+                for p in world.props.burning():
+                    self.particles.emit("ember", rate(("burn_e", p.id), 120.0),
+                                        x=p.x, y=p.y - 10)
+                    self.particles.emit("smoke", rate(("burn_s", p.id), 60.0),
+                                        x=p.x, y=p.y - 24)
+            for st in world.structures.all():
+                if not st.state.get("lit"):
+                    continue
+                # A bonfire throws a column of sparks rather than a firepit's
+                # single ember. It shares the pool's "ember" budget with burning
+                # props on purpose - a wildfire and a bonfire at once should
+                # compete for the same 500 particles, not double them.
+                if getattr(st, "bonfire_active", False):
+                    self.particles.emit("ember", rate(("fire_e", st.id), 300.0),
+                                        x=(st.x - 13.0, st.x + 13.0),
+                                        y=(st.y - 30.0, st.y - 12.0),
+                                        vy=(-150.0, -55.0), life=(0.9, 2.4))
+                    self.particles.emit("smoke", rate(("fire_s", st.id), 120.0),
+                                        x=(st.x - 9.0, st.x + 9.0),
+                                        y=st.y - 44.0)
+                else:
+                    self.particles.emit("ember", rate(("fire_e", st.id), 60.0),
+                                        x=st.x, y=st.y - 8)
+            if not world.is_night:
+                return
+            if scene not in (SCENE_BLIZZARD, SCENE_FLOOD) and getattr(ev, "rain", 0) < 0.1:
+                self.particles.emit("firefly", rate("firefly", 60.0))
+        finally:
+            self._emit_acc = acc
+
+    def _emit_lava_sparks(self, lava, dt: float, rate) -> None:
         """Throw sparks and smoke off the flow.
 
-        Deliberately dt-scaled, like the sandstorm's grit and unlike the rain
-        and snow emitters above: this runs at whatever rate the app happens to
-        be compositing at, and a per-frame count would put sixteen times as many
-        sparks in the preview window as on the 4 Hz wallpaper push.
+        Deliberately dt-scaled: this runs at whatever rate the app happens to be
+        compositing at, and a per-frame count would put sixteen times as many
+        sparks in a 60 fps preview as on a machine drawing at four. When this was
+        written it and the sandstorm's grit were the only two emitters that knew
+        that; :meth:`_emit_weather` now applies the same rule to all of them.
 
         Only three launch points per flow, spread across it, rather than one per
         sampled column: an emit() call is a numpy round trip and the particles
         spread themselves out anyway once the ember kind's negative gravity has
         carried them up. Read-only and fails soft - a full pool or a missing
         channel just means no sparks this frame.
+
+        The smoke puff below used to be the one literal frame counter in this
+        file - ``self._frame % 3`` - which is 20 puffs a second at 60 fps and
+        ten at 30. It now goes through the same per-second *rate* accumulator
+        as everything else in _emit_weather, at the 20/s that ``% 3`` meant on
+        the machine it was tuned on.
         """
         try:
             step = max(0.0, min(0.25, float(dt)))
             if step <= 0.0:
                 return
-            for pts, heat in lava:
+            for f_i, (pts, heat) in enumerate(lava):
                 n = int(LAVA_EMBERS_PER_SEC * heat * step)
                 if n <= 0 or len(pts) < 2:
                     continue
@@ -1094,9 +1724,11 @@ class Renderer:
                                         x=(x - 14.0, x + 14.0), y=(y - 6.0, y),
                                         vx=(-26.0, 26.0), vy=(-120.0, -40.0),
                                         life=(0.7, 2.1), size=(0.7, 2.0), color=17)
-                if self._frame % 3 == 0:
+                puffs = rate(("lava_s", f_i), 20.0)
+                if puffs > 0:
                     mid = pts[len(pts) // 2]
-                    self.particles.emit("smoke", 1, x=(mid[0] - 30.0, mid[0] + 30.0),
+                    self.particles.emit("smoke", puffs,
+                                        x=(mid[0] - 30.0, mid[0] + 30.0),
                                         y=(mid[1] - 20.0, mid[1]))
         except Exception:
             log.debug("lava spark emit failed", exc_info=True)
@@ -1156,8 +1788,13 @@ class Renderer:
             for count, is_back, tone in ((back, True, 9), (n - back, False, 10)):
                 if count <= 0:
                     continue
+                # VIEW-relative, and slid onto the camera: a sandstorm is a
+                # thing you see, and grit seeded across all of WORLD_W would
+                # put three quarters of the pool in empty desert and thin the
+                # visible storm to a quarter at four times the cost.
+                vx0 = self.camera.x
                 self.particles.emit(
-                    "dust", count, x=(-40.0, float(RENDER_W) + 40.0),
+                    "dust", count, x=(vx0 - 40.0, vx0 + float(RENDER_W) + 40.0),
                     y=(RENDER_H * 0.12, RENDER_H * 0.80),
                     vx=vx, vy=(-45.0, 45.0), life=(0.65, 1.7),
                     size=(0.5, 1.9), color=tone, back=is_back)

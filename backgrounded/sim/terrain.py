@@ -5,9 +5,14 @@ headless so the simulation can be tested without a display.
 
 Coordinate system (see docs/ARCHITECTURE.md section 3):
 
-    * world space *is* render space, origin top-left
-    * ``x`` runs 0 .. RENDER_W-1, one array column per screen pixel column
-    * ``y`` grows **downward**, so a *smaller* height value is *higher* ground
+    * ``x`` runs 0 .. WORLD_W-1, one array column per **world** pixel column.
+      It used to say RENDER_W, and world space used to *be* render space; they
+      are now different numbers (6400 vs 1600) and a camera maps between them.
+      Terrain knows nothing about the camera: it is the land, all of it.
+    * ``y`` grows **downward**, so a *smaller* height value is *higher* ground.
+      There is no vertical camera and RENDER_H is unchanged, so every height
+      constant below is still expressed against RENDER_H and still means what
+      it always meant.
 
 Every mutator is written to fail soft: bad indices are clamped, NaNs are
 dropped, and nothing in here raises on a per-frame path.
@@ -34,7 +39,9 @@ does not change what the rock under it is made of.
 
 ``epoch`` counts every change to the surface (height or either overlay), so a
 caller that caches something derived from it can invalidate on an integer
-compare instead of diffing a 1600-column array.
+compare instead of diffing a 6400-column array.  That mattered more when the
+array was 1600 wide; it matters four times as much now, and the renderer's
+terrain cache additionally chunks against it rather than rebuilding whole.
 
 Interfaces other modules rely on
 --------------------------------
@@ -57,6 +64,7 @@ Interfaces other modules rely on
 from __future__ import annotations
 
 import base64
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -78,8 +86,11 @@ from ..constants import (
     MAX_SLOPE_CLIMB,
     MAX_SLOPE_WALK,
     RENDER_H,
-    RENDER_W,
+    WORLD_SCALE,
+    WORLD_W,
 )
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "Terrain",
@@ -194,6 +205,63 @@ DECK_LANDING_DROP: float = 8.0
 #: Cosine falloff width used by :meth:`Terrain.deform` with ``blend='smooth'``.
 DEFORM_EDGE: int = 24
 
+# -- migrating a save written before the world got wider ----------------------
+# A save carries its own column count in ``w``.  When that is smaller than
+# WORLD_W the columns it holds are the land the colony was BUILT ON, and every
+# saved x - agents, structures, props, animals, the chasm span, the crossing
+# overlays - is expressed against it.  So the saved band is restored VERBATIM at
+# x=0 and only the new land past it is generated.  See
+# :meth:`Terrain._restore_saved_band` for why x=0 and not centred.
+#
+# The join is the one thing that has to be built rather than copied.  The
+# restored rim and the generated land meet at an arbitrary pair of heights, and
+# this world kills colonists with falls, so a step there is a death trap dressed
+# up as scenery.  Two mechanisms, in this order:
+#
+#   1. PHASE.  The extension is a slice of the generated map, and which slice is
+#      free.  Pick the start column whose height already matches the restored
+#      rim and whose own ground is flat there, and the step to be blended out is
+#      a few px rather than a few hundred.
+#   2. BLEND.  Whatever step is left is added to the extension and decayed to
+#      zero over ``blend`` px with a smoothstep, so the join is exactly
+#      continuous and the far extension is untouched geology.  A smoothstep's
+#      gradient peaks at 1.5x its average, so the width a step needs is
+#      ``step * 1.5 / gradient`` - the same one-liner _cut_chasm's walls use.
+
+#: |dy/dx| the seam blend itself may contribute.  A quarter of the walk
+#: gradient: the blend has to share the budget with whatever slope the geology
+#: on either side of the join already has, and it is the half we control.
+SEAM_BLEND_GRADIENT: float = MAX_SLOPE_WALK * 0.25
+
+#: Bounds on the derived blend width, px.  The floor keeps a near-perfect match
+#: from producing a two-column ramp that a 5 px central difference reads as a
+#: notch; the ceiling is a quarter of the narrowest extension the migration can
+#: ever face (WORLD_W - RENDER_W = 4800), so the blend cannot eat the new land.
+SEAM_BLEND_MIN: int = 48
+SEAM_BLEND_MAX: int = 1200
+
+#: Columns each side of the join the finished seam is verified over.  ``slope``
+#: is a central difference reaching 2.5 px, so anything past a few columns is
+#: pure geology; 48 is generous enough to catch the whole blend toe.
+SEAM_PROBE: int = 48
+
+#: Px of gentle new land the phase search insists on finding immediately past
+#: the join.  A continuous join is not enough on its own: matched on one column
+#: only, the reference save's seam read 0.04 and then put a generated
+#: escarpment 44 px past it, which is a walk of well under a second from the
+#: colony's outermost building.  This is the run an agent stepping off the old
+#: map's rim gets before the new land is allowed to have an opinion.
+SEAM_LANDING: int = 160
+
+#: Re-blends allowed while verifying the measured seam gradient against the
+#: predicted one.  Same shape, and the same reason, as CHASM_WALL_TRIES.
+SEAM_TRIES: int = 4
+
+#: Px of height error a unit of |dy/dx| is worth when choosing where the
+#: generated extension starts.  Landing the join on flat ground is worth a small
+#: height mismatch, because the mismatch is blended out and the slope is not.
+SEAM_PHASE_SLOPE_WEIGHT: float = 80.0
+
 #: px the reachability sweep looks ahead when judging a step.  Deliberately the
 #: same number as ``entities.STEP_PROBE``: that is the span the physics itself
 #: measures a step over, so the graph refuses exactly the steps the mover does.
@@ -201,6 +269,17 @@ DEFORM_EDGE: int = 24
 #: entities in the import order and must not reach back up.
 BARRIER_PROBE: int = 3
 
+#: Noise cells across ONE STAGE (RENDER_W px), not across the map.  These are
+#: multiplied by WORLD_SCALE at the ``_fbm`` call below, and that multiply is
+#: the whole point: ``_value_noise`` spreads ``cells`` control points over the
+#: full array, so a cells-per-MAP number stretches every landform by whatever
+#: the map grew by.  Left at 3.0 on a 6400 px world you get the same five hills
+#: as before, each 2000 px across - the colony walks a quarter of the world
+#: without a change of grade, every window is locally flat, and the "at least
+#: one 120 px shelf" guarantee becomes trivially true everywhere.
+#: Holding cells-per-stage constant instead holds the FEATURE SIZE IN PIXELS
+#: constant, which is what a walker actually feels, and it keeps these five
+#: numbers comparable to the styles they were tuned against.
 _BASE_CELLS: dict[str, float] = {
     "hills": 3.0,
     "cliffs": 4.0,
@@ -322,6 +401,81 @@ def _overlaps(a: tuple[float, float], b: tuple[float, float] | None, pad: float 
     return not (a[1] + pad < b[0] or a[0] - pad > b[1])
 
 
+def _array_len(d: object) -> int | None:
+    """How many elements a :func:`_b64_array` payload actually holds.
+
+    COUNTED OFF THE BASE64, always, with the declared ``shape`` as a last
+    resort rather than the authority.  Used to decide whether a save's terrain
+    is the width this build expects, and deliberately NOT taken from the save's
+    ``w`` field: ``w`` is a separate claim that a hand-edit or a save old enough
+    to predate the field can get wrong, and being wrong there sends the arrays
+    into the resampler.
+
+    ``shape`` used to be trusted ahead of the payload, and that was the same
+    mistake one field along.  ``shape`` is every bit as much a separate claim as
+    ``w`` is: a save declaring ``[6400]`` while carrying 1600 columns made
+    ``saved_w == WORLD_W``, SKIPPED the width migration in :meth:`Terrain
+    .from_dict` entirely, and went into :func:`_unb64_array` with
+    ``resample=True`` - reproducing exactly the 4x stretch that put huts 174 px
+    in the air and killed a colony by falls.  Measured on five genuine 1600 px
+    saves with only the shape field edited: the restored band was 152-429 px
+    away from the land that was saved, carrying the stretch signature.  The
+    length of the payload is the one thing here that is not a claim - it is the
+    data - and it is also what :func:`_unb64_array` will actually decode, so
+    counting it is what makes the two functions agree.
+
+    ``nbytes % size`` must come out even, because ``np.frombuffer`` refuses a
+    buffer that is not a whole number of elements; a ragged payload therefore
+    answers "cannot tell" rather than a length that nothing can decode.
+
+    Never raises; ``None`` means "cannot tell".
+    """
+    if not isinstance(d, dict):
+        return None
+    raw = d.get("b64")
+    if isinstance(raw, str):
+        try:
+            size = int(np.dtype(str(d.get("dtype", "float32"))).itemsize)
+            nbytes = len(base64.b64decode(raw.encode("ascii"), validate=False))
+        except Exception:
+            size = nbytes = 0
+        if size > 0 and nbytes >= size and nbytes % size == 0:
+            return nbytes // size
+    # No readable payload at all.  ``shape`` is all that is left, and a save in
+    # this state has nothing for _unb64_array to decode either, so whatever it
+    # says the caller is heading for a regenerate regardless.
+    shp = d.get("shape")
+    if isinstance(shp, (list, tuple)) and len(shp) == 1:
+        try:
+            v = int(shp[0])
+        except (TypeError, ValueError):
+            return None
+        if v > 0:
+            return v
+    return None
+
+
+def _abs_slope_of(h: np.ndarray) -> np.ndarray:
+    """``|dy/dx|`` per column of a bare profile.
+
+    The same kernel :meth:`Terrain.column_slope` uses - a central difference
+    over ``SLOPE_SPAN`` px, edge padded - but on an array rather than on a
+    built Terrain, so the migration can measure a candidate seam before it
+    commits to one.  Never raises: a degenerate input answers all zeros.
+    """
+    try:
+        a = np.asarray(h, dtype=np.float64).reshape(-1)
+    except Exception:
+        return np.zeros(0, dtype=np.float64)
+    m = a.size
+    if m == 0:
+        return np.zeros(0, dtype=np.float64)
+    hp = np.pad(a, 3, mode="edge")
+    ahead = 0.5 * (hp[5 : 5 + m] + hp[6 : 6 + m])
+    behind = 0.5 * (hp[0:m] + hp[1 : 1 + m])
+    return np.abs((ahead - behind) / SLOPE_SPAN)
+
+
 def _b64_array(arr: np.ndarray) -> dict:
     return {
         "b64": base64.b64encode(np.ascontiguousarray(arr).tobytes()).decode("ascii"),
@@ -330,8 +484,17 @@ def _b64_array(arr: np.ndarray) -> dict:
     }
 
 
-def _unb64_array(d: object, dtype: str, length: int) -> np.ndarray | None:
-    """Inverse of :func:`_b64_array`.  Returns ``None`` if anything is off."""
+def _unb64_array(
+    d: object, dtype: str, length: int, resample: bool = True
+) -> np.ndarray | None:
+    """Inverse of :func:`_b64_array`.  Returns ``None`` if anything is off.
+
+    ``resample=False`` demands exactly ``length`` elements and answers ``None``
+    otherwise.  That is what the width migration decodes with: it is asking
+    "are these the saved columns, all of them, unaltered?", and a stretched
+    answer to that question is worse than no answer - it is plausible-looking
+    land that nothing was built on.
+    """
     if not isinstance(d, dict):
         return None
     raw = d.get("b64")
@@ -346,6 +509,8 @@ def _unb64_array(d: object, dtype: str, length: int) -> np.ndarray | None:
         return None
     arr = arr.astype(dtype, copy=True)
     if arr.size != length:
+        if not resample:
+            return None
         # Saved at a different render width - resample rather than give up.
         src = np.linspace(0.0, 1.0, arr.size)
         dst = np.linspace(0.0, 1.0, length)
@@ -364,12 +529,12 @@ def _unb64_array(d: object, dtype: str, length: int) -> np.ndarray | None:
 class Terrain:
     """A one-dimensional landscape: ground height and material per column."""
 
-    W: int = RENDER_W
+    W: int = WORLD_W
     height: np.ndarray = field(
-        default_factory=lambda: np.full(RENDER_W, RENDER_H * 0.72, dtype=np.float32)
+        default_factory=lambda: np.full(WORLD_W, RENDER_H * 0.72, dtype=np.float32)
     )
     material: np.ndarray = field(
-        default_factory=lambda: np.full(RENDER_W, MAT_GRASS, dtype=np.uint8)
+        default_factory=lambda: np.full(WORLD_W, MAT_GRASS, dtype=np.uint8)
     )
     seed: int = 0
     style: str = "hills"
@@ -397,7 +562,7 @@ class Terrain:
         self._reach: tuple[np.ndarray, tuple[tuple[int, int, float], ...]] | None = None
         self._reach_epoch: int = -1
 
-        self.W = int(self.W) if int(self.W) > 8 else RENDER_W
+        self.W = int(self.W) if int(self.W) > 8 else WORLD_W
         self.height = np.asarray(self.height, dtype=np.float32).reshape(-1).copy()
         self.material = np.asarray(self.material, dtype=np.uint8).reshape(-1).copy()
         if self.height.size != self.W:
@@ -547,9 +712,10 @@ class Terrain:
         seed_i = int(seed) & 0xFFFFFFFF
         style = style if style in STYLES else "hills"
         rng = np.random.default_rng(seed_i)
-        w = RENDER_W
+        w = WORLD_W
 
-        f = _normalise(_fbm(rng, w, octaves=5, base_cells=_BASE_CELLS.get(style, 3.0)))
+        cells = _BASE_CELLS.get(style, 3.0) * float(WORLD_SCALE)
+        f = _normalise(_fbm(rng, w, octaves=5, base_cells=cells))
         f = _shape_style(f, style, rng, w)
         h = HEIGHT_MAX - (HEIGHT_MAX - HEIGHT_MIN) * np.clip(f, 0.0, 1.0)
 
@@ -565,22 +731,46 @@ class Terrain:
         if style == "chasm":
             t._cut_chasm(rng)
 
+        # Landmarks are per-map counts and so must scale with the map. Each of
+        # these carves exactly ONE feature per call, and the guarantee sweep
+        # below only ever asks for "at least one" - so on a 6400 px world an
+        # unscaled pass leaves a quarter of the old landmark density and a
+        # colony that happens to seat at x=4800 may never see either a cliff or
+        # a shelf. Run each WORLD_SCALE times over disjoint windows.
+        #
+        # Windowed rather than repeated over the whole map for two reasons.
+        # Disjoint windows are what makes them *spread*: unwindowed, _carve_shelf
+        # picks the globally flattest span every time and four calls flatten
+        # four overlapping copies of the same hilltop. And _carve_shelf builds
+        # sliding_window_view(sl, span).max(axis=1), which at 6400x220 float64
+        # materialises ~11 MB per call; per quarter it is ~2.8 MB. Same result,
+        # a quarter of the peak.
+        n_win = max(1, int(round(float(WORLD_SCALE))))
+        step = w / float(n_win)
+        shelves: list[tuple[int, int] | None] = []
+        for i in range(n_win):
+            win = (int(i * step), int((i + 1) * step))
+            shelves.append(t._carve_shelf(rng, window=win))
         # The *zone*, not the declared span: an escarpment landing on the outer
         # half of a chasm wall would re-steepen the face the cut just softened.
-        shelf = t._carve_shelf(rng)
-        t._carve_cliff(rng, avoid=(shelf, t._chasm_zone()))
+        avoid = tuple(shelves) + (t._chasm_zone(),)
+        for i in range(n_win):
+            win = (int(i * step), int((i + 1) * step))
+            t._carve_cliff(rng, avoid=avoid, window=win)
         t._clip_gen()
 
         # -- guarantee sweep ------------------------------------------------
+        # Still global and still "at least one": the windowed passes above raise
+        # the expected count, this is the floor that must hold on every seed.
         for _ in range(3):
             if t._has_cliff():
                 break
-            t._carve_cliff(rng, avoid=(shelf, t._chasm_zone()), force=True)
+            t._carve_cliff(rng, avoid=avoid, force=True)
             t._clip_gen()
         for _ in range(3):
             if t._has_shelf(120):
                 break
-            shelf = t._carve_shelf(rng)
+            t._carve_shelf(rng)
             t._clip_gen()
 
         t.retexture()
@@ -589,7 +779,7 @@ class Terrain:
     @classmethod
     def _fallback(cls, seed: int, style: str) -> "Terrain":
         """Dumb but valid terrain, used only if generation somehow explodes."""
-        w = RENDER_W
+        w = WORLD_W
         x = np.arange(w, dtype=np.float64)
         h = (
             RENDER_H * 0.70
@@ -603,12 +793,19 @@ class Terrain:
             seed=int(seed) & 0xFFFFFFFF,
             style=style if style in STYLES else "hills",
         )
-        # A guaranteed shelf and a guaranteed cliff, hand placed.
-        t.height[300:460] = t.height[380]
-        step = np.arange(w) >= 900
+        # A guaranteed shelf and a guaranteed cliff, hand placed. Fractions of
+        # w, not the absolute 300/460/900 they were: those were written when w
+        # was 1600 and would now put both landmarks inside the far-left seventh
+        # of the map, which is the one place a colony seated anywhere else can
+        # never reach. The fractions are the old pixels over 1600, so at
+        # RENDER_W this is byte-identical to what it always produced.
+        sh0, sh1 = int(w * 0.1875), int(w * 0.2875)
+        t.height[sh0:sh1] = t.height[(sh0 + sh1) // 2]
+        c = int(w * 0.5625)
+        step = np.arange(w) >= c
         t.height[step] -= 150.0
-        edge = slice(894, 907)
-        t.height[edge] = np.linspace(t.height[893], t.height[907], 13)
+        edge = slice(c - 6, c + 7)
+        t.height[edge] = np.linspace(t.height[c - 7], t.height[c + 7], 13)
         np.clip(t.height, HEIGHT_MIN, HEIGHT_MAX, out=t.height)
         t.touch()
         t.retexture()
@@ -756,21 +953,36 @@ class Terrain:
             return 0.0
         return float(np.max(absslope[a : b + 1]))
 
-    def _carve_shelf(self, rng: np.random.Generator) -> tuple[int, int] | None:
+    def _carve_shelf(
+        self,
+        rng: np.random.Generator,
+        window: tuple[int, int] | None = None,
+    ) -> tuple[int, int] | None:
         """Flatten the already-flattest window into a genuinely level shelf.
 
         Returns the ``(x0, x1)`` of the perfectly flat core (>= 120 px wide).
+
+        ``window`` restricts the search to ``[lo, hi)`` columns.  Generation
+        passes one quarter of the map per call so the shelves spread out instead
+        of four calls all finding the same globally-flattest hilltop; it also
+        keeps the sliding-window temporary to a quarter of its size.  ``None``
+        searches the whole map, which is what the guarantee sweep wants.
         """
         w = self.W
+        lo = 0 if window is None else int(max(0, min(w - 1, window[0])))
+        hi = w if window is None else int(max(lo + 1, min(w, window[1])))
         edge = 26
         span = int(rng.integers(190, 246))
+        # The w//4 clamp is against the WORLD, not the window: it exists so a
+        # tiny map cannot ask for a shelf wider than itself, and 190-246 px is
+        # already the shelf we want at every real width.
         span = int(min(span, max(2 * edge + 130, w // 4)))
-        n = w - span + 1
+        n = (hi - lo) - span + 1
         if n < 2:
             return None
 
         sl = np.abs(self.column_slope(raw=True))
-        win = np.lib.stride_tricks.sliding_window_view(sl, span)
+        win = np.lib.stride_tricks.sliding_window_view(sl[lo:hi], span)
         score = win.max(axis=1) + 0.25 * win.mean(axis=1)
 
         bad = np.zeros(n, dtype=bool)
@@ -781,13 +993,18 @@ class Terrain:
         # the two profiles met.
         zone = self._chasm_zone(12)
         if zone is not None:
-            starts = np.arange(n)
+            starts = np.arange(n) + lo
             bad |= (starts + span > zone[0]) & (starts < zone[1])
         if not bad.all():
             score = np.where(bad, np.inf, score)
-        i0 = int(np.argmin(score))
-        if not np.isfinite(score[i0]):
-            i0 = max(0, w // 2 - span // 2)
+        j0 = int(np.argmin(score))
+        if not np.isfinite(score[j0]):
+            # Unreachable while any start survives (argmin prefers a finite
+            # entry), so this is the all-NaN-slope guard it always was. Centre
+            # of the WINDOW now, not of the map - the global call is the one
+            # that still lands mid-map, and it is the one that used to.
+            j0 = max(0, (hi - lo) // 2 - span // 2)
+        i0 = lo + j0
 
         seg = self.height[i0 : i0 + span].astype(np.float64)
         core = seg[edge : span - edge]
@@ -807,9 +1024,18 @@ class Terrain:
         rng: np.random.Generator,
         avoid: tuple[tuple[int, int] | None, ...] = (),
         force: bool = False,
+        window: tuple[int, int] | None = None,
     ) -> bool:
-        """Cut an escarpment: a steep face, a short terrace, a long relaxation."""
+        """Cut an escarpment: a steep face, a short terrace, a long relaxation.
+
+        ``window`` restricts where the *face* may start; the terrace and the
+        relaxation tail are deliberately allowed to run past it, because those
+        are the parts that have to land on whatever geology is next door and
+        clipping them at a window edge would put a step exactly there.
+        """
         w = self.W
+        wlo = 0 if window is None else int(max(0, min(w - 1, window[0])))
+        whi = w if window is None else int(max(wlo + 1, min(w, window[1])))
         for attempt in range(6):
             wid = int(rng.integers(9, 17)) if not force else 7
             terrace = int(rng.integers(30, 90))
@@ -817,14 +1043,19 @@ class Terrain:
             want = float(rng.uniform(130.0, 200.0))
             reach = 2 * wid + terrace + relax
 
+            # 70 px in from the world rim, and inside the window if there is
+            # one. The rim margin is against the WORLD: a face hard against
+            # x=0 has no ground to relax into on one side.
+            c_lo = max(70, wlo)
+            c_hi = max(c_lo + 1, min(whi, w - 60 - reach))
             cands: list[int] = []
-            for cx in range(70, max(71, w - 60 - reach), 6):
+            for cx in range(c_lo, c_hi, 6):
                 box = (float(cx - wid), float(cx + wid + terrace + relax))
                 if any(_overlaps(box, a, pad=36.0) for a in avoid):
                     continue
                 cands.append(cx)
             if not cands:
-                cands = list(range(70, max(71, w - 60 - reach), 6)) or [w // 3]
+                cands = list(range(c_lo, c_hi, 6)) or [(wlo + whi) // 2]
             cx = int(cands[int(rng.integers(0, len(cands)))])
 
             here = float(self.height[min(max(cx, 0), w - 1)])
@@ -1723,6 +1954,259 @@ class Terrain:
         return d
 
     @classmethod
+    def _restore_saved_band(
+        cls,
+        d: dict,
+        saved_w: int,
+        seed: int,
+        style: str,
+        chasm: tuple[int, int] | None,
+    ) -> "Terrain | None":
+        """:meth:`_restore_saved_band_impl`, with the guarantee bolted on.
+
+        ``from_dict`` is the one method here that must not raise - persist.py
+        reads an exception as a corrupt save and QUARANTINES it, which destroys
+        a live colony - so the migration is wrapped rather than trusted, exactly
+        as ``generate`` wraps ``_generate_impl``.  Anything that escapes reads
+        as "could not do this honestly" and the caller regenerates.
+        """
+        try:
+            return cls._restore_saved_band_impl(d, int(saved_w), int(seed),
+                                                str(style), chasm)
+        except Exception:
+            log.exception("width migration failed; regenerating instead")
+            return None
+
+    @classmethod
+    def _restore_saved_band_impl(
+        cls,
+        d: dict,
+        saved_w: int,
+        seed: int,
+        style: str,
+        chasm: tuple[int, int] | None,
+    ) -> "Terrain | None":
+        """Restore a save whose column count is not ``WORLD_W``.
+
+        Returns ``None`` - "I could not do this honestly" - for anything at all
+        suspect, and the caller then regenerates.  It never returns a
+        half-restored landscape, because a half-restored landscape is the
+        failure this whole method exists to stop: it loads clean, looks like a
+        world, and drops the colony onto land it was not built on.
+
+        Where the saved band SITS, and why it is x=0
+        -------------------------------------------
+        At x=0, and the alternative is not close.  Every other coordinate in the
+        save - agent x, structure x, prop x, animal x, the spears in flight, the
+        chasm span, the crossing overlays, the harvest-claim table keyed by
+        column - is expressed against the saved world's own origin.  Restoring
+        the band at offset 0 is the only placement that needs none of them
+        rewritten.  Centring it (offset 2400) would mean translating every one
+        of those, across half a dozen modules, and a single field missed by that
+        sweep puts an entity on land it was not built on - which is exactly the
+        bug being fixed here, reintroduced by the fix.
+
+        The camera finds it perfectly well there.  ``colony_center()`` is a mean
+        over the saved structures, so on a restored 1600 px band it answers
+        somewhere inside 0..1600 - measured 1062.6 on the reference save - which
+        is a real interior x of the 6400 px map.  ``stage_bounds()`` clamps to
+        the map and gives (262.6, 1862.6); ``Camera.follow`` clamps its own x0
+        into ``[0, WORLD_W - RENDER_W]`` and opens on the colony exactly as it
+        did before the widening.  Centring buys the camera nothing it does not
+        already have.
+
+        The one honest cost: the colony now lives against the world's left rim,
+        so ``offstage_x(world, -1)`` clamps to 0 rather than standing a full
+        OFFSTAGE out.  On the reference save that point is still 1062 px from
+        the colony - past STAGE_HALF, so still genuinely off camera - but a
+        colony that later drifts left of x=800 loses the guarantee.  That is a
+        property of the clamp which any colony near either rim already has,
+        loaded or fresh, and the new land all arrives on the right, which is
+        where the colony can walk to.
+        """
+        try:
+            n = int(saved_w)
+        except (TypeError, ValueError):
+            return None
+        if n <= 8 or n == WORLD_W:
+            return None
+
+        # The saved columns or nothing: resample=False.  A heightmap that is not
+        # the length the save claims is junk, and the whole point here is that
+        # stretched junk is indistinguishable from land.
+        height = _unb64_array(d.get("height"), "float32", n, resample=False)
+        if height is None or height.size != n:
+            return None
+        height = height.astype(np.float64, copy=True)
+        if not bool(np.isfinite(height).all()):
+            # A heightmap with holes in it is not the land anything was built
+            # on either.  Regenerating loses the settlement's footing, which is
+            # bad; patching over the holes and calling it the saved land is
+            # worse, because nothing downstream can tell.
+            return None
+
+        material = _unb64_array(d.get("material"), "uint8", n, resample=False)
+
+        def _band(key: str) -> np.ndarray | None:
+            """A saved overlay, restored into its own columns and NaN elsewhere."""
+            if key not in d:
+                return None
+            a = _unb64_array(d.get(key), "float32", n, resample=False)
+            if a is None or a.size != n:
+                return None
+            out = np.full(WORLD_W, np.nan, dtype=np.float32)
+            out[: min(n, WORLD_W)] = a[: min(n, WORLD_W)]
+            return out
+
+        # A saved span that does not lie inside the saved band is a hand-edit;
+        # drop it rather than declare a cut across land that has none.
+        band_chasm: tuple[int, int] | None = None
+        if chasm is not None and 0 <= chasm[0] < chasm[1] <= n:
+            band_chasm = (int(chasm[0]), int(chasm[1]))
+
+        # -- the world SHRANK.  Only reachable from a save written by a build
+        # with a wider WORLD_W than this one, which has never existed; handled
+        # anyway because cropping is verbatim and one branch, where the resample
+        # path would silently squeeze the settlement into a smaller map.
+        if n > WORLD_W:
+            deck = _band("deck")
+            climb = _band("climb")
+            mat = (material[:WORLD_W].astype(np.uint8)
+                   if material is not None and material.size == n
+                   else np.full(WORLD_W, MAT_GRASS, dtype=np.uint8))
+            return cls(
+                W=WORLD_W,
+                height=height[:WORLD_W].astype(np.float32),
+                material=mat,
+                seed=seed,
+                style=style,
+                chasm=band_chasm if (band_chasm and band_chasm[1] <= WORLD_W) else None,
+                deck=deck,
+                climb=climb,
+            )
+
+        # -- the world GREW: restore the band, generate the rest --------------
+        ext_len = WORLD_W - n
+
+        # A save that already declares a cut keeps it, and the extension is then
+        # generated WITHOUT one: `chasm` is a single span, so a second cut in
+        # the new land could not be declared, and an undeclared cut is invisible
+        # to find_flat_span, find_climb_face and the bridge director - which
+        # would happily site a hut on its floor and a ladder up its wall.
+        gen_style = "hills" if (band_chasm is not None and style == "chasm") else style
+        g = cls.generate(seed, gen_style)
+        gh = g.height.astype(np.float64)
+        if gh.size != WORLD_W:
+            return None
+        gsl = _abs_slope_of(gh)
+
+        # 1. PHASE - which slice of the generated map the new land is.
+        #
+        # Judged on the whole first SEAM_LANDING columns of the candidate slice,
+        # not on column k alone.  Matching a single column is enough to make the
+        # join continuous, and measured that way it happily lands the colony's
+        # first step past the seam onto a generated escarpment - on the
+        # reference save the join read 0.04 and 44 px further on |slope| was
+        # 8.6, and over 40 migrated terrains eight of them put ground steeper
+        # than the walk gradient within 4 px of the join.
+        #
+        # A FILTER, not just a weight, and that is the difference between those
+        # eight and none: a soft penalty is a trade, and on a terraced 'cliffs'
+        # map where nothing is gentle the height term simply outbids it.  So the
+        # candidates are first cut down to those whose landing strip is walkable
+        # WITH the blend's own contribution already subtracted, and the height
+        # match only chooses between survivors.  A map with no qualifying strip
+        # at that length asks for a shorter one, and finally takes the best
+        # score it can get - fail-soft, never fail-hard.
+        rim = float(height[-1])
+        k_hi = WORLD_W - ext_len                      # == n
+        gentle = max(0.05, float(MAX_SLOPE_WALK) - float(SEAM_BLEND_GRADIENT))
+        k = 0
+        for want in (SEAM_LANDING, SEAM_LANDING // 2, SEAM_LANDING // 4, 8):
+            probe = int(max(1, min(int(want), ext_len)))
+            roll = np.lib.stride_tricks.sliding_window_view(
+                gsl[: k_hi + probe], probe).max(axis=1)  # roll[k] over [k, k+probe)
+            m = int(min(k_hi + 1, roll.size))
+            if m <= 0:
+                return None
+            base = np.abs(gh[:m] - rim) + SEAM_PHASE_SLOPE_WEIGHT * roll[:m]
+            ok = roll[:m] <= gentle
+            if bool(ok.any()):
+                k = int(np.argmin(np.where(ok, base, np.inf)))
+                break
+            k = int(np.argmin(base))
+
+        # 2. BLEND - decay whatever step is left over `blend` px.
+        ext_raw = gh[k : k + ext_len].copy()
+        if ext_raw.size != ext_len:
+            return None
+        step = rim - float(ext_raw[0])
+        blend = int(np.clip(
+            np.ceil(abs(step) * 1.5 / max(1e-6, float(SEAM_BLEND_GRADIENT))),
+            SEAM_BLEND_MIN, SEAM_BLEND_MAX))
+
+        # Verified against what the land ALREADY read like on the saved map's
+        # own right-hand edge, not against MAX_SLOPE_WALK alone: the saved band
+        # is restored verbatim, so if it ends in a cliff of its own no blend can
+        # make the reading gentler, and holding out for one would just burn the
+        # retries.  The bar is "the join is no worse than the ground it joins".
+        rim_peak = float(_abs_slope_of(height)[max(0, n - SEAM_PROBE):].max())
+        limit = max(float(MAX_SLOPE_WALK), rim_peak)
+
+        full = np.empty(WORLD_W, dtype=np.float64)
+        full[:n] = height
+        idx = np.arange(ext_len, dtype=np.float64)
+        a = max(0, n - SEAM_PROBE)
+        b = min(WORLD_W, n + SEAM_PROBE)
+        peak = 0.0
+        for _ in range(max(1, SEAM_TRIES)):
+            full[n:] = ext_raw + step * (1.0 - _smoothstep(idx / float(max(1, blend))))
+            peak = float(_abs_slope_of(full)[a:b].max())
+            if peak <= limit or blend >= SEAM_BLEND_MAX:
+                break
+            blend = int(min(SEAM_BLEND_MAX,
+                            int(np.ceil(blend * peak / max(1e-6, limit))) + 1))
+
+        # The restored band is NOT clipped here and must not be: the old build's
+        # HARD_MIN/HARD_MAX are this build's (RENDER_H never changed), so every
+        # saved value is already inside them and __post_init__'s clip is a no-op
+        # on the band.  The extension can leave the band after the offset, and
+        # that same clip catches it.
+        mat = np.empty(WORLD_W, dtype=np.uint8)
+        if material is not None and material.size == n:
+            mat[:n] = material
+        else:
+            mat[:n] = MAT_GRASS
+        mat[n:] = g.material[k : k + ext_len]
+
+        t = cls(
+            W=WORLD_W,
+            height=full.astype(np.float32),
+            material=mat,
+            seed=seed,
+            style=style,
+            chasm=band_chasm,
+            deck=_band("deck"),
+            climb=_band("climb"),
+        )
+        # The generated map's own cut, translated into the extension, but only
+        # when the save had none of its own and the whole cut - walls included -
+        # landed inside the slice.  A half-sliced cut is declared as no cut at
+        # all rather than as a span running off the end of the map.
+        if band_chasm is None and g.chasm is not None:
+            try:
+                z = g._chasm_zone(4)
+                if z is not None and z[0] >= k and z[1] <= k + ext_len:
+                    t.chasm = (int(g.chasm[0]) - k + n, int(g.chasm[1]) - k + n)
+            except Exception:
+                t.chasm = None
+        log.info(
+            "terrain widened from a %d px save: band 0..%d restored verbatim, "
+            "%d px generated from column %d, seam blend %d px, peak |slope| "
+            "%.2f (limit %.2f)", n, n - 1, ext_len, k, blend, peak, limit)
+        return t
+
+    @classmethod
     def from_dict(cls, d: dict) -> "Terrain":
         """Restore a saved landscape.  Never raises.
 
@@ -1740,20 +2224,6 @@ class Terrain:
         style = d.get("style", "hills")
         style = style if isinstance(style, str) and style in STYLES else "hills"
 
-        try:
-            w = int(d.get("w", RENDER_W))
-        except (TypeError, ValueError):
-            w = RENDER_W
-        if w != RENDER_W:
-            w = RENDER_W
-
-        height = _unb64_array(d.get("height"), "float32", w)
-        material = _unb64_array(d.get("material"), "uint8", w)
-        if height is None:
-            return cls.generate(seed, style)
-        if material is None:
-            material = np.full(w, MAT_GRASS, dtype=np.uint8)
-
         chasm: tuple[int, int] | None = None
         raw = d.get("chasm")
         if isinstance(raw, (list, tuple)) and len(raw) == 2:
@@ -1761,6 +2231,54 @@ class Terrain:
                 chasm = (int(raw[0]), int(raw[1]))
             except (TypeError, ValueError):
                 chasm = None
+
+        # Old saves carry w=1600, and that number is the whole migration. It
+        # used to be thrown away - w was forced to WORLD_W and the 1600-column
+        # heightmap went through _unb64_array's resampler, which STRETCHED the
+        # saved land four times wider. The save loaded without raising, so
+        # persist.py never quarantined it, and the settlement was then standing
+        # on land that had moved under it by a mean of 98 px: huts 174-182 px in
+        # the air, a barricade 180 px underground, and a population of 8 down to
+        # 3 inside three sim-minutes with every death a fall. "Loads clean, then
+        # the colony falls to its death" is the worst failure this file has,
+        # because it looks like success.
+        #
+        # So a width that is not WORLD_W now goes to _restore_saved_band, which
+        # keeps the saved columns byte-for-byte and generates only the new land.
+        # It returns None rather than guessing, and a None here regenerates -
+        # the documented fail-soft, and still never a stretch. SAVE_VERSION
+        # stays 1: nothing about the format changed, only what is done with a
+        # field it always carried.
+        #
+        # The width the height array ACTUALLY is decides this, with `w` as the
+        # fallback rather than the authority. `w` is a separate claim about the
+        # same fact, and a save old enough to predate the field - or one a hand
+        # has been in - would otherwise sail straight past this branch and into
+        # the resampler with a 1600-column heightmap.
+        saved_w = _array_len(d.get("height"))
+        if saved_w is None:
+            try:
+                saved_w = int(d.get("w", WORLD_W))
+            except (TypeError, ValueError):
+                saved_w = WORLD_W
+
+        if saved_w != WORLD_W:
+            band = cls._restore_saved_band(d, saved_w, seed, style, chasm)
+            if band is not None:
+                return band
+            log.warning(
+                "save carries a %s px terrain (w field says %r) that could not "
+                "be restored; regenerating from seed %d",
+                saved_w, d.get("w"), seed)
+            return cls.generate(seed, style)
+
+        w = WORLD_W
+        height = _unb64_array(d.get("height"), "float32", w)
+        material = _unb64_array(d.get("material"), "uint8", w)
+        if height is None:
+            return cls.generate(seed, style)
+        if material is None:
+            material = np.full(w, MAT_GRASS, dtype=np.uint8)
 
         # A crossing overlay is pure convenience: it can always be re-stamped by
         # the structure that owns it on its next tick.  So anything unreadable
@@ -1797,7 +2315,13 @@ def _shape_style(
 
     if style == "plateau":
         cx = float(rng.integers(int(w * 0.30), int(w * 0.70)))
-        hw = float(rng.integers(150, 300))
+        # Half-width as a fraction of the map, not the absolute 150-300 px it
+        # was: those numbers made the plateau 19-37% of a 1600 px world, which
+        # is what "plateau" means as a *style*. Left absolute on 6400 px it
+        # becomes a 300 px bump covering 4.7% of the land and the style stops
+        # being distinguishable from 'hills'. The fractions are the old pixels
+        # over 1600, so RENDER_W-wide worlds are unchanged.
+        hw = float(rng.integers(int(w * 0.09375), int(w * 0.1875)))
         edge = float(rng.uniform(15.0, 26.0))
         d = np.abs(x - cx)
         mask = _smoothstep((hw + edge - d) / (2.0 * edge))

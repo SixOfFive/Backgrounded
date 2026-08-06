@@ -92,9 +92,10 @@ from typing import Any, Sequence
 
 import pygame
 
-from ..constants import RENDER_H, RENDER_W
+from ..constants import RENDER_H
 from ..sim.entities import AGENT_HEIGHT
 from . import fx
+from .camera import IDENTITY, Camera
 
 log = logging.getLogger(__name__)
 
@@ -247,19 +248,23 @@ def _iter_spears(world: Any) -> list[Any]:
 
 # -------------------------------------------------------------- one spear --
 def spear_pose(spear: Any, world: Any = None) -> tuple[float, float, float] | None:
-    """``(tip_x, tip_y, angle)`` for *spear*, or None if it should not be drawn.
+    """``(tip_x, tip_y, angle)`` for *spear* in WORLD space, or None.
 
     Split out from the drawing so the geometry can be asserted in a test
     without a Surface, and so the flight/ground decision lives in exactly one
     place. Duck-typed throughout - ``state`` may be missing entirely, in which
     case a spear with velocity is flying and one without is lying down, which
     is the same answer the sim would give.
+
+    The horizontal cull used to live here and it was wrong twice over: it
+    compared a WORLD x against RENDER_W, which discards everything past the
+    first quarter of a 6400 px map, and it made a geometry function depend on
+    where the camera happened to be looking. It now lives in :func:`draw_one`,
+    in screen space, which is the only place that knows about a frame.
     """
     x = fx.attr_num(spear, "x", default=math.nan)
     y = fx.attr_num(spear, "y", default=math.nan)
     if not (math.isfinite(x) and math.isfinite(y)):
-        return None
-    if x < -_CULL or x > RENDER_W + _CULL:
         return None
     if y < -_CULL or y > RENDER_H + _CULL:
         return None
@@ -334,12 +339,23 @@ def draw_spear(surf: pygame.Surface, x: float, y: float, angle: float, *,
               (gx + ux * _GRIP_HALF, gy + uy * _GRIP_HALF), _SHAFT_W)
 
 
-def draw_one(surf: pygame.Surface, spear: Any, world: Any) -> None:
-    """Draw a single sim spear, lit or flat. Raises nothing the caller minds."""
+def draw_one(surf: pygame.Surface, spear: Any, world: Any, *,
+             cam: Camera) -> None:
+    """Draw a single sim spear, lit or flat. Raises nothing the caller minds.
+
+    *cam* is REQUIRED and has no default: a spear's ``x`` is a world x on a
+    6400 px map against a 1600 px frame. sim/throwing.py modelled a real
+    projectile for 230 throws before anything drew it at all; drawing it at
+    world coordinates is the same failure wearing a call site.
+    """
     pose = spear_pose(spear, world)
     if pose is None:
         return
-    x, y, ang = pose
+    wx, y, ang = pose
+    # The cull the geometry function used to do, now in screen space and with
+    # the shaft's own length as the pad so a spear does not pop in at the edge.
+    if not cam.visible(wx, _CULL):
+        return
     grounded = str(getattr(spear, "state", "") or "") != "flight"
     # Sample the light at the middle of the shaft, not at the tip. The object
     # is 25 px long and the silhouette test is a single point, so the sample
@@ -348,14 +364,18 @@ def draw_one(surf: pygame.Surface, spear: Any, world: Any) -> None:
     # the tip would flip the whole thing flat while most of it is lit.
     # creatures._draw_animal does exactly this and for exactly this reason - it
     # samples `y - height * 0.5`, the middle of the body, not the feet.
-    lit = _light_at(world, x - math.cos(ang) * _LEN * 0.5,
+    # WORLD x for the light sample - lighting.light_at reads the sim's own
+    # sources - and screen x for the drawing. The one conversion is on the
+    # draw_spear line.
+    lit = _light_at(world, wx - math.cos(ang) * _LEN * 0.5,
                     y - math.sin(ang) * _LEN * 0.5)
     flat: Color | None = _SIL_COLOR if lit < _SIL_CUTOFF else None
-    draw_spear(surf, x, y, ang, flat=flat,
+    draw_spear(surf, cam.sx(wx), y, ang, flat=flat,
                fade=_GROUND_FADE if grounded else 1.0)
 
 
-def draw_spears(surf: pygame.Surface, world: Any, t: float = 0.0) -> None:
+def draw_spears(surf: pygame.Surface, world: Any, t: float = 0.0, *,
+                cam: Camera) -> None:
     """Draw every spear in *world*. Fails soft, per spear and overall.
 
     *t* is accepted and ignored, so the call site matches
@@ -363,6 +383,8 @@ def draw_spears(surf: pygame.Surface, world: Any, t: float = 0.0) -> None:
     nothing for a clock to drive here: both poses are pure functions of sim
     state, which is the reason a spear does not jitter while the game is
     paused.
+
+    *cam* is REQUIRED and has no default - see :func:`draw_one`.
     """
     try:
         spears = _iter_spears(world)
@@ -373,7 +395,7 @@ def draw_spears(surf: pygame.Surface, world: Any, t: float = 0.0) -> None:
         return
     for s in spears:
         try:
-            draw_one(surf, s, world)
+            draw_one(surf, s, world, cam=cam)
         except Exception:
             log.debug("spear draw failed", exc_info=True)
 
@@ -408,14 +430,26 @@ if __name__ == "__main__":                             # pragma: no cover
     from ..sim.throwing import Spear, STATE_FLIGHT, STATE_GROUND
 
     gy = world.terrain.ground_y
-    for i, (sx, ang) in enumerate(((300.0, -1.05), (420.0, -0.35), (540.0, 0.45))):
+    # Sited relative to the COLONY, not at absolute 300-820. The world is 6400
+    # px wide and the camera is wherever the villagers are, so the literal
+    # coordinates this used put every spear ~3500 px off the left of the frame
+    # and the "does this module draw anything" assertion below failed for the
+    # only reason it must never fail for: the test was looking the wrong way.
+    from ..sim.actions import colony_center
+
+    home = float(colony_center(world))
+    ren = Renderer()
+    ren.camera.snap_to(home)
+
+    for i, (off, ang) in enumerate(((-260.0, -1.05), (-140.0, -0.35), (-20.0, 0.45))):
+        sx = home + off
         reg.spears.append(Spear(id=90 + i, x=sx, y=gy(sx) - 70.0,
                                 vx=math.cos(ang) * 300.0,
                                 vy=math.sin(ang) * 300.0, state=STATE_FLIGHT))
-    for i, sx in enumerate((640.0, 700.0, 760.0, 820.0)):
+    for i, off in enumerate((80.0, 140.0, 200.0, 260.0)):
+        sx = home + off
         reg.spears.append(Spear(id=80 + i, x=sx, y=gy(sx), state=STATE_GROUND))
 
-    ren = Renderer()
     # The base frame has to be rendered with this module STUBBED OUT, because
     # renderer.draw already calls draw_spears at step 7. Copying the finished
     # frame instead measures "what does drawing the same AA line twice change",
@@ -428,7 +462,9 @@ if __name__ == "__main__":                             # pragma: no cover
     finally:
         _self.draw_spears = _real
     before = pygame.surfarray.array3d(scene).copy()
-    draw_spears(scene, world, world.world_time)
+    # ren.camera, not IDENTITY: this second pass has to land on top of the
+    # frame ren.draw just produced, and that frame is wherever the colony is.
+    draw_spears(scene, world, world.world_time, cam=ren.camera)
     after = pygame.surfarray.array3d(scene)
     changed = int((before != after).any(axis=2).sum())
     print(f"{len(reg.spears)} spears from {src}: {changed} px changed "
@@ -439,7 +475,7 @@ if __name__ == "__main__":                             # pragma: no cover
     def _cost(n_frames: int = 400) -> float:
         t0 = _time.perf_counter()
         for _ in range(n_frames):
-            draw_spears(scene, world, 0.0)
+            draw_spears(scene, world, 0.0, cam=ren.camera)
         return (_time.perf_counter() - t0) * 1e6 / n_frames
 
     busy = _cost()
@@ -454,14 +490,28 @@ if __name__ == "__main__":                             # pragma: no cover
     class _Bare:
         pass
 
-    draw_spears(scene, _Bare(), 0.0)
+    draw_spears(scene, _Bare(), 0.0, cam=IDENTITY)
     bare = _Bare()
     bare.spears = [None, 7, "spear", types.SimpleNamespace(x="?", y=1.0)]
-    draw_spears(scene, bare, 0.0)
+    draw_spears(scene, bare, 0.0, cam=IDENTITY)
     bare2 = _Bare()
     bare2.spears = list(reg.spears)                    # registry as a plain list
-    draw_spears(scene, bare2, 0.0)
-    assert spear_pose(types.SimpleNamespace(x=1e9, y=0.0)) is None, "no culling"
+    draw_spears(scene, bare2, 0.0, cam=IDENTITY)
+    # spear_pose answers in WORLD space and no longer culls on x: a spear at
+    # 1e9 is a real position on no map we ship, but it is the CAMERA that
+    # decides it is off frame, and it does that in draw_one.
+    assert spear_pose(types.SimpleNamespace(x=1e9, y=0.0)) is not None
+    _probe = types.SimpleNamespace(id=1, x=1e9, y=0.0, state="ground")
+    _b = pygame.surfarray.array3d(scene).copy()
+    draw_one(scene, _probe, None, cam=IDENTITY)
+    assert not (_b != pygame.surfarray.array3d(scene)).any(), \
+        "draw_one drew a spear a billion px off screen"
+    try:
+        draw_spears(scene, bare2, 0.0)                  # type: ignore[call-arg]
+    except TypeError as _exc:
+        print("cam is required:", _exc)
+    else:
+        raise SystemExit("draw_spears accepted a call with no camera")
     print("fail-soft OK")
 
     out = os.path.join(os.environ.get("TEMP", "."), "throwing_smoke.png")

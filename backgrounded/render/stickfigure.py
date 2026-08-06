@@ -52,11 +52,12 @@ from ..sim.entities import (
     Stickman,
     morph_scales,
 )
+from .camera import IDENTITY, Camera
 
 log = logging.getLogger(__name__)
 
 __all__ = [
-    "POSES", "Skeleton", "build_skeleton", "pose_of",
+    "POSES", "Skeleton", "build_skeleton", "to_screen", "pose_of",
     "draw_stickman", "draw_grave", "SILHOUETTE",
 ]
 
@@ -747,36 +748,79 @@ _creatures: Any = None
 
 
 # ------------------------------------------------------------- main draw --
+def to_screen(sk: Skeleton, dx: float) -> Skeleton:
+    """*sk* translated by *dx* px along x: world space -> screen space.
+
+    The camera is a pure horizontal translation, so converting a solved
+    skeleton is cheaper and far less error-prone than teaching ``_solve`` about
+    a camera: every joint moves by the same number and nothing else about the
+    pose changes. It also keeps :func:`build_skeleton`'s public contract - it
+    still answers in WORLD space, which is what ``creatures.draw_gear`` and
+    ``items`` want when they solve one themselves.
+
+    Returns *sk* itself when there is nothing to do, so the identity camera and
+    the contact sheets pay nothing at all.
+    """
+    if not dx:
+        return sk
+    def m(p: tuple[float, float]) -> tuple[float, float]:
+        return (p[0] + dx, p[1])
+    return Skeleton(
+        hip=m(sk.hip), neck=m(sk.neck), shoulder=m(sk.shoulder), head=m(sk.head),
+        head_r=sk.head_r,
+        knees=[m(p) for p in sk.knees], feet=[m(p) for p in sk.feet],
+        elbows=[m(p) for p in sk.elbows], hands=[m(p) for p in sk.hands],
+        height=sk.height, facing=sk.facing, pose=sk.pose, girth=sk.girth,
+    )
+
+
 def draw_stickman(
     surf: pygame.Surface,
     s: Stickman,
     t: float,
     alpha_color: tuple[int, int, int] | None = None,
+    *,
+    cam: Camera,
 ) -> None:
     """Draw one stickman, its held items and its speech bubble.
 
     *t* is the render clock in seconds (breathing, flicker, jitter). Pass
     *alpha_color* to force silhouette mode - a flat near-black outline for an
     agent standing outside every light source.
+
+    *cam* is REQUIRED and has no default. ``s.x`` is a world x on a 6400 px map
+    and *surf* is a 1600 px frame, so a caller that forgets the camera draws
+    every villager off the right-hand edge - which is precisely what happened
+    while this parameter was optional, and it cost a whole workflow round: the
+    frame came back with name plates floating over empty ground and not one
+    body pixel anywhere. A missing camera must be a TypeError on the first
+    frame, not a picture that is quietly wrong. Pass ``camera.IDENTITY`` if you
+    genuinely mean "world coordinates are screen coordinates".
     """
     try:
-        _draw(surf, s, float(t), alpha_color)
+        _draw(surf, s, float(t), alpha_color, cam)
     except Exception:
         log.exception("draw_stickman failed for %s", getattr(s, "name", "?"))
 
 
 def _draw(surf: pygame.Surface, s: Stickman, t: float,
-          alpha_color: tuple[int, int, int] | None) -> None:
+          alpha_color: tuple[int, int, int] | None, cam: Camera) -> None:
     x = float(getattr(s, "x", 0.0))
     y = float(getattr(s, "y", 0.0))
     if not (math.isfinite(x) and math.isfinite(y)):
         return
     h = _height_of(s)
-    # Cheap reject: bubbles and flung limbs stay inside this margin.
-    if x < -h * 2.0 or x > RENDER_W + h * 2.0 or y < -h * 3.0 or y > RENDER_H + h * 2.0:
+    # Cheap reject, in SCREEN space. Culling on the world x was the second half
+    # of the bug: it threw away everything past x = 1600 on a 6400 px map and
+    # mislaid the rest by cam.x. Bubbles and flung limbs stay inside the pad.
+    if not cam.visible(x, h * 2.0):
+        return
+    if y < -h * 3.0 or y > RENDER_H + h * 2.0:
         return
 
-    sk = build_skeleton(s, t)
+    # ONE conversion, here. Everything below this line is screen space: the
+    # skeleton, the gear solved off it, the bubble's RENDER_W clamps.
+    sk = to_screen(build_skeleton(s, t), -cam.x)
     silhouette = alpha_color is not None
     if silhouette:
         base = tuple(int(c) for c in alpha_color[:3])   # type: ignore[index]
@@ -1150,16 +1194,19 @@ _GLYPH_DRAW: dict[str, Callable[..., None]] = {
 
 # ------------------------------------------------------------------ grave --
 def draw_grave(surf: pygame.Surface, prop: Any,
-               alpha_color: tuple[int, int, int] | None = None) -> None:
+               alpha_color: tuple[int, int, int] | None = None,
+               *, cam: Camera) -> None:
     """Draw a gravestone.
 
     *prop* is duck-typed so props.py owns the real class: anything with ``x``
     and ``y`` attributes (or a dict with those keys) works. An optional
     ``color`` is used as an identity chip on the stone, and an optional
     ``name`` seeds the stone's lean so a row of graves is not uniform.
+
+    *cam* is REQUIRED - ``prop.x`` is a world x. See :func:`draw_stickman`.
     """
     try:
-        _draw_grave(surf, prop, alpha_color)
+        _draw_grave(surf, prop, alpha_color, cam)
     except Exception:
         log.exception("draw_grave failed")
 
@@ -1171,16 +1218,20 @@ def _get(prop: Any, key: str, default: Any = None) -> Any:
 
 
 def _draw_grave(surf: pygame.Surface, prop: Any,
-                alpha_color: tuple[int, int, int] | None) -> None:
+                alpha_color: tuple[int, int, int] | None,
+                cam: Camera) -> None:
     try:
-        x = float(_get(prop, "x", 0.0))
+        wx = float(_get(prop, "x", 0.0))
         y = float(_get(prop, "y", 0.0))
     except Exception:
         return
-    if not (math.isfinite(x) and math.isfinite(y)):
+    if not (math.isfinite(wx) and math.isfinite(y)):
         return
-    if x < -24 or x > RENDER_W + 24 or y < -24 or y > RENDER_H + 24:
+    if not cam.visible(wx, 24.0):
         return
+    if y < -24 or y > RENDER_H + 24:
+        return
+    x = cam.sx(wx)
 
     silhouette = alpha_color is not None
     stone = tuple(int(c) for c in alpha_color[:3]) if silhouette else _GRAVE_STONE
@@ -1190,7 +1241,11 @@ def _draw_grave(surf: pygame.Surface, prop: Any,
     h = AGENT_HEIGHT * 0.62
     w = h * 0.62
     # Deterministic lean from position: no rng, no state, stable across frames.
-    tilt = math.sin(x * 0.37 + y * 0.11) * 0.13
+    # Off the WORLD x deliberately - keyed to the screen x it would change as
+    # the camera eased past, and a headstone that leans differently depending
+    # on where you are looking from is the most obviously wrong thing on the
+    # map. Every coordinate below this line is screen space.
+    tilt = math.sin(wx * 0.37 + y * 0.11) * 0.13
     st, ct = math.sin(tilt), math.cos(tilt)
 
     def pt(lx: float, ly: float) -> tuple[int, int]:
@@ -1258,12 +1313,23 @@ if __name__ == "__main__":   # pragma: no cover - visual smoke test
         elif pose != "silhouette":
             a.pose_override = pose
         draw_stickman(sheet, a, 1.35,
-                      SILHOUETTE if pose == "silhouette" else None)
+                      SILHOUETTE if pose == "silhouette" else None,
+                      cam=IDENTITY)
         pygame.draw.line(sheet, (40, 44, 52), (cx - 34, cy), (cx + 34, cy))
 
     for k in range(3):
         draw_grave(sheet, {"x": 26 + k * 16, "y": CELL_H - 22,
-                           "color": (232, 106, 106), "name": "Vessa"})
+                           "color": (232, 106, 106), "name": "Vessa"},
+                   cam=IDENTITY)
+
+    # The camera is not optional any more, and a contact sheet is the one place
+    # that genuinely means "world coordinates are screen coordinates".
+    try:
+        draw_stickman(sheet, pop.spawn(10, 10, rng=rng), 1.35)   # type: ignore[call-arg]
+    except TypeError as exc:
+        print("cam is required:", exc)
+    else:
+        raise SystemExit("draw_stickman accepted a call with no camera")
 
     import tempfile
     out = os.path.join(tempfile.gettempdir(), "backgrounded_poses.png")

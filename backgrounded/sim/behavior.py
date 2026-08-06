@@ -47,6 +47,8 @@ from ..constants import (
     MAT_STONE,
     MAX_SLOPE_CLIMB,
     MAX_SLOPE_WALK,
+    MIN_POP,
+    POP_PER_HUT,
     RELIC_FETCH_RANGE,
     RENDER_W,
     RES_COOKED,
@@ -57,7 +59,9 @@ from ..constants import (
     RES_WOOD,
     SCENE_BLIZZARD,
     SCENE_NIGHT_STORM,
+    STAGE_HALF,
     WALK_SPEED,
+    WORLD_W,
 )
 from .actions import (
     CARRY_CAP,
@@ -77,6 +81,7 @@ from .actions import (
     prop_alive,
     props_of,
     rng_of,
+    settlement_center,
     slope_at,
     stock_qty,
     structures_of,
@@ -103,6 +108,8 @@ __all__ = [
     "stone_surplus",
     "pick_hut_upgrade",
     "find_chasm",
+    "chasm_in_reach",
+    "crossing_reach",
     "find_cutoff",
     "plan_crossing",
     "HYSTERESIS_BONUS",
@@ -146,11 +153,57 @@ TIEBREAK = 0.03             # random jitter so identical scores do not lock step
 OVERRIDE_FLOOR = 0.95       # scores at or above this ignore hysteresis
 DIRECTOR_PERIOD = 2.0       # seconds between director passes
 MAX_CONCURRENT_SITES = 2    # unfinished buildings the colony tolerates at once
-MAX_HUTS = 6
+#: Raised 6 -> 7 with MAX_POP 10 -> 20, and it is not a taste change: growth is
+#: gated on shelter in ``World._tick_hut_tier``'s neighbour at world.py:931,
+#: ``n >= huts * POP_PER_HUT``. POP_PER_HUT is 3, so six huts house 18 and the
+#: colony could never reach its own cap - the roster would stall two short of 20
+#: with no message and no visible cause, and MAX_POP would silently not be the
+#: thing limiting the population. Seven huts house 21, which puts the ceiling
+#: back where the constant says it is.
+MAX_HUTS = 7
 MAX_WALLS = 4
 TOTEM_POP = 8
 TREE_TARGET = 10            # below this, someone plants saplings
-SITE_RANGE = 300.0          # how far from the colony centre a site may be
+#: How far from the colony centre a site may be.
+#:
+#: Raised 300 -> 500 for MAX_POP 20. Twenty people want seven huts (was four);
+#: at the hut ``spacing`` of 54 px that is 378 px of hut alone, inside a band
+#: that also has to hold a firepit (58), a stockpile (28), a watchtower (120), a
+#: workshop (80), a totem and up to four walls. It does not fit in 600 px, and
+#: the failure mode is quiet in the worst way: ``pick_site`` starts returning
+#: None because every column is inside somebody's spacing, so ``_stake_out_site``
+#: no-ops and the build order stalls forever with nothing logged.
+#:
+#: 500 is affordable now and was not before. On a 1600 px world a 1000 px
+#: settlement was most of the map, wilderness included; on a 6400 px world it is
+#: a sixth of the land and still sits comfortably inside the 1600 px camera, so
+#: the whole colony stays in one frame.
+#:
+#: Knock-on worth knowing rather than acting on: spreading twenty colonists over
+#: 1000 px instead of 600 px lowers their linear density, which pushes the BFG's
+#: measured P(line clear) back UP from where doubling the roster alone put it.
+#: The two effects are coupled, so the corridor numbers in constants.py:993 must
+#: be re-measured against BOTH changes at once, never against either alone.
+SITE_RANGE = 500.0
+#: How far out from the settlement a barricade stands, in px.
+#:
+#: STAGE_HALF (800) is the frame edge and is the wrong answer by exactly the
+#: slack it leaves, which is none. Measured on seed 7 at 25 sim-minutes: a
+#: barricade staked at -800 when the colony was four buildings old ended up 942
+#: px from the settlement centre, because every hut that went up afterwards
+#: pulled the mean 140 px the other way - so a defence that was on camera when
+#: it was built was off it by the time anything attacked. The camera has the
+#: same problem from the other end: it follows the agent CLUSTER, not the
+#: structure mean, so the frame is already offset from this centre by whatever
+#: the colonists are doing.
+#:
+#: 160 px of slack, the same margin OFFSTAGE uses over STAGE_HALF, covers both.
+#: 640 is still 140 px outside SITE_RANGE, so the band's outer half never
+#: overlaps the settlement footprint; its inner end (640 - 256 = 384) does, but
+#: the scorer prefers the outermost non-cliff column, so a barricade only comes
+#: in that far when the whole outer band is cliff - which is the case where
+#: standing it up at all beats standing it up in the right place.
+BARRICADE_STANDOFF = STAGE_HALF - 160.0
 CHILD_MATURE_AGE = 480.0    # seconds before a child picks up a trade
 BUILDER_RATIO = 0.45
 CHASM_DEPTH = 36.0
@@ -378,6 +431,86 @@ KIND_PRIORITY: dict[str, float] = {
     "watchtower": 0.54,
     "totem": 0.40,
 }
+
+#: ...but that priority is earned by PROXIMITY, not by kind, and this is the
+#: number that says so. A crossing outranks the roof over the colony's head
+#: because it is *blocking* - while it is missing, the ground, the wood or one
+#: of the people is on the far side of a drop. A crossing the colony has to walk
+#: a stage-width to reach is blocking nothing at home; it is an expedition.
+#:
+#: On a 1600 px world the distinction did not exist, because "the wall in the
+#: way" was never more than STAGE_HALF away and the walk was free. Measured on
+#: the 6400 px world: seed 2 staked a bridge 1329 px from the settlement with a
+#: half-built hut standing at 135 px, and `_mk_build` sent both surviving
+#: colonists to the bridge - the queue is sorted by priority and pools only what
+#: is within 0.06 of the head, so at 1.10 against 0.85 the hut was not even a
+#: candidate. The hut was still at completion 0.0 twelve minutes later, nobody
+#: could sleep, fatigue pegged at 1.00, morale fell to 0.00 against a
+#: MORALE_TO_GROW of 0.45, and the colony sat at MIN_POP for 73 of 90 minutes.
+#:
+#: 0.82 is chosen against the two numbers it has to sit between: below `hut`
+#: (0.85) so a roof wins outright, and within `_mk_build`'s 0.06 pool window of
+#: it so that when both are open the *closer* one wins rather than the kind.
+#: Above `grave` and every outwork, because a way across is still worth more
+#: than a fence. A crossing inside the stage keeps 1.10 untouched, so the chasm
+#: maps KIND_PRIORITY was written for are unaffected.
+CROSSING_FAR_PRIORITY = 0.82
+
+#: How far from the settlement the colony will stake a crossing it is not being
+#: killed by, and the two numbers that let that grow.
+#:
+#: This is the barricade migration applied to the crossing director. `_barricade_
+#: site` was already moved off "the edge of the MAP" onto "the edge of the
+#: COLONY" when the world went 1600 -> 6400; the crossing planner was left
+#: reasoning about all 6400 px, and so was the legacy "there is a chasm
+#: somewhere, bridge it eventually" line in the build order. Measured at t=0 over
+#: the 14-seed sweep, `find_chasm` names a gap 54, 683, 754, 786, 900, 1084,
+#: 1308, 1391, 1503, 1653, 2617, 2718, 3856 and 4307 px from the settlement -
+#: twelve of fourteen seeds have one, and on the old world every one of them
+#: would have been inside a stage-width by construction.
+#:
+#: THE TWO BASES ARE DIFFERENT NUMBERS BECAUSE THEY ANSWER DIFFERENT QUESTIONS,
+#: and collapsing them was measured costing more than it saved. A *blocking*
+#: crossing is answering something the colony actually needs - its fire, its
+#: stores, one of its own people, or the last wood on its side - and where the
+#: wall sits is not the colony's choice. The legacy line is answering nothing at
+#: all: "there is a gap over there and one day we should span it".
+#:
+#: So the blocking planner gets RENDER_W, one whole camera width - the country
+#: the colony works, well outside the stage it is drawn on, and the distance
+#: animals already walk in from - while the "eventually" line gets STAGE_HALF,
+#: the ground the player can actually watch. Run at STAGE_HALF for both, the
+#: 14-seed sweep gated out a ladder seed 3 had built at 868 px to get back to
+#: its own fire, and fall deaths over the sweep went 55 -> 76: crossings are
+#: what stop people going over edges, and a blocking one is usually earning its
+#: keep. Run at RENDER_W for both, the legacy line is straight back to staking
+#: bridges over dips 1500 px away that nothing needed.
+#:
+#: Both then GROW with what the colony has actually built, which is the whole
+#: reason this is a budget and not a ban - the wide map is the point, and a
+#: settlement with huts up has the people and the rested hours to spend on an
+#: expedition that a settlement without a roof does not.
+#:
+#: Nothing here gates an URGENT crossing - one with a body at the foot of it or
+#: somebody trapped inside it. Those are rescues, they are the evidence
+#: `_rank_obstacles` trusts most, and seed 42's seven fall deaths at one face
+#: are the standing argument for answering them wherever they are.
+CROSSING_REACH_BASE = float(RENDER_W)   # 1600.0 - a camera width of country
+CHASM_REACH_BASE = STAGE_HALF           # 800.0 - the stage, for the idle bridge
+CROSSING_REACH_PER_HUT = 400.0          # earned reach per standing hut
+CROSSING_REACH_MAX = 3200.0             # half the world, then stop
+CHASM_REACH_MAX = 2400.0
+
+#: ...and the colony has to be big enough to be asking. The legacy chasm line is
+#: the one entry in the build order with no population floor on it, sitting
+#: below three lines that have one (barricade and wall at 4, watchtower at 5)
+#: and above the totem at 8. That gap is not cosmetic: a colony at three people
+#: falls straight THROUGH the wall and watchtower lines - both of which it is
+#: too small for - and lands on "build a bridge". Seed 101 did exactly that at
+#: t=555 and staked a bridge 1494 px away with three people alive; it never
+#: finished it and spent 78 of 90 minutes at MIN_POP. 6 is one clear of the
+#: watchtower and is the first headcount at which the order wants three huts.
+CHASM_BRIDGE_MIN_POP = 6
 
 #: The stone-hut upgrade's weight, and the ceiling on how much any villager
 #: wants to do it. Both numbers exist to keep the tier a luxury.
@@ -1025,7 +1158,7 @@ def _tillable_near(world: Any, center: float, radius: float = 260.0) -> bool:
         return False
     x = center - radius
     while x <= center + radius:
-        cx = max(4.0, min(float(RENDER_W - 4), x))
+        cx = max(4.0, min(float(WORLD_W - 4), x))
         try:
             if int(mat_at(cx)) in (MAT_GRASS, MAT_DIRT) and \
                     abs(slope_at(world, cx)) < MAX_SLOPE_WALK * 0.7:
@@ -1809,7 +1942,23 @@ def update_director(world: Any, dt: float) -> None:
 
     try:
         queue: list[dict[str, Any]] = []
+        # Where the people live, for the proximity test below. Read once: this
+        # is a mean over the registry and the queue can be several entries long.
+        # `settlement_center`, not `colony_center`, for the reason that function
+        # documents - a barricade sits about STAGE_HALF out and folding one into
+        # the mean moves the answer by that over the building count.
+        try:
+            home_x = settlement_center(world)
+        except Exception:
+            home_x = None
         for s in reg.incomplete():
+            prio = KIND_PRIORITY.get(s.kind, 0.5)
+            # A crossing's blocking priority is earned by proximity - see
+            # CROSSING_FAR_PRIORITY. Off the stage it is an expedition, and an
+            # expedition does not outrank the roof the colony sleeps under.
+            if (s.kind in CROSSING_KINDS and home_x is not None
+                    and abs(float(s.x) - home_x) > STAGE_HALF):
+                prio = CROSSING_FAR_PRIORITY
             queue.append({
                 "id": int(s.id),
                 "kind": str(s.kind),
@@ -1817,7 +1966,7 @@ def update_director(world: Any, dt: float) -> None:
                 "y": float(s.y),
                 "stage": int(s.stage),
                 "completion": float(s.completion()),
-                "priority": KIND_PRIORITY.get(s.kind, 0.5),
+                "priority": prio,
                 "needs": {k: int(v) for k, v in s.total_remaining_cost().items()},
             })
         queue.sort(key=lambda q: (-q["priority"], -q["completion"]))
@@ -1862,14 +2011,90 @@ def _publish(world: Any, queue: list[dict[str, Any]], needs: dict[str, int]) -> 
             pass
 
 
-def next_build_kind(world: Any, reg: StructureRegistry | None = None) -> str | None:
+def crossing_reach(world: Any, reg: StructureRegistry | None = None,
+                   blocking: bool = True) -> float:
+    """How far from the settlement a non-urgent crossing may be staked.
+
+    A budget, not a ban - see :data:`CROSSING_REACH_BASE`. Starts at a camera
+    width for a crossing the colony is blocked by, at the stage for one it
+    merely fancies, and grows with the roofs it has actually got up, so a
+    settlement with shelter can still go and bridge the far side and one without
+    a roof cannot spend its last two pairs of hands walking there.
+
+    Never raises: a world that will not say how many huts it has reads as none,
+    which is the tight end of the budget and the safe answer.
+    """
+    reg = reg if reg is not None else structures_of(world)
+    huts = 0
+    if reg is not None:
+        try:
+            huts = int(reg.count("hut", built_only=True))
+        except Exception:
+            huts = 0
+    base = CROSSING_REACH_BASE if blocking else CHASM_REACH_BASE
+    cap = CROSSING_REACH_MAX if blocking else CHASM_REACH_MAX
+    return float(min(cap, base + CROSSING_REACH_PER_HUT * max(0, huts)))
+
+
+def _within_reach(world: Any, lo: float, hi: float,
+                  reg: StructureRegistry | None = None,
+                  home_x: float | None = None, blocking: bool = True) -> bool:
+    """Is the near end of ``[lo, hi]`` inside :func:`crossing_reach`?
+
+    Measured to the NEAR rim, because that is the end a builder walks to and
+    stands on - `_bridge_pair` anchors the deck on home ground and `pick_site`'s
+    chasm fallback anchors at the near rim for the same reason.
+    """
+    x = settlement_center(world) if home_x is None else float(home_x)
+    near = min(abs(float(lo) - x), abs(float(hi) - x))
+    return near <= crossing_reach(world, reg, blocking)
+
+
+def chasm_in_reach(world: Any, reg: StructureRegistry | None = None
+                   ) -> tuple[float, float] | None:
+    """:func:`find_chasm`, but only if the colony could afford to walk to it.
+
+    The build order's legacy "there is a chasm, bridge it eventually" entry and
+    :func:`pick_site`'s fallback for it both go through here, so the kind the
+    order asks for and the site it gets can never disagree - a kind that is
+    wanted but unsiteable is the jam `_stake_out_site`'s skip set exists for,
+    and there is no reason to create another one.
+    """
+    span = find_chasm(world)
+    if span is None:
+        return None
+    return (span if _within_reach(world, span[0], span[1], reg, blocking=False)
+            else None)
+
+
+def next_build_kind(world: Any, reg: StructureRegistry | None = None,
+                    skip: Any = ()) -> str | None:
     """What the colony wants next: a crossing if one is blocking, then
     firepit -> stockpile -> hut -> more huts -> wall -> watchtower ->
-    bridge (if a chasm exists) -> totem at a milestone."""
+    bridge (if a chasm exists) -> totem at a milestone.
+
+    *skip* is the set of kinds the caller has already failed to find a site for
+    this pass, so the order can step over one it cannot place instead of jamming
+    on it. This is a real stall, not a hypothetical: the order asks for a second
+    barricade unconditionally once the colony is BARRICADE_MIN_POP strong, and a
+    colony seated within ~544 px of a rim of the map has no land on one of its
+    two approaches at all - the band is entirely off the world, `pick_site`
+    answers None every pass forever, and every line BELOW the barricade (huts 4
+    through 7, walls, watchtower, totem, the second firepit) is never reached.
+    The same jam was always reachable via "the band is nothing but cliff"; the
+    wide world just made it common.
+    """
     reg = reg if reg is not None else structures_of(world)
     if reg is None:
         return None
     pop = len(alive_agents(world))
+    try:
+        skipped = frozenset(str(k) for k in skip)
+    except TypeError:
+        skipped = frozenset()
+
+    def want(kind: str) -> bool:
+        return kind not in skipped
 
     def built(kind: str) -> int:
         try:
@@ -1894,41 +2119,52 @@ def next_build_kind(world: Any, reg: StructureRegistry | None = None) -> str | N
     # was right all along. This still returns None on a map with no barrier,
     # which is almost every map, so the ordinary order below is untouched.
     blocking = plan_crossing(world, reg)
-    if blocking is not None:
+    if blocking is not None and want(str(blocking["kind"])):
         return str(blocking["kind"])
 
-    if built("firepit") < 1:
+    if built("firepit") < 1 and want("firepit"):
         return "firepit"
-    if built("stockpile") < 1:
+    if built("stockpile") < 1 and want("stockpile"):
         return "stockpile"
-    if built("hut") < 1:
+    if built("hut") < 1 and want("hut"):
         return "hut"
     # Edge defence is interleaved with expansion, not deferred behind it, so it
     # goes up *as the colony progresses* rather than after five huts. First
     # shelter, then the first spiked barricade on one edge, then keep growing,
     # and the second edge once the settlement is a bit bigger. Placement (which
     # edge) is decided in pick_site; here we only ask for the next one.
-    if pop >= BARRICADE_MIN_POP and built("barricade") < 1:
+    if pop >= BARRICADE_MIN_POP and built("barricade") < 1 and want("barricade"):
         return "barricade"
-    if built("hut") < 3:
+    if built("hut") < 3 and want("hut"):
         return "hut"
-    if pop >= BARRICADE_MIN_POP and built("barricade") < 2:
+    if pop >= BARRICADE_MIN_POP and built("barricade") < 2 and want("barricade"):
         return "barricade"
     want_huts = min(MAX_HUTS, max(1, (pop + 1) // 2))
-    if built("hut") < want_huts:
+    if built("hut") < want_huts and want("hut"):
         return "hut"
-    if pop >= 4 and built("wall") < 1:
+    if pop >= 4 and built("wall") < 1 and want("wall"):
         return "wall"
-    if pop >= 5 and built("watchtower") < 1:
+    if pop >= 5 and built("watchtower") < 1 and want("watchtower"):
         return "watchtower"
-    if built("bridge") < 1 and find_chasm(world) is not None:
+    # The one line in this order that had no population floor and no notion of
+    # where the colony lives, sitting between two that have both. It is also the
+    # most expensive thing the order ever asks for. A colony too small for a
+    # watchtower falls straight through the two lines above and lands here, and
+    # `find_chasm` will happily name a dip 4307 px away on a 6400 px map. Both
+    # halves of that are now spelled out: see CHASM_BRIDGE_MIN_POP and
+    # CROSSING_REACH_BASE. This is the *unblocked* bridge - "there is a gap over
+    # there and one day we should span it". The blocked case, where the colony
+    # genuinely cannot reach its food or one of its own, is `plan_crossing` at
+    # the top of this function and is not gated on headcount at all.
+    if (pop >= CHASM_BRIDGE_MIN_POP and built("bridge") < 1 and want("bridge")
+            and chasm_in_reach(world, reg) is not None):
         return "bridge"
-    if pop >= TOTEM_POP and built("totem") < 1:
+    if pop >= TOTEM_POP and built("totem") < 1 and want("totem"):
         return "totem"
     want_walls = min(MAX_WALLS, pop // 3)
-    if built("wall") < want_walls:
+    if built("wall") < want_walls and want("wall"):
         return "wall"
-    if built("firepit") < min(2, 1 + pop // 6):
+    if built("firepit") < min(2, 1 + pop // 6) and want("firepit"):
         return "firepit"
     return None
 
@@ -1940,25 +2176,40 @@ def _stake_out_site(world: Any, reg: StructureRegistry) -> None:
         pending = reg.incomplete()
     except Exception:
         return
-    kind = next_build_kind(world, reg)
-    if kind is None:
+    # An unsiteable kind is stepped over, not stalled on. `pick_site` answering
+    # None used to end the pass, so a kind the map cannot hold blocked every
+    # kind below it in the order for the rest of the run - see next_build_kind's
+    # docstring for the barricade-against-a-rim case that makes this common on a
+    # 6400 px world. Bounded at four tries because this is on the director's 2 s
+    # cadence and there is no point walking the whole order every time.
+    #
+    # Safe for determinism: neither next_build_kind nor pick_site draws from the
+    # seeded stream (the only rng use is reg.create below, which happens at most
+    # once), and find_cutoff/find_chasm are both cached, so the extra passes are
+    # reads. Only the accepted site consumes randomness, exactly as before.
+    skip: set[str] = set()
+    for _ in range(4):
+        kind = next_build_kind(world, reg, skip=skip)
+        if kind is None:
+            return
+        # A blocking crossing is allowed one slot over the concurrency cap.
+        # Without it a barrier that appears while two ordinary sites are already
+        # open - a miner opening a pit, which is exactly the case this exists
+        # for - waits for a hut to finish before anyone even stakes the way out.
+        cap = MAX_CONCURRENT_SITES + (1 if kind in CROSSING_KINDS else 0)
+        if len(pending) >= cap:
+            return
+        if any(s.kind == kind for s in pending):
+            return
+        site = pick_site(world, reg, kind)
+        if site is None:
+            skip.add(kind)
+            continue
+        x, y, extra = site
+        reg.create(kind, x, y, rng=rng_of(world), state=extra or None)
+        chronicle(world, _stake_line(world, kind))
+        log.debug("director staked %s at %.0f", kind, x)
         return
-    # A blocking crossing is allowed one slot over the concurrency cap. Without
-    # it a barrier that appears while two ordinary sites are already open - a
-    # miner opening a pit, which is exactly the case this exists for - waits for
-    # a hut to finish before anyone even stakes the way out.
-    cap = MAX_CONCURRENT_SITES + (1 if kind in CROSSING_KINDS else 0)
-    if len(pending) >= cap:
-        return
-    if any(s.kind == kind for s in pending):
-        return
-    site = pick_site(world, reg, kind)
-    if site is None:
-        return
-    x, y, extra = site
-    s = reg.create(kind, x, y, rng=rng_of(world), state=extra or None)
-    chronicle(world, _stake_line(world, kind))
-    log.debug("director staked %s at %.0f", kind, x)
 
 
 # ===========================================================================
@@ -2122,9 +2373,15 @@ def _stake_line(world: Any, kind: str) -> str:
 def pick_site(
     world: Any, reg: StructureRegistry, kind: str
 ) -> tuple[float, float, dict[str, Any]] | None:
-    """Choose where to put a `kind`. Returns (x, y, extra_state) or None."""
+    """Choose where to put a `kind`. Returns (x, y, extra_state) or None.
+
+    Sites are measured from ``settlement_center``, not ``colony_center``: the
+    latter averages the barricades in, and a barricade is deliberately about
+    STAGE_HALF out, so one unpaired outwork drags every subsequent site a couple
+    of hundred px toward it. See :func:`actions.settlement_center`.
+    """
     spec = structure_spec(kind)
-    center = colony_center(world)
+    center = settlement_center(world)
 
     if kind in CROSSING_KINDS:
         # The reachability survey is the authority: it knows which side the
@@ -2136,7 +2393,9 @@ def pick_site(
             return None
         # Fallback for the legacy "there is a chasm, build a bridge eventually"
         # entry in the build order, which fires with nothing actually blocked.
-        span = find_chasm(world)
+        # Reach-gated through the same helper the order asks with, so the two
+        # cannot disagree about which chasms exist.
+        span = chasm_in_reach(world, reg)
         if span is None:
             return None
         x0, x1 = span
@@ -2147,7 +2406,7 @@ def pick_site(
         # the edge of the gap they were there to bridge.
         near = x0 if abs(x0 - center) <= abs(x1 - center) else x1
         anchor = float(np.clip(near + (-4.0 if near == x0 else 4.0),
-                               4.0, float(RENDER_W - 5)))
+                               4.0, float(WORLD_W - 5)))
         return anchor, rim, {"w": (x1 - x0) + 18.0, "span": [float(x0), float(x1)]}
 
     # A barricade does not belong near the colony centre like everything else -
@@ -2157,9 +2416,20 @@ def pick_site(
         return _barricade_site(world, reg)
 
     lo = max(24.0, center - SITE_RANGE)
-    hi = min(float(RENDER_W - 24), center + SITE_RANGE)
+    hi = min(float(WORLD_W - 24), center + SITE_RANGE)
     if hi - lo < 24.0:
-        lo, hi = 24.0, float(RENDER_W - 24)
+        # The clamp collapsed the window - the colony is jammed against a rim.
+        # Fall back to the stage (colony +/- STAGE_HALF), NOT to the whole map,
+        # which is what this line used to say back when they were the same
+        # thing. On a 6400 px world "the whole map" is both wrong (it will
+        # happily stake a hut 3000 px from the people who have to build it) and
+        # expensive: `ys`/`slopes` below are Python loops over `xs`, so a
+        # 6-px-step sweep of the map is 1063 ground_y calls on the director's
+        # 2 s cadence instead of 267.
+        lo = max(24.0, center - STAGE_HALF)
+        hi = min(float(WORLD_W - 24), center + STAGE_HALF)
+        if hi - lo < 24.0:
+            return None
     xs = np.arange(lo, hi, 6.0, dtype=np.float64)
     if xs.size == 0:
         return None
@@ -2236,22 +2506,62 @@ def _is_cliff(world: Any, x: float) -> bool:
 def _barricade_site(
     world: Any, reg: StructureRegistry
 ) -> tuple[float, float, dict[str, Any]] | None:
-    """A site for a barricade, hard against whichever edge has none yet.
+    """A site for a barricade, hard against whichever approach has none yet.
 
-    The animals cross in at ``x = 0`` and ``x = RENDER_W``; a barricade wants to
-    sit in the band within ``BARRICADE_EDGE_FRAC * RENDER_W`` of one of them, on
-    non-cliff ground, as close to the edge as the terrain allows so it bites an
-    incursion the moment it lands. Left edge is filled first, then the right.
+    A barricade wants to sit in the band within ``BARRICADE_EDGE_FRAC *
+    RENDER_W`` of the point where an incursion first becomes visible, on
+    non-cliff ground, as close to that point as the terrain allows so it bites
+    the moment the animal lands. Near approach is filled first, then the far.
     Returns ``(x, y, {})`` in the same shape as :func:`pick_site`, or None if
-    both edges are covered or the band is nothing but cliff.
+    both sides are covered or the band is nothing but cliff.
+
+    THE EDGE IS THE COLONY'S EDGE, NOT THE MAP'S. This used to read "the animals
+    cross in at x = 0 and x = RENDER_W", which was true only while the world and
+    the view were the same 1600 px. Left as ``RENDER_W -> WORLD_W`` it puts the
+    spikes 1000 px from the rims of a 6400 px map - up to 2600 px from the
+    settlement, permanently off camera, defending empty hillside, while animals
+    that now enter at ``actions.offstage_x`` walk straight past them. That is
+    the whole barricade feature quietly deleted by a rename.
+
+    So the anchor is ``settlement_center() +/- BARRICADE_STANDOFF``, just inside
+    the frame edge. Animals enter at OFFSTAGE (960) and walk in; STAGE_HALF
+    (800) is the first x at which anyone can see it happen, so a barricade a
+    little inside that is the first thing an incursion meets on screen. That is
+    what the old ``x = 6`` on a 1600 px world was - 794 px from a colony sitting
+    at the middle of it. See BARRICADE_STANDOFF for why it is not 800 exactly.
+
+    Deliberately NOT centred on OFFSTAGE, which is where the contract's letter
+    points: half of such a band is past STAGE_HALF and therefore never drawn,
+    and a defence the player cannot watch work is not a defence, it is
+    bookkeeping. The band keeps its px width (BARRICADE_EDGE_FRAC of RENDER_W,
+    the stage, ~256 px) and runs INWARD from the anchor, so every candidate is
+    on camera.
+
+    The centre is ``settlement_center``, NOT ``colony_center``: a barricade
+    that has already gone up must not move the point the next one is measured
+    from, and ``colony_center`` averages it in. See that function for the
+    measurement.
     """
     band = max(24.0, BARRICADE_EDGE_FRAC * float(RENDER_W))
-    mid = RENDER_W * 0.5
+    mid = settlement_center(world)
 
-    # Which edges already hold a barricade (built or still going up)?
+    # Which approaches already hold a barricade (built or still going up)?
+    #
+    # A barricade further than STAGE_HALF from the settlement does not count.
+    # Barricades are permanent and colonies are not: measured on seed 88 at 25
+    # sim-minutes, a barricade correctly staked at -640 ended up 1022 px out
+    # because the colony crossed a ladder and rebuilt itself 380 px to the east,
+    # leaving its west approach undefended and *marked as defended*. Ignoring
+    # the stranded one lets the director stake a replacement where the people
+    # now live. The churn is bounded without any extra bookkeeping: the build
+    # order asks for at most two BUILT barricades (`built("barricade") < 2`)
+    # and counts them wherever they stand, so a colony that keeps moving gets
+    # two and then stops, rather than a fence post every time it wanders.
     left_has = right_has = False
     try:
         for s in reg.of_kind("barricade"):
+            if abs(float(s.x) - mid) > STAGE_HALF:
+                continue
             if float(s.x) <= mid:
                 left_has = True
             else:
@@ -2262,18 +2572,32 @@ def _barricade_site(
     # Candidate edges, left first, that still need one. Trying both (rather than
     # committing to the left) means an all-cliff left band falls through to the
     # right instead of stalling the build order forever.
+    # Each candidate is (lo, hi, edge): the inward-running band and the point it
+    # is measured from. `edge` is the stage rim, so scoring by -|cx - edge| still
+    # means "as far out as the terrain allows" - it just stopped meaning "as far
+    # out as the MAP allows", which is now a different and much emptier place.
+    #
+    # The anchors are clamped into the map before the band is cut from them, so
+    # a colony seated near a rim gets its band slid onto whatever land there is
+    # rather than losing that approach entirely - the left band for a colony at
+    # x=178 would otherwise run [-622, -366], i.e. nowhere. The `mid -/+ 24`
+    # cap then stops a slid band crossing the settlement and being mistaken for
+    # the other side's barricade by the has-test above.
+    left_edge = max(4.0, mid - BARRICADE_STANDOFF)
+    right_edge = min(float(WORLD_W - 4), mid + BARRICADE_STANDOFF)
     candidates: list[tuple[float, float, float]] = []
     if not left_has:
-        candidates.append((6.0, band, 0.0))
+        candidates.append((left_edge, min(left_edge + band, mid - 24.0),
+                           left_edge))
     if not right_has:
-        candidates.append((float(RENDER_W) - band, float(RENDER_W) - 6.0,
-                           float(RENDER_W)))
+        candidates.append((max(right_edge - band, mid + 24.0), right_edge,
+                           right_edge))
     if not candidates:
-        return None                      # both edges covered - nothing to do
+        return None                      # both approaches covered - nothing to do
 
     for lo, hi, edge in candidates:
         lo = max(4.0, lo)
-        hi = min(float(RENDER_W - 4), hi)
+        hi = min(float(WORLD_W - 4), hi)
         if hi <= lo:
             continue
         # Walk the band; keep the non-cliff column closest to the edge and,
@@ -3171,7 +3495,14 @@ def _crossing_geometry(world: Any, cut: dict[str, Any]) -> dict[str, Any] | None
     # Where the colony stands *inside* its own region - the crossing has to be
     # walkable-to, so it is measured from home, not from a centre that may have
     # been dragged across the gap by whoever is stranded on the far side.
-    home_x = colony_center(world)
+    #
+    # `settlement_center` rather than `colony_center`, which is the same
+    # correction `_barricade_site` and MINE_KEEP_OUT already carry: a barricade
+    # sits deliberately about STAGE_HALF out, so folding one into the structure
+    # mean moves this by that distance over the building count. This value now
+    # decides which obstacles are in reach at all, not just how ties are broken,
+    # so a couple of hundred px of outwork drag is no longer harmless.
+    home_x = settlement_center(world)
     if _region_of(lab, home_x) != home:
         idx = np.flatnonzero(lab == home)
         if idx.size == 0:
@@ -3228,6 +3559,21 @@ def _rank_obstacles(
         entry = dict(o)
         entry["hits"] = int(hits)
         entry["urgent"] = bool(hits) or o["mid"] in (cut.get("trapped") or ())
+        # ...and in the way of somebody who can get to it. Distance used to rank
+        # nothing here - it was the last tiebreak, under weight - which was
+        # sound on a 1600 px map where the furthest wall on the whole world was
+        # a stage-width off. On 6400 px it let a colony with a half-built hut
+        # 135 px away commit to a wall 1329 px away (seed 2), and `_mk_build`
+        # then sent every builder to the one with the higher KIND_PRIORITY.
+        #
+        # An urgent obstacle - a body at the foot of it, a man trapped inside it
+        # - is exempt: that is a rescue, and seed 42's seven fall deaths at a
+        # single face are the standing argument for going wherever it is.
+        # Everything else has to be inside CROSSING_REACH, which grows with the
+        # roofs the colony has up, so the far side stays reachable eventually.
+        if not entry["urgent"] and not _within_reach(
+                world, o["lo"], o["hi"], home_x=home_x):
+            continue
         entry["weight"] = int(weight)
         # Why *this* obstacle, which is not always why the survey fired: the
         # chronicle should say what the colony noticed at the wall it is
@@ -3746,6 +4092,106 @@ def _worker_role(world: Any) -> str:
     return "builder" if (builders / total) < BUILDER_RATIO else "gatherer"
 
 
+#: How long the shelter lock has to hold before a gatherer is put on the tools.
+#:
+#: Measured rather than guessed. A control tree with the promotion removed and
+#: a read-only observer in its place (proved inert by identical ``to_dict``
+#: digests against the plain control) says the "no builder at all" state is NOT
+#: the momentary hand-over the first version assumed: over ten seeds and 90
+#: sim-minutes each its median life is 128 s and its p90 is 909 s. A debounce
+#: on its own therefore separates nothing.
+#:
+#: What 120 s buys, on top of the other four gates below, is the firing count
+#: on colonies that were never in trouble. Firings per seed for the full
+#: condition, from those same observer runs:
+#:
+#:      hold      2    555   70707 | 42   101  1234  7777 12345 40404 333435
+#:      ----   ----   ----   ----  | ---  ---  ----  ----  ----  ----  ------
+#:        0 s     2      3      7  |  0    0     0     0     0     2       2
+#:       60 s     2      3      7  |  0    0     0     0     0     2       2
+#:      120 s     2      3      6  |  0    0     0     0     0     0       2
+#:      300 s     2      2      4  |  0    0     0     0     0     0       2
+#:
+#: 120 s is the knee: it is where the last healthy seed (40404) stops firing,
+#: and the three colonies that actually collapse are untouched by it - they are
+#: still firing at 300 s and seed 2's lock never breaks at all inside 90
+#: minutes. Longer than that only starts costing the tail.
+SHELTER_LOCK_HOLD = 120.0
+
+
+def _shelter_lock_candidate(world: Any, agents: list[Any], adults: list[Any],
+                            reg: Any) -> Any | None:
+    """The gatherer to put on the tools, or None - and usually None.
+
+    This is the *collapse*, not the symptom. Five things have to be true at
+    once, and every one of them is load-bearing:
+
+    * the colony is at or below MIN_POP. Not "small": MIN_POP is the floor
+      ``_tick_population`` respawns to, so this is a colony on life support.
+    * nobody is on the tools at all. Deliberately NOT "below BUILDER_RATIO" -
+      see the note in :func:`assign_roles` for the two wider forms that were
+      measured and cost more than they saved.
+    * the colony cannot house another head. This is character-for-character the
+      birth gate in ``World._tick_population`` (``huts <= 0 or n >= huts *
+      POP_PER_HUT``), which is the whole reason the trap is a trap: no roof, no
+      birth, and at MIN_POP no child either, so the roster can never change.
+    * a SHELTER is what is unfinished. The old condition took any outstanding
+      work at all, and 43 of the 114 firings measured across ten seeds were for
+      a barricade, a watchtower, a totem or a bridge - none of which lift the
+      birth gate, so none of which end the trap.
+    * the materials for that hut's current stage are already in the store. If
+      they are not, the colony is short of hands on the resources, not on the
+      tools, and moving its last gatherer is exactly the wrong way round.
+
+    Order matters for cost, not just for meaning: the population test is a
+    single ``len`` and it is first, so on a healthy colony this function is one
+    integer compare per tick. The old block called ``reg.incomplete()`` every
+    tick on every colony.
+
+    Ties break on the lowest id and nothing here draws from the rng, so on the
+    seeds where it never fires it re-phases nothing.
+    """
+    if len(agents) > MIN_POP:
+        return None
+    workers = [a for a in adults if _role(a) in ("gatherer", "builder")]
+    if not workers or any(_role(a) == "builder" for a in workers):
+        return None
+    # A child about to come of age supplies a builder by itself: `_worker_role`
+    # returns "builder" whenever the roster holds none. Vacuous on a world that
+    # started fresh - `Population.spawn` defaults to gatherer and nothing in
+    # World passes "child", so 0 of the 114 measured firings had a child
+    # standing there - but a save restored through `from_dict` can carry one,
+    # and pre-empting an arrival that is already on its way is not a rescue.
+    for a in agents:
+        if _role(a) != "child":
+            continue
+        age = _age_of(a)
+        if age is None or age >= CHILD_MATURE_AGE - SHELTER_LOCK_HOLD:
+            return None
+    if reg is None:
+        return None
+    try:
+        huts = int(reg.count("hut"))
+    except Exception:
+        return None
+    if huts > 0 and len(agents) < huts * POP_PER_HUT:
+        return None
+    try:
+        unfinished = [s for s in reg.incomplete()
+                      if getattr(s, "kind", "") == "hut"]
+    except Exception:
+        return None
+    for s in unfinished:
+        try:
+            missing = s.missing_for_stage()
+        except Exception:
+            continue
+        if all(stock_qty(world, res) >= int(qty)
+               for res, qty in missing.items()):
+            return min(workers, key=lambda a: int(getattr(a, "id", 0) or 0))
+    return None
+
+
 def _set_role(agent: Any, role: str) -> bool:
     if not hasattr(agent, "role"):
         return False
@@ -3829,6 +4275,85 @@ def assign_roles(world: Any, dt: float) -> None:
         for a in lookouts:
             _set_role(a, _worker_role(world))
 
+    # --- and somebody is on the tools ---------------------------------------
+    # BUILDER_RATIO was only ever *consulted*, never *enforced*. `_worker_role`
+    # is asked which trade the colony is short of, but the only three callers
+    # are a child coming of age, an elder standing down and a lookout being
+    # stood down - so a colony that loses its builders keeps none until a child
+    # grows up, and a colony pinned at MIN_POP never has a child.
+    #
+    # That is the terminal state of the MIN_POP trap, and it is a lock rather
+    # than a slow patch. Seed 2 loses its only builder at t=240 with the first
+    # hut at completion 0.50; seventy minutes later the hut is at 0.75 and the
+    # store holds 25 wood and 6 fibre against a remaining cost of 5 and 2.
+    # Nobody is missing anything - `aff["build"]` is 1.00 for a builder and 0.55
+    # for a gatherer, so BuildStructure scores 0.30 against Farm's ~0.50 and the
+    # two survivors farm 239 food while the only roof in the colony stands
+    # three quarters up. No roof is no sleep and, via the hut gate in
+    # `_tick_population`, no births ever: MIN_POP forever.
+    #
+    # Deliberately NONE, not "below BUILDER_RATIO". Both wider forms were
+    # measured over the 14-seed sweep and both cost more than they saved:
+    #
+    #   * ratio enforced always - fixed both trapped seeds, then took seed 42
+    #     from 17/7 to 7/3 and 808 from 20/7 to 14/6. A thriving colony's
+    #     roster is already the shape it wants and moving 45% of it onto the
+    #     tools takes hands off the food.
+    #   * ratio enforced while roofless - reached 9/14 at MAX_POP and 13/14 at
+    #     hut #7, but it fires at FOUNDING on every map, because the founding
+    #     four are an elder, two gatherers and one builder (1 of 3 workers,
+    #     0.33 < 0.45) and every colony starts with no roof. Seed 7777, the
+    #     healthiest map in the sweep, went from 20/7 to 6/2 on it.
+    #
+    # NONE is the condition that is actually a lock rather than a preference,
+    # and that part still stands. What did not stand is the other half of the
+    # first version's test: "there is work outstanding". That is true on a
+    # perfectly healthy colony - anyone can be the last builder, and any of the
+    # ten structure kinds can be half-built - so the rescue fired on colonies
+    # that were never in trouble, and every firing re-rolls the seeded rng from
+    # that moment on. A hostile control tree differing by exactly the old block
+    # put numbers on the cost: seeds 1234, 12345, 40404 and 333435 all reach
+    # 20 pop / 7 huts without it and 14/5, 14/5, 13/6 and 12/6 with it, and 42
+    # and 7777 go 20/7 -> 11/5 and 20/7 -> 10/5 on top.
+    #
+    # So the test is now the collapse itself rather than its symptom, in
+    # `_shelter_lock_candidate`: at or below MIN_POP, nobody on the tools, no
+    # room to house another head, an unfinished HUT specifically, and its
+    # materials already in the store. Across the ten diagnostic seeds that
+    # takes the firing count from 114 to 13, and every one of the 13 is on one
+    # of the four seeds that are genuinely stuck.
+    #
+    # The hold is the fifth gate and it is not decoration. Measured in a tree
+    # with the promotion removed, "no builder" is not momentary - median 128 s,
+    # p90 909 s - so the debounce is not filtering a hand-over. It is what
+    # takes seed 40404 from two firings to none while leaving seeds 2, 555 and
+    # 70707 firing; see SHELTER_LOCK_HOLD for the table.
+    #
+    # `_bhv_shelter_lock_t` is a transient like `_bhv_dir_t` and the other
+    # `_bhv_*` marks: it is not in `to_dict`, so it cannot change a save, and a
+    # reload simply starts the two minutes again. Ties still break on id and
+    # nothing here draws from the rng.
+    pick = _shelter_lock_candidate(world, agents, adults, reg)
+    if pick is None:
+        setattr(world, "_bhv_shelter_lock_t", None)
+    else:
+        now = world_now(world)
+        since = getattr(world, "_bhv_shelter_lock_t", None)
+        if not isinstance(since, (int, float)) or now < float(since):
+            # First tick of the lock, or a clock that went backwards under us
+            # (a save loaded over a running world). Start the clock, do not
+            # act on a duration we cannot vouch for.
+            setattr(world, "_bhv_shelter_lock_t", now)
+        elif now - float(since) >= SHELTER_LOCK_HOLD:
+            if _set_role(pick, "builder"):
+                chronicle(world, f"{getattr(pick, 'name', 'Someone')} put the "
+                                 f"basket down and picked up the tools.")
+            # Restart rather than clear: the next call sees a builder and
+            # clears it anyway, but if anything upstream reverts the role this
+            # tick the colony still waits another two minutes before trying
+            # again instead of promoting somebody every frame.
+            setattr(world, "_bhv_shelter_lock_t", now)
+
 
 if __name__ == "__main__":  # pragma: no cover - headless smoke test
     from dataclasses import dataclass as _dc
@@ -3842,18 +4367,22 @@ if __name__ == "__main__":  # pragma: no cover - headless smoke test
         alive: bool = True
 
     class _Terrain:
+        # WORLD_W wide, not RENDER_W: this stub stands in for the real terrain,
+        # and the point of the harness is to run the director against a map the
+        # size of the one it will actually get. The founders below sit at ~580,
+        # so the chasm at 700-760 is still right next to them.
         def __init__(self) -> None:
-            self.height = (600.0 + 40.0 * np.sin(np.arange(RENDER_W) / 180.0)).astype(
+            self.height = (600.0 + 40.0 * np.sin(np.arange(WORLD_W) / 180.0)).astype(
                 np.float32)
             self.height[700:760] += 90.0          # a chasm to bridge
-            self.material = np.zeros(RENDER_W, dtype=np.uint8)
+            self.material = np.zeros(WORLD_W, dtype=np.uint8)
 
         def ground_y(self, x: float) -> float:
-            i = int(max(0, min(RENDER_W - 1, x)))
+            i = int(max(0, min(WORLD_W - 1, x)))
             return float(self.height[i])
 
         def slope(self, x: float) -> float:
-            i = int(max(1, min(RENDER_W - 2, x)))
+            i = int(max(1, min(WORLD_W - 2, x)))
             return float(self.height[i + 1] - self.height[i - 1]) * 0.5
 
     class _Agent:

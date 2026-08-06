@@ -41,10 +41,10 @@ from ..constants import (
     HUT_SCALE_MIN,
     HUT_STORE_WEIGHT,
     RENDER_H,
-    RENDER_W,
     RES_FIBRE,
     RES_STONE,
     RES_WOOD,
+    WORLD_W,
 )
 
 log = logging.getLogger(__name__)
@@ -1461,7 +1461,20 @@ class Structure:
         s = cls(
             id=_as_int(d, "id", 0),
             kind=kind,
-            x=_as_float(d, "x", RENDER_W * 0.5),
+            # WORLD_W * 0.5, not RENDER_W * 0.5, and the reasoning is not "rename
+            # the constant": this default only fires when a save carries a
+            # structure whose x is missing or unparseable, and what it must NOT
+            # do is drag `colony_center` - which is the plain mean of these very
+            # x values - somewhere the colony has never been. On a 6400 px map
+            # RENDER_W * 0.5 is x = 800, i.e. the far-left eighth, so one junk
+            # entry hauled the whole settlement's centre (and with it every build
+            # site, spawn anchor and camera target derived from it) toward a
+            # corner. The world's own midpoint is the only "nowhere in
+            # particular" available to a classmethod that cannot see the
+            # registry, and it is the same answer every other no-information
+            # default in sim/ gives (actions.colony_center, animals, dragons,
+            # events and ufo all fall back to WORLD_W * 0.5).
+            x=_as_float(d, "x", WORLD_W * 0.5),
             y=_as_float(d, "y", RENDER_H * 0.75),
             stage=max(0, min(max_stage, _as_int(d, "stage", 0))),
             max_stage=max_stage,
@@ -1804,7 +1817,25 @@ class StructureRegistry:
                 out.append(ls)
         return out
 
-    def colony_center(self, default: float = RENDER_W * 0.5) -> float:
+    def colony_center(self, default: float = WORLD_W * 0.5) -> float:
+        """Mean x of the standing, non-grave structures - the settlement.
+
+        The *default* is this registry's answer to "nowhere in particular", and
+        it is the centre of the LAND (3200), not half the camera (800). It used
+        to be the latter, which was the same number while the world and the
+        frame were both 1600 px and was 2400 px adrift the moment they were not:
+        a colony that has not finished its first building would have reported
+        its home as x = 800 wherever it was actually seeded, and that answer
+        anchors the camera, the barricade band, the quarry keep-out and every
+        build site the director picks.
+
+        In the main path ``actions.colony_center`` never sees this, because it
+        deliberately asks with ``float("nan")`` so that "I have no buildings" is
+        distinguishable from a mean that happens to land here, and falls through
+        to the agents. That is a guard around this default, not a replacement
+        for it: the bare call is still what a duck-typed registry that will not
+        take the argument gets, and what any other direct caller gets.
+        """
         xs = [s.x for s in self._by_id.values() if s.kind != "grave" and not s.is_ruined]
         if not xs:
             return float(default)
