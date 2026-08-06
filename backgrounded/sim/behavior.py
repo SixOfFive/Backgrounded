@@ -52,6 +52,11 @@ from ..constants import (
     LITTER_CLUSTER_FULL,
     LITTER_CLUSTER_MIN,
     LADDER_MAX_W,
+    HERMIT_FIRE_DAMP,
+    HERMIT_HOMESICK,
+    HERMIT_KEEP_ADULTS,
+    HERMIT_MIN_ADULTS,
+    HERMIT_ROAM,
     LADDER_MIN_RISE,
     LADDER_MIN_W,
     LADDER_SLOPE,
@@ -103,6 +108,8 @@ from .actions import (
     free_litter_cluster,
     ground_y,
     hazards_of,
+    hermit_home,
+    is_hermit,
     is_night,
     make_action,
     nearest_structure,
@@ -116,6 +123,7 @@ from .actions import (
     world_now,
 )
 from .entities import GRAVITY
+from .names import ROLE_HERMIT
 from .structures import (
     CROSSING_KINDS,
     HUT_UPGRADE_COST,
@@ -415,7 +423,8 @@ CUTOFF_SHORT_QTY = 8
 GRAVE_FRESH = 300.0
 CELEBRATION_FRESH = 30.0
 
-ROLES: tuple[str, ...] = ("gatherer", "builder", "elder", "child", "lookout")
+ROLES: tuple[str, ...] = ("gatherer", "builder", "elder", "child", "lookout",
+                          "hermit")
 
 # per-role appetite for each family of work. `farm` and `mine` are the two
 # sustained jobs: gatherers lean to the fields (reliable food), builders to the
@@ -438,6 +447,25 @@ ROLE_AFFINITY: dict[str, dict[str, float]] = {
                  "farm": 0.45, "mine": 0.55, "cleanup": 0.55},
     "child":    {"gather": 0.30, "build": 0.15, "social": 1.00, "watch": 0.10,
                  "farm": 0.25, "mine": 0.10, "cleanup": 0.75},
+    # The hermit is the elder's mirror: the elder is the colony's social centre
+    # at 1.00 and he is its edge at 0.04. `gather` is the one thing he is good
+    # at, and it is what feeds him - ForageBerries takes its target as the bush
+    # nearest HIM, so a high gather affinity is self-sufficiency at his own camp
+    # rather than a job he does for anybody.
+    #
+    # `farm` is deliberately LOW even though farming is the better food. Fields
+    # are tilled near the settlement (`_tillable_near` measures from the colony
+    # centre), so a farming hermit is a commuting hermit. The un-damped
+    # `hunger * 0.12` term in the Farm score is left to speak for itself: a
+    # hermit who is genuinely starving will still walk to a field, which is the
+    # behaviour we want at the one moment it matters.
+    #
+    # `mine` and `cleanup` are floors rather than zeroes so nothing here divides
+    # by an absent key, and because a hermit cracking a rock at his own camp is
+    # fine - it is the quarry and the litter sweep, both sited in town, that the
+    # low number is buying his way out of.
+    "hermit":   {"gather": 0.85, "build": 0.10, "social": 0.04, "watch": 0.20,
+                 "farm": 0.15, "mine": 0.05, "cleanup": 0.05},
 }
 _DEFAULT_AFFINITY = ROLE_AFFINITY["gatherer"]
 
@@ -1181,7 +1209,120 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
     # it has to lose to a wolf combat_actions just scored and beat everything
     # the colony was calmly getting on with. See _score_raise.
     _score_raise(s, agent, world, danger)
+    # And the hermit, last of all and for the same reason as those two: he has
+    # to be able to lose to the wolf combat_actions has just scored - his pull
+    # home must never outrank running away - and to beat everything the colony
+    # was calmly getting on with. Scored here rather than up with the chores
+    # because the combat merge is a `dict.update` and would otherwise put the
+    # colony's workbench back on his list after he had walked away from it.
+    if role == ROLE_HERMIT:
+        _hermit_bias(s, agent, world, night, fatigue, warmth, carry_qty,
+                     carrying, danger is not None)
     return s
+
+
+def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
+                 fatigue: float, warmth: float, carry_qty: int, carrying: Any,
+                 danger: bool) -> None:
+    """Turn a scored roster of colony jobs into a scored roster for a recluse.
+
+    WEIGHTS AND TARGETS, NOT NEW ACTIONS, and that is the constraint this
+    function exists to respect. `choose_action` draws one `rng.uniform` tiebreak
+    per SCORED candidate, so adding a "GoHome" action would re-phase the world
+    stream for every colonist on every tick and move unrelated outcomes by
+    ~16%. Everything here either zeroes a key that already existed or re-weights
+    one, so a colony with no hermit in it draws exactly what it drew before.
+
+    Five groups, in order of how much argument they need:
+
+    1. THE THINGS A HERMIT DOES NOT DO. Company (Converse dies with the 0.04
+       social affinity, but Celebrate is `0.82 * morale + 0.18` and is not
+       affinity-scaled at all, so it has to be said out loud), and the colony's
+       work: raising, upgrading, repairing, cooking, sweeping, watching, and
+       carrying anything to the store. Mourn is NOT in this list. He comes in
+       for a funeral, and that is the one thing the whole colony does that he
+       is still part of. Neither is anything combat_actions scores: he runs from
+       a wolf, fights one that corners him, and walks in to the workbench to arm
+       himself, because a hermit who will not defend himself is just a slow
+       death (measured at 137 s of workbench time in 75 min, which is a visit,
+       not a commute).
+
+    2. THE TWO GATHERS THAT ARE NOT HIS. This is the correction that mattered
+       most, and it was measured, not guessed. `gather` is ONE affinity feeding
+       THREE jobs, and only one of them - ForageBerries - is food he can eat.
+       At 0.85 the first cut of this role sent him to the trees and the loose
+       rock as well, and `_deposit_step` then handed him his load back: over 75
+       sim-min he spent 13-19k ticks felling the colony's forest and cracking
+       its rock and DESTROYED every unit of it. That is not a hermit being
+       antisocial, it is a hermit strip-mining the map, and it cost seeds 7 and
+       11 their whole colony (peak pop 13 and 10 against a control of 20).
+       Mine goes with them: `MINE_KEEP_OUT` sites quarries away from the
+       settlement, so a digging hermit is a hermit anywhere but home.
+
+    3. HIS OWN SHELTER, WHICH IS SLEEP AND WARMTH AT ONCE. The base Sleep score
+       gates on `_free_hut` - a building in town - so it is recomputed here
+       without one, and `WarmAtFire` is damped to HERMIT_FIRE_DAMP because the
+       colony's firepit is the other thing that was dragging him back in (8-9k
+       ticks of WarmAtFire on three of five seeds, and he was still the coldest
+       man in the colony at the end of it). Instead the cold sends him to BED:
+       `warmth` gets its own arm on the Sleep score and `_h_sleep_rough` pays
+       warmth back at a hut's rate. That is a real grant - he gets shelter he
+       did not build - and it is deliberate. The alternative measured worse on
+       every axis at once, and a hermit who walks into town every night to stand
+       at somebody else's fire is not a hermit at all.
+
+       The damp is a damp and not a zero, which is the safety valve: in a
+       blizzard (chill 0.008/s against the 0.030/s his camp pays back) the
+       `warmth > 0.9` override sets the raw score to 1.0, and 1.0 * 0.35 still
+       beats an idle colony's chores. Weather that would kill him can still put
+       him at the colony's fire.
+
+    4. THE PULL HOME. `Wander` is normally a flat 0.10 - the floor that means
+       "nothing better to do". For a hermit standing outside his own roam radius
+       it is HERMIT_HOMESICK instead, which outranks the colony's small chores
+       and loses to Eat, Sleep and anything combat scored. That ordering is the
+       design: he drifts back out to his camp of his own accord after hunger or
+       a wolf has dragged him in, but the pull home never outranks the reason he
+       came - and while there is danger on the map it is not applied at all, so
+       "get home" can never compete with "get away".
+
+    5. A FULL LARDER STOPS THE FORAGING. `_deposit_step` hands a hermit his food
+       back instead of shelving it, so his hands stay full - and a full-handed
+       forager re-enters the deliver phase the instant he picks anything up,
+       which is a job that starts and finishes every tick. Zeroing the two food
+       jobs at CARRY_CAP costs nothing (he is holding a meal, by definition) and
+       removes the thrash.
+    """
+    for dead in ("Converse", "Celebrate", "FollowParent", "Lookout", "ClimbTo",
+                 "CleanLitter", "CookFood", "HaulToStockpile",
+                 "BuildStructure", "UpgradeStructure", "RepairStructure",
+                 "PlantSapling", "GatherWood", "GatherStone", "Mine"):
+        s[dead] = 0.0
+
+    s["WarmAtFire"] = _clamp01(s.get("WarmAtFire", 0.0) * HERMIT_FIRE_DAMP)
+    s["Sleep"] = _clamp01(fatigue * fatigue * (1.55 if night else 0.45)
+                          + warmth * warmth * (1.35 if night else 0.60))
+    if fatigue > 0.93 or warmth > 0.90:
+        s["Sleep"] = 1.0
+
+    if carry_qty >= CARRY_CAP and carrying in (RES_FOOD, RES_COOKED):
+        s["ForageBerries"] = 0.0
+        s["Farm"] = 0.0
+
+    if danger:
+        # This function runs AFTER the danger clamp - it has to, or the combat
+        # merge would put the workbench back on his list - so it has to reapply
+        # it to the two scores it just wrote, or a cold hermit lies down to
+        # sleep in a flood. Same ceiling, same reason: nothing outranks fleeing.
+        s["Sleep"] = min(s["Sleep"], 0.35)
+        s["WarmAtFire"] = min(s["WarmAtFire"], 0.35)
+        return
+    try:
+        away = abs(float(getattr(agent, "x", 0.0)) - hermit_home(world))
+    except (TypeError, ValueError):
+        away = 0.0
+    if away > HERMIT_ROAM:
+        s["Wander"] = HERMIT_HOMESICK
 
 
 def _short_frac(qty: Any, scale: float) -> float:
@@ -1893,6 +2034,11 @@ def _mk_flee(agent: Any, world: Any) -> Action | None:
 
 
 def _mk_sleep(agent: Any, world: Any) -> Action | None:
+    # A hermit never books a bed - `_h_sleep` sends him to `_h_sleep_rough`, and
+    # a target here would only make `_c_sleep` try to evict him from a hut he
+    # was never in.
+    if is_hermit(agent):
+        return make_action("Sleep")
     hut = _free_hut(world, agent)
     return make_action("Sleep", target=hut.id) if hut is not None else None
 
@@ -3566,6 +3712,20 @@ def _compute_cutoff(world: Any) -> dict[str, Any] | None:
         if r < 0 or r == home:
             continue
         hole = _obstacle_holding(obs, r)
+        # A hermit standing outside the colony's region is not stranded, he is
+        # home. He is alone by design and he stays put for hours, so he clears
+        # STRANDED_DWELL_LONE (90 s) permanently and would otherwise stake a
+        # weight-3 "stranded" candidate that never expires - a bridge built
+        # toward a man who does not want one, paid for out of the same labour
+        # budget the MIN_POP trap was fixed by protecting.
+        #
+        # A HOLE STILL COUNTS, and that exception is the whole reason this is a
+        # `continue` here rather than a filter on `alive` above. Living apart is
+        # a choice; being at the bottom of a chasm with nothing to eat and no
+        # way up is not, and it is a rescue for him on exactly the same terms as
+        # for anybody else.
+        if hole is None and is_hermit(a):
+            continue
         if _stranded_for(world, a) >= (STRANDED_HOLE_DWELL if hole is not None
                                        else STRANDED_DWELL):
             away_from_home.append((a, hole))
@@ -4530,24 +4690,65 @@ def assign_roles(world: Any, dt: float) -> None:
     if not adults:
         return
 
+    def seniority(a: Any) -> tuple[int, float, int]:
+        return (
+            int(getattr(a, "generation", 0) or 0),
+            -(_age_of(a) or 0.0),
+            int(getattr(a, "id", 0) or 0),
+        )
+
     # --- the eldest leads ---------------------------------------------------
-    if len(adults) >= 3:
-        def seniority(a: Any) -> tuple[int, float, int]:
-            return (
-                int(getattr(a, "generation", 0) or 0),
-                -(_age_of(a) or 0.0),
-                int(getattr(a, "id", 0) or 0),
-            )
-        elder = sorted(adults, key=seniority)[0]
-        for a in adults:
+    # The hermit is out of the running by construction. Without that exclusion
+    # the two titles fight: the hermit is picked for seniority too, so on the
+    # tick the elder dies the hermit is the next most senior, is made elder,
+    # walks back into town, and the hermit slot is refilled behind him - a
+    # three-way churn triggered by every elder's death.
+    hermits = [a for a in adults if _role(a) == ROLE_HERMIT]
+    elder_pool = [a for a in adults if _role(a) != ROLE_HERMIT]
+    if len(adults) >= 3 and elder_pool:
+        elder = sorted(elder_pool, key=seniority)[0]
+        for a in elder_pool:
             if a is not elder and _role(a) == "elder":
                 _set_role(a, _worker_role(world))
         if _role(elder) != "elder" and _set_role(elder, "elder"):
             chronicle(world, f"{getattr(elder, 'name', 'Someone')} is now the elder.")
     else:
-        for a in adults:
+        for a in elder_pool:
             if _role(a) == "elder":
                 _set_role(a, _worker_role(world))
+
+    # --- and one of them lives apart ----------------------------------------
+    # Same shape as the elder above, with one difference that is the whole of
+    # "when they die, another takes the name": INCUMBENCY. The elder is
+    # recomputed from scratch every pass, which is fine for a title that means
+    # "the most senior person here". The hermit's means "the one who went away",
+    # and recomputing that every pass would move it to whoever happened to be
+    # most senior at the time - so a child coming of age, or the elder dying,
+    # would march a different colonist out into the wilderness. A sitting hermit
+    # therefore keeps the title until he dies or the colony gets too small, and
+    # succession is emergent exactly as the elder's is: he dies, he is no longer
+    # in `adults`, `hermits` is empty on the next pass, and the next most senior
+    # non-elder walks out and takes the name.
+    if len(adults) < HERMIT_KEEP_ADULTS:
+        # Too few hands left to spare one. Not the same number as the appointing
+        # gate: with one threshold a colony sitting on the boundary would send a
+        # man out and call him back every time somebody died and was born.
+        for a in hermits:
+            if _set_role(a, _worker_role(world)):
+                chronicle(world,
+                          f"{getattr(a, 'name', 'The hermit')} came back in "
+                          f"from the wilds.")
+    else:
+        for extra in hermits[1:]:       # never more than one, whatever a save says
+            _set_role(extra, _worker_role(world))
+        if not hermits and len(adults) >= HERMIT_MIN_ADULTS:
+            pool = [a for a in adults if _role(a) not in ("elder", ROLE_HERMIT)]
+            if pool:
+                pick = sorted(pool, key=seniority)[0]
+                if _set_role(pick, ROLE_HERMIT):
+                    chronicle(world,
+                              f"{getattr(pick, 'name', 'Someone')} went to live "
+                              f"apart, as the hermit.")
 
     # --- someone watches from the tower -------------------------------------
     towers = 0

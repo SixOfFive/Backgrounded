@@ -835,6 +835,59 @@ BARRICADE_RANGE = 48.0      # px
 BARRICADE_EDGE_FRAC = 0.16  # a barricade sits within this fraction of an edge
 BARRICADE_MIN_POP = 4       # colony builds them once it is this many strong
 
+# ------------------------------------------------------------------ hermit --
+#: The colonist who lives apart. A title like the elder's: at most one at a
+#: time, appointed rather than born to, and passed on when the incumbent dies.
+#:
+#: THE WHOLE TENSION IS THE DISTANCE, and it is a tension rather than a maximum.
+#: render/camera.py follows the mean of the densest RENDER_W-wide window of
+#: colonists, so "as far away as possible" taken literally is a colonist the
+#: user never sees - which is how nine previous features shipped invisible. The
+#: numbers below are picked against the camera, not against the map:
+#:
+#:   * the hermit is inside the window with everyone else while the colony's
+#:     whole span (settlement + hermit) stays under RENDER_W, so he is part of
+#:     the mean the camera centres on rather than a reason to abandon him;
+#:   * being in the mean pulls the camera *toward* him by roughly his distance
+#:     divided by the headcount - about 45 px in a colony of twelve - so his
+#:     distance from the frame centre is always a little less than his distance
+#:     from the settlement;
+#:   * STANDOFF_MAX + ROAM = 780 < STAGE_HALF (800), so even the far edge of his
+#:     range is on camera BEFORE that pull is counted.
+#:
+#: The floor is set by the other half of the request: he has to read as living
+#: apart. STANDOFF_MIN - ROAM = 300 px is past the far side of any settlement
+#: (huts, fire and store all sit within ~200 px of settlement_center), so at his
+#: closest he is still outside the town rather than at the edge of it.
+HERMIT_STANDOFF_MIN = 460.0
+HERMIT_STANDOFF_MAX = 620.0
+#: How far he mills about his own camp. Big enough that he is not a statue,
+#: small enough that "his own area" is a place rather than a habit.
+HERMIT_ROAM = 160.0
+#: His camp is never staked inside this of a world edge, so a colony founded
+#: near x=0 gets a hermit on its inland shoulder instead of one pressed flat
+#: against the wall (and `hermit_home` flips sides to honour it).
+HERMIT_EDGE_MARGIN = 340.0
+#: Adults needed before the colony appoints one, and the smaller number it may
+#: fall to before he is called back in. A hermit costs the labour pool a whole
+#: worker on top of the elder, so the gate sits far above the MIN_POP trap: 6
+#: adults is 1 elder + 1 hermit + 4 workers, against a founding roster of 4 and
+#: a measured peak of 14-16. The hysteresis gap stops the title flapping on and
+#: off across a single death.
+HERMIT_MIN_ADULTS = 6
+HERMIT_KEEP_ADULTS = 5
+#: What idling is worth to a hermit who is away from his camp. It has to beat
+#: the colony's small chores (so he drifts back out after a wolf or a meal drags
+#: him in) and lose to Eat, Sleep and fleeing (so the pull home never outranks
+#: staying alive). At his camp his Wander score is the ordinary 0.10.
+HERMIT_HOMESICK = 0.45
+#: How much of the colony firepit's pull survives for a hermit. A DAMP, never a
+#: zero: his camp shelters him against an ordinary night and does not shelter
+#: him against a blizzard, so the fire has to stay reachable or the role kills
+#: people. Measured at 1.0 (no damp) he spent 8-9k ticks of 75 sim-min walking
+#: to the fire on three of five seeds and was still the coldest colonist alive.
+HERMIT_FIRE_DAMP = 0.35
+
 # ------------------------------------------------------------------ scenes --
 SCENE_NIGHT_STORM = "night_storm"
 SCENE_CLEAR = "clear"

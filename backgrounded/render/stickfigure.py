@@ -52,6 +52,7 @@ from ..sim.entities import (
     Stickman,
     morph_scales,
 )
+from ..sim.names import ROLE_HERMIT
 from .camera import IDENTITY, Camera
 
 log = logging.getLogger(__name__)
@@ -134,6 +135,11 @@ _CANDLE_WAX = (232, 224, 200)
 _TORCH_SHAFT = (120, 82, 44)      # a longer wooden haft than the candle's stub
 _TORCH_HEAD = (60, 44, 30)        # the pitch-soaked wrap at the top
 _TORCH_FLAME = (255, 138, 40)
+#: The hermit's staff. Paler and greyer than either haft above so the two
+#: reference lengths in the colony - a torch and a walking stick - do not read
+#: as the same object at different sizes.
+_STAFF_WOOD = (166, 148, 118)
+_STAFF_KNOT = (198, 186, 158)
 
 _BUBBLE_BG = (233, 236, 244)
 _BUBBLE_EDGE = (44, 48, 58)
@@ -893,7 +899,15 @@ def _draw(surf: pygame.Surface, s: Stickman, t: float,
 
     if getattr(s, "carrying", None) and int(getattr(s, "carry_qty", 0) or 0) > 0:
         _draw_carried(surf, s, sk, base, silhouette)
-    if getattr(s, "holds_candle", False) and getattr(s, "alive", True):
+    # The hermit's tell comes FIRST and takes the hand, so he is the one figure
+    # in the colony with no flame on him. That is deliberate and it is half the
+    # read: every other stickman carries a torch (`holds_torch` defaults True)
+    # or, for the elder, a candle, so at night the settlement is a cluster of
+    # little fires and the hermit is a dark shape a long way off with a stick
+    # taller than he is. By day the staff carries it on its own.
+    if str(getattr(s, "role", "")) == ROLE_HERMIT and getattr(s, "alive", True):
+        _draw_staff(surf, s, sk, base, silhouette)
+    elif getattr(s, "holds_candle", False) and getattr(s, "alive", True):
         _draw_candle(surf, s, sk, t, base)
     elif getattr(s, "holds_torch", False) and getattr(s, "alive", True):
         _draw_torch(surf, s, sk, t, base)
@@ -954,6 +968,41 @@ def _draw_candle(surf: pygame.Surface, s: Stickman, sk: Skeleton,
     fc = (tip[0] + lean, tip[1] - r * 0.75)
     _disc(surf, _FLAME_OUTER, fc, r)
     _disc(surf, _FLAME_CORE, (fc[0] + lean * 0.3, fc[1] + r * 0.18), r * 0.5)
+
+
+def _draw_staff(surf: pygame.Surface, s: Stickman, sk: Skeleton,
+                base: Sequence[int], silhouette: bool) -> None:
+    """The hermit's walking staff: one line, taller than he is, and unlit.
+
+    The whole tell is the SILHOUETTE, because that is all the user gets from a
+    figure the width of a fingernail at the far edge of the frame. So the staff
+    is drawn from the ground beside his feet to well above his head - about 1.3
+    body heights of vertical line - which is the only mark in the colony taller
+    than the person holding it. Nothing here needs new art or a new asset: it is
+    two calls, exactly like the candle it takes the place of.
+
+    Anchored through the front hand rather than at a fixed offset so it tracks
+    every pose for free - it swings forward as he walks, drops with him when he
+    stoops - and planted at his feet rather than dangling from the grip, because
+    a staff that ends in mid-air reads as a spear. The lean is proportional to
+    how far the hand has travelled from the hip, which is what makes it look
+    held rather than glued on.
+
+    No flicker term and no time argument: the point of it is that it does not
+    burn (see the call site).
+    """
+    hx, hy = sk.front_hand
+    foot_y = max((f[1] for f in sk.feet), default=hy)
+    top_y = hy - max(3.0, sk.height * 0.62)
+    # Plant the butt just outside the stance, ahead of the leading foot.
+    bx = hx + sk.facing * max(0.8, sk.height * 0.05)
+    w = 2 if sk.height >= 17 else 1
+    col = base if silhouette else _STAFF_WOOD
+    _line(surf, col, (bx, foot_y), (hx, hy), w)
+    _line(surf, col, (hx, hy), (hx - sk.facing * max(0.4, sk.height * 0.03), top_y), w)
+    knot = base if silhouette else _STAFF_KNOT
+    _disc(surf, knot, (hx - sk.facing * max(0.4, sk.height * 0.03), top_y),
+          max(0.9, sk.height * 0.045))
 
 
 def _draw_torch(surf: pygame.Surface, s: Stickman, sk: Skeleton,

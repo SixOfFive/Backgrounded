@@ -27,13 +27,21 @@ ROLE_BUILDER = "builder"
 ROLE_ELDER = "elder"
 ROLE_CHILD = "child"
 ROLE_LOOKOUT = "lookout"
+#: The one who lives apart. A TITLE, exactly like ``ROLE_ELDER``: the colony
+#: holds at most one, it is never inherited by name, and when the incumbent dies
+#: ``behavior.assign_roles`` hands the title to somebody else on the next pass.
+#: Deliberately NOT in ``WORKING_ROLES`` - nobody is born to it and no child
+#: matures into it; a grown colonist is appointed and walks out.
+ROLE_HERMIT = "hermit"
 
 ROLES: tuple[str, ...] = (
     ROLE_GATHERER, ROLE_BUILDER, ROLE_ELDER, ROLE_CHILD, ROLE_LOOKOUT,
+    ROLE_HERMIT,
 )
 
 #: Roles a grown stickman may hold (a child matures into one of these).
-ADULT_ROLES: tuple[str, ...] = (ROLE_GATHERER, ROLE_BUILDER, ROLE_LOOKOUT, ROLE_ELDER)
+ADULT_ROLES: tuple[str, ...] = (ROLE_GATHERER, ROLE_BUILDER, ROLE_LOOKOUT,
+                                ROLE_ELDER, ROLE_HERMIT)
 
 #: Roles a freshly matured child picks from, weighted by listing frequency.
 WORKING_ROLES: tuple[str, ...] = (
@@ -47,6 +55,7 @@ ROLE_LABELS: dict[str, str] = {
     ROLE_ELDER: "Elder",
     ROLE_CHILD: "Child",
     ROLE_LOOKOUT: "Lookout",
+    ROLE_HERMIT: "Hermit",
 }
 
 

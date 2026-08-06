@@ -937,7 +937,16 @@ class World:
                     color=(255, 186, 92), intensity=0.85, flicker=0.30,
                     kind="candle", owner_id=agent.id,
                 ))
-            elif getattr(agent, "holds_torch", True):
+            elif (getattr(agent, "holds_torch", True)
+                  and getattr(agent, "role", "") != names.ROLE_HERMIT):
+                # The hermit carries no light, and it is decided HERE rather than
+                # by clearing holds_torch on appointment. render/stickfigure.py
+                # already declines to draw his flame, so the two halves have to
+                # agree; a flag toggled at appointment has to be un-toggled on
+                # every demotion path (death, the population floor, a UFO return
+                # handing back a stale role) and one missed path leaves a light
+                # with no source - which is exactly the bug this replaces, a
+                # moving pool of torchlight lighting nobody.
                 srcs.append(LightSource(
                     x=agent.x, y=agent.y - 16.0, radius=TORCH_RADIUS,
                     color=TORCH_COLOR, intensity=TORCH_INTENSITY,

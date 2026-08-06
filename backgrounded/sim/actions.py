@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import math
 import random
+import zlib
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
@@ -26,6 +27,10 @@ from ..constants import (
     FARM_FIELD_SIZE,
     FARM_HARVEST_FOOD,
     FARM_TILL_SEC,
+    HERMIT_EDGE_MARGIN,
+    HERMIT_ROAM,
+    HERMIT_STANDOFF_MAX,
+    HERMIT_STANDOFF_MIN,
     LITTER_CLUSTER_MIN,
     LITTER_CLUSTER_R,
     MAT_DIRT,
@@ -51,6 +56,7 @@ from ..constants import (
     WALK_SPEED,
 )
 from .entities import GROUND_SNAP, STEP_DROP_MAX
+from .names import ROLE_HERMIT
 
 # ---------------------------------------------------------------- geometry --
 # RENDER_W used to mean two things at once because the world and the view were
@@ -558,6 +564,95 @@ def settlement_center(world: Any) -> float:
     if ags:
         return float(sum(float(getattr(a, "x", 0.0)) for a in ags) / len(ags))
     return colony_center(world)
+
+
+# ------------------------------------------------------------------ hermit --
+def is_hermit(agent: Any) -> bool:
+    """True for the colonist holding the hermit title. Never raises."""
+    try:
+        return str(getattr(agent, "role", "")) == ROLE_HERMIT
+    except Exception:
+        return False
+
+
+def _hermit_base(world: Any) -> float:
+    """The settlement the hermit is measuring himself away FROM.
+
+    :func:`settlement_center` with one correction, and the correction is the
+    whole reason this exists. That function prefers the structure mean and falls
+    back to the mean of the LIVING AGENTS - and the hermit is a living agent. On
+    a colony that has not put a building up yet, ``home = mean + D`` with the
+    hermit's own x inside ``mean`` is a feedback loop: it settles rather than
+    running away (``home = m + D*n/(n-1)`` for the other n-1 colonists' mean m),
+    but it still over-throws the standoff by a third at n=4 and puts the camp
+    past the far side of the budget the constants were picked for.
+
+    So the fallback averages everyone EXCEPT the hermit. The structure branch is
+    left to ``settlement_center`` verbatim - buildings do not walk, and having
+    two averages of the same buildings that could disagree is worse than the
+    duplication it would save.
+    """
+    reg = structures_of(world)
+    n = 0
+    if reg is not None:
+        try:
+            for s in reg:
+                kind = str(getattr(s, "kind", ""))
+                if kind in OUTWORK_KINDS or kind == "grave":
+                    continue
+                if getattr(s, "is_ruined", False):
+                    continue
+                n += 1
+        except Exception:
+            n = 0
+    if n:
+        return settlement_center(world)
+    ags = [a for a in alive_agents(world) if not is_hermit(a)]
+    if ags:
+        return float(sum(float(getattr(a, "x", 0.0)) for a in ags) / len(ags))
+    return settlement_center(world)
+
+
+def hermit_home(world: Any) -> float:
+    """Where the colony's hermit lives, in WORLD px. Never raises.
+
+    DERIVED, not stored, and that is a deliberate choice against adding a world
+    field. A persisted anchor has to be initialised in ``_init_colony_state`` or
+    it exists on the ``__init__`` path only and the whole subsystem switches
+    itself off on a loaded world; it has to be re-sited when "New Landscape"
+    picks the colony up and puts it somewhere else; and it is a second source of
+    truth about where the colony is. Deriving it from ``_hermit_base`` plus a
+    seeded offset gets all three for free: a loaded world computes the same
+    answer as the one that saved it because ``world.seed`` round-trips, and a
+    re-landscaped world re-sites the camp because ``randomise_terrain`` draws a
+    new seed and moves the settlement.
+
+    ``zlib.crc32``, never ``hash()``: str hashing is salted per process, so the
+    same seed in two processes would put the hermit on opposite sides of the map
+    and no two-process digest comparison could ever match.
+
+    The side flips rather than clamps when the chosen shoulder runs out of map.
+    Clamping would silently pull the camp in toward the settlement near a world
+    edge - the one place the standoff matters most - and a colony founded at
+    x=200 would get a "hermit" living 200 px away, which is to say in town.
+    """
+    base = _hermit_base(world)
+    try:
+        seed = int(getattr(world, "seed", 0) or 0) & 0xFFFFFFFF
+    except (TypeError, ValueError):
+        seed = 0
+    h = zlib.crc32(b"hermit:" + str(seed).encode("ascii"))
+    frac = ((h >> 8) & 0xFFFF) / 65535.0
+    dist = HERMIT_STANDOFF_MIN + frac * (HERMIT_STANDOFF_MAX - HERMIT_STANDOFF_MIN)
+    side = 1.0 if (h & 1) else -1.0
+    lo = float(HERMIT_EDGE_MARGIN)
+    hi = float(WORLD_W) - float(HERMIT_EDGE_MARGIN)
+    home = base + side * dist
+    if not (lo <= home <= hi):
+        home = base - side * dist       # the other shoulder has the room
+    if not math.isfinite(home):
+        home = float(WORLD_W) * 0.5
+    return _clamp(home, lo, hi)
 
 
 def stage_bounds(world: Any) -> tuple[float, float]:
@@ -1513,6 +1608,40 @@ def _deposit_step(action: "Action", agent: Any, world: Any, dt: float) -> bool:
     """Walk to the stockpile and unload. Returns True when finished."""
     if not _has_load(agent, action):
         return True
+    if is_hermit(agent):
+        # A hermit has no stockpile and no reason to walk to the colony's. This
+        # is the single line that stops him commuting: every gather ends in a
+        # deliver phase that routes through here, so without it a hermit who
+        # forages one bush walks the full standoff back into the crowd, drops
+        # six berries and walks out again - which is a colonist with a long
+        # commute, not a hermit.
+        #
+        # Food stays in his hands. That is his larder, and it is also his
+        # starvation guard: `Eat` scores `hunger**2` on a held load and is
+        # forced to 1.0 past 0.85, so a hermit with anything edible on him
+        # cannot starve, and one with nothing still has the walk to the store as
+        # a last resort (see HERMIT_HOMESICK - the pull home loses to a really
+        # hungry man).
+        #
+        # Everything else is spent out there and does not come back. There is no
+        # book this breaks: World.reconcile conserves PEOPLE, not resources, and
+        # the stockpile is a counter rather than an inventory of objects. It is
+        # the cost of the role stated honestly - what the hermit picks, the
+        # colony never sees - and it is nearly hypothetical anyway, because his
+        # build/mine/cleanup affinities are 0.05-0.10. Clearing the slot rather
+        # than keeping it is load-bearing: a hermit left holding wood forever
+        # could never pick up food again.
+        res = getattr(agent, "carrying", None)
+        qty = int(getattr(agent, "carry_qty", 0) or 0)
+        action.data["stash"] = {}
+        if qty <= 0 or res not in (RES_FOOD, RES_COOKED):
+            try:
+                agent.carrying = None
+                agent.carry_qty = 0
+            except Exception:
+                pass
+        _halt(agent)
+        return True
     sp = nearest_structure(world, "stockpile", agent.x, built_only=True)
     tx = sp.x if sp is not None else colony_center(world)
     action.pose = "carry"
@@ -1692,7 +1821,22 @@ def _h_wander(a: Action, ag: Any, w: Any, dt: float) -> None:
     if a.phase == "start":
         rng = rng_of(w)
         span = rng.uniform(45.0, 230.0) * (1.0 if rng.random() < 0.5 else -1.0)
-        a.data["tx"] = _clamp_x(float(ag.x) + span)
+        if is_hermit(ag):
+            # An ordinary colonist wanders FROM WHERE HE STANDS, which is why
+            # the colony clusters: everyone's jobs are in the same place, so
+            # everyone's random walk starts there. A hermit wanders around HIS
+            # place instead. That one substitution is the whole of "hangs around
+            # their own area": nothing else in the sim positions an idle agent,
+            # so nothing else can hold him anywhere.
+            #
+            # THE SAME TWO DRAWS, deliberately. Re-using `span` rather than
+            # asking the rng for a fresh offset keeps the stream phase identical
+            # to a run with no hermit in it, so the only thing that moves is the
+            # hermit. It is rescaled to HERMIT_ROAM, which is the radius the
+            # camera budget in constants.py was picked against.
+            a.data["tx"] = _clamp_x(hermit_home(w) + span * (HERMIT_ROAM / 230.0))
+        else:
+            a.data["tx"] = _clamp_x(float(ag.x) + span)
         a.data["pause"] = rng.uniform(1.2, 4.5)
         a.data["pt"] = 0.0
         a.phase = "walk"
@@ -2167,7 +2311,60 @@ def _pick_hut(w: Any, ag: Any) -> Structure | None:
     )
 
 
+def _h_sleep_rough(a: Action, ag: Any, w: Any, dt: float) -> None:
+    """A hermit sleeps where he lies, at his own camp. No hut, no walk home.
+
+    This is not a nicety, it is the load-bearing half of the role. Fatigue is
+    the one need with no field remedy: `_h_sleep` is the only thing in the sim
+    that sets ``pose == "sleep"`` on purpose, and `entities.update_needs` only
+    pays fatigue back for that pose. A hermit denied it would sit pinned near
+    1.0, and fatigue pins MORALE too (``target = 1 - max(hunger, fatigue,
+    warmth)``) - which does not kill him, but does drag the colony MEAN morale
+    that `behavior._thrift` and the stone-hut tier's 0.55-for-180 s gate are
+    both read off. One permanently miserable man would have quietly cost the
+    colony its masonry.
+
+    The alternative was letting him use a hut, and a hermit who walks back into
+    town every single night is not a hermit.
+
+    SO HIS CAMP IS SHELTER, and it shelters him from the cold at the same rate a
+    hut does (0.030/s). That is a grant - he gets a roof he never built - and it
+    was arrived at the hard way. The first cut paid warmth back at half a hut's
+    rate on the theory that rough sleep should be strictly worse than a bed, and
+    it was worse in exactly the way that ruins the feature: he could not clear a
+    night's chill lying down (COLD_PER_SEC * 0.6 = 0.002/s over a ~600 s night),
+    so `WarmAtFire` won instead and he spent 8-9k ticks per 75 sim-min walking
+    to the colony's firepit - and was still the coldest colonist in the run.
+    Sleep is now his answer to being cold as well as to being tired, which is
+    what a lean-to is for.
+
+    Rough sleep is still worse than a bed where it costs him rather than the
+    feature: fatigue comes back at 0.040/s against a hut's 0.055/s, so he needs
+    more of the night to rest, and a blizzard (0.008/s) out-chills the camp and
+    can still drive him in to the fire. See `behavior._hermit_bias`.
+    """
+    a.pose = "sleep"
+    _halt(ag)
+    _adjust(ag, "fatigue", -0.040 * dt)
+    _adjust(ag, "warmth", -0.030 * dt)
+    _adjust(ag, "hunger", 0.004 * dt)
+    _adjust(ag, "morale", 0.004 * dt)
+    fatigue = _need(ag, "fatigue")
+    warm_enough = _need(ag, "warmth") < 0.30
+    # Warmth is in the wake test as well as the sleep score, or a hermit who
+    # bedded down cold would get up the moment he stopped being tired and start
+    # the walk to the fire he lay down to avoid.
+    if a.t > 400.0 or (warm_enough and (
+            fatigue <= 0.02 or (not is_night(w) and fatigue < 0.22))):
+        a.done = True
+
+
 def _h_sleep(a: Action, ag: Any, w: Any, dt: float) -> None:
+    if is_hermit(ag):
+        # Never claims a bed, so `_c_sleep` has nothing to release: it reads
+        # a.target (None) and a.data["in"] (unset) and is a no-op on both.
+        _h_sleep_rough(a, ag, w, dt)
+        return
     hut = structure_by_id(w, a.target)
     if hut is None or getattr(hut, "is_ruined", False) or not getattr(hut, "built", False):
         if a.phase == "sleep":
