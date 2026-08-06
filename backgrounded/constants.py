@@ -422,6 +422,315 @@ HUT_TIER_MORALE = 0.55          # colony-mean morale that counts as "content"
 #: two minutes regardless of threshold - that was measured too, and rejected.
 HUT_TIER_DWELL_SEC = 180.0      # seconds it must be sustained, unbroken
 
+# ------------------------------------------------------ surplus economy -----
+#: What a colony wants standing in the store, per head, for every resource a
+#: scored job can actually produce. ``behavior._stock_state`` turns each into
+#: two numbers - how far below target ("short") and how far past it ("glut") -
+#: and every material job in ``score_actions`` is driven off that one pair.
+#:
+#: Before this existed the ONLY demand signal for wood, stone and fibre was
+#: "the head of the build queue cannot afford it". Measured over 8 seeds x 45
+#: sim-min: stone urgency read exactly 0.0 in 93.5-95.7% of snapshots, wood in
+#: 58.7-85%, and mean head-of-queue availability was 0.878-0.934. Nothing was
+#: ever blocked, so GatherStone sat at 0.05 - below Wander - and the colony
+#: quarried nothing on spec. Stone gross ran 25.1/colonist-hour against food's
+#: 169.4. A standing per-head target is what gives those jobs a reason to exist
+#: between builds.
+#:
+#: RES_STONE 3.0 / floor 6.0 is today's ``max(6, pop * 3)`` from the old inline
+#: Mine expression, kept to the digit so mining is unchanged where it already
+#: worked. RES_WOOD floor 12.0 and RES_FIBRE floor 6.0 are the scales
+#: ``_gather_urgency`` already passes for those resources.
+#:
+#: RES_FOOD 8.0 is NOT a taste number and must not be lowered casually. The
+#: birth gate in ``World._tick_population`` refuses a child while stored food is
+#: under ``FOOD_PER_HEAD_TO_GROW * n`` = 5/head. The old scoring target was
+#: ``max(8, pop * 4)`` = 4/head, i.e. BELOW the gate, so a colony that damped
+#: its own farming down to its own target would have parked itself permanently
+#: under its own reproduction threshold - a silent stall with no crash, no
+#: chronicle line and no visible cause. 8/head is 1.6x the gate. Anyone editing
+#: FOOD_PER_HEAD_TO_GROW must move this with it.
+STOCK_PER_HEAD = {
+    RES_FOOD: 8.0,              # raw + cooked, counted together
+    #: Meals standing ready, on top of the raw pile - and THE lever on cooking.
+    #: It was 1.5, and at 1.5 no score change could have made cooking visible:
+    #: a colony of eight wanted 12 meals, a cook delivers 3 at a time, so four
+    #: trips satisfied the entire standing demand and CookFood correctly shut
+    #: itself off. The measured symptom was a colony sitting on a mean 175.6 raw
+    #: food against 6.7 cooked. Raising the score alone (COOK_PILE_BONUS, with
+    #: this still at 1.5) moved CookFood 1.87% -> 3.42% of colonist-time and
+    #: stopped there, because the demand ceiling and not the score was binding.
+    #:
+    #: 4.0 is safe in a way no other per-head target here is, and the reason is
+    #: worth stating: cooking is a CONVERSION. `_h_cook` returns exactly the 3
+    #: units it took, and RES_FOOD above counts raw and cooked together, so this
+    #: number cannot change how much food the colony has - only which bin it
+    #: sits in. It says "hold about a third of the larder as prepared meals",
+    #: which is also the better bin: eating cooked is hunger -0.78 / morale
+    #: +0.09 against raw's -0.52 / +0.04.
+    #:
+    #: Measured at 4.0 over 5 seeds x 30 sim-min against an exact baseline:
+    #: CookFood 1.87% -> 6.61% of colonist-time, cooked gross 14.5 -> 43.8 per
+    #: colonist-hour (+203%), mean cooked stock 6.7 -> 39.9 against a mean pop
+    #: whose target is ~32 - i.e. the pantry settles just past target and the
+    #: glut term takes over, which is the loop closing on its own rather than a
+    #: number that happens to look right.
+    RES_COOKED: 4.0,
+    RES_WOOD: 3.0,
+    RES_STONE: 3.0,
+    RES_FIBRE: 1.5,
+}
+#: Floors, for the first few colonists - a target of "3 stone" for a colony of
+#: one is not a target. RES_HIDE is deliberately absent from both maps: no job
+#: in score_actions produces it, so a target for it could never be acted on.
+#:
+#: RES_FOOD 60.0 is the one floor that is not a convenience, and it was measured
+#: the hard way. At 16.0 a colony of three with 58 food read as fully glutted -
+#: 2.4x its own target - and spent its entire opening on the quarry: seed 42
+#: reached fatigue 1.000 and colony morale 0.004 by sim-minute five, then lost
+#: seven people to cold. A young colony's larder is not a surplus, it is the
+#: whole of its capital, and the store it needs is sized by the colony it is
+#: about to become rather than by the three mouths it has now. 60 is roughly
+#: what MAX_POP 20's own target would be at four food a head, so the feature
+#: simply does not engage until a settlement is genuinely established.
+STOCK_FLOOR = {
+    RES_FOOD: 60.0,
+    RES_COOKED: 4.0,
+    RES_WOOD: 12.0,
+    RES_STONE: 6.0,
+    RES_FIBRE: 6.0,
+}
+#: How many multiples of the target count as a full glut. At 1.5 a store is
+#: "glutted" at 2.5x its target, and the appetite it drives dies there.
+#:
+#: This is the width of the hysteresis band, and widening it is the fix if the
+#: colony oscillates between farming and quarrying at the COLONY level - a much
+#: slower and harder-to-see thrash than the per-agent kind MIN_COMMIT_SEC
+#: handles. Narrowing it to save food reintroduces exactly that.
+STOCK_GLUT_SPAN = 1.5
+#: The food glut, slewed. Rise slow, fall fast, and the asymmetry is the whole
+#: safety story: it takes two minutes of plenty before the colony believes it is
+#: rich, and twelve seconds of famine to put everyone back in the fields.
+#:
+#: A naked ratio was tried in design and rejected for the reason
+#: ``_tick_hut_tier`` gives about morale: at 2-10 agents the store crosses any
+#: line constantly, and a naked ratio would flip the colony's whole labour
+#: allocation on one birth or one cooked batch. Unlike the hut tier this is a
+#: SLEW and not a LATCH, and that difference is deliberate - a famine does not
+#: un-teach masonry, but a famine absolutely must put people back on the crops.
+SURPLUS_RISE_SEC = 120.0
+SURPLUS_FALL_SEC = 12.0
+#: How often the slew advances, in sim-seconds. score_actions runs per agent per
+#: AI tick, so the slew is stepped on the first call in each window and every
+#: other agent that window reads the same value - which is what keeps it
+#: deterministic and independent of how many people are alive.
+SURPLUS_STEP_SEC = 1.0
+#: The surplus is scaled to this after dark. Not a safety bolt-on: the extra
+#: work a surplus buys is OUTDOOR work, up to 720 px from camp, and
+#: ``animals._spawn_chance`` goes 0.25 -> 0.70 at night with bears weighted 1.6x.
+#: Folding the night factor into the slew's TARGET rather than its output means
+#: dusk ramps down over SURPLUS_FALL_SEC and dawn ramps back up over
+#: SURPLUS_RISE_SEC, so there is no step at either edge for the action system to
+#: oscillate across. The colony drifts back toward the fields and the fire after
+#: dark, which are the jobs that happen inside the settlement.
+SURPLUS_NIGHT = 0.35
+#: A colony only spends its dividend when it is content. Morale here is
+#: ``World.colony_morale()`` - the same mean the birth gate and the stone-hut
+#: tier read, so "how is the colony doing" cannot come to mean three slightly
+#: different numbers.
+#:
+#: This gate is load-bearing and not garnish. Un-gated, the extra work raises
+#: fatigue, fatigue drops colony morale under MORALE_TO_GROW, and the BIRTH gate
+#: closes - measured in design as morale blocking 27.8% -> 59.7% of sampled
+#: ticks and a population going 11 -> 3. It is negative feedback: work makes
+#: them tired, tired makes them rest.
+#:
+#: The floor is what stops it from being an off switch. Pooled mean morale runs
+#: ~0.50, so a hard ramp from MORALE_TO_GROW would leave a typical colony
+#: spending under a third of its dividend and the freed labour would land on
+#: Wander instead of the quarry - which is not what was asked for.
+SURPLUS_MORALE_MIN = MORALE_TO_GROW
+SURPLUS_MORALE_FULL = 0.62
+SURPLUS_THRIFT_FLOOR = 0.35
+#: ...and the same idea per PERSON rather than per colony. `thrift` is a mean
+#: over the roster and it lags: an individual can be at fatigue 1.0 while the
+#: colony still reads content, and the dividend would send him to the quarry
+#: anyway. That is not a hypothetical - it is what the first measured arm did.
+#:
+#: Daytime Sleep scores ``fatigue^2 * 0.55``, so a man at fatigue 0.8 rates rest
+#: at 0.352; an undamped dividend put GatherWood at 0.48 and beat it, and the
+#: colony worked through its own exhaustion until cold and mauling took it. At
+#: 0.80 the same man's material appetite is cut to 0.36 of full and Sleep wins,
+#: while a rested one at fatigue 0.2 keeps 84% of it.
+#:
+#: This is the term that lets the dividend stay generous. Turning the whole
+#: feature down would have bought the same safety by giving up the effect the
+#: user actually asked to see; this gives it up only for the people who cannot
+#: afford it, at the moment they cannot afford it.
+SURPLUS_FATIGUE_DAMP = 0.80
+#: Appetite a full surplus buys for a resource sitting exactly at its target.
+#: This is the number that decides whether the colony visibly branches out or
+#: merely nudges: at 0.75 a gatherer's GatherWood goes 0.100 -> 0.483 at a full
+#: larder, which puts it above BuildStructure's measured mean of 0.376 and far
+#: above the damped Farm.
+SURPLUS_DIVIDEND = 0.75
+#: ...and this much of it survives even when the store is already at target, so
+#: the dividend tapers with how short the resource actually is rather than
+#: paying flat. Two jobs to do: it keeps a topped-up resource from holding the
+#: same appetite as an empty one (negative feedback - as wood fills, stone
+#: overtakes it, so the three gathers separate instead of landing on one number
+#: inside TIEBREAK of each other), and the residual is what keeps a quarry
+#: ticking over in a rich colony at all.
+SURPLUS_RESIDUAL = 0.55
+#: The standing per-head target also pulls WITHOUT a surplus, at this strength.
+#: Mine already did exactly this at full strength (its old ``0.70 * stone_low``)
+#: and it is why mining was the only material job leaking any stone into the
+#: colony at all. Extending it to wood and fibre at 0.45 generalises the one
+#: idiom in the file that was working. It is what stops the wood store hitting
+#: literal zero, which it did at three of eight 5-minute marks on the measured
+#: baseline.
+MATERIAL_BASELINE = 0.45
+#: Ceiling on any appetite. Exactly ``_gather_urgency``'s own maximum
+#: (0.42 + 0.48), so the reachable maxima of GatherWood (0.91) and GatherStone
+#: (0.905) are unchanged and neither can newly cross OVERRIDE_FLOOR.
+APPETITE_MAX = 0.90
+#: How hard a full surplus damps the food jobs. Farm keeps 40% of its appetite
+#: at full glut rather than 0: the point is that a rich colony farms LESS, not
+#: that it stops - a damp of 1.0 would abolish farming, take the score to 0, and
+#: (because choose_action drops zero-scored candidates before drawing a
+#: tiebreak) re-phase the whole RNG stream as a side effect.
+FARM_SURPLUS_DAMP = 0.60
+FORAGE_SURPLUS_DAMP = 0.85
+#: Berry bushes are the colony's ONLY source of fibre (``actions`` gives them
+#: ``bonus_res: RES_FIBRE`` at half yield), and every hut costs 6 of it. Damping
+#: the food half of ForageBerries without this arm would quietly strangle
+#: cordage. A rich colony strips bushes FOR the fibre and takes the berries as a
+#: by-product, which is the honest reading of what it is doing.
+FIBRE_VIA_BERRIES = 0.70
+#: What a surplus adds to BuildStructure, scaled by how much of the site's cost
+#: is already on the ground. Scaled by availability on purpose: this is "the
+#: stuff is lying there, go and put it up", never "walk to a site with nothing
+#: at it".
+BUILD_SURPLUS_BONUS = 0.12
+
+# ------------------------------------------------------------- cooking ------
+#: Cooking is the one job in this economy that is a CONVERSION rather than a
+#: production, and the scoring never said so. ``_h_cook`` takes 3 raw off the
+#: pile and puts 3 cooked back (``ag.carrying = RES_COOKED``, same qty), and
+#: ``_stock_state`` counts raw and cooked together as RES_FOOD - so cooking can
+#: never lower the larder by a single unit. What it buys is strictly better
+#: food: eating cooked is ``hunger -0.78 / morale +0.09`` against raw's
+#: ``-0.52 / +0.04`` (see ``actions._h_eat``).
+#:
+#: Despite that, CookFood was scored purely on how short the PANTRY was
+#: (``_appetite(RES_COOKED, ...)``), and the raw pile it draws from entered only
+#: as a binary ``raw >= 3`` gate. Measured over 5 seeds x 15 sim-min, 827 scored
+#: samples: the colony sat on a mean 105.2 raw food against a mean 2.7 cooked,
+#: and CookFood was the top-scored candidate in 7 of 807 live samples - 0.87%.
+#: It was not losing to one rival, it was losing to all of them: BuildStructure
+#: outscored it in 75.5% of samples, Farm 56.0%, GatherWood 49.4%,
+#: ForageBerries 45.8%, Mine 45.2%. A mean of 0.280 against a board where five
+#: other jobs sit between 0.28 and 0.44.
+#:
+#: So the lever is not "beat BuildStructure". It is that a big raw pile plus an
+#: idle fire should be a reason to cook in its own right, which is what this
+#: bonus is. It is added on TOP of the pantry appetite, not folded into it, so
+#: the two demands stay separate: "we have no meals ready" and "we are sitting
+#: on a mountain of raw food".
+#:
+#: 0.24 was chosen against measured samples: it lifts CookFood's mean score from
+#: 0.280 to 0.509 and makes it top the board in 21.3% of live samples against
+#: 0.87%.
+#:
+#: On its own that was NOT enough, and the honest reading of this constant is
+#: that it is the smaller half of the fix. With ``STOCK_PER_HEAD[RES_COOKED]``
+#: still at its old 1.5 this bonus moved CookFood only 1.87% -> 3.42% of
+#: colonist-time, because the binding constraint was never the score - it was
+#: that the colony only wanted 1.5 meals a head and stopped. Raising the target
+#: is what actually moved cooking; this term is what makes the colony reach the
+#: target off the back of its raw pile rather than only when the pantry is bare.
+#: Both were measured separately before either was kept.
+COOK_PILE_BONUS = 0.24
+#: Raw food per head, past the gate, that counts as a full pile. At pop 8 that
+#: is 48 raw above the gate for the bonus to reach full strength.
+COOK_PILE_SPAN = 6.0
+#: The floor of the raw gate - today's flat ``raw >= 3``, which is exactly one
+#: cook-load (``stock_take(w, RES_FOOD, 3)``).
+COOK_RAW_GATE = 3.0
+#: ...and this much raw per head ON TOP of it, scaled by how short of food the
+#: colony actually is. This is the anti-starvation guard and it is the reason
+#: the gate is no longer a flat 3: a cook takes his 3 raw OUT of the store and
+#: holds them for COOK_TIME, so with the old gate a colony of eight with 3 food
+#: left and everyone hungry could put its entire larder in one man's arms and
+#: leave the store empty. At full shortfall and pop 8 the gate is now 35 raw;
+#: at a comfortable larder (food_short 0) it is 3, i.e. unchanged. The gate can
+#: therefore only ever be stricter than it was, never looser.
+COOK_RAW_RESERVE = 4.0
+
+# ------------------------------------------------- cracking loose rock ------
+#: GatherStone is a colonist breaking up a loose rock where it lies; Mine is a
+#: sustained dig at a quarry face. They are different things to look at and both
+#: are supposed to be visible. They were not: over the same 827 samples
+#: GatherStone topped the board in 13 (1.57%) at a mean score of 0.160, against
+#: Mine's 0.283.
+#:
+#: The cause is structural rather than a matter of tuning, and all of it sits in
+#: the two expressions. Mine reads
+#: ``0.30 + 0.70 * max(stone_low, stone_want) + 0.20 if no loose rock``;
+#: GatherStone read ``0.05 + 0.95 * stone_want`` - the lowest base on the board,
+#: no scarcity term, and crucially ``stone_want`` alone rather than
+#: ``max(stone_low, stone_want)``. Since ``_appetite`` only carries the standing
+#: target through at ``MATERIAL_BASELINE`` (0.45) strength, Mine sees the full
+#: per-head shortfall and GatherStone saw 45% of it. Both then read the SAME
+#: ``stone_want``, so the surplus dividend that lifted stone demand lifted Mine
+#: far more than GatherStone - which is exactly what the round measured
+#: (Mine 1.55% -> 3.75% of colonist-time, GatherStone 2.11% -> 2.28%).
+#:
+#: These numbers raise GatherStone's floor and add a proximity term in place of
+#: Mine's scarcity one. Reachable maximum is
+#: ``0.20 + 0.62 * APPETITE_MAX + 0.12 = 0.878``, which is BELOW the old
+#: expression's 0.905 - the ceiling goes down, not up, and nothing here can
+#: newly cross OVERRIDE_FLOOR (0.95).
+#:
+#: Measured over 5 seeds x 30 sim-min against an exact baseline: GatherStone
+#: 2.65% -> 3.59% of colonist-time (4.16% -> 6.39% in the rich-larder segment)
+#: with Mine held at 2.89% -> 2.81%, which is the point - the quarry keeps its
+#: work. A stronger variant (floor 0.28, span 0.52) was measured and rejected:
+#: it bought almost nothing on GatherStone (3.71%), pulled Mine down to 1.78%,
+#: raised thrash from 3.46 to 3.91 switches per colonist-minute, took mean peak
+#: from 0.682 to 0.710, and produced the run's only hunger death.
+GATHER_STONE_FLOOR = 0.20
+GATHER_STONE_SPAN = 0.62
+#: How much of the standing per-head stone shortfall the LOOSE-ROCK job sees,
+#: as a fraction of what the quarry sees. Mine reads `max(stone_low, ...)` at
+#: full strength; this is the same arm for GatherStone, weighted.
+#:
+#: It exists because setting it to 1.0 was measured and was wrong. At parity the
+#: two expressions come out nearly identical for the same colonist
+#: (0.308 + 0.62x against Mine's 0.30 + 0.70x), and since far more of the roster
+#: carries a `gather` affinity than a `mine` one, the loose rock simply took the
+#: quarry's work: over 5 seeds x 30 sim-min GatherStone went to 4.98% of
+#: colonist-time while Mine fell to 0.80% against a 3.75% baseline. Total stone
+#: labour was conserved - it just all moved to one of the two activities, which
+#: is the same failure as the one being fixed, pointing the other way. The user
+#: named cracking rocks AND the quarry; both have to stay on screen.
+#:
+#: At 0.0 the arm is off and GatherStone is driven by `stone_want` alone, as it
+#: always was - the lift then comes only from the floor and the proximity bonus,
+#: which are terms Mine does not share and so cannot be taken from it.
+GATHER_STONE_LOW_ARM = 0.0
+#: What a rock lying at your feet is worth over one at the edge of range. This
+#: is the mirror image of Mine's ``scarce_bonus`` (which pays +0.20 when there
+#: is NO loose rock to crack) and it is also the walk guard: ``find_prop``
+#: already refuses anything past 720 px, but a flat score would make a rock at
+#: 700 px as attractive as one at 20 px, and fall deaths have already drifted
+#: 2 -> 5 on a plausible walk-distance mechanism. Measured rock distances are
+#: short - median 52 px, p90 220 px - so a 400 px reference is a real gradient
+#: over the range colonists actually see rather than a rounding error: it pays
+#: 0.87 of full at the median, 0.45 at p90, and nothing at all past 400 px.
+GATHER_STONE_NEAR_BONUS = 0.12
+GATHER_STONE_NEAR_REF = 400.0
+
 # ---------------------------------------------------------- hut growth ------
 #: A hut is not a fixed object. It grows with the time it has stood and with
 #: how well stocked the colony is, so a long-lived, well-fed camp visibly

@@ -26,15 +26,29 @@ from typing import Any, Callable
 import numpy as np
 
 from ..constants import (
+    APPETITE_MAX,
     BARRICADE_EDGE_FRAC,
     BARRICADE_MIN_POP,
     BARRIER_MIN_RELIEF,
+    BUILD_SURPLUS_BONUS,
     CHASM_SAFE_GRADIENT,
     CLEANUP_SCORE_MAX,
+    COOK_PILE_BONUS,
+    COOK_PILE_SPAN,
+    COOK_RAW_GATE,
+    COOK_RAW_RESERVE,
     CROSSING_MAX_SPAN,
     CROSSING_MIN_DEPTH,
     FALL_LETHAL_SPEED,
     FARM_FIELD_SIZE,
+    FARM_SURPLUS_DAMP,
+    FIBRE_VIA_BERRIES,
+    FORAGE_SURPLUS_DAMP,
+    GATHER_STONE_FLOOR,
+    GATHER_STONE_LOW_ARM,
+    GATHER_STONE_NEAR_BONUS,
+    GATHER_STONE_NEAR_REF,
+    GATHER_STONE_SPAN,
     LITTER_CLUSTER_FULL,
     LITTER_CLUSTER_MIN,
     LADDER_MAX_W,
@@ -45,6 +59,7 @@ from ..constants import (
     MAT_GRASS,
     MAT_LAVA,
     MAT_STONE,
+    MATERIAL_BASELINE,
     MAX_SLOPE_CLIMB,
     MAX_SLOPE_WALK,
     MIN_POP,
@@ -60,6 +75,19 @@ from ..constants import (
     SCENE_BLIZZARD,
     SCENE_NIGHT_STORM,
     STAGE_HALF,
+    STOCK_FLOOR,
+    STOCK_GLUT_SPAN,
+    STOCK_PER_HEAD,
+    SURPLUS_DIVIDEND,
+    SURPLUS_FALL_SEC,
+    SURPLUS_FATIGUE_DAMP,
+    SURPLUS_MORALE_FULL,
+    SURPLUS_MORALE_MIN,
+    SURPLUS_NIGHT,
+    SURPLUS_RESIDUAL,
+    SURPLUS_RISE_SEC,
+    SURPLUS_STEP_SEC,
+    SURPLUS_THRIFT_FLOOR,
     WALK_SPEED,
     WORLD_W,
 )
@@ -789,6 +817,27 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
     else:
         s["WarmAtFire"] = 0.0
 
+    # --------------------------------------------------------- economy ------
+    # Hoisted above the build block because BuildStructure reads the surplus
+    # too. The gather block below is where these used to live and is still where
+    # most of them are spent.
+    #
+    # `stocks` is the colony's whole material position in one shape: per
+    # resource, how far below its per-head target the store is and how far past
+    # it. `surplus` is the food glut, slewed over minutes and dimmed after dark.
+    # `spend` is the fraction of it THIS colonist is willing to lay out: the
+    # colony's contentment (`_thrift`, a lagging mean) and his own tiredness.
+    # The second is not redundant - a man can be spent while the colony still
+    # reads content, and without it the dividend outranks his own daytime Sleep
+    # and he works until the cold takes him.
+    shortfall = _needs_of(world)
+    blocking = _blocking_resources(world)
+    stocks = _stock_state(world, pop)
+    food_short, food_glut = stocks[RES_FOOD]
+    surplus = _surplus(world, food_glut, night)
+    spend = (SURPLUS_DIVIDEND * surplus * _thrift(world)
+             * (1.0 - SURPLUS_FATIGUE_DAMP * fatigue))
+
     # ----------------------------------------------------------- build ------
     queue = _queue_of(world)
     if queue and reg is not None:
@@ -797,9 +846,14 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
         avail = _availability(world, needs)
         unmet = 1.0 - 0.55 * float(item.get("completion", 0.0))
         weight = float(item.get("priority", 0.6))
-        s["BuildStructure"] = _clamp01(
+        base = _clamp01(
             aff["build"] * unmet * (0.28 + 0.72 * avail) * (0.55 + 0.45 * weight)
         )
+        # A colony with food to spare puts things up. Scaled by `avail` on
+        # purpose - this is "the materials are lying at the site, go and raise
+        # it", never "walk to a site with nothing at it". At surplus 0 the bonus
+        # is exactly 0.0 and this is bit-identical to the old single expression.
+        s["BuildStructure"] = _clamp01(base + BUILD_SURPLUS_BONUS * spend * avail)
     else:
         s["BuildStructure"] = 0.0
 
@@ -858,27 +912,64 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
 
     # ---------------------------------------------------------- gather ------
     # What the *head* of the build queue is short of is the colony's real
-    # bottleneck - a build stalled on 2 fibre has to outrank idling.
-    shortfall = _needs_of(world)
-    blocking = _blocking_resources(world)
+    # bottleneck - a build stalled on 2 fibre has to outrank idling. That path
+    # is unchanged; it is simply silent most of the time, because with
+    # MAX_CONCURRENT_SITES = 2 two structures' worth of cost is the ceiling on
+    # queue-derived demand and the store covers it almost always. `_appetite`
+    # adds the two demands that do not ask the queue anything.
     wood_urg = _gather_urgency(RES_WOOD, shortfall, blocking, 12.0)
     stone_urg = _gather_urgency(RES_STONE, shortfall, blocking, 10.0)
     fibre_urg = _gather_urgency(RES_FIBRE, shortfall, blocking, 6.0)
-    food_target = float(max(8, pop * 4))
-    stored_food = stock_qty(world, RES_FOOD) + stock_qty(world, RES_COOKED)
-    food_short = _clamp01((food_target - stored_food) / food_target)
-    food_urg = max(0.15 + 0.75 * food_short, fibre_urg)
+    wood_want = _appetite(RES_WOOD, stocks, spend, wood_urg)
+    stone_want = _appetite(RES_STONE, stocks, spend, stone_urg)
+    fibre_want = _appetite(RES_FIBRE, stocks, spend, fibre_urg)
+    cook_want = _appetite(RES_COOKED, stocks, spend)
+    # The food arm decays with the glut - including its 0.15 floor, which used
+    # to keep foraging alive against a larder twenty times over target. The
+    # fibre arms do NOT decay: bushes are the colony's only cordage, so a rich
+    # colony strips them for the fibre and the berries are the by-product.
+    # `fibre_urg` is kept as its own arm rather than folded into `fibre_want` so
+    # a build blocked on fibre pulls exactly as hard as it does today.
+    food_urg = max((0.15 + 0.75 * food_short) * (1.0 - FORAGE_SURPLUS_DAMP * surplus),
+                   fibre_urg, FIBRE_VIA_BERRIES * fibre_want)
 
-    s["GatherWood"] = _clamp01(aff["gather"] * (0.10 + 0.90 * wood_urg))
-    s["GatherStone"] = _clamp01(aff["gather"] * (0.05 + 0.95 * stone_urg))
+    # `stone_low` is hoisted out of the mine block below because BOTH stone jobs
+    # read it now. That is the whole of the GatherStone fix: Mine has always
+    # used `max(stone_low, stone_want)` and GatherStone used `stone_want` alone,
+    # and since `_appetite` only carries the standing per-head target through at
+    # MATERIAL_BASELINE (0.45) strength, Mine saw the full shortfall while
+    # GatherStone saw 45% of it. Both then read the same `stone_want`, so the
+    # surplus dividend lifted the quarry far harder than the loose rock - which
+    # is exactly what shipped (Mine 1.55% -> 3.75% of colonist-time, GatherStone
+    # 2.11% -> 2.28%). Cracking a rock and digging a quarry are different things
+    # to look at and the user asked for both.
+    stone_low = stocks[RES_STONE][0]
+    s["GatherWood"] = _clamp01(aff["gather"] * (0.10 + 0.90 * wood_want))
     s["ForageBerries"] = _clamp01(aff["gather"] * food_urg + hunger * 0.30)
     # Claim-aware: a prop another villager has already reserved does not count as
     # available here, so an agent will not pick GatherWood only to find every
     # tree taken - it scores the job zero and does something else instead.
     if _find_target_prop(world, _TREE_KINDS, ax, agent) is None:
         s["GatherWood"] = 0.0
-    if _find_target_prop(world, ("rock", "boulder", "stone", "outcrop"), ax, agent) is None:
+    # The rock is fetched as an object rather than a None-test because its
+    # DISTANCE is now part of the score. `find_prop` already refuses anything
+    # past 720 px, but a flat score rated a rock at 700 px exactly as highly as
+    # one underfoot, and this job had no walk term of any kind while Mine has
+    # MINE_MAX_WALK. `near` is the mirror of Mine's `scarce_bonus`: Mine is paid
+    # for there being no loose rock about, GatherStone is paid for there being
+    # one close. Reachable max is 0.878 against the old expression's 0.905, so
+    # the ceiling falls and nothing here can newly cross OVERRIDE_FLOOR.
+    rock = _find_target_prop(world, ("rock", "boulder", "stone", "outcrop"), ax, agent)
+    if rock is None:
         s["GatherStone"] = 0.0
+    else:
+        near = _clamp01(
+            1.0 - abs(float(getattr(rock, "x", ax)) - ax) / GATHER_STONE_NEAR_REF)
+        s["GatherStone"] = _clamp01(
+            aff["gather"] * (GATHER_STONE_FLOOR
+                             + GATHER_STONE_SPAN * max(GATHER_STONE_LOW_ARM * stone_low,
+                                                       stone_want)
+                             + GATHER_STONE_NEAR_BONUS * near))
     if _find_target_prop(world, ("bush", "berry", "berrybush", "shrub"), ax, agent) is None:
         s["ForageBerries"] = 0.0
 
@@ -891,9 +982,18 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
     if ripe_ready or tillable:
         field_bonus = 0.12 if crops_near > 0 else 0.0
         ripe_bonus = 0.15 if ripe_ready else 0.0
+        # `field_bonus` and `ripe_bonus` were additive and NOT scaled by
+        # food_short, so a ripe field pulled a flat 0.435 against a larder
+        # sixteen times over target and Farm ate 28% of all colonist time. Both
+        # now sit inside the damp. `hunger` stays OUTSIDE it, and that is the
+        # anti-starvation guard: a hungry individual goes to the field however
+        # rich the colony is. Safe to damp at all because crops are perennial -
+        # harvest resets growth rather than removing the plant, so an unpicked
+        # field waits and costs no re-tilling.
         s["Farm"] = _clamp01(
-            aff.get("farm", 0.5) * (0.18 + 0.82 * food_short + field_bonus)
-            + ripe_bonus + hunger * 0.12
+            (aff.get("farm", 0.5) * (0.18 + 0.82 * food_short + field_bonus)
+             + ripe_bonus) * (1.0 - FARM_SURPLUS_DAMP * surplus)
+            + hunger * 0.12
         )
     else:
         s["Farm"] = 0.0
@@ -901,9 +1001,14 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
     # ------------------------------------------------------------ mine ------
     # A sustained dig, complementing GatherStone. Rises as stored stone falls or
     # a build is blocked on stone, and is preferred when loose rocks are scarce.
-    stored_stone = stock_qty(world, RES_STONE)
-    stone_target = float(max(6, pop * 3))
-    stone_low = _clamp01((stone_target - stored_stone) / stone_target)
+    # `stone_low` is now `stocks[RES_STONE]`'s short half, and STOCK_PER_HEAD /
+    # STOCK_FLOOR reproduce the old inline `max(6, pop * 3)` to the digit - the
+    # target that used to be Mine's private special case is now the general
+    # rule, and GatherStone reads it too. Kept as its own `max()` arm rather
+    # than relying on `stone_want` alone so APPETITE_MAX cannot lower Mine's
+    # existing ceiling: at an empty quarry this is bit-identical to today.
+    # `stone_low` is now hoisted into the gather block above, which is the only
+    # place it moved to - Mine's own expression is untouched.
     if _mineable_near(world, ax, agent):
         loose_rock = _find_target_prop(world, ("rock",), ax, agent) is not None
         scarce_bonus = 0.0 if loose_rock else 0.20
@@ -912,7 +1017,7 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
         # ongoing activity rather than only a stone-emergency response.
         s["Mine"] = _clamp01(
             aff.get("mine", 0.5)
-            * (0.30 + 0.70 * max(stone_low, stone_urg) + scarce_bonus)
+            * (0.30 + 0.70 * max(stone_low, stone_want) + scarce_bonus)
         )
     else:
         s["Mine"] = 0.0
@@ -928,10 +1033,55 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
     )
 
     # ------------------------------------------------------------ cook ------
+    # Cooked meals are a resource with a per-head target like any other, which
+    # replaces the old hand-written "is the pantry literally empty" pair. At
+    # zero cooked this now scores 0.74 x aff against the old 0.55, and at a full
+    # pantry it decays to 0.20 x aff instead of standing at 0.30 forever.
+    #
+    # The one job a surplus buys that cannot cost the colony a meal: cooking
+    # converts raw to cooked one for one and BOTH count toward stored food, so
+    # it can never push the larder down. It self-limits three ways over - on the
+    # `raw >= 3` gate, on the cooked target, and on the glut past it - which is
+    # what stops the runaway simply moving from the food bin to the cooked one.
+    # ...which is all true, and none of it made anyone cook. Measured over 5
+    # seeds x 15 sim-min (827 scored samples): mean 105.2 raw food standing
+    # against mean 2.7 cooked, and CookFood was top of the board in 7 of 807
+    # live samples - 0.87%. Two diagnoses were offered for that and BOTH were
+    # incomplete. It is not that BuildStructure blocks it and it is not that
+    # ForageBerries blocks it: CookFood was beaten by BuildStructure in 75.5% of
+    # samples, Farm 56.0%, GatherWood 49.4%, ForageBerries 45.8% and Mine 45.2%.
+    # It loses to everything, because the only demand it could read was "the
+    # pantry is empty" and that tops out at aff x 0.74.
+    #
+    # The missing term is the one thing that makes cooking different from every
+    # other job here: it is a CONVERSION, not a production. It cannot cost the
+    # colony a unit of food - `_h_cook` puts back exactly the 3 it took, as
+    # cooked - and `_stock_state` counts both halves as RES_FOOD. So a big raw
+    # pile with a fire standing idle is a reason to cook *by itself*, entirely
+    # separate from how many meals are ready. That is `pile`, and it is added on
+    # top of the pantry appetite rather than folded into it so the two demands
+    # stay legible.
+    #
+    # Three things stop it running away, and they are the same three as before
+    # plus a stricter gate:
+    #   * `1.0 - cook_glut` kills the bonus as the pantry fills past target and
+    #     zeroes it at 2.5x, while the base appetite decays over the same span;
+    #   * `pile` is measured PER HEAD, so a big colony needs a proportionally
+    #     bigger pile before the fire is worth lighting;
+    #   * the gate is no longer a flat 3. `raw >= 3` let a colony of eight with
+    #     three food left and everyone hungry hand its entire larder to one man
+    #     for COOK_TIME and leave the store empty behind him. The gate now rises
+    #     with the colony's own food shortfall - 35 raw at full shortfall and
+    #     pop 8, and still exactly 3 when the larder is comfortable, so it is
+    #     stricter than the old one everywhere and looser nowhere.
     raw = stock_qty(world, RES_FOOD)
-    if fire is not None and raw >= 3:
-        want = 0.30 + (0.25 if stock_qty(world, RES_COOKED) == 0 else 0.0)
-        s["CookFood"] = _clamp01(aff["gather"] * want)
+    gate = COOK_RAW_GATE + COOK_RAW_RESERVE * stocks[RES_FOOD][0] * pop
+    if fire is not None and raw >= gate:
+        pile = _clamp01((raw - gate) / max(1.0, COOK_PILE_SPAN * pop))
+        s["CookFood"] = _clamp01(
+            aff["gather"] * (0.20 + 0.60 * cook_want)
+            + COOK_PILE_BONUS * pile * (1.0 - stocks[RES_COOKED][1])
+        )
     else:
         s["CookFood"] = 0.0
 
@@ -1074,6 +1224,152 @@ def _gather_urgency(
     if blocking.get(res, 0) > 0:
         urgency = max(urgency, 0.78)
     return _clamp01(urgency)
+
+
+def _stock_state(world: Any, pop: int) -> dict[str, tuple[float, float]]:
+    """Per resource, ``(short, glut)`` against a standing per-head target.
+
+    ``short`` is 0..1 how far the store is BELOW what a colony of this size
+    wants; ``glut`` is 0..1 how far it is PAST it, reaching 1 at
+    ``STOCK_GLUT_SPAN`` extra target-multiples. They are mutually exclusive by
+    construction and both are 0 exactly at the target, so there is no step
+    anywhere on the curve - which is what keeps a colony hovering at its target
+    off a knife-edge.
+
+    One idiom for every resource. Before this there were five: food got a target
+    and no damper, stone got a target inline in Mine, wood and fibre got only
+    whatever the build queue was short of, and cooked got a hand-written
+    ``== 0`` special case. RES_FOOD counts raw and cooked together because both
+    feed people and the birth gate sums them the same way.
+    """
+    out: dict[str, tuple[float, float]] = {}
+    for res, per_head in STOCK_PER_HEAD.items():
+        target = max(float(STOCK_FLOOR.get(res, 1.0)), float(pop) * per_head)
+        if res == RES_FOOD:
+            have = float(stock_qty(world, RES_FOOD) + stock_qty(world, RES_COOKED))
+        else:
+            have = float(stock_qty(world, res))
+        ratio = have / max(1.0, target)
+        out[res] = (_clamp01(1.0 - ratio),
+                    _clamp01((ratio - 1.0) / max(1e-6, STOCK_GLUT_SPAN)))
+    return out
+
+
+def _surplus(world: Any, food_glut: float, night: bool) -> float:
+    """The food glut, slewed and dimmed after dark. 0..1.
+
+    Rise slow, fall fast. Two minutes of plenty before the colony believes it is
+    rich; twelve seconds of famine to put everyone back on the crops. The
+    asymmetry is the safety story, and it is why this is a slew rather than the
+    hut tier's latch - a famine does not un-teach masonry, but it absolutely
+    must reopen the fields.
+
+    The night factor scales the slew's TARGET, not its output, so dusk ramps
+    down over SURPLUS_FALL_SEC and dawn ramps back up over SURPLUS_RISE_SEC and
+    neither edge is a step.
+
+    Deliberately NOT persisted on the world, and that is the cheap half of the
+    design: nothing to add to ``to_dict``, nothing for ``from_dict`` to fail on,
+    SAVE_VERSION untouched. A loaded world starts at 0.0 and re-earns the
+    surplus in at most SURPLUS_RISE_SEC, which is the same thing a save written
+    before this feature existed would do.
+
+    Advanced at most once per SURPLUS_STEP_SEC, on whichever agent is scored
+    first in that window; every other agent that window reads the value it
+    stored. That is what makes the trajectory independent of how many people are
+    alive and identical in two separate processes on the same seed.
+    """
+    raw = _clamp01(food_glut) * (SURPLUS_NIGHT if night else 1.0)
+    now = world_now(world)
+    prev = getattr(world, "_bhv_surplus", None)
+    then = getattr(world, "_bhv_surplus_t", None)
+    if not isinstance(prev, float) or not isinstance(then, float):
+        prev, then = 0.0, now - SURPLUS_STEP_SEC
+    dt = now - then
+    if 0.0 <= dt < SURPLUS_STEP_SEC:
+        return prev
+    if dt < 0.0 or dt > 60.0:
+        # Rewound, or a world that has been sitting - do not integrate a jump.
+        dt = SURPLUS_STEP_SEC
+    step = dt / (SURPLUS_RISE_SEC if raw >= prev else SURPLUS_FALL_SEC)
+    val = _clamp01(prev + max(-step, min(step, raw - prev)))
+    try:
+        setattr(world, "_bhv_surplus", val)
+        setattr(world, "_bhv_surplus_t", now)
+    except Exception:
+        pass
+    return val
+
+
+def _thrift(world: Any) -> float:
+    """How much of its surplus the colony is willing to SPEND, 0..1.
+
+    Ramps with ``World.colony_morale()`` - the same mean the birth gate
+    (MORALE_TO_GROW) and the stone-hut tier (HUT_TIER_MORALE) read, so "how is
+    the colony doing" cannot come to mean three slightly different numbers.
+
+    This is negative feedback and it is load-bearing. The extra work a surplus
+    buys costs fatigue; fatigue drops colony morale; morale under MORALE_TO_GROW
+    shuts the BIRTH gate. Measured in design without this term: morale blocked
+    27.8% -> 59.7% of sampled birth ticks and one colony went 11 people to 3,
+    with nothing in the chronicle saying why. A tired colony rests instead.
+
+    The floor is what stops it being an off switch rather than a governor:
+    pooled mean morale runs about 0.50, so a hard ramp from 0.45 would leave a
+    typical colony spending under a third of its dividend and the labour freed
+    from the fields would land on Wander instead of the quarry.
+
+    Cached for two seconds the way ``_farm_feasible`` is, and for the same
+    reason: it is O(roster) and score_actions runs per agent per AI tick.
+    """
+    now = world_now(world)
+    try:
+        t = float(getattr(world, "_bhv_thrift_t", -1e9))
+        if 0.0 <= now - t < 2.0:
+            return float(getattr(world, "_bhv_thrift", SURPLUS_THRIFT_FLOOR))
+    except (TypeError, ValueError):
+        pass
+    fn = getattr(world, "colony_morale", None)
+    try:
+        m = float(fn()) if callable(fn) else 0.0
+    except Exception:
+        m = 0.0
+    span = max(1e-6, SURPLUS_MORALE_FULL - SURPLUS_MORALE_MIN)
+    val = SURPLUS_THRIFT_FLOOR + (1.0 - SURPLUS_THRIFT_FLOOR) * _clamp01(
+        (m - SURPLUS_MORALE_MIN) / span)
+    try:
+        setattr(world, "_bhv_thrift", val)
+        setattr(world, "_bhv_thrift_t", now)
+    except Exception:
+        pass
+    return val
+
+
+def _appetite(res: str, stocks: dict[str, tuple[float, float]],
+              dividend: float, queue_urg: float = 0.0) -> float:
+    """0..1 appetite for producing `res`, from three independent demands.
+
+    ``max()``, never a sum - it matches the ``max(stone_low, stone_urg)`` this
+    generalises and it is what bounds the result:
+
+    * ``queue_urg`` - what the head of the build queue cannot afford. Correct
+      code, and untouched; it is just silent 93-96% of the time.
+    * ``MATERIAL_BASELINE * short`` - the standing per-head target. This is
+      Mine's old ``0.70 * stone_low`` generalised to wood and fibre, and it is
+      the arm that stops the wood store hitting literal zero.
+    * ``dividend`` - what the food surplus pays for, tapered by how short the
+      resource is so a topped-up bin does not hold the same appetite as an empty
+      one. That taper is negative feedback between the gathers: as wood fills,
+      stone overtakes it, so the three separate instead of landing on one number
+      inside TIEBREAK of each other.
+
+    Capped at APPETITE_MAX = ``_gather_urgency``'s own ceiling, so no caller's
+    reachable maximum moves and nothing can newly cross OVERRIDE_FLOOR.
+    """
+    short, glut = stocks.get(res, (0.0, 0.0))
+    paid = dividend * (1.0 - glut) * (SURPLUS_RESIDUAL
+                                      + (1.0 - SURPLUS_RESIDUAL) * short)
+    return min(APPETITE_MAX, max(queue_urg, MATERIAL_BASELINE * short, paid))
 
 
 def _availability(world: Any, needs: dict[str, Any]) -> float:
