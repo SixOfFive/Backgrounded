@@ -9,6 +9,8 @@ reliably see — until lightning cracks and the whole landscape is revealed for 
 quarter of a second: every figure frozen mid-stride, the hut they are half way
 through building, the tree line on the ridge. Then it's dark again.
 
+![A colony at night in a storm, lit by the fire and one carried candle](docs/shots/colony-night-storm.png)
+
 They keep going whether or not you're looking. Close the program, come back
 tomorrow, and they've still got the hut, the firepit, the names of everyone who
 died getting there.
@@ -77,6 +79,11 @@ three need bars. **A full bar is bad:**
 A ring around the colour dot marks whoever is carrying the candle. The bottom
 line is the most recent entry in the chronicle.
 
+![Twenty stickmen at the population cap, huts part timber and part stone](docs/shots/colony-at-cap.png)
+
+A colony at its cap of twenty, mid-upgrade: some huts still timber, some
+already rebuilt in stone. Losses in the chronicle are red, arrivals green.
+
 ## Your wallpaper
 
 The program records your current wallpaper at startup and puts it back when it
@@ -96,6 +103,11 @@ gather wood and stone, haul it to a stockpile, and build a firepit, huts, a
 wall, a bridge, a watchtower and eventually a totem. They eat, sleep, get cold,
 huddle at the fire, talk to each other, celebrate finished buildings, and mourn
 at gravestones.
+
+![A settled colony of eighteen, all seven huts rebuilt in stone](docs/shots/colony-stone-huts.png)
+
+Stay content for long enough and the huts come back up in stone — the first
+tech tier, and one the colony has to earn rather than research.
 
 They also die: falls from cliffs, lightning strikes, wildfires, mudslides,
 floods, drowning, meteor strikes, and — if the colony truly runs out — hunger
