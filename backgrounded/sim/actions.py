@@ -28,9 +28,14 @@ from ..constants import (
     FARM_HARVEST_FOOD,
     FARM_TILL_SEC,
     HERMIT_EDGE_MARGIN,
+    HERMIT_FELL_REACH,
     HERMIT_ROAM,
     HERMIT_STANDOFF_MAX,
     HERMIT_STANDOFF_MIN,
+    HERMIT_VISIT_GIFT,
+    HERMIT_VISIT_MORALE_GUEST,
+    HERMIT_VISIT_MORALE_HOST,
+    HERMIT_VISIT_TIMEOUT,
     LITTER_CLUSTER_MIN,
     LITTER_CLUSTER_R,
     MAT_DIRT,
@@ -125,6 +130,13 @@ CELEBRATE_TIME = 6.0
 MOURN_TIME = 5.0
 PLANT_TIME = 2.5
 CLIMB_TIME = 2.5
+#: Seconds a hermit will spend walking to his own front door before giving up
+#: and lying down where he stands. Generous against the distance he actually has
+#: to cover (HERMIT_ROAM is 90 px, ~3 s of clear ground) and deliberately so:
+#: the number is not a travel budget, it is the guard that stops a shack he
+#: cannot reach - over a ledge, behind a fire - from costing him the night's
+#: sleep. Fatigue is the one need with no field remedy; see `_h_sleep_rough`.
+HERMIT_BED_WALK = 26.0
 CHOP_YIELD = 6
 STONE_YIELD = 5
 BERRY_YIELD = 4
@@ -517,7 +529,16 @@ def colony_center(world: Any) -> float:
 #: Structures deliberately placed at the colony's EDGE rather than inside it.
 #: They have to be left out of any "where is the colony" average, because the
 #: whole point of them is to sit a long way from that answer.
-OUTWORK_KINDS = ("barricade",)
+#:
+#: ``hermit_hut`` is here for a sharper version of the same reason and one extra
+#: one. A barricade folded into the mean merely moves it; the hermit's shack
+#: folded into the mean moves it and then feeds back, because ``hermit_home``
+#: below is *derived* from ``settlement_center`` plus a fixed standoff. Leave
+#: the shack in and every director pass sites the camp a little further out
+#: than the last, a runaway with a 760 px step. See also
+#: ``structures.NON_SETTLEMENT_KINDS``, which carries the same exclusion for the
+#: registry's own average (the camera's fallback, and stage_bounds').
+OUTWORK_KINDS = ("barricade", "hermit_hut", "hermit_fire")
 
 
 def settlement_center(world: Any) -> float:
@@ -613,8 +634,266 @@ def _hermit_base(world: Any) -> float:
     return settlement_center(world)
 
 
+def _hermit_owned(world: Any, kind: str, built_only: bool) -> Any | None:
+    """The hermit's one building of *kind*, or None. Never raises.
+
+    There is at most one of each, because :func:`behavior._ensure_hermit_camp`
+    only ever stakes one; if a mangled save carries several this returns the one
+    with the lowest id, deterministically, rather than whichever the dict
+    happened to yield first.
+
+    Ruins are never returned. A burned-out shack is not shelter, is not a build
+    target, and must not go on anchoring the camp - and it lingers as rubble for
+    RUIN_LINGER (240 s) before ``purge_ruins`` takes it away, which is 240 s of
+    a hermit who would otherwise be sleeping in a pile of ash.
+    """
+    reg = structures_of(world)
+    if reg is None:
+        return None
+    best = None
+    try:
+        for s in reg:
+            if str(getattr(s, "kind", "")) != kind:
+                continue
+            if getattr(s, "is_ruined", False):
+                continue
+            if built_only and not getattr(s, "built", False):
+                continue
+            sid = int(getattr(s, "id", 0) or 0)
+            if best is None or sid < int(getattr(best, "id", 0) or 0):
+                best = s
+    except Exception:
+        return None
+    return best
+
+
+def hermit_house(world: Any, *, built_only: bool = False) -> Any | None:
+    """The hermit's shack, or None. Never raises."""
+    return _hermit_owned(world, "hermit_hut", built_only)
+
+
+def hermit_fire(world: Any, *, built_only: bool = False) -> Any | None:
+    """The hermit's own firepit, or None. Never raises.
+
+    THIS IS ONE HALF OF THE MUTUAL GATE, and it is the half that needs a
+    function rather than a kind check. The other half is free: a villager looks
+    up ``nearest_structure(w, "firepit", ..)`` and a ``hermit_fire`` is not a
+    ``firepit``, so no villager can reach it however close he is standing. But a
+    hermit looking up "firepit" WOULD find the colony's, and geometry is not a
+    gate - a hermit dragged into town by a wolf is standing next to it. So every
+    warmth and cooking path a hermit can take is routed through here instead,
+    and it can only ever return something he built.
+    """
+    return _hermit_owned(world, "hermit_fire", built_only)
+
+
+def hermit_worksite(world: Any) -> Any | None:
+    """The unfinished building at his camp he should be working on, or None.
+
+    FIRE FIRST, THEN WALLS, and that order is the whole of this function. The
+    fire is 4 wood against the shack's 12 and it is what replaced the deleted
+    HERMIT_FIRE_DAMP safety valve, so the cheap warmth has to land before the
+    expensive roof or a hermit appointed on the eve of a blizzard has neither.
+    """
+    fire = hermit_fire(world)
+    if fire is not None and not getattr(fire, "built", False):
+        return fire
+    house = hermit_house(world)
+    if house is not None and not getattr(house, "built", False):
+        return house
+    return None
+
+
+def fire_for(agent: Any, world: Any) -> Any | None:
+    """The one fire *agent* is allowed to use, or None. THE MUTUAL GATE.
+
+    Every warmth and cooking path in the sim resolves its fire through here or
+    through :func:`fire_kind_for`, so the gate is one function rather than a
+    rule six call sites are each trusted to remember. It is symmetrical and it
+    is absolute:
+
+      * a HERMIT gets ``hermit_fire`` and nothing else. Not the colony's, ever,
+        at any distance, in any weather - see the deleted HERMIT_FIRE_DAMP note
+        in constants.py for what this replaced and why the damp had to go.
+      * ANYBODY ELSE gets the nearest built ``firepit`` and nothing else. That
+        half is already true by construction (a ``hermit_fire`` is not a
+        ``firepit``, so ``nearest_structure`` cannot return one), and it is
+        written out anyway because "by construction" is exactly the argument
+        that stops being true the day somebody passes a kinds tuple to that
+        call.
+
+    Never raises: a world with no fire of the relevant sort returns None and the
+    caller fails its action, which is what it did before any of this.
+    """
+    if is_hermit(agent):
+        return hermit_fire(world, built_only=True)
+    try:
+        ax = float(getattr(agent, "x", 0.0))
+    except (TypeError, ValueError):
+        ax = 0.0
+    return nearest_structure(world, "firepit", ax, built_only=True)
+
+
+#: The hermit's own buildings. Nothing the COLONY does may touch these - not
+#: building them, not repairing them, not celebrating them, not counting them.
+#: The census sites get that for free because these are separate kinds; the
+#: sites that iterate over ALL structures do not, and they are the ones that
+#: need this tuple.
+HERMIT_KINDS: tuple[str, ...] = ("hermit_hut", "hermit_fire")
+
+
+def is_hermit_built(st: Any) -> bool:
+    """True for a building that belongs to the hermit rather than the colony."""
+    try:
+        return str(getattr(st, "kind", "")) in HERMIT_KINDS
+    except Exception:
+        return False
+
+
+def colony_repairable(reg: Any, *, threshold: float = 0.9) -> list[Any]:
+    """Damaged buildings THE COLONY is allowed to mend. Never raises.
+
+    ``StructureRegistry.damaged`` walks every structure there is, so it hands
+    back the hermit's shack along with the huts - and `_mk_repair` then picks
+    ``min(..., abs(s.x - ax))`` over the result, which on a shack chewed by a
+    wolf is a villager sent on a 600 px walk to mend a building he may not
+    enter, for a man who did not ask. That is the same "the colony does his work
+    for him" failure `_colony_sites` exists to prevent, arriving through a
+    different door: `damaged()` is kind-agnostic where `count()` is not, so the
+    separate-kind trick does not cover it and an explicit filter has to.
+
+    Nobody mends his camp, including him - RepairStructure is one of the keys
+    `_hermit_bias` zeroes. A shack that takes damage stays damaged and, if it
+    is hit enough, falls down, and `_ensure_hermit_house` stakes him another.
+    Rebuilding is the loop this role already has and it is the one worth
+    watching; a repair loop would be a second one that looks identical.
+    """
+    try:
+        return [st for st in reg.damaged(threshold=threshold)
+                if not is_hermit_built(st)]
+    except Exception:
+        return []
+
+
+def fire_kind_for(agent: Any) -> str:
+    """The only structure kind *agent* may warm at or cook on."""
+    return "hermit_fire" if is_hermit(agent) else "firepit"
+
+
+def _fire_ok(fire: Any, agent: Any) -> bool:
+    """True if *fire* is a live fire this agent is permitted to use.
+
+    The kind test is the load-bearing half. An action carries its fire as an id
+    across ticks, and ids are handed out afresh as structures are purged and
+    staked, so "the target I was given" and "a fire I am allowed to stand at"
+    are two different questions and only this one is safe to act on.
+
+    WHAT FALSE ACTUALLY DOES, because it has been described wrongly: an action
+    handed the wrong fire is REDIRECTED, not refused. Every caller (`_h_warm`,
+    `_h_cook` through :func:`_regate_fire`, and `_h_clean`'s burn phase) answers
+    a False here by asking :func:`fire_for` for the one fire this agent may use,
+    rewriting its own target to that, and PUTTING ITSELF BACK INTO ITS APPROACH
+    PHASE so the agent walks to it. Only when `fire_for` itself comes back None -
+    a hermit with no fire of his own, a villager with no hearth standing - does
+    the action fail. So the gate is absolute about WHICH fire and silent about
+    it: a hermit dragged into town by a wolf and re-scored onto WarmAtFire does
+    not stand there failing, he turns round and walks home to his own.
+
+    The walk is not decoration - see `_regate_fire` for the tick on seed 7 where
+    it was missing and a redirect drew warmth off a fire 700 px away.
+    """
+    return (fire is not None
+            and str(getattr(fire, "kind", "")) == fire_kind_for(agent)
+            and not getattr(fire, "is_ruined", False)
+            and bool(getattr(fire, "built", False)))
+
+
+def _regate_fire(a: Any, ag: Any, w: Any) -> Any | None:
+    """The fire this action may use, re-resolved through the gate every tick.
+
+    ONE CALLER'S WORTH OF LOGIC THAT WAS COPIED INTO THREE, and the copies had
+    drifted into a bug. Each read its fire out of ``a.target``, tested it with
+    :func:`_fire_ok`, and on a failure swapped in :func:`fire_for`'s answer -
+    but left ``a.phase`` alone. A redirect that lands while the phase is already
+    ``warm`` or ``cook`` therefore skipped the walk entirely: the agent stood
+    where he was and drew warmth, or cooked a meal, at a fire that could be
+    seven hundred pixels away. Reachable two ways, both real - a structure id
+    reused after a purge, and a villager handed the hermit's title while he was
+    stood at the colony hearth (measured on seed 7, tick 34195).
+
+    So the redirect is a redirect: it rewrites the target AND puts the action
+    back into its approach phase, with a fresh walk clock in ``walk_t0`` so a
+    swap late in a long action does not immediately time the walk out. The agent
+    turns round and walks to the fire he is allowed to use.
+
+    ``start`` and ``fetch`` are left alone: neither has arrived anywhere yet, so
+    both fall into their own approach in the normal way.
+
+    Returns None and sets ``a.failed`` when there is no fire of the right sort
+    at all - a hermit whose camp has not been raised, a colony with no hearth.
+    """
+    fire = structure_by_id(w, a.target)
+    if _fire_ok(fire, ag):
+        return fire
+    fire = fire_for(ag, w)              # the mutual gate - see `fire_for`
+    if fire is None:
+        a.failed = True
+        return None
+    a.target = fire.id
+    if a.phase not in ("start", "fetch"):
+        a.phase = "approach"
+        a.data["walk_t0"] = float(getattr(a, "t", 0.0) or 0.0)
+    return fire
+
+
+def _walked_for(a: Any) -> float:
+    """Seconds this action has spent in its CURRENT walk. See `_regate_fire`."""
+    try:
+        return float(getattr(a, "t", 0.0) or 0.0) - float(a.data.get("walk_t0", 0.0))
+    except (TypeError, ValueError):
+        return float(getattr(a, "t", 0.0) or 0.0)
+
+
+def _stoke_wood(ag: Any, w: Any, want: int) -> int:
+    """Wood for a fire: out of his hands first, then out of the store.
+
+    A HERMIT NEVER TOUCHES THE STORE. He has no claim on it - the whole role is
+    built on "what the hermit picks, the colony never sees" - and the store is
+    700 px away besides, so a hermit permitted to draw on it would walk into
+    town every time his fire guttered, which is the commute this feature exists
+    to end. He feeds his fire out of the armful he cut himself, or it stays out
+    and he goes and cuts more (`behavior._hermit_bias` scores exactly that).
+    """
+    got = 0
+    if getattr(ag, "carrying", None) == RES_WOOD:
+        got = min(int(want), int(getattr(ag, "carry_qty", 0) or 0))
+        if got > 0:
+            ag.carry_qty = int(ag.carry_qty) - got
+            if ag.carry_qty <= 0:
+                ag.carrying = None
+    if got <= 0 and not is_hermit(ag):
+        got = stock_take(w, RES_WOOD, int(want))
+    return int(got)
+
+
 def hermit_home(world: Any) -> float:
     """Where the colony's hermit lives, in WORLD px. Never raises.
+
+    ONCE THE SHACK IS STANDING, THE SHACK IS THE ANSWER. Everything below this
+    paragraph describes how the camp is *sited in the first place*; from the
+    moment there is a building on it, the building is the single source of truth
+    about where the camp is, and the derivation stops running.
+
+    That is what makes the camp stop moving. The derivation is anchored on
+    ``_hermit_base``, which is a mean over the colony's buildings, so it drifts
+    every time the colony puts a hut up - and a camp that drifts is a hermit who
+    walks a little further from his own front door every ten minutes. It is also
+    the answer to what succession does with the house: the next hermit inherits
+    it, because ``hermit_home`` keeps returning the same x whoever holds the
+    title, so he walks out to the place the last one lived rather than founding a
+    new camp somewhere else. The seeded offset only decides where the FIRST one
+    goes, and where the next one goes if the shack has burned down and been
+    cleared away.
 
     DERIVED, not stored, and that is a deliberate choice against adding a world
     field. A persisted anchor has to be initialised in ``_init_colony_state`` or
@@ -636,6 +915,14 @@ def hermit_home(world: Any) -> float:
     edge - the one place the standoff matters most - and a colony founded at
     x=200 would get a "hermit" living 200 px away, which is to say in town.
     """
+    house = hermit_house(world)
+    if house is not None:
+        try:
+            hx = float(getattr(house, "x", 0.0))
+            if math.isfinite(hx):
+                return _clamp(hx, 0.0, float(WORLD_W))
+        except (TypeError, ValueError):
+            pass
     base = _hermit_base(world)
     try:
         seed = int(getattr(world, "seed", 0) or 0) & 0xFFFFFFFF
@@ -1631,6 +1918,66 @@ def _deposit_step(action: "Action", agent: Any, world: Any, dt: float) -> bool:
         # build/mine/cleanup affinities are 0.05-0.10. Clearing the slot rather
         # than keeping it is load-bearing: a hermit left holding wood forever
         # could never pick up food again.
+        # ...UNLESS HIS OWN SHACK IS SHORT OF IT, in which case THIS is his
+        # delivery. The whole build loop for the hermit lives inside the gather
+        # action rather than being handed to `BuildStructure`, and that is not an
+        # optimisation, it is the only shape that works.
+        #
+        # The obvious design - keep the load, let BuildStructure walk it to the
+        # site - was written, measured and thrown away. A hermit's `carrying`
+        # slot is almost always full of BERRIES: `_hermit_bias` only zeroes
+        # ForageBerries at CARRY_CAP, so his steady state is a man holding eight
+        # to eleven food, which is his larder and his starvation guard and must
+        # not be dropped. `_carry_add` puts a second resource in the ACTION's
+        # ``stash``, and a stash does not outlive the action that made it - so
+        # every log he cut while holding food was destroyed the moment the gather
+        # ended, and on seed 7 he sat at stage 0 with an empty frame for the
+        # entire 45 minutes. Delivering here, inside the action that still owns
+        # the stash, is what lets him carry a meal in one hand and a log in the
+        # other.
+        # `hermit_worksite`, NOT `hermit_house`, AND THE DIFFERENCE IS A
+        # DEADLOCK. This delivery and `behavior._mk_build`'s target have to name
+        # the same building, because the hermit's whole build loop is the two of
+        # them in a ring: the gather delivers the wood, the build spends it, and
+        # `_hermit_bias` only scores BuildStructure once the frame is stocked.
+        # Point them at different frames and the ring opens - measured on seed 7
+        # with this line still saying `hermit_house`: he cut wood for 45 minutes
+        # (396 GatherWood samples), delivered 6 of it into a HOUSE nobody was
+        # building, while `_mk_build` sat pointed at a FIRE that never received
+        # a single log, and scored BuildStructure exactly zero times in the
+        # whole run. Both frames finished the run at stage 0. One accessor for
+        # both callers is what makes that unrepresentable.
+        site = hermit_worksite(world)
+        want: dict[str, int] = {}
+        if site is not None:
+            try:
+                want = site.total_remaining_cost()
+            except Exception:
+                want = {}
+        if want and _load_is_useful(agent, action, want):
+            action.pose = "carry"
+            rem = step_toward(agent, world, float(site.x), dt,
+                              speed=WALK_SPEED * 0.92)
+            if rem > REACH * 1.6 and action.t <= 120.0:
+                return False
+            res = getattr(agent, "carrying", None)
+            qty = int(getattr(agent, "carry_qty", 0) or 0)
+            if res and qty > 0:
+                took = site.deliver(str(res), qty)
+                try:
+                    agent.carry_qty = qty - took
+                    if agent.carry_qty <= 0:
+                        agent.carrying = None
+                except Exception:
+                    pass
+            stash = action.data.get("stash")
+            if isinstance(stash, dict):
+                for r, q in list(stash.items()):
+                    took = site.deliver(str(r), int(q))
+                    stash[r] = int(q) - took
+                    if stash[r] <= 0:
+                        stash.pop(r, None)
+
         res = getattr(agent, "carrying", None)
         qty = int(getattr(agent, "carry_qty", 0) or 0)
         action.data["stash"] = {}
@@ -1881,7 +2228,18 @@ def _h_gather(a: Action, ag: Any, w: Any, dt: float) -> None:
     aid = getattr(ag, "id", None)
 
     if a.phase == "start":
-        p = find_prop(w, spec["kinds"], ag.x, claimant=aid)
+        # A HERMIT FELLS AT HIS OWN CAMP, not wherever he happens to be standing.
+        # `find_prop` takes the nearest to the x it is given, so handing it his
+        # own position makes each tree a stepping stone to the next one: measured
+        # on seed 7, he walked from his camp at 4133 out to 5469 inside four
+        # minutes, ended up level with the settlement, and was by then further
+        # from his own building site than `_h_build` will walk. Anchoring the
+        # search on the camp bounds the whole loop instead. HERMIT_FELL_REACH,
+        # and `_hermit_bias` checks the same thing before it scores this at all.
+        origin, reach = float(ag.x), 720.0
+        if a.kind == "GatherWood" and is_hermit(ag):
+            origin, reach = hermit_home(w), float(HERMIT_FELL_REACH)
+        p = find_prop(w, spec["kinds"], origin, max_dist=reach, claimant=aid)
         if p is None:
             a.failed = True
             return
@@ -2013,6 +2371,20 @@ def _h_build(a: Action, ag: Any, w: Any, dt: float) -> None:
         a.phase = "fetch"
 
     if a.phase == "fetch":
+        if is_hermit(ag):
+            # THERE IS NO FETCH FOR A HERMIT. "fetch" means walk to the colony's
+            # stockpile and draw on it, and he has neither a stockpile nor any
+            # business at theirs - `_deposit_step` spends a whole docstring on
+            # why he does not make that walk in the other direction either.
+            #
+            # Failing here is not a dead end, it is the handoff. A failed action
+            # drops him straight back into `choose_action`, where `_hermit_bias`
+            # has GatherWood scored for exactly this case, and `_deposit_step`
+            # then leaves the load in his hands instead of destroying it. He
+            # goes and cuts his own, and arrives back here in "approach".
+            a.data["short"] = {k: int(v) for k, v in need.items()}
+            a.failed = True
+            return
         want_res, want_qty = None, 0
         for res, qty in sorted(need.items(), key=lambda kv: -kv[1]):
             have = stock_qty(w, res)
@@ -2070,8 +2442,17 @@ def _h_build(a: Action, ag: Any, w: Any, dt: float) -> None:
         completed = s.advance(dt, _work_rate(ag))
         if completed:
             name = getattr(ag, "name", "Someone")
-            chronicle(w, f"{name} finished the {s.kind}.")
-            push_celebration(w, float(s.x), float(s.y), str(s.kind))
+            label = s.label() if hasattr(s, "label") else str(s.kind)
+            chronicle(w, f"{name} finished the {label}.")
+            # NO CELEBRATION AT THE HERMITAGE. `_fresh_celebration` is read by
+            # every colonist's Celebrate score, and a celebration is a POINT ON
+            # THE MAP they walk to - so pushing one when the hermit finishes his
+            # own shack summons the entire colony 600 px out to his door to
+            # dance outside the house of the man who left to get away from them.
+            # It is also the one build in the game nobody but the builder knows
+            # happened, which is the better reason: he raised it alone.
+            if not is_hermit_built(s):
+                push_celebration(w, float(s.x), float(s.y), str(s.kind))
             _adjust(ag, "morale", 0.18)
             a.done = True
         elif s.missing_for_stage():
@@ -2212,14 +2593,14 @@ def _h_repair(a: Action, ag: Any, w: Any, dt: float) -> None:
     if s is None:
         reg = structures_of(w)
         if reg is not None:
-            try:
-                dmg = reg.damaged()
-            except Exception:
-                dmg = []
+            dmg = colony_repairable(reg, threshold=1.0) if reg is not None else []
             if dmg:
                 s = min(dmg, key=lambda st: abs(st.x - float(ag.x)))
                 a.target = s.id
-    if s is None or getattr(s, "is_ruined", False):
+    # A repair that has ended up pointed at the hermit's camp - by a stale id, a
+    # save, or a re-target - is abandoned rather than carried out. See
+    # `colony_repairable`.
+    if s is None or getattr(s, "is_ruined", False) or is_hermit_built(s):
         a.failed = True
         return
     if s.hp >= s.max_hp:
@@ -2327,7 +2708,21 @@ def _h_sleep_rough(a: Action, ag: Any, w: Any, dt: float) -> None:
     The alternative was letting him use a hut, and a hermit who walks back into
     town every single night is not a hermit.
 
-    SO HIS CAMP IS SHELTER, and it shelters him from the cold at the same rate a
+    HE NOW HAS A SHACK, and when it is standing he sleeps IN it - `hermit_house`,
+    `enter()`, `ag.inside`, the lot, exactly the way a villager uses a hut, so
+    the renderer lights his doorway at night for free and he is not sprawled on
+    his own doorstep. Two guards make that safe rather than merely nicer:
+    HERMIT_BED_WALK bounds the walk (he lies down where he stands if the door is
+    somehow unreachable, which is the guarantee this whole function exists to
+    keep), and a shack that burns down mid-sleep drops him back out onto the
+    ground instead of leaving him flagged inside a building that no longer
+    exists - which is invisible forever.
+    Indoors he gets a HUT's fatigue and morale rates rather than the rough ones
+    below, so the role's measured safety margin can only widen: a bed he built
+    himself is strictly better than the ground beside it, never worse.
+
+    SO HIS CAMP IS SHELTER even before the shack goes up, and it shelters him
+    from the cold at the same rate a
     hut does (0.030/s). That is a grant - he gets a roof he never built - and it
     was arrived at the hard way. The first cut paid warmth back at half a hut's
     rate on the theory that rough sleep should be strictly worse than a bed, and
@@ -2343,12 +2738,52 @@ def _h_sleep_rough(a: Action, ag: Any, w: Any, dt: float) -> None:
     more of the night to rest, and a blizzard (0.008/s) out-chills the camp and
     can still drive him in to the fire. See `behavior._hermit_bias`.
     """
+    house = hermit_house(w, built_only=True)
+    if a.data.get("in"):
+        # Already in bed. If the roof has come off in the night - burned by a
+        # dragon, or simply gone - get him out of it now. `ag.inside` pointing
+        # at a structure that no longer exists is a colonist nothing draws.
+        if house is None or structure_by_id(w, a.target) is not house:
+            _c_sleep(a, ag, w)
+            house = None
+    elif house is not None and a.phase != "rough":
+        a.target = house.id
+        a.phase = "approach"
+        a.pose = "walk"
+        rem = step_toward(ag, w, float(house.x), dt)
+        if rem <= REACH * 1.4:
+            if house.enter(int(getattr(ag, "id", 0))):
+                a.data["in"] = 1
+                a.phase = "bed"
+                try:
+                    ag.inside = int(house.id)
+                except Exception:
+                    pass
+            else:                       # somebody else's shack, or no room
+                a.phase = "rough"
+        elif a.t > HERMIT_BED_WALK:
+            # Out of walking budget. Lying down here beats pacing toward a door
+            # he cannot reach while his fatigue pins at 1.0 - see the docstring.
+            a.phase = "rough"
+        return
+
+    indoors = bool(a.data.get("in")) and house is not None
     a.pose = "sleep"
     _halt(ag)
-    _adjust(ag, "fatigue", -0.040 * dt)
+    if indoors:
+        # Park him at the shack, as `_h_sleep` does with a hut: he is not drawn
+        # in there, but the position is where he reappears on waking and where
+        # anything he carries shines from.
+        try:
+            ag.x = float(house.x)
+            ag.y = float(house.y) - 2.0
+            ag.inside = int(house.id)
+        except Exception:
+            indoors = False
+    _adjust(ag, "fatigue", -(0.055 if indoors else 0.040) * dt)
     _adjust(ag, "warmth", -0.030 * dt)
     _adjust(ag, "hunger", 0.004 * dt)
-    _adjust(ag, "morale", 0.004 * dt)
+    _adjust(ag, "morale", (0.006 if indoors else 0.004) * dt)
     fatigue = _need(ag, "fatigue")
     warm_enough = _need(ag, "warmth") < 0.30
     # Warmth is in the wake test as well as the sleep score, or a hermit who
@@ -2356,13 +2791,20 @@ def _h_sleep_rough(a: Action, ag: Any, w: Any, dt: float) -> None:
     # the walk to the fire he lay down to avoid.
     if a.t > 400.0 or (warm_enough and (
             fatigue <= 0.02 or (not is_night(w) and fatigue < 0.22))):
+        # Free the bed here, not just via abandon(), for the same reason
+        # `_h_sleep` does: a hermit who wakes up still counted as an occupant
+        # locks the only place his successor could sleep.
+        if a.data.get("in"):
+            _c_sleep(a, ag, w)
         a.done = True
 
 
 def _h_sleep(a: Action, ag: Any, w: Any, dt: float) -> None:
     if is_hermit(ag):
-        # Never claims a bed, so `_c_sleep` has nothing to release: it reads
-        # a.target (None) and a.data["in"] (unset) and is a no-op on both.
+        # He never claims a HUT. He does claim his own shack when he has one,
+        # and `_h_sleep_rough` sets a.target and a.data["in"] for it, so the
+        # shared `_c_sleep` cleanup releases the right building either way -
+        # and is still a no-op on the nights he sleeps on the ground.
         _h_sleep_rough(a, ag, w, dt)
         return
     hut = structure_by_id(w, a.target)
@@ -2442,13 +2884,9 @@ def _c_sleep(a: Action, ag: Any, w: Any) -> None:
 
 
 def _h_warm(a: Action, ag: Any, w: Any, dt: float) -> None:
-    fire = structure_by_id(w, a.target)
-    if fire is None or fire.kind != "firepit" or getattr(fire, "is_ruined", False):
-        fire = nearest_structure(w, "firepit", ag.x, built_only=True)
-        if fire is None:
-            a.failed = True
-            return
-        a.target = fire.id
+    fire = _regate_fire(a, ag, w)       # the mutual gate - see `fire_for`
+    if fire is None:
+        return
 
     if a.phase in ("start", "approach"):
         a.phase = "approach"
@@ -2456,7 +2894,7 @@ def _h_warm(a: Action, ag: Any, w: Any, dt: float) -> None:
         rem = step_toward(ag, w, float(fire.x), dt, arrive=FIRE_REACH)
         if rem <= FIRE_REACH:
             a.phase = "warm"
-        elif a.t > 75.0:
+        elif _walked_for(a) > 75.0:
             a.failed = True
         return
 
@@ -2464,15 +2902,7 @@ def _h_warm(a: Action, ag: Any, w: Any, dt: float) -> None:
     _halt(ag)
     _face(ag, float(fire.x) - float(ag.x))
     if not fire.fire_active:
-        wood = 0
-        if getattr(ag, "carrying", None) == RES_WOOD:
-            wood = min(2, int(getattr(ag, "carry_qty", 0) or 0))
-            if wood:
-                ag.carry_qty = int(ag.carry_qty) - wood
-                if ag.carry_qty <= 0:
-                    ag.carrying = None
-        if wood <= 0:
-            wood = stock_take(w, RES_WOOD, 2)
+        wood = _stoke_wood(ag, w, 2)
         if wood <= 0:
             a.failed = True
             return
@@ -2487,22 +2917,31 @@ def _h_warm(a: Action, ag: Any, w: Any, dt: float) -> None:
 
 
 def _h_cook(a: Action, ag: Any, w: Any, dt: float) -> None:
-    fire = structure_by_id(w, a.target)
-    if fire is None or getattr(fire, "is_ruined", False):
-        fire = nearest_structure(w, "firepit", ag.x, built_only=True)
-        if fire is None:
-            a.failed = True
-            return
-        a.target = fire.id
+    fire = _regate_fire(a, ag, w)       # the mutual gate - see `fire_for`
+    if fire is None:
+        return
 
+    held_food = (getattr(ag, "carrying", None) == RES_FOOD
+                 and int(getattr(ag, "carry_qty", 0) or 0) > 0)
     if a.phase == "start":
-        if stock_qty(w, RES_FOOD) <= 0 and getattr(ag, "carrying", None) != RES_FOOD:
+        # A HERMIT COOKS WHAT HE PICKED. The store test below - and the whole
+        # "fetch" phase under it - is a walk to the colony's stockpile, which is
+        # the one errand this role must never run. His larder is his hands
+        # (`_deposit_step` hands a hermit his forage back instead of shelving
+        # it), so nothing raw in hand means nothing to cook, full stop.
+        if is_hermit(ag):
+            if not held_food:
+                a.failed = True
+                return
+            a.phase = "approach"
+        elif stock_qty(w, RES_FOOD) <= 0 and not held_food:
             a.failed = True
             return
-        a.phase = "fetch"
+        else:
+            a.phase = "fetch"
 
     if a.phase == "fetch":
-        if getattr(ag, "carrying", None) == RES_FOOD and int(getattr(ag, "carry_qty", 0) or 0) > 0:
+        if held_food:
             a.phase = "approach"
         else:
             sp = nearest_structure(w, "stockpile", ag.x, built_only=True)
@@ -2526,7 +2965,7 @@ def _h_cook(a: Action, ag: Any, w: Any, dt: float) -> None:
         if rem <= FIRE_REACH:
             a.phase = "cook"
             a.data["ct"] = 0.0
-        elif a.t > 120.0:
+        elif _walked_for(a) > 120.0:
             a.failed = True
         return
 
@@ -2535,7 +2974,7 @@ def _h_cook(a: Action, ag: Any, w: Any, dt: float) -> None:
         _halt(ag)
         _face(ag, float(fire.x) - float(ag.x))
         if not fire.fire_active:
-            got = stock_take(w, RES_WOOD, 1)
+            got = _stoke_wood(ag, w, 1)
             if got > 0:
                 fire.stoke(got)
                 fire.light_fire(0.4)
@@ -2602,8 +3041,40 @@ def _h_plant(a: Action, ag: Any, w: Any, dt: float) -> None:
 
 
 def _h_converse(a: Action, ag: Any, w: Any, dt: float) -> None:
+    """Two colonists stop and talk - and, once in a while, a visit to the hermit.
+
+    A VISIT IS THIS ACTION WITH A LONGER LEASH, not an action of its own, and
+    that is a measurement constraint rather than a saving. `choose_action` draws
+    one `rng.uniform` tiebreak per POSITIVELY SCORED candidate, so a new action
+    kind re-phases the world's random stream for every colonist on every tick -
+    the same reason `_hermit_bias` is built entirely out of re-weighting keys
+    that already existed. Reusing Converse costs one extra draw, for one
+    colonist, on the ticks a visit is actually open.
+
+    Three things change when ``a.data["visit"]`` is set, all of them because the
+    partner is 700 px away instead of 30:
+
+    * the approach budget goes from 30 s to HERMIT_VISIT_TIMEOUT. Thirty seconds
+      does not cross the standoff even on flat ground, so a visit under the
+      ordinary budget would be a man who sets off, gives up halfway and turns
+      round - which is worse than no feature at all;
+    * the talk runs longer, because somebody who walked a quarter of a mile does
+      not say hello and leave;
+    * it pays out once, on contact: a chronicle line, morale for both (more for
+      the host - he is the one who has not spoken to anybody), and whatever food
+      the visitor happened to be carrying.
+
+    The walk home needs no code. The visitor's jobs, his stockpile and his bed
+    are all back in the settlement, so the moment this finishes every score he
+    has points that way.
+    """
+    visit = bool(a.data.get("visit"))
     other = agent_by_id(w, a.target)
     if other is None or not getattr(other, "alive", True):
+        if visit:                    # the host died on the way out
+            _close_hermit_visit(w)
+            a.done = True
+            return
         other = _nearest_other(w, ag, 240.0)
         if other is None:
             a.done = True
@@ -2620,7 +3091,20 @@ def _h_converse(a: Action, ag: Any, w: Any, dt: float) -> None:
             a.phase = "talk"
             a.data["st"] = 0.0
             _pair_up(w, ag, other)
-        elif a.t > 30.0:
+            if visit:
+                # Measured from CONTACT, not from setting out. `a.t` has the
+                # whole walk in it by now - 60 s and more across the standoff -
+                # so a stay expressed as an absolute `a.t` bound is a stay that
+                # has already expired the instant he arrives, and the visit is a
+                # man who walks 700 px and turns straight round. Caught by the
+                # hermit standing frozen in "approach" for the whole 260 s
+                # watchdog afterwards, which is what a visit that never opened
+                # and never closed looks like from his end.
+                a.data["until"] = float(a.t) + CONVERSE_TIME * 3.0
+                _arrive_at_hermit(w, ag, other)
+        elif a.t > (HERMIT_VISIT_TIMEOUT if visit else 30.0):
+            if visit:
+                _close_hermit_visit(w)
             a.done = True
         return
 
@@ -2628,6 +3112,8 @@ def _h_converse(a: Action, ag: Any, w: Any, dt: float) -> None:
     _halt(ag)
     _face(ag, float(other.x) - float(ag.x))
     if abs(float(other.x) - float(ag.x)) > TALK_REACH * 2.2:
+        if visit:
+            _close_hermit_visit(w)
         a.done = True
         return
     a.data["st"] = float(a.data.get("st", 0.0)) + dt
@@ -2637,8 +3123,62 @@ def _h_converse(a: Action, ag: Any, w: Any, dt: float) -> None:
         emit_speech(w, ag, rng.choice(SPEECH_SYMBOLS))
     _adjust(ag, "morale", 0.030 * dt)
     _adjust(ag, "fatigue", -0.002 * dt)
-    if a.t > CONVERSE_TIME + 1.0:
+    if a.t > (a.data.get("until") or (CONVERSE_TIME + 1.0)):
+        if visit:
+            _close_hermit_visit(w)
         a.done = True
+
+
+def _close_hermit_visit(w: Any) -> None:
+    """Hand the visit slot back. Never raises; safe to call twice."""
+    try:
+        setattr(w, "hermit_visit", None)
+    except Exception:
+        pass
+
+
+def _arrive_at_hermit(w: Any, guest: Any, host: Any) -> None:
+    """The moment of the visit. Fires once, on contact, and never raises.
+
+    Deliberately does NOT touch the stockpile. A gift that came out of the
+    colony's stores would be a transfer the colony never carried and never
+    misses, invented 700 px from the building it came out of; the whole role is
+    built on "what the hermit picks, the colony never sees" and this is the same
+    rule pointed the other way. So the gift is whatever the visitor already has
+    in his hands - which is often something, because a gatherer on his way to
+    the store is exactly the sort of person with a spare hand for the walk - and
+    on the trips where it is nothing, the visit is just company. That reads
+    better than a guaranteed handout anyway.
+    """
+    try:
+        gname = str(getattr(guest, "name", "Someone"))
+        hname = str(getattr(host, "name", "the hermit"))
+        _adjust(host, "morale", HERMIT_VISIT_MORALE_HOST)
+        _adjust(guest, "morale", HERMIT_VISIT_MORALE_GUEST)
+        gave = 0
+        res = getattr(guest, "carrying", None)
+        qty = int(getattr(guest, "carry_qty", 0) or 0)
+        if res in (RES_FOOD, RES_COOKED) and qty > 0 and not getattr(host, "carrying", None):
+            gave = min(qty, int(HERMIT_VISIT_GIFT), CARRY_CAP)
+            try:
+                host.carrying = res
+                host.carry_qty = gave
+                guest.carry_qty = qty - gave
+                if guest.carry_qty <= 0:
+                    guest.carrying = None
+            except Exception:
+                gave = 0
+        if gave > 0:
+            chronicle(w, f"{gname} walked out to the hermit's shack and left "
+                         f"{hname} some food.")
+        else:
+            chronicle(w, f"{gname} walked out to sit a while with {hname}.")
+        try:
+            w.stats["hermit_visits"] = int(w.stats.get("hermit_visits", 0)) + 1
+        except Exception:
+            pass
+    except Exception:
+        log.debug("hermit visit payout failed", exc_info=True)
 
 
 def _nearest_other(w: Any, ag: Any, max_dist: float) -> Any | None:
@@ -3596,7 +4136,15 @@ def _h_clean(a: Action, ag: Any, w: Any, dt: float) -> None:
             # load would arrive at the fire invisible.
             a.failed = True
             return
-        if nearest_structure(w, "firepit", ag.x, built_only=True) is None:
+        # THE SAME QUESTION THE "burn" PHASE WILL ASK, and it has to be, because
+        # the two used to disagree. This was a raw `nearest_structure(w,
+        # "firepit", ..)` while the phase seventy lines below picks its fire
+        # through `fire_for` - so for a hermit the premise passed on the
+        # COLONY's hearth and the delivery then resolved to his own or to
+        # nothing at all. Unreachable today only because `_hermit_bias` zeroes
+        # CleanLitter, which is a gate held shut by a second gate somewhere
+        # else: exactly how one rots. One function, asked twice.
+        if fire_for(ag, w) is None:
             a.failed = True
             return
         pile = free_litter_cluster(w, aid)
@@ -3665,9 +4213,15 @@ def _h_clean(a: Action, ag: Any, w: Any, dt: float) -> None:
         # The fire is tracked in `data`, not in `target`: `target` still holds
         # the last claimed litter id, and `_c_clean` releases that claim by it.
         fire = structure_by_id(w, a.data.get("fire"))
-        if fire is None or fire.kind != "firepit" or getattr(fire, "is_ruined", False):
-            fire = nearest_structure(w, "firepit", ag.x, built_only=True)
+        if not _fire_ok(fire, ag):
+            fire = fire_for(ag, w)      # the mutual gate - see `fire_for`
             a.data["fire"] = getattr(fire, "id", None) if fire is not None else None
+            # A REDIRECT IS A NEW WALK. This phase already re-walks every tick,
+            # so unlike `_h_warm`/`_h_cook` there is no phase to rewind - but the
+            # CLEAN_WALK_TIMEOUT below is measured from `burn_t0`, and a swap
+            # late in the errand would otherwise time the new walk out on its
+            # first step and shed the load. Same rule as `_regate_fire`.
+            a.data["burn_t0"] = float(a.t)
         if fire is None:
             # The fire burned down while we were sweeping. Put the load back on
             # the ground rather than deleting it.

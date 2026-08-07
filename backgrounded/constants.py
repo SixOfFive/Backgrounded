@@ -851,19 +851,89 @@ BARRICADE_MIN_POP = 4       # colony builds them once it is this many strong
 #:   * being in the mean pulls the camera *toward* him by roughly his distance
 #:     divided by the headcount - about 45 px in a colony of twelve - so his
 #:     distance from the frame centre is always a little less than his distance
-#:     from the settlement;
-#:   * STANDOFF_MAX + ROAM = 780 < STAGE_HALF (800), so even the far edge of his
-#:     range is on camera BEFORE that pull is counted.
+#:     from the settlement.
 #:
-#: The floor is set by the other half of the request: he has to read as living
-#: apart. STANDOFF_MIN - ROAM = 300 px is past the far side of any settlement
+#: THE FIRST CUT OF THIS ROLE SAT AT 460-620 WITH A 160 px ROAM, chosen so that
+#: STANDOFF_MAX + ROAM = 780 < STAGE_HALF (800) and he was therefore on camera
+#: by arithmetic before the pull toward him was even counted. That was a
+#: compromise and it was overruled - the ask is "far far away, by the edge of
+#: the screen, as far from the regular camp" - so the guarantee is gone and
+#: these numbers are picked against measurement instead.
+#:
+#: CLIPPING WAS NEVER THE CONSTRAINT, AND THE FIRST VERSION OF THIS NOTE SAID
+#: IT WAS. It quoted a clipping rate of 10.6% for the man and picked the band to
+#: dodge it, on sprite pads that were GUESSED: +/-12 px for the figure, +/-23
+#: for the shack, +/-15 for the fire. Every one of them is wrong. INK-DIFFED
+#: against the real renderer - draw the thing on a transparent surface and read
+#: the columns whose alpha is non-zero, relative to the anchor the renderer
+#: blits on - the true drawn extents are:
+#:
+#:     figure   -29 .. +29 px worst frame (p95 -27/+20, median +/-7)
+#:     shack    -21 .. +18 px over every baked stage and variant
+#:     fire     -13 .. +12 px
+#:
+#: i.e. the figure is more than twice as wide as assumed and the two buildings
+#: are NARROWER. Re-measured with those pads over 20 seeds x 45 sim-min, the
+#: band below clips the man in 2.0% of frames and his fire in 1.3%, not one in
+#: nine. There was never a clipping problem to tune against.
+#:
+#: WHAT ACTUALLY BOUNDS THE STANDOFF IS THE CAMERA DROPPING HIM ALTOGETHER.
+#: `render/camera.py` follows the densest RENDER_W-wide window of colonists;
+#: past a certain distance the hermit stops being part of that window and the
+#: view abandons him, so the frames he loses are frames he is WHOLLY OFF, not
+#: frames he is half on. Six bands, 20 seeds x 45 sim-min each, all with the
+#: fire ward on (see HERMIT_FIRE_WARD) and all at the OLD 1/960 burn rate, so
+#: the rows are comparable to each other rather than to the shipping numbers.
+#: (At the band that shipped, slowing HERMIT_FIRE_BURN afterwards takes its
+#: alight column from 69.5% to 91.4%; the other five were not re-measured with
+#: the slower burn, because none of them was in contention on any other column.)
+#:
+#:   band / roam      mean out   MAN full  clip  off | FIRE full  off | alight
+#:   520-650 /  80     532 px      90.6%   2.0%  7.4%    96.9%  1.8%   69.5%
+#:   520-650 / 160     538 px      84.9%   3.0% 12.1%    91.4%  7.8%   72.9%
+#:   560-690 / 130     559 px      87.8%   2.9%  9.3%    95.4%  3.4%   68.6%
+#:   570-700 /  80     596 px      85.0%   3.0% 12.0%    91.3%  7.7%   72.0%
+#:   620-760 /  80     645 px      79.6%   4.8% 15.6%    90.9%  8.0%   63.6%
+#:   700-840 /  80     737 px      73.0%   6.4% 20.6%    86.9%  7.9%   67.6%
+#:
+#: SO THE BAND DID NOT MOVE OUT, AND THAT IS A MEASUREMENT AND NOT A FLINCH.
+#: Every metre further out costs the man ~1.5 points of visibility per 10 px,
+#: costs his fire five to eight points at a step, and - the one nobody
+#: predicted - costs him his LIFE: mauling damage per hermit-hour is 128 at
+#: this band and 187-222 at every band beyond it, because the ward is a place
+#: he has to be standing in and a longer walk to timber is a longer walk out of
+#: it. The three things the user cares about - a hermit far away, a hermit on
+#: screen, and a hermit who is not being eaten - stop agreeing at about 540 px.
+#:
+#: The ROAM is 80 for the same reason and it is now a safety number rather than
+#: a clipping one. At 160 with everything else held (row two above) his mean
+#: distance moves 6 px, his visibility drops 5.7 points, his fire's drops 5.5 -
+#: and his mauling goes from 128 hp/hermit-hour to 179, because a wider roam is
+#: simply more time spent outside the light of his own fire. It was tuned
+#: against clipping and it survives on better grounds than the ones it was
+#: picked for.
+#:
+#: The floor is the other half of the request: he has to read as living apart.
+#: STANDOFF_MIN - ROAM = 440 px is well past the far side of any settlement
 #: (huts, fire and store all sit within ~200 px of settlement_center), so at his
-#: closest he is still outside the town rather than at the edge of it.
-HERMIT_STANDOFF_MIN = 460.0
-HERMIT_STANDOFF_MAX = 620.0
-#: How far he mills about his own camp. Big enough that he is not a statue,
-#: small enough that "his own area" is a place rather than a habit.
-HERMIT_ROAM = 160.0
+#: closest he is a long way outside the town rather than at the edge of it. And
+#: see `behavior._ensure_hermit_house` for the rest of the answer: the shack has
+#: to be allowed to MOVE, because the settlement it is measured from does.
+HERMIT_STANDOFF_MIN = 520.0
+HERMIT_STANDOFF_MAX = 650.0
+#: How far he mills about his own camp - now his own doorstep. Small, and see
+#: the roam paragraph above for why: it buys 6 px of distance, costs 5.7 points
+#: of his own visibility and 5.5 of his fire's, and costs him 51 hp/hermit-hour
+#: of mauling by taking him out of the ward.
+HERMIT_ROAM = 80.0
+#: How far the standing shack may drift out of the standoff band before he
+#: strikes camp and builds a new one - see `behavior._ensure_hermit_house`. The
+#: shack does not move and the settlement does, so without this the distance is
+#: unbounded in both directions: measured at 974 px on seed 7, which is off the
+#: frame entirely. Wide enough that re-siting is a rare event rather than a
+#: tremor (the whole permitted band is 470..770, against a staking band of
+#: 560..680), narrow enough that the tail never reaches the border.
+HERMIT_RESITE_SLACK = 90.0
 #: His camp is never staked inside this of a world edge, so a colony founded
 #: near x=0 gets a hermit on its inland shoulder instead of one pressed flat
 #: against the wall (and `hermit_home` flips sides to honour it).
@@ -881,12 +951,220 @@ HERMIT_KEEP_ADULTS = 5
 #: him in) and lose to Eat, Sleep and fleeing (so the pull home never outranks
 #: staying alive). At his camp his Wander score is the ordinary 0.10.
 HERMIT_HOMESICK = 0.45
-#: How much of the colony firepit's pull survives for a hermit. A DAMP, never a
-#: zero: his camp shelters him against an ordinary night and does not shelter
-#: him against a blizzard, so the fire has to stay reachable or the role kills
-#: people. Measured at 1.0 (no damp) he spent 8-9k ticks of 75 sim-min walking
-#: to the fire on three of five seeds and was still the coldest colonist alive.
-HERMIT_FIRE_DAMP = 0.35
+#: HERMIT_FIRE_DAMP USED TO LIVE HERE, AND IT IS GONE ON PURPOSE. It was 0.35:
+#: the fraction of the COLONY firepit's pull that survived for a hermit, a damp
+#: rather than a zero because his camp shelters him against an ordinary night
+#: and not against a blizzard, and at 1.0 he spent 8-9k ticks of 75 sim-min
+#: walking to the colony's fire and was still the coldest man alive.
+#:
+#: The damp existed because the village fire was the only fire on the map. It
+#: now is not: he builds his own (below), and the gate on the two of them is
+#: ABSOLUTE in both directions - he never warms or cooks at theirs, no villager
+#: ever warms or cooks at his. A damp is a soft gate, and a soft gate is the
+#: thing the whole request was against ("gate it off to them and gate off the
+#: other houses to the hermit ... that'll keep them going where they should").
+#:
+#: What replaces the safety valve is not nothing, it is three things: his own
+#: fire is scored UNDAMPED (and keeps the cold-scene arm the colony's score has,
+#: so a blizzard can still drive it to 1.0) because it is at his doorstep rather
+#: than 700 px away; `_h_sleep_rough` still pays warmth back at a hut's rate;
+#: and the fire is the FIRST thing he builds, at 4 wood against the shack's 12.
+#:
+#: "ZERO DEATHS OF ANY CAUSE ON ANY SEED" USED TO BE WRITTEN HERE AND IT WAS
+#: NOT TRUE. Re-measured with the `entities.on_death` hook, cross-checked so the
+#: hook's count equals `World.reconcile()["deaths"]` on every run, 20 seeds x 45
+#: sim-min: the hermit died 16 times over 7.93 hermit-hours, 2.02 per
+#: hermit-hour, and EIGHT of those were maulings. The warmth half of the claim
+#: held up - nobody freezes and nobody starves out there - but the wolves were
+#: never counted, and the fourth thing that replaced the damp had to be added
+#: afterwards to pay for them. See HERMIT_FIRE_WARD for what it is and for the
+#: measurements that chose it over two behavioural fixes that both made it
+#: worse. With it in, the same 20 seeds give 1.12 deaths per hermit-hour
+#: against a villager's 2.14: he is safer than the people he left, which is
+#: what the commute used to buy him and is the bar this has to clear.
+
+# ---------------------------------------------------------- hermit's fire --
+#: Wood to raise his own firepit, and what it is worth to him to raise it.
+#: FOUR, against the colony pit's 6 wood + 6 stone. It is a ring of stones and
+#: an armful of sticks a single man laid, not the settlement's hearth, and the
+#: price has to be payable by one gather at his own camp - he has no stockpile
+#: and nobody hauls for him. Stone is excluded for the same reason the shack
+#: excludes it: quarries are sited in town by MINE_KEEP_OUT.
+HERMIT_FIRE_WOOD = 4
+#: Placed just above HERMIT_BUILD_URGE (0.66) so that when both his fire and his
+#: shack are unbuilt he lays the fire first. That ordering is load-bearing, not
+#: taste: the fire is a third of the price and it is the thing that replaces the
+#: deleted damp, so the cheap warmth has to land before the expensive walls.
+HERMIT_FIRE_URGE = 0.68
+#: How fast a hermit fire spends its fuel. The colony pit is FIRE_FUEL_BURN
+#: (1/240 - four minutes a tank) because a dozen people walk past it with an
+#: armful of wood all day. His is banked and fed by one man out of what he
+#: personally carried, so it burns at a SIXTH of that.
+#:
+#: The arithmetic: 1/1440 is 24 min from a full tank, and one 2-wood stoke
+#: (FIRE_STOKE_PER_WOOD 0.34 x 2 = 0.68 fuel) buys ~16 min. So he tends it three
+#: or four times an hour - often enough that the loop is something to watch,
+#: seldom enough that it is not the only thing he does. At the colony's rate the
+#: same arithmetic gives a stoke every ~2.7 min, which is a treadmill, not a man
+#: keeping a fire in.
+#:
+#: THIS WAS 1/960 AND THE NUMBER DEFENDING IT WAS WRONG. The note here claimed
+#: the fire was alight for 80.7% of the time it stood. Re-measured, 20 seeds x
+#: 45 sim-min, counting ticks where a BUILT, un-ruined hermit_fire has
+#: `fire_active` set: 69.5%, with the two worst seeds at 0.48 - a ring of cold
+#: stones more than half the time it existed. At 1/1440 the same 20 seeds give
+#: 91.4% pooled, worst seed 0.72, and no seed under 0.7.
+#:
+#: Two nudges were measured and this is the one that took. Raising
+#: HERMIT_STOKE_BELOW to 0.45 - tell him to top it up sooner - did nothing for
+#: the alight fraction (68.9%) and cost him 41 hp/hermit-hour of mauling,
+#: because "sooner" means more trips out of HERMIT_FIRE_WARD for wood. Slowing
+#: the burn asks him for fewer trips, not more, which is why it works on both
+#: axes at once: 1.17 deaths per hermit-hour against 1.39 at the old rate.
+#:
+#: The alight fraction is not decoration any more. HERMIT_FIRE_WARD only holds
+#: while the fire is BURNING, so this constant is now the difference between a
+#: hermit who is safe at home and one who is not.
+HERMIT_FIRE_BURN = 1.0 / 1440.0
+#: Fuel below which he will go and put wood on it unprompted, and what doing so
+#: is worth. The urge sits between HERMIT_HOMESICK (0.45) and HERMIT_FELL_URGE
+#: (0.58), so tending the fire outranks drifting home and loses to cutting the
+#: wood the fire needs - and both lose to eating, sleeping and running away. A
+#: fire he only feeds when he is already cold is a fire that is out every time
+#: he wants to cook, which is how this shipped inert the first time it was
+#: tried.
+HERMIT_STOKE_BELOW = 0.30
+HERMIT_STOKE_URGE = 0.52
+#: HOW FAR A BURNING HERMIT FIRE KEEPS WOLVES OFF, and the reason the fuel
+#: economy above is worth caring about. 0.0 switches the ward off entirely and
+#: is the control arm of the A/B below.
+#:
+#: THIS IS THE HERMIT'S SAFETY, AND HE USED TO HAVE IT FOR THE WRONG REASON.
+#: Before he had a camp of his own he walked into the settlement for warmth
+#: several times an hour, and the settlement is where a wolf meets barricades
+#: (BARRICADE_DAMAGE, 22 hp/s) and eleven armed neighbours. Measured across the
+#: role's first shipped version he was never mauled at all. Then his own fire
+#: replaced the commute, and the commute was the armour: measured over 20 seeds
+#: x 45 sim-min on the shipped code he took 213 hp of mauling per hermit-hour
+#: against a villager's 109 - TWICE as chewed as the people he left - and half
+#: his deaths were maulings against a fifth of theirs.
+#:
+#: The measurement that decided the shape of the fix: his EXPOSURE was 0.88x a
+#: villager's (a wolf was inside FLEE_RADIUS for 1.12% of his ticks against
+#: their 1.28%), so he was not meeting more wolves. He was surviving fewer of
+#: them, because he met them alone. Two behavioural fixes were measured first
+#: and both made it WORSE - making him flee instead of fight took him to 273
+#: hp/h (the wolf lives, and comes back), and stripping his camp chores while
+#: threatened took him to 262. He fights well; what he lacked was the thing a
+#: villager gets from a barricade.
+#:
+#: So the fire is the barricade. A wolf will not pick, and breaks off, anybody
+#: standing this close to a LIT hermit fire - a target filter, exactly like
+#: `_refuse_scale`, so "he was the last one alive" falls out for free as an
+#: animal with nobody to hunt walking off the map. It is NOT a damage exemption:
+#: he is caught in the open like anyone else while foraging, felling, visiting
+#: or sleeping under a dead fire.
+#:
+#: 110 px, against HERMIT_ROAM 80: his camp and the doorstep he mills around,
+#: and no further. Wide enough that being at home is genuinely safe, narrow
+#: enough that the safety is a place he has to be rather than a property he
+#: carries. And it puts teeth on HERMIT_FIRE_BURN: a fire he lets go out is not
+#: only a cold night, it is the night he gets bitten.
+#:
+#: MEASURED, 20 seeds x 45 sim-min, deaths counted with the `entities.on_death`
+#: hook and cross-checked against `World.reconcile()["deaths"]` on every run:
+#:
+#:                        deaths/hermit-h   vs villager   maul hp/hermit-h
+#:     before             2.02              2.73          212.7  (villager 109)
+#:     ward only          1.39              2.50          128.1  (villager 107)
+#:     ward + slow burn   1.17              2.23          139.9  (villager 109)
+#:
+#: He is not invulnerable and the numbers say so: four of his nine deaths are
+#: still maulings, he still fights (399 hp of his mauling arrives in
+#: FightAnimal, out in the open), and a wolf is still inside FLEE_RADIUS for
+#: 0.95% of his ticks. What changed is that being at home is now worth
+#: something. He takes ~29% more wolf damage per hour than a villager and dies
+#: barely half as often, which is the shape a man with one small advantage and
+#: no neighbours should have.
+HERMIT_FIRE_WARD = 110.0
+#: What cooking his own supper is worth to him. Deliberately modest and
+#: deliberately BELOW the Eat score a hungry man carries (`hunger**2`, forced to
+#: 1.0 past 0.85): a hermit with berries in his hands and an empty stomach eats
+#: them raw, and only a man who is fed and has a fire going bothers to cook. It
+#: also sits below HERMIT_STOKE_URGE, so a low fire gets wood before it gets a
+#: meal put on it - which is the right order and also the only one that works,
+#: since `actions._h_cook` needs the fire alight to cook at all.
+HERMIT_COOK_URGE = 0.42
+
+# --------------------------------------------------------- hermit's house --
+#: Whether the hermit builds himself a shack at all. A kill switch for the
+#: A/B, and the thing the control run flips - see tools/smoke.py and the
+#: measurement note in behavior._ensure_hermit_house. Never flipped at runtime.
+HERMIT_HOUSE = True
+#: Seconds of applied work per stage of it, and how much wood the whole thing
+#: costs (three stages, so this is split across them by StructureSpec).
+#: WOOD ONLY, deliberately. He has no stockpile to draw on and no colony to
+#: haul for him: everything in that shack is something he personally carried
+#: there, so the bill has to be payable by the one gather he actually does at
+#: his own camp. Stone would mean a quarry (sited in town by MINE_KEEP_OUT) and
+#: fibre would mean the colony's fields.
+HERMIT_HOUSE_WOOD = 12
+#: What raising it is worth to him, and what cutting the wood for it is worth.
+#: Both are handed back to two scores `_hermit_bias` otherwise zeroes, and only
+#: while the shack is unfinished. Placed above HERMIT_HOMESICK (0.45) so the
+#: work outranks drifting home and below every survival score, so it never
+#: outranks eating, sleeping or running - a hermit must not build through a
+#: blizzard. Felling sits under building so a man holding a log goes and puts it
+#: on the frame rather than cutting another.
+HERMIT_BUILD_URGE = 0.66
+HERMIT_FELL_URGE = 0.58
+#: How far from HIS CAMP - not from him - a tree may be for him to go and fell
+#: it for the shack. This number is the difference between a hermit and a
+#: lumberjack, and it was measured the hard way: without it he takes
+#: `find_prop`'s nearest tree to HIMSELF, walks to it, is nearest to the next
+#: one from there, and ranges 1300 px from his own camp inside four minutes -
+#: which put him in the middle of the settlement, dragged his mean distance from
+#: 640 px down to 280, and left him carrying a log he never delivered because
+#: the site was by then further away than `_h_build`'s approach budget.
+#:
+#: 300 px is about two roam radii plus a walk. Too small and a camp on bare
+#: hillside never gets a shack at all; too large and the role dissolves. If no
+#: tree is inside it, `_hermit_bias` does not score the fell in the first place,
+#: so he waits rather than thrashing against an action that fails on sight -
+#: and `behavior._camp_site` sites the camp itself toward the nearest timber in
+#: the standoff band, so "no tree within reach" is rare rather than routine.
+HERMIT_FELL_REACH = 420.0
+
+# ------------------------------------------------------- visiting the hermit --
+#: Mean seconds between one colonist walking out to see him, and the jitter
+#: either side of it. He is the one colonist who never converses; a visit is the
+#: exception that says so out loud, which means it has to be RARE. At ~15 min
+#: mean it fires 3-4 times a colony-hour - often enough that a user watching for
+#: ten minutes has a fair chance of catching one, seldom enough that it never
+#: becomes traffic. Measured: see the report.
+HERMIT_VISIT_PERIOD = 900.0
+HERMIT_VISIT_JITTER = 420.0
+#: How long a visit may stay open before the director gives up on it. The walk
+#: out is ~25 s of clear ground at WALK_SPEED and a good deal more over broken
+#: terrain, and a visitor who gets waylaid by a wolf on the way must not pin the
+#: slot shut forever.
+HERMIT_VISIT_TIMEOUT = 260.0
+#: What the visit is worth, to the man who lives alone and to the one who walked
+#: out. The host gets more: he is the one who has not spoken to anybody.
+HERMIT_VISIT_MORALE_HOST = 0.16
+HERMIT_VISIT_MORALE_GUEST = 0.10
+#: Units of food a visitor who happens to be carrying some will leave with him.
+#: Never taken from the stockpile - see actions._arrive_at_hermit.
+HERMIT_VISIT_GIFT = 3
+#: How badly the appointed visitor wants to make the walk, and how badly the
+#: hermit wants to answer the door once he is there. Both beat every ordinary
+#: colony chore and both lose to Eat, Sleep, fleeing and anything combat_actions
+#: scores: a visit is an occasion, not an emergency, and nobody dies being
+#: sociable. The guest's is the higher of the two because he has to hold the
+#: intention across a 700 px walk, while the host only has to notice a man
+#: standing in front of him.
+HERMIT_VISIT_URGE = 0.72
+HERMIT_HOST_URGE = 0.70
 
 # ------------------------------------------------------------------ scenes --
 SCENE_NIGHT_STORM = "night_storm"

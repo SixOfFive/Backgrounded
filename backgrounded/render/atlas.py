@@ -95,6 +95,8 @@ KIND_VARIANTS: dict[str, int] = {
     "stockpile": 2,
     "crop": 4,              # four field looks; growth lives on the stage axis
     "barricade": 4,         # spiked palisades raised near the world edges
+    "hermit_hut": 2,        # one man's lean-to, facing either way
+    "hermit_fire": 2,       # his own scrape fire, two stone layouts
 }
 
 #: Hut sprite kind -> the material its walls are drawn in.
@@ -133,6 +135,8 @@ ART_STAGES: dict[str, int] = {
     "stockpile": 3,
     "grave": 2,
     "barricade": 3,
+    "hermit_hut": 3,
+    "hermit_fire": 2,
 }
 
 # kind -> number of build stages the simulation uses (stage 0 is stakes /
@@ -218,6 +222,14 @@ KIND_SIZE: dict[str, tuple[int, int]] = {
     "totem": (30, 90),
     "stockpile": (52, 38),
     "barricade": (60, 58),
+    # The hermit's shack. Deliberately much smaller than a hut (78x64) and a
+    # different shape: see _bake_hermit_hut for why a lone lean-to must not
+    # resolve to village housing.
+    "hermit_hut": (46, 40),
+    # His fire, against the colony pit's (46, 28). Two thirds the width and a
+    # good deal lower: see _bake_hermit_fire for why a scrape must not resolve
+    # to the settlement's hearth.
+    "hermit_fire": (30, 20),
 }
 
 SCALE_BUCKET = 20.0              # scales quantise to 1/20 = 0.05 steps
@@ -1299,6 +1311,198 @@ def _bake_barricade(stage: int, rng: random.Random) -> pygame.Surface:
     return surf
 
 
+def _bake_hermit_fire(stage: int, rng: random.Random) -> pygame.Surface:
+    """The hermit's fire: a scrape with stones round it, and NOT a firepit.
+
+    Same argument as ``_bake_hermit_hut``, one building along. This is drawn a
+    few px from his shack at the far edge of the frame, and if it reads as the
+    colony's hearth then what the user sees out there is a second settlement
+    rather than one man living alone - which is worse than drawing nothing,
+    because it is wrong rather than missing.
+
+    So it is the colony pit's silhouette taken apart:
+
+      * (30, 20) against the pit's (46, 28) - two thirds the width, and lower;
+      * a BROKEN ring. The pit lays a closed ring of eight stones, which is a
+        built thing. This is four or five, uneven, with a gap at the front where
+        he sits, which is a fire somebody scraped out with his hands;
+      * no crossed woodpile. The pit stacks three logs in a lattice over itself
+        even unlit - the colony has firewood banked. He has two or three sticks
+        laid in, ends out, because he is burning what he cut this afternoon.
+
+    Two stages against the pit's three, because the sim gives it two: a scrape
+    and the stones set, then the sticks laid in it. There are no flames at any
+    stage in either building - fire is drawn by the renderer off ``fire_active``
+    and lit by ``Structure.light_source``, so a lit fire baked into the sprite
+    would be a fire that is always burning even when it is out.
+
+    ``rng`` is seeded per ``(kind, variant, stage)`` by ``Atlas._rng``, so the
+    two variants keep their own stone layout across both stages.
+    """
+    surf = _canvas("hermit_fire")
+    w, h = surf.get_size()
+    cx, cy = w // 2, h - 5
+    st = max(0, min(int(stage), 1))
+
+    # The scrape: bare turned earth, wider than the stones, the mark of a fire
+    # somebody dug out rather than built up.
+    _ellipse(surf, EARTH, cx, cy + 2, w * 0.42, 4.0)
+
+    # A BROKEN ring, and the gap is the character. Five stones over ~250 degrees
+    # with the opening facing the viewer, each one nudged off the circle so no
+    # two sit at the same height - the pit's ring is regular on purpose and this
+    # one must not be.
+    stones = 4 if st == 0 else 5
+    span = 4.35                                  # radians, ~250 deg - not a ring
+    start = 3.60 + rng.uniform(-0.25, 0.25)
+    for i in range(stones):
+        a = start + span * (i / max(1, stones - 1))
+        jx = rng.uniform(-1.2, 1.2)
+        jy = rng.uniform(-0.8, 0.8)
+        sx = cx + math.cos(a) * w * 0.31 + jx
+        sy = cy + math.sin(a) * 4.2 + jy
+        rx = rng.uniform(2.6, 3.8)
+        _ellipse(surf, STONE, sx, sy, rx, rx * 0.72)
+        _rim_arc(surf, sx, sy, rx, rx * 0.72, 3.1, 6.0, 78)
+
+    if st >= 1:
+        # Sticks laid IN, ends sticking out over the stones. Never a stacked
+        # lattice - that is the colony's banked firewood and it is the one shape
+        # this must not borrow.
+        for i in range(3):
+            x0 = cx - 6 + i * 6 + rng.uniform(-1.0, 1.0)
+            y0 = cy - 1
+            x1 = x0 + rng.uniform(-7.0, 7.0)
+            y1 = cy - rng.uniform(4.0, 7.0)
+            _line(surf, WOOD_DARK if i % 2 else WOOD, (x0, y0), (x1, y1), 2)
+        _rim_line(surf, (cx - 6, cy - 4), (cx + 6, cy - 5), 78)
+    return surf
+
+
+def _bake_hermit_hut(stage: int, rng: random.Random) -> pygame.Surface:
+    """The hermit's shack: a single-pitch lean-to, and NOT a small hut.
+
+    THE SILHOUETTE IS THE WHOLE POINT, for the same reason his staff is. This
+    building is drawn at the far edge of the frame with the settlement a long way
+    off to one side, and the one thing it must never do is read as "the colony
+    put up another hut over there". A hut is symmetric: two slopes meeting at a
+    ridge over the middle of its walls. This is deliberately the opposite -
+    ONE slope, running from a tall open mouth down to a back wall barely off the
+    ground, with no gable and no ridge line anywhere. At thirty px across in the
+    dark the asymmetry is legible when nothing else is, which is the only test
+    that matters here.
+
+    The rest of the character is scarcity. It is 46x40 against a hut's 78x64 and
+    it never grows (``Structure.scale`` is 1.0 for everything but a hut, and
+    ``growth_target`` returns 0.0 for this kind), so a settlement of grown huts
+    at 1.85x makes it look smaller as the colony prospers, which is exactly
+    right. The frame is unsawn poles rather than posts, the thatch is laid in
+    uneven courses, and the whole thing leans a little.
+
+    Stages, on the sim's three:
+      0  two poles driven into a scrape of turned earth, and a spare laid beside
+         them - the frame of a thing, and it is meant to look like almost
+         nothing, because the interesting part is watching one man walk twelve
+         loads of wood to it;
+      1  the poles carry a head beam and bare rafters. A skeleton with the sky
+         still coming through it;
+      2  thatched, with a dark mouth under the high end and a small stack of
+         firewood at the back. Finished.
+
+    ``rng`` is seeded per ``(kind, variant, stage)`` by ``Atlas._rng``, so the
+    two variants keep their own jitter and their own facing across every stage,
+    and nothing here re-rolls between stages. The one draw taken up front and
+    unconditionally is the facing, for the reason ``_bake_hut`` spells out: a
+    draw taken inside a stage branch makes the building change character as it
+    is built.
+    """
+    surf = _canvas("hermit_hut")
+    w, h = surf.get_size()
+    base = h - 2
+    st = max(0, min(int(stage), 2))
+
+    # Drawn before any branch: which way the mouth faces, how badly the poles
+    # were driven, how ragged the thatch is.
+    face_right = rng.random() < 0.5
+    lean = rng.uniform(-1.1, 1.1)
+    ragged = rng.uniform(0.0, 1.0)
+    extra = rng.randint(0, 1)
+
+    # The tall (open) end and the low (back) end, in canvas x.
+    tall_x = int(w * (0.74 if face_right else 0.26))
+    back_x = int(w * (0.20 if face_right else 0.80))
+    tall_y = int(h * 0.20)
+    back_y = int(h * 0.62)
+
+    _ellipse(surf, EARTH, (tall_x + back_x) // 2, base, w * 0.40, 2.6)
+
+    if st == 0:
+        # Two driven poles and a spare on the ground. Nothing else exists yet.
+        _stake(surf, tall_x, base, tall_y + h * 0.18, 2.0, lean=lean, point=0.0)
+        _stake(surf, back_x, base, back_y + h * 0.10, 1.8, lean=-lean * 0.6, point=0.0)
+        _line(surf, WOOD, (int(w * 0.30), base - 1), (int(w * 0.62), base - 2), 2, 180)
+        _rim_line(surf, (tall_x, tall_y + h * 0.18), (tall_x, base), 90)
+        return surf
+
+    # Stage 1 and 2 share the frame: two uprights and the single sloping beam.
+    _stake(surf, tall_x, base, tall_y, 2.2, lean=lean, point=0.0)
+    _stake(surf, back_x, base, back_y, 2.0, lean=-lean * 0.5, point=0.0)
+    _line(surf, WOOD_LIGHT, (tall_x, tall_y), (back_x, back_y), 2)
+
+    # Rafters, hanging off the slope toward the ground on the closed side.
+    n = 3 + extra
+    eave_x = int(w * (0.06 if face_right else 0.94))
+    for i in range(n):
+        t = (i + 1) / (n + 1)
+        rx = int(tall_x + (back_x - tall_x) * t)
+        ry = int(tall_y + (back_y - tall_y) * t)
+        fx = int(rx + (eave_x - rx) * 0.34)
+        _line(surf, WOOD, (rx, ry), (fx, base - int(h * 0.06 * (1.0 - t))), 1, 210)
+
+    if st == 1:
+        _rim_line(surf, (tall_x, tall_y), (back_x, back_y), 120)
+        return surf
+
+    # Finished: thatch laid over the slope in uneven courses.
+    roof = [
+        (tall_x, tall_y - 1),
+        (back_x, back_y - 1),
+        (int(back_x + (eave_x - back_x) * 0.55), base - int(h * 0.04)),
+        (int(tall_x + (eave_x - tall_x) * 0.30), base - int(h * 0.22)),
+    ]
+    _poly(surf, THATCH, roof)
+    courses = 3 + int(ragged * 2.0)
+    for i in range(courses):
+        t = (i + 0.5) / courses
+        ax = int(tall_x + (back_x - tall_x) * t)
+        ay = int(tall_y + (back_y - tall_y) * t)
+        bx = int(ax + (eave_x - ax) * (0.30 + 0.26 * t))
+        by = base - int(h * (0.22 - 0.18 * t))
+        _line(surf, THATCH_LIGHT if i % 2 else WOOD_DARK, (ax, ay), (bx, by), 1, 200)
+
+    # The mouth: a dark opening under the high end. This is the one hole in the
+    # silhouette and it is what says "somebody lives in here".
+    mw = max(4, int(w * 0.17))
+    mh = max(6, int(h * 0.36))
+    mx = tall_x - (mw if face_right else 0)
+    _poly(surf, (18, 14, 12), [
+        (mx, base), (mx + mw, base),
+        (mx + mw, base - mh), (mx, base - mh + int(h * 0.06)),
+    ])
+
+    # A little stacked firewood against the closed end - his whole economy.
+    sx = int(back_x + (eave_x - back_x) * 0.22)
+    for i in range(2 + extra):
+        yy = base - 1 - i * 2
+        _line(surf, WOOD_LIGHT if i % 2 else WOOD, (sx - 4, yy), (sx + 4, yy), 2, 230)
+
+    # Rim along the one slope, which is the line that has to survive the dark.
+    _rim_line(surf, (tall_x, tall_y - 1), (back_x, back_y - 1), RIM_A)
+    _rim_line(surf, (tall_x, tall_y - 1),
+              (int(tall_x + (eave_x - tall_x) * 0.30), base - int(h * 0.22)), 80)
+    return surf
+
+
 _STRUCTURE_BAKERS = {
     "firepit": _bake_firepit,
     "hut": _bake_hut,
@@ -1309,6 +1513,8 @@ _STRUCTURE_BAKERS = {
     "stockpile": _bake_stockpile,
     "grave": _bake_grave_structure,
     "barricade": _bake_barricade,
+    "hermit_hut": _bake_hermit_hut,
+    "hermit_fire": _bake_hermit_fire,
 }
 
 _sync_with_sim()

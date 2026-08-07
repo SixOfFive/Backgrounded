@@ -92,6 +92,7 @@ from ..constants import (
     ANIMAL_SPAWN_MIN,
     ANIMAL_STATS,
     ANIMAL_WOLF,
+    HERMIT_FIRE_WARD,
     OFFSTAGE,
     RELIC_SCALE,
     RES_HIDE,
@@ -316,6 +317,44 @@ def _agents(world: Any) -> list[Any]:
         return [a for a in (pop or ()) if getattr(a, "alive", False)]
     except Exception:
         return []
+
+
+def _ward_x(world: Any) -> float | None:
+    """Where a hermit fire is BURNING, or None. Never raises.
+
+    The one thing on the map that keeps wolves off somebody, and it is deliberate
+    that it reads ``fire_active`` rather than merely ``built``: a cold ring of
+    stones is not a ward, and the whole point of HERMIT_FIRE_WARD is to make the
+    fuel economy matter. See that constant for the measurements.
+
+    The import is deferred to call time for the same reason ``_colony_x``
+    defers its one: ``actions`` imports ``entities``/``structures`` and
+    ``world`` imports us.
+    """
+    if HERMIT_FIRE_WARD <= 0.0:
+        return None
+    try:
+        from . import actions as _actions            # noqa: PLC0415 - see above
+        fire = _actions.hermit_fire(world, built_only=True)
+    except Exception:
+        log.debug("hermit fire unavailable", exc_info=True)
+        return None
+    if fire is None or not getattr(fire, "fire_active", False):
+        return None
+    try:
+        return _f(getattr(fire, "x", 0.0))
+    except Exception:
+        return None
+
+
+def _warded(agent: Any, ward: float | None) -> bool:
+    """Is *agent* standing in the light of a burning hermit fire?"""
+    if ward is None:
+        return False
+    try:
+        return abs(_f(getattr(agent, "x", 0.0)) - ward) <= HERMIT_FIRE_WARD
+    except Exception:
+        return False
 
 
 def _colony_x(world: Any) -> float:
@@ -691,6 +730,11 @@ class Animal:
 class AnimalRegistry:
     """Every animal in the world, plus the incursion timer that brings them."""
 
+    #: See the note in ``__init__``. Declared here as well so an instance that
+    #: never ran ``__init__`` still answers the attribute rather than raising
+    #: out of ``_pick_target`` on its first frame.
+    _ward: float | None = None
+
     def __init__(self, seed: int | None = None) -> None:
         self.animals: list[Animal] = []
         self.next_id: int = 1
@@ -711,6 +755,14 @@ class AnimalRegistry:
         #: of three would otherwise print it three times in one incursion.
         #: Persisted, so it stays a moment across a reload too.
         self._scale_told: bool = False
+        #: Where the hermit's fire is burning this tick, or None. Recomputed
+        #: once per :meth:`tick` and read by every animal in it, because
+        #: ``_ward_x`` walks the structure registry and doing that four times a
+        #: frame for an answer that cannot change inside the frame is waste.
+        #: Transient by design - derived from the structures, never saved, and
+        #: a class-level default besides so an object built by ``from_dict`` or
+        #: by a test stub has it before the first tick.
+        self._ward: float | None = None
 
     # ----------------------------------------------------------- container --
     def __len__(self) -> int:
@@ -964,6 +1016,8 @@ class AnimalRegistry:
             if step <= 0.0:
                 return
             self.t += step
+            # Once per frame, before anything reads it. See HERMIT_FIRE_WARD.
+            self._ward = _ward_x(world)
             self._tick_spawn(world, step)
             for a in list(self.animals):
                 try:
@@ -1067,6 +1121,16 @@ class AnimalRegistry:
 
         dx = _f(getattr(target, "x", a.x), a.x) - a.x
         if abs(dx) > ANIMAL_REACH * REACH_HYSTERESIS:
+            self._enter(a, STATE_APPROACH)
+            return
+
+        # He made it back to his fire. Break off - the ward has to be checked
+        # here as well as in `_pick_target`, or an animal that closed on him in
+        # the open goes on biting inside the light, and the one moment the ward
+        # is supposed to be worth watching is the one it would never cover.
+        if _warded(target, self._ward):
+            a.target_id = None
+            a.vx = 0.0
             self._enter(a, STATE_APPROACH)
             return
 
@@ -1188,6 +1252,15 @@ class AnimalRegistry:
         Distance in pixels is the score; every animal already on a person adds
         FOCUS_PENALTY, and the target already held gets STICKY_BONUS off so the
         choice does not oscillate. Writes ``a.target_id`` and returns the agent.
+
+        Two people are skipped outright rather than scored: a dragonscale wearer
+        this animal has already tried (see ``_refuse_scale``) and anybody
+        standing in the light of a burning hermit fire (see HERMIT_FIRE_WARD).
+        Both are FILTERS rather than damage exemptions, and for the same reason:
+        a filter degrades correctly when the protected person is the last one
+        alive - ``_approach_step`` gets None and walks the animal off the map -
+        where a penalty would lose to an empty field and the pack would chew on
+        them anyway.
         """
         best: Any = None
         best_score = float("inf")
@@ -1199,6 +1272,8 @@ class AnimalRegistry:
                 continue
             if a.scale_refused is not None and aid == int(a.scale_refused):
                 continue          # already tried them; they were wearing scale
+            if _warded(ag, self._ward):
+                continue          # stood at a lit hermit fire; wolves will not
             score = abs(_f(getattr(ag, "x", 0.0)) - a.x)
             score += FOCUS_PENALTY * self._attackers_on(aid, a.id)
             if a.target_id is not None and aid == int(a.target_id):

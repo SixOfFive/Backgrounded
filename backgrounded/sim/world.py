@@ -122,6 +122,15 @@ STAT_DEFAULTS: dict[str, int] = {
     # reads as "children". Adding a raising to it would say the colony had a baby
     # every time it dug one back up.
     "relics_found": 0, "relics_used": 0, "raised": 0,
+    # Visits paid to the hermit. Declared at zero for the third-time-paid-for
+    # reason spelled out below: actions._arrive_at_hermit bumps it with a
+    # .get()-style write that would CONJURE the key on the first visit, so on
+    # every colony that has never paid one it would be a KeyError rather than a
+    # zero - and a counter that does not exist until the event happens cannot be
+    # used to prove the event never happened, which is exactly what an A/B run
+    # of this feature needs it for. Not a display counter; nothing in the HUD
+    # reads it.
+    "hermit_visits": 0,
     # The wyrm-gun's two counters, and they are here for the third time this
     # lesson has been paid for. combat_actions._bump_stat writes them with
     # ``st[key] = int(st.get(key, 0) or 0) + 1``, which CONJURES the key on the
@@ -328,6 +337,23 @@ class World:
         # saved copy is a second source of truth that can disagree with the
         # structure it claims to describe. The truth lives on the Structure.
         self.upgrade_job: dict[str, Any] | None = None
+
+        # The hermit's visit slot and the clock that opens it. Declared HERE for
+        # the reason this whole method exists: behavior._tick_hermit_visit rides
+        # inside _guarded("colony"), so on a loaded world a missing attribute
+        # would not crash - it would raise once, disable the colony subsystem for
+        # the session, and quietly take update_director and assign_roles down
+        # with it. Nothing visible would say why.
+        #
+        # Neither is serialised, and both are transients rather than state:
+        # `hermit_visit` describes an action that is already saved on the
+        # visitor himself (a save taken mid-visit reloads with him simply
+        # walking home), and `_hermit_visit_due` is a countdown that costs at
+        # most one extra visit to restart. A saved copy of either would be a
+        # second source of truth, which is the argument `upgrade_job` above
+        # makes for itself.
+        self.hermit_visit: dict[str, Any] | None = None
+        self._hermit_visit_due: float = 0.0
 
         # Things the player's Hand tool is currently carrying, by id. Transient
         # by design: never serialised, so a save mid-drag reloads with nothing
@@ -1052,6 +1078,16 @@ class World:
         if self.colony_morale() < MORALE_TO_GROW:
             return
         # Somewhere to sleep, or nobody wants to bring anyone into it.
+        #
+        # "hut" IS THE EXACT KIND STRING AND IT MUST STAY THAT WAY. This is the
+        # birth gate: it turns roofs into a population cap, and it is the site
+        # the note on `structures.hermit_hut` calls out as the one that fails
+        # SILENTLY if a building nobody in the colony lives in is counted here.
+        # The hermit's shack (`hermit_hut`) and his fire (`hermit_fire`) are
+        # separate kinds precisely so this line cannot see them - a shack
+        # counted here would raise the colony's cap by POP_PER_HUT on a house
+        # with one recluse in it who does not breed, and nothing would error.
+        # Do not widen this to a kinds tuple or a "has capacity" test.
         huts = self.structures.count("hut")
         if huts <= 0 or n >= huts * POP_PER_HUT:
             return

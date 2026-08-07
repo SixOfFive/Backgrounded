@@ -473,7 +473,7 @@ class Lighting:
                 if isinstance(v, str) and v:
                     kind = v.lower()
                     break
-            if kind in ("firepit", "fire", "campfire", "hearth", "brazier"):
+            if kind in ("firepit", "hermit_fire", "fire", "campfire", "hearth", "brazier"):
                 if not getattr(ob, "lit", True):
                     return
                 stage_ok = getattr(ob, "complete", True)

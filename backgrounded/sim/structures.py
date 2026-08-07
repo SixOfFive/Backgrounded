@@ -39,6 +39,9 @@ from ..constants import (
     HUT_GROWTH_STORE_REF,
     HUT_SCALE_MAX,
     HUT_SCALE_MIN,
+    HERMIT_FIRE_BURN,
+    HERMIT_FIRE_WOOD,
+    HERMIT_HOUSE_WOOD,
     HUT_STORE_WEIGHT,
     RENDER_H,
     RES_FIBRE,
@@ -99,6 +102,9 @@ __all__ = [
     "STRUCTURE_SPECS",
     "STRUCTURE_KINDS",
     "CROSSING_KINDS",
+    "NON_SETTLEMENT_KINDS",
+    "FIRE_KINDS",
+    "KIND_LABELS",
     "structure_spec",
     "plan_ladder",
     "FIRE_LIGHT_COLOR",
@@ -113,6 +119,63 @@ __all__ = [
 #: Kinds that write themselves into Terrain's effective-surface overlay when
 #: they finish, and take themselves back out when they fall down.
 CROSSING_KINDS: tuple[str, ...] = ("bridge", "ladder")
+
+#: Buildings that are NOT part of "where the colony is", for the purpose of
+#: averaging structure positions. Graves because they are sited out of the way;
+#: the hermit's shack because being a long way from the settlement is the entire
+#: point of it, and folding it into the mean would move the settlement toward it.
+#:
+#: That is not a tidiness argument, it is two feedback loops. ``colony_center``
+#: below is what render/camera.py falls back to, what ``actions.stage_bounds``
+#: derives the visible slice from, and what the quarry keep-out and the
+#: barricade band are measured from - a shack 760 px out with six other
+#: buildings standing drags all of them ~110 px toward the wilderness. And
+#: ``actions.hermit_home`` is *derived* from the settlement mean, so a shack
+#: inside that mean pushes the next camp further out again, every pass.
+#: ``actions.OUTWORK_KINDS`` carries the same exclusion for
+#: ``settlement_center``; the two lists are separate because they answer to
+#: different callers, and they agree about this kind on purpose.
+NON_SETTLEMENT_KINDS: tuple[str, ...] = ("grave", "hermit_hut", "hermit_fire")
+
+#: Kinds that BEHAVE like a fire - they hold fuel, they can be lit and stoked,
+#: they burn it down over time and they cast light while they do.
+#:
+#: This is the one list the hermit's fire is deliberately IN, and it is worth
+#: being clear about why it does not contradict the long note above or the one
+#: on ``hermit_fire``'s spec. Those are about CENSUS: how many fires has the
+#: colony got, how many roofs, where is the settlement. His fire must be
+#: invisible to every one of those, and a separate kind makes it invisible by
+#: construction - ``reg.count("firepit")`` cannot see a ``hermit_fire`` however
+#: hard it looks, so ``behavior.next_build_kind``'s ``built("firepit") < 1``
+#: still sends the colony to build its own.
+#:
+#: This list is about PHYSICS, and the physics of a fire are the same fire
+#: wherever it is: ``light_fire``, ``stoke``, ``fire_active`` and ``_tick_fuel``
+#: are guards on the Structure's own methods, and a fire kind left out of them
+#: is a fire that can never be lit. That was the first cut and it shipped a
+#: hermit sitting next to a permanently cold ring of stones.
+#:
+#: ``feed_garbage``, ``garbage_left`` and ``bonfire_active`` are POINTEDLY not
+#: keyed off this list and still test ``kind == "firepit"``. The bonfire is the
+#: payoff of the colony's litter sweep, the hermit does not sweep (CleanLitter
+#: is zeroed for him) and no villager can route rubbish to his fire (they look
+#: up "firepit"), so a hermit bonfire is unreachable in play - and a state key
+#: that can only ever arrive from a corrupt save is a state key worth refusing.
+FIRE_KINDS: tuple[str, ...] = ("firepit", "hermit_fire")
+
+#: What the chronicle calls a building. Only kinds whose bare identifier reads
+#: badly in a sentence need a row; everything else IS its own name ("the hut
+#: burned to the ground" is fine, "the hermit_hut burned to the ground" is not,
+#: and that line is the one the user sees when a dragon comes).
+#:
+#: Deliberately not a general i18n table and deliberately not on StructureSpec.
+#: It is consulted by :meth:`Structure.label` and nothing else reads it, so a
+#: kind added without a row degrades to the identifier, exactly as today.
+KIND_LABELS: dict[str, str] = {
+    "hermit_hut": "hermit's shack",
+    "hermit_fire": "hermit's fire",
+    "firepit": "firepit",
+}
 
 # ------------------------------------------------------------------ tuning --
 FIRE_LIGHT_COLOR: tuple[int, int, int] = (255, 168, 82)
@@ -216,6 +279,82 @@ STRUCTURE_SPECS: dict[str, StructureSpec] = {
         "hut", 4, 130.0, {RES_WOOD: 18, RES_STONE: 4, RES_FIBRE: 6},
         width=46.0, height=38.0, capacity=3, flammable=True,
         build_time=9.0, spacing=58.0, variants=4,
+    ),
+    # THE HERMIT'S SHACK, AND IT IS ITS OWN KIND RATHER THAN A FLAGGED HUT.
+    # That is the opposite of the choice HUT_MATERIALS documents above, and for
+    # the opposite reason. A stone hut wants to BE a hut everywhere: it houses
+    # people, it satisfies the colony's demand for housing, it raises the birth
+    # cap. This does none of those things, and every one of the eight literal
+    # `kind == "hut"` comparisons that note complains about is a site where a
+    # hermit's shack must NOT count:
+    #
+    #   world.py             the birth gate. A shack counted here raises the
+    #                        colony's population cap on a house nobody lives in.
+    #   behavior/actions     `nearest_structure(..., "hut")` - how a tired
+    #                        colonist finds a bed. Counted, villagers would trek
+    #                        800 px to sleep in it.
+    #   behavior             the hut ladder and want_huts. Counted, the shack
+    #                        satisfies the colony's own demand for roofs and
+    #                        they stop building for themselves.
+    #   behavior/actions     the build-queue entry and the celebration table.
+    #   dragons              the stone-hut tech gate's census.
+    #
+    # A flagged hut opts IN to all eight and every one then needs an exclusion
+    # bolted on: eight chances to miss one, and the one that fails - the birth
+    # gate - fails SILENTLY. A separate kind opts OUT of all eight by
+    # construction, and the only places that have to learn about it are the two
+    # hermit-only code paths written for it anyway (he sleeps in it, he builds
+    # it). The failure modes are not symmetric either: a site missed here means
+    # "the shack is not special-cased somewhere", which is cosmetic. A site
+    # missed the other way means the colony's own arithmetic is wrong.
+    #
+    # Three stages, wood only, one occupant, and small: it is a lean-to a single
+    # man put up on his own, not village housing, and render/atlas draws it as
+    # one. `flammable=True` is not an oversight - see events._FLAMMABLE, which
+    # derives from this flag, and dragons._raze_target, which takes the nearest
+    # built structure. It can burn, and he rebuilds it.
+    "hermit_hut": StructureSpec(
+        "hermit_hut", 2, 90.0, {RES_WOOD: HERMIT_HOUSE_WOOD},
+        width=34.0, height=30.0, capacity=1, flammable=True,
+        build_time=8.0, spacing=40.0, variants=2,
+    ),
+    # HIS FIRE, AND IT IS ITS OWN KIND FOR THE SAME REASON THE SHACK IS.
+    # The note on `hermit_hut` above lists the eight `kind == "hut"` sites a
+    # shack must not be counted by; this kind's list is shorter and one entry on
+    # it is worse than any of them:
+    #
+    #   behavior.next_build_kind   `built("firepit") < 1` is the FIRST thing the
+    #                              colony ever builds. A hermit fire counted
+    #                              there and the colony never lays its own
+    #                              hearth at all - and warmth is not a nicety in
+    #                              this sim, it is the thing that stops a
+    #                              blizzard emptying the map. It fails silently:
+    #                              nothing errors, the colony just quietly
+    #                              freezes 700 px from a fire it may not use.
+    #                              The same line at `min(2, 1 + pop // 6)` costs
+    #                              the colony its second pit the same way.
+    #   actions/behavior           `nearest_structure(.., "firepit")` - warmth,
+    #                              cooking and where swept litter gets burned.
+    #                              Counted, a villager on the colony's edge
+    #                              walks the whole standoff to warm himself at a
+    #                              hermit's fire, which is the mutual gate the
+    #                              user asked for failing in the visible
+    #                              direction.
+    #
+    # One stage, wood only, and no capacity: a ring of stones and an armful of
+    # sticks, laid in an afternoon by one man out of what he cut himself. It is
+    # `flammable=False` exactly as the colony's pit is - a firepit is the thing
+    # that sets other things alight, not a thing that catches - so the dragon
+    # that burns his shack down leaves his fire standing, and he still has
+    # somewhere to cook while he rebuilds.
+    #
+    # It IS in FIRE_KINDS, which is what makes it a fire rather than a prop:
+    # see the note there for why the physics list and the census lists point in
+    # opposite directions on purpose.
+    "hermit_fire": StructureSpec(
+        "hermit_fire", 1, 40.0, {RES_WOOD: HERMIT_FIRE_WOOD},
+        width=22.0, height=10.0, capacity=0, flammable=False,
+        build_time=5.0, spacing=30.0, variants=2,
     ),
     "wall": StructureSpec(
         "wall", 2, 170.0, {RES_STONE: 14, RES_WOOD: 4},
@@ -629,7 +768,7 @@ class Structure:
     def _on_complete(self) -> None:
         self.state.pop("delivered", None)
         self.state["delivered"] = {}
-        if self.kind == "firepit":
+        if self.kind in FIRE_KINDS:
             self.state.setdefault("lit", True)
             self.state.setdefault("fuel", 1.0)
         elif self.kind == "totem":
@@ -820,6 +959,13 @@ class Structure:
     def is_burning(self) -> bool:
         return bool(self.state.get("burning"))
 
+    def label(self) -> str:
+        """This building's name in the chronicle's voice. Never raises."""
+        try:
+            return KIND_LABELS.get(str(self.kind), str(self.kind))
+        except Exception:
+            return "building"
+
     def damage(self, amount: float, cause: str = "") -> bool:
         """Apply damage. Returns True if this call collapsed the structure."""
         if amount <= 0.0 or self.is_ruined:
@@ -897,7 +1043,7 @@ class Structure:
 
     def light_fire(self, fuel: float = 0.7) -> bool:
         """Light a firepit. Returns True if it is lit afterwards."""
-        if self.kind != "firepit" or not self.built or self.is_ruined:
+        if self.kind not in FIRE_KINDS or not self.built or self.is_ruined:
             return False
         self.state["lit"] = True
         self.state["fuel"] = max(float(self.state.get("fuel", 0.0)), _clamp01(fuel))
@@ -905,7 +1051,7 @@ class Structure:
 
     def stoke(self, wood: int = 1) -> None:
         """Feed wood to a lit (or unlit but built) firepit."""
-        if self.kind != "firepit" or self.is_ruined or not self.built:
+        if self.kind not in FIRE_KINDS or self.is_ruined or not self.built:
             return
         fuel = float(self.state.get("fuel", 0.0)) + FIRE_STOKE_PER_WOOD * max(0, int(wood))
         self.state["fuel"] = _clamp01(fuel)
@@ -970,7 +1116,7 @@ class Structure:
     @property
     def fire_active(self) -> bool:
         return (
-            self.kind == "firepit"
+            self.kind in FIRE_KINDS
             and self.built
             and not self.is_ruined
             and bool(self.state.get("lit"))
@@ -1209,7 +1355,7 @@ class Structure:
                 self.state["crossing_on"] = True
                 self._chronicle(
                     world,
-                    f"The {self.kind} is open - the far side can be reached."
+                    f"The {self.label()} is open - the far side can be reached."
                     if self.kind == "bridge"
                     else "The ladder is up; the cliff can be climbed.",
                 )
@@ -1217,7 +1363,7 @@ class Structure:
         clear = getattr(terrain, "clear_crossing", None)
         if callable(clear) and clear(x0, x1):
             self.state.pop("crossing_on", None)
-            self._chronicle(world, f"The {self.kind} is gone; the way is cut off again.")
+            self._chronicle(world, f"The {self.label()} is gone; the way is cut off again.")
 
     # ----------------------------------------------------------------- tick --
     def update(self, dt: float, world: Any | None = None) -> None:
@@ -1251,9 +1397,9 @@ class Structure:
         if self.state.get("burning"):
             self.state["burn_t"] = float(self.state.get("burn_t", 0.0)) + dt
             if self.damage(BURN_DPS * dt, "fire"):
-                self._chronicle(world, f"The {self.kind} burned to the ground.")
+                self._chronicle(world, f"The {self.label()} burned to the ground.")
                 return
-        if self.kind == "firepit" and self.state.get("lit"):
+        if self.kind in FIRE_KINDS and self.state.get("lit"):
             self._tick_fuel(dt, world)
         if self.kind == "totem" and self.built:
             self.state["glow"] = _clamp01(float(self.state.get("glow", 1.0)))
@@ -1299,7 +1445,13 @@ class Structure:
         if was_bonfire:                      # e.g. a save loaded mid-bonfire
             for key in ("garbage", "bonfire", "bonfire_t"):
                 self.state.pop(key, None)
-        fuel = float(self.state.get("fuel", 0.0)) - FIRE_FUEL_BURN * dt
+        # A hermit's fire burns at a quarter of the colony's rate. Not a fudge:
+        # the colony pit is a hearth a dozen people walk past with an armful of
+        # wood all day, and his is one banked fire one man feeds by hand out of
+        # what he personally carried. At the colony rate he stoked it 14 times a
+        # colony-hour and did nothing else. See HERMIT_FIRE_BURN.
+        rate = HERMIT_FIRE_BURN if self.kind == "hermit_fire" else FIRE_FUEL_BURN
+        fuel = float(self.state.get("fuel", 0.0)) - rate * dt
         if fuel <= 0.0:
             self.state["fuel"] = 0.0
             self.state["lit"] = False
@@ -1836,7 +1988,8 @@ class StructureRegistry:
         for it: the bare call is still what a duck-typed registry that will not
         take the argument gets, and what any other direct caller gets.
         """
-        xs = [s.x for s in self._by_id.values() if s.kind != "grave" and not s.is_ruined]
+        xs = [s.x for s in self._by_id.values()
+              if s.kind not in NON_SETTLEMENT_KINDS and not s.is_ruined]
         if not xs:
             return float(default)
         return float(sum(xs) / len(xs))
