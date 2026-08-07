@@ -20,6 +20,7 @@ import numpy as np
 from ..constants import (
     AI_TICKS, ALL_RESOURCES, DAY_LENGTH_SEC, DRAGON_GATE_STONE_HUTS,
     FOOD_PER_HEAD_TO_GROW,
+    HERMIT_STASH_CAP,
     HUT_TIER_DWELL_SEC, HUT_TIER_MORALE,
     MAX_POP, MIN_POP, MORALE_TO_GROW, MORPH_LABELS,
     POP_BIRTH_COOLDOWN, POP_PER_HUT,
@@ -354,6 +355,30 @@ class World:
         # makes for itself.
         self.hermit_visit: dict[str, Any] | None = None
         self._hermit_visit_due: float = 0.0
+
+        # THE HERMIT'S PRIVATE STASH - his camp's store, not the colony's.
+        # Declared HERE and not in __init__ for exactly the reason this method
+        # exists: `actions.hermit_stash_of` reads it on the gather/build/stoke
+        # paths, all of which ride inside guarded ticks, so a field that existed
+        # only on the __init__ path would not crash a loaded world - it would
+        # raise once, disable a subsystem for the session, and quietly leave the
+        # hermit unable to bank or spend anything for the rest of the run, with
+        # nothing visible saying why. That is the exact failure `auto_scene_rotate`
+        # shipped with.
+        #
+        # WORLD-LEVEL, KEYED TO THE CAMP, rather than hung off the hut. The hut
+        # is the more dramatic owner - a dragon burning it would take the winter
+        # stores too - but he has no hut for the first minutes of his life, none
+        # while a burned one is rubble, and none across the tick he strikes camp
+        # and re-stakes. A store that vanishes at the three moments he most needs
+        # one is not a store. Here the successor inherits it exactly as he
+        # inherits the hut, because the camp outlives the man.
+        #
+        # It is NOT `stockpile` and it must never be summed with it: the colony
+        # cannot see it and he cannot draw on theirs. `World.reconcile` conserves
+        # PEOPLE and not resources, so there is no accounting hazard - the gate
+        # is about the role, not the arithmetic.
+        self.hermit_stash: dict[str, int] = {r: 0 for r in ALL_RESOURCES}
 
         # Things the player's Hand tool is currently carrying, by id. Transient
         # by design: never serialised, so a save mid-drag reloads with nothing
@@ -1083,8 +1108,8 @@ class World:
         # birth gate: it turns roofs into a population cap, and it is the site
         # the note on `structures.hermit_hut` calls out as the one that fails
         # SILENTLY if a building nobody in the colony lives in is counted here.
-        # The hermit's shack (`hermit_hut`) and his fire (`hermit_fire`) are
-        # separate kinds precisely so this line cannot see them - a shack
+        # The hermit's hut (`hermit_hut`) and his fire (`hermit_fire`) are
+        # separate kinds precisely so this line cannot see them - a hut
         # counted here would raise the colony's cap by POP_PER_HUT on a house
         # with one recluse in it who does not breed, and nothing would error.
         # Do not widen this to a kinds tuple or a "has capacity" test.
@@ -1324,6 +1349,10 @@ class World:
             "ufo": self.ufo.to_dict(),
             "auto_scene_rotate": bool(getattr(self, "auto_scene_rotate", True)),
             "stockpile": dict(self.stockpile),
+            # His camp's store, kept apart from the colony's above it. Additive
+            # like the tier latches below, so SAVE_VERSION stays 1 and a build
+            # old enough not to know the key simply ignores it.
+            "hermit_stash": dict(getattr(self, "hermit_stash", {}) or {}),
             "build_queue": list(self.build_queue),
             "chronicle": list(self.chronicle),
             "stats": dict(self.stats),
@@ -1521,6 +1550,25 @@ class World:
             # test also does the type check.
             if k in ALL_RESOURCES:
                 w.stockpile[k] = _int(v, 0, lo=0, hi=1_000_000_000)
+
+        # The hermit's camp store, on exactly the same terms as the colony's
+        # above it and deliberately in a separate dict: the two books never meet.
+        # A save written before the stash existed carries no key at all, loads
+        # empty, and the hermit simply starts banking from that moment - the same
+        # "growth" precedent every additive field here follows. `_init_colony_state`
+        # already put an all-zero dict on `w`; this overwrites the entries a save
+        # actually carries and drops anything that is not a resource.
+        w.hermit_stash = {r: 0 for r in ALL_RESOURCES}
+        raw_stash = d.get("hermit_stash")
+        if not isinstance(raw_stash, dict):
+            if raw_stash:
+                log.warning("save section 'hermit_stash' was %s, not a mapping; "
+                            "the camp store resets to zero",
+                            type(raw_stash).__name__)
+            raw_stash = {}
+        for k, v in raw_stash.items():
+            if k in ALL_RESOURCES:
+                w.hermit_stash[k] = _int(v, 0, lo=0, hi=HERMIT_STASH_CAP)
 
         raw_queue = d.get("build_queue")
         if not isinstance(raw_queue, (list, tuple)):

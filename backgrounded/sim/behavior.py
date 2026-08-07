@@ -60,11 +60,13 @@ from ..constants import (
     HERMIT_FIRE_URGE,
     HERMIT_HOMESICK,
     HERMIT_HOST_URGE,
-    HERMIT_HOUSE,
+    HERMIT_HUT,
     HERMIT_KEEP_ADULTS,
     HERMIT_MIN_ADULTS,
-    HERMIT_RESITE_SLACK,
     HERMIT_ROAM,
+    HERMIT_SHELF_HALF,
+    HERMIT_STAKE_MAX,
+    HERMIT_STAKE_MIN,
     HERMIT_STANDOFF_MAX,
     HERMIT_STANDOFF_MIN,
     HERMIT_STOKE_BELOW,
@@ -73,6 +75,8 @@ from ..constants import (
     HERMIT_VISIT_PERIOD,
     HERMIT_VISIT_TIMEOUT,
     HERMIT_VISIT_URGE,
+    HERMIT_WOODPILE,
+    HERMIT_WOODPILE_URGE,
     LADDER_MIN_RISE,
     LADDER_MIN_W,
     LADDER_SLOPE,
@@ -123,7 +127,7 @@ from .actions import (
     _clamp_x,
     # Private on purpose and imported anyway: it is `settlement_center` with the
     # hermit himself taken out of the agent fallback, and the re-siting test in
-    # `_ensure_hermit_house` has to ask the same question `hermit_home` asks or
+    # `_ensure_hermit_hut` has to ask the same question `hermit_home` asks or
     # the two disagree about where the colony is and the camp oscillates.
     _hermit_base,
     agent_by_id,
@@ -140,7 +144,9 @@ from .actions import (
     hazards_of,
     hermit_fire,
     hermit_home,
-    hermit_house,
+    hermit_hut,
+    hermit_stash_food,
+    hermit_stash_qty,
     hermit_worksite,
     is_hermit,
     is_night,
@@ -963,7 +969,7 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
     # ---------------------------------------------------------- repair ------
     s["RepairStructure"] = 0.0
     if reg is not None:
-        # `colony_repairable`, not `reg.damaged` - the hermit's shack is not the
+        # `colony_repairable`, not `reg.damaged` - the hermit's hut is not the
         # colony's to mend. See the note on that function.
         dmg = colony_repairable(reg, threshold=0.9)
         if dmg:
@@ -1395,6 +1401,23 @@ def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
     if fatigue > 0.93 or warmth > 0.90:
         s["Sleep"] = 1.0
 
+    # HIS STASH IS FOOD HE CAN GET AT, so it scores like food in his hands. The
+    # colony arm of `_score_wants` already raises Eat on `food_qty > 0`, i.e. on
+    # the COLONY'S store, which a hermit reaches only by the long walk `_h_eat`
+    # keeps as a last resort. Without this line a hermit with a full larder
+    # banked ten paces away and nothing in his hands would score Eat off a store
+    # he does not want to use - or, on a colony whose own store is empty, score
+    # it at 0.12 and go hungry beside his own pile. `max`, never an assignment:
+    # this can only ever raise the score, so it cannot weaken the guard above it.
+    if hermit_stash_food(world)[0] is not None:
+        try:
+            hunger = float(getattr(agent, "hunger", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            hunger = 0.0
+        s["Eat"] = max(float(s.get("Eat", 0.0)), _clamp01(hunger * hunger))
+        if hunger > 0.85:
+            s["Eat"] = 1.0
+
     if carry_qty >= CARRY_CAP and carrying in (RES_FOOD, RES_COOKED):
         s["ForageBerries"] = 0.0
         s["Farm"] = 0.0
@@ -1417,14 +1440,14 @@ def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
     # 6. HIS OWN HOUSE, which is the only building in the colony he is allowed
     #    to touch. Both keys below were zeroed at the top of this function and
     #    are being handed back CONDITIONALLY - while, and only while, there is an
-    #    unfinished shack of his own standing at his camp. A hermit with a
-    #    finished house draws exactly what he drew before this existed.
+    #    unfinished hut of his own standing at his camp. A hermit with a
+    #    finished hut draws exactly what he drew before this existed.
     #
     #    The loop is: nothing in his hands -> GatherWood (his own trees, near
     #    his own camp, because `_h_gather` takes the nearest one to HIM);
     #    `actions._deposit_step` then declines to destroy the load for once,
-    #    because his shack wants it; wood in his hands -> BuildStructure, which
-    #    `_mk_build` points at the shack and `_h_build` walks to and delivers.
+    #    because his hut wants it; wood in his hands -> BuildStructure, which
+    #    `_mk_build` points at the hut and `_h_build` walks to and delivers.
     #    Repeat until the frame is up. `_h_build`'s "fetch" phase - the one that
     #    would send him to the colony's stockpile - fails on sight of a hermit,
     #    which is what drops him back here to cut his own.
@@ -1441,9 +1464,17 @@ def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
     #     premises true - a lit fire, raw food in hand - so he never picks a job
     #     that fails on its first update. Scored below Eat, so a starving hermit
     #     eats the berries raw rather than standing over a fire with them.
-    if (own_fire is not None and bool(getattr(own_fire, "fire_active", False))
-            and carry_qty > 0 and carrying == RES_FOOD):
-        s["CookFood"] = HERMIT_COOK_URGE
+    #     RAW FOOD IN HIS HANDS *OR* IN HIS PILE. `_h_cook`'s hermit arm draws
+    #     from the stash when his hands are empty of raw, and the two have to
+    #     agree or he picks a job that fails on its first update - the standing
+    #     rule for every score in this function. Without the stash arm here the
+    #     stash arm THERE is unreachable, which is how a feature ships inert: he
+    #     banks berries, never scores a cook against them, and `ck` stays 0 on
+    #     the panel forever.
+    if own_fire is not None and bool(getattr(own_fire, "fire_active", False)):
+        if ((carry_qty > 0 and carrying == RES_FOOD)
+                or hermit_stash_qty(world, RES_FOOD) > 0):
+            s["CookFood"] = HERMIT_COOK_URGE
 
     # 6b. TENDING IT. A fire nobody feeds is out inside a quarter of an hour,
     #     and a hermit whose fire is always out is a hermit with a cold ring of
@@ -1460,10 +1491,36 @@ def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
         except (TypeError, ValueError):
             fuel = 0.0
         if fuel < HERMIT_STOKE_BELOW:
-            if carry_qty > 0 and carrying == RES_WOOD:
+            # Wood in his hands OR wood in his stash both mean "go and feed it"
+            # rather than "go and cut some", and that ordering is the whole point
+            # of the pile: `_stoke_wood` takes from the hands first and the stash
+            # second, so a banked armful is a stoke with no walk in it, and a
+            # stoke with no walk is a stoke that never leaves HERMIT_FIRE_WARD.
+            if ((carry_qty > 0 and carrying == RES_WOOD)
+                    or hermit_stash_qty(world, RES_WOOD) > 0):
                 s["WarmAtFire"] = max(s.get("WarmAtFire", 0.0), HERMIT_STOKE_URGE)
             elif _tree_in_reach(world, agent):
                 s["GatherWood"] = max(s.get("GatherWood", 0.0), HERMIT_STOKE_URGE)
+
+    # 6c. AND THE WOODPILE, which is the only job here that is not a reaction to
+    #     something. Everything above waits for a need - a low fire, an unbuilt
+    #     frame, an empty stomach - and at 530..1060 px waiting is what put the
+    #     fire out: every reactive trip to timber is twice the walk it used to
+    #     be and all of it is outside HERMIT_FIRE_WARD. Measured on the first
+    #     pass at the new band, before this existed: his banked wood peaked at 5
+    #     units over eight seeds and the fire was alight 74.8% of the time it
+    #     stood, against 91.4% at half the distance.
+    #
+    #     So he cuts AHEAD of the need and banks it, and `_stoke_wood` then
+    #     feeds the fire without him leaving the ward at all. Gated on a tree
+    #     inside HERMIT_FELL_REACH of the CAMP - the same question `_h_gather`
+    #     asks when it picks the tree, so the score and the action cannot
+    #     disagree - and on the pile being under HERMIT_WOODPILE, so it is a
+    #     job that finishes rather than a treadmill. `max`, so it can never
+    #     lower a stoke or a build that already wants the same action.
+    if (hermit_stash_qty(world, RES_WOOD) < HERMIT_WOODPILE
+            and _tree_in_reach(world, agent)):
+        s["GatherWood"] = max(s.get("GatherWood", 0.0), HERMIT_WOODPILE_URGE)
 
     site = hermit_worksite(world)
     if site is not None:
@@ -1472,10 +1529,16 @@ def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
         except Exception:
             need_now = {}
         holding = carry_qty > 0 and carrying in need_now
-        if holding or not need_now:
+        # ...or it is in the pile by his door, which `_h_build`'s hermit fetch
+        # now draws on without moving. Scoring it here is what keeps the score
+        # and the action agreeing: ask a different question from the one the
+        # handler asks and he picks a job that fails on its first update, which
+        # is the deadlock this whole loop was rebuilt around once already.
+        banked = any(hermit_stash_qty(world, r) > 0 for r in need_now)
+        if holding or banked or not need_now:
             # Either he is carrying what the frame is short of, or the frame is
             # fully stocked and only wants work. Both are `_h_build`'s job.
-            # The fire is worth marginally more than the shack (see
+            # The fire is worth marginally more than the hut (see
             # HERMIT_FIRE_URGE) so that with both unbuilt he lays the fire
             # first - it is a third of the price and it is his only warmth.
             s["BuildStructure"] = (HERMIT_FIRE_URGE
@@ -1485,7 +1548,7 @@ def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
             # Go and cut it - but only if there is something to cut WITHIN REACH
             # OF HIS CAMP. Note there is no test on what his hands are already
             # full of, and that is deliberate: his steady state is a full larder
-            # of berries, so a hands-free requirement is a shack that never gets
+            # of berries, so a hands-free requirement is a hut that never gets
             # past its first stake. `actions._deposit_step` delivers the log out
             # of the gather action's own stash for exactly that reason.
             #
@@ -1494,7 +1557,7 @@ def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
             # tree to HERMIT_HOME, not to him, inside HERMIT_FELL_REACH - so the
             # score and the action can never disagree and he never picks a job
             # that fails on its first update. On a camp with no wood near it he
-            # simply never gets a shack, which is the honest outcome.
+            # simply never gets a hut, which is the honest outcome.
             if _tree_in_reach(world, agent):
                 s["GatherWood"] = HERMIT_FELL_URGE
 
@@ -1507,7 +1570,7 @@ def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
     #
     #    Two conditions, and the second one was paid for. It is not enough that
     #    a visit is OPEN and the guest is nearby: the guest has to actually be
-    #    stood there talking. Measured on seed 7 - a guest reached the shack,
+    #    stood there talking. Measured on seed 7 - a guest reached the hut,
     #    paid the visit out, and was then pulled away by a wolf before his
     #    Converse could close the slot. The slot stayed open for the full 260 s
     #    watchdog, and for all 260 s the hermit re-picked a Converse against a
@@ -2267,7 +2330,7 @@ def _mk_cook(agent: Any, world: Any) -> Action | None:
 
 def _mk_build(agent: Any, world: Any) -> Action | None:
     if is_hermit(agent):
-        # HIS SHACK OR NOTHING. The colony's queue is not his and the "nearest
+        # HIS HUT OR NOTHING. The colony's queue is not his and the "nearest
         # incomplete anything" fallback below is worse still - it would send him
         # to whatever the colony happened to be raising, which is 700 px away in
         # the middle of town. Returning None when his own frame is finished (or
@@ -2614,11 +2677,11 @@ def update_director(world: Any, dt: float) -> None:
             pass
 
     # The hermit's own two lines of colony business, and they are deliberately
-    # AFTER the colony's own staking: a shack that failed to go up must never be
+    # AFTER the colony's own staking: a hut that failed to go up must never be
     # able to cost the settlement its build slot for the pass. Both swallow
     # everything - a hermit is a garnish, and a garnish does not get to take the
     # director down with it.
-    _ensure_hermit_house(world, reg)
+    _ensure_hermit_hut(world, reg)
     _ensure_hermit_fire(world, reg)
     _tick_hermit_visit(world)
 
@@ -2854,11 +2917,11 @@ def next_build_kind(world: Any, reg: StructureRegistry | None = None,
 def _colony_sites(reg: StructureRegistry) -> list[Structure]:
     """Unfinished buildings THE COLONY is responsible for. Never raises.
 
-    ``reg.incomplete()`` with the hermit's shack taken out, and both callers
+    ``reg.incomplete()`` with the hermit's hut taken out, and both callers
     need it out for a different reason.
 
     `_stake_out_site` treats the list as the colony's open work: it refuses to
-    stake anything new once ``len(pending) >= MAX_CONCURRENT_SITES``. A shack
+    stake anything new once ``len(pending) >= MAX_CONCURRENT_SITES``. A hut
     counted there is a build slot the colony has lost to a building it is not
     allowed to work on - and it sits open for as long as one man takes to carry
     twelve wood a hundred px at a time, which is minutes. That is a colony that
@@ -2866,8 +2929,8 @@ def _colony_sites(reg: StructureRegistry) -> list[Structure]:
 
     `update_director` turns the same list into the build QUEUE and the
     ``build_needs`` totals, which are what `_mk_build` sends builders to and
-    what the gather scores read as "what are we short of". A shack in there
-    sends the nearest villager on a 700 px walk to build the hermit's house for
+    what the gather scores read as "what are we short of". A hut in there
+    sends the nearest villager on a 700 px walk to build the hermit's hut for
     him, which is the opposite of the point of him.
     """
     try:
@@ -2918,7 +2981,7 @@ def _stake_out_site(world: Any, reg: StructureRegistry) -> None:
 
 
 # ===========================================================================
-#  The hermit's shack, and the visits to it
+#  The hermit's hut, and the visits to it
 # ===========================================================================
 #: Seconds a newly appointed visitor is given to actually pick the walk up
 #: before the slot is treated as stale. He is scored on his own decision
@@ -2950,83 +3013,362 @@ def living_hermit(world: Any) -> Any | None:
     return best
 
 
+#: Process-local memo for the peak scan, ``{(seed, epoch, base_q, side): mask}``.
+#: The scan is a rolling max over 6400 columns; it is cheap (~1 ms) but it is
+#: not free, and `_camp_site` can be asked several times a minute on a colony
+#: that keeps losing its hermit. Keyed on ``terrain.epoch``, which is bumped by
+#: every change to the walkable surface, so a mudslide or a finished ladder
+#: invalidates it for free. Derived and never persisted - a stale process cache
+#: cannot outlive the process that made it.
+_SHELF_MEMO: dict[tuple[int, int], Any] = {}
+
+#: PURE DIAGNOSTIC. `_camp_site` writes its reasoning here and NOTHING IN THE
+#: SIM EVER READS IT - it exists so the measurement harness can ask "was the
+#: highest point in the band rejected, and why" without the answer having to be
+#: reconstructed from the outside and possibly differ from what actually ran.
+#: Overwritten on every call, never persisted, never rendered.
+_LAST_CAMP_PICK: dict[str, Any] = {}
+
+
+def _shelf_mask(terrain: Any) -> "np.ndarray | None":
+    """Columns whose whole HERMIT_SHELF_HALF shelf is walkable. Never raises.
+
+    A CAMP IS TWO BUILDINGS, NOT A POINT, which is the whole reason this is a
+    window rather than a slope read. `_ensure_hermit_fire` puts the firepit
+    34 px off the door and the hut sprite is 46 px across, so a site whose
+    single column happens to be flat while the ground falls away 20 px either
+    side gets a hut on the level and a fire on a face - or a hermit who cannot
+    walk from one to the other. The window is +/-HERMIT_SHELF_HALF and every
+    column in it has to be walkable, not merely the mean of them.
+
+    This matters far more now than it did at 520 px. The band is searched for
+    its HIGHEST ground, and the highest ground is by definition a place the land
+    falls away from in both directions: "peak" and "knife edge" are the same
+    word until something tests the shelf.
+    """
+    try:
+        sl = np.abs(terrain.column_slope())
+        n = int(sl.size)
+        half = int(round(float(HERMIT_SHELF_HALF)))
+        if n <= 0 or half <= 0 or 2 * half + 1 > n:
+            return None
+        pad = np.pad(sl, half, mode="edge")
+        win = np.lib.stride_tricks.sliding_window_view(pad, 2 * half + 1)
+        return np.asarray(win.max(axis=1) <= float(MAX_SLOPE_WALK))
+    except Exception:
+        log.debug("shelf scan failed", exc_info=True)
+        return None
+
+
+def _tree_xs(world: Any) -> "np.ndarray":
+    """Sorted x of every living tree. Deterministic; empty array if none."""
+    xs = []
+    try:
+        for p in props_of(world):
+            if not prop_alive(p):
+                continue
+            if str(getattr(p, "kind", "")).lower() not in _TREE_KINDS:
+                continue
+            try:
+                xs.append(float(getattr(p, "x", 0.0)))
+            except (TypeError, ValueError):
+                continue
+    except Exception:
+        return np.empty(0, dtype=np.float64)
+    return np.sort(np.asarray(xs, dtype=np.float64))
+
+
 def _camp_site(world: Any) -> float:
-    """Where to stake the shack: the seeded standoff, nudged toward WOOD.
+    """Where to stake the hut: THE HIGHEST SAFE GROUND IN THE STANDOFF BAND.
 
-    `hermit_home`'s derived offset answers "how far away", and on its own that
-    was not enough. He is the only builder in the colony with no stockpile
-    behind him, so a camp with no timber inside HERMIT_FELL_REACH is a camp
-    where the shack never gets past its first stake - and it is not a corner
-    case. Measured on seed 11: not one tree within 300 px of his camp for the
-    whole 45 minutes, so he spent 17 000 ticks wandering beside an empty frame,
-    and the same silence on three of eight seeds.
+    The band stopped being a seeded pick and became a SEARCH RANGE. The ask was
+    "double that distance away ... at the highest point beyond 530px", so the
+    distance is a corridor - HERMIT_STANDOFF_MIN..HERMIT_STANDOFF_MAX, 530..1060
+    px from `_hermit_base` - and which point inside it he lives on is the
+    hillside's decision. He is always at least 530 px out, never past 1060, and
+    in between he takes the summit.
 
-    So the DISTANCE BAND is fixed and the choice within it is made against the
-    trees. If there is nothing near the derived point, the search widens to the
-    whole band the camp is allowed to occupy - the same band
-    `_ensure_hermit_house` re-sites against, so a camp sited this way is already
-    inside the range it will be judged by and cannot be re-sited on the next
-    pass for being out of position - and within that band it takes the timber
-    nearest the FAR end, because the ask was "as far from the regular camp" as
-    it can be and the band's own ceiling is what keeps that honest.
+    THE SEARCH RUNS TWICE, over two corridors, and the reason is
+    HERMIT_RESITE_SLACK. The first pass takes HERMIT_STAKE_MIN..HERMIT_STAKE_MAX
+    (620..970), the band inset by the slack, so a new hut starts with room to
+    give at both walls and `_ensure_hermit_hut` can enforce 530..1060 strictly.
+    The second takes the WHOLE band, and it exists because the inset is not
+    free: it throws away 180 px of candidate shelf, and measured over 60 fresh
+    worlds that alone moved six seeds off a clean walk home (17 cliff-crossing
+    sites became 23). A clean route is worth more than a wide margin against
+    churn, so when nothing inside the corridor has one the search widens before
+    it settles for a face. With both passes in, cliff-crossing is back to 17 of
+    60 - the same as before the corridor narrowed.
 
-    Deterministic: `props_of` iterates in registry order and the tie-break is a
-    strict ``<``, so two processes on one seed pick the same tree. Falls back to
-    the derived point on anything unexpected - a camp with no wood is a hermit
-    with no shack, which is a disappointment, not a failure.
+    A PEAK IS SURROUNDED BY DESCENT, WHICH IS WHY MOST OF THIS FUNCTION IS A
+    SAFETY TEST. "Highest point in the band" taken literally is an instruction
+    to stake a camp on a knife edge, and this project has a documented history
+    of steep ground killing colonies - a mining pass once cut a face of |slope|
+    19.68 against a MAX_SLOPE_CLIMB of 2.6 and emptied seeds. So a candidate has
+    to clear two tests before its height is even looked at:
+
+      * SHELF. Every column within HERMIT_SHELF_HALF of it is walkable
+        (|slope| <= MAX_SLOPE_WALK, 0.9). That is the hut's footprint plus the
+        34 px the fire sits off the door, so both buildings land on the level
+        and he can walk between them. See `_shelf_mask`.
+      * ROUTE. There is no CLIFF column (|slope| > MAX_SLOPE_CLIMB, 2.6) between
+        the candidate and the settlement it is measured from. A cliff on the way
+        home is a slip roll every time he goes for timber, and `entities`
+        charges those in fall damage. Counted exactly, with a cumulative sum
+        over the cliff mask, rather than sampled - a one-column face cannot hide
+        between two samples.
+
+    ...and one preference, which is not a safety test but is the difference
+    between a hermit and a man standing next to an empty frame for 45 minutes:
+
+      * TIMBER. Everything in his camp is wood he cut himself within
+        HERMIT_FELL_REACH of the camp, so a summit with no tree near it is a
+        summit with no hut and no fire on it. Measured on the old code, seed 11:
+        not one tree within reach for the entire run. So candidates that have
+        timber are preferred to candidates that do not - and among them it is
+        still the highest that wins, so this reorders the shortlist rather than
+        replacing the rule.
+
+    THE LADDER, in order, first match wins, seeded shoulder before the other one
+    inside each rung:
+
+        1. shelf + route + timber      the ordinary answer
+        2. shelf + route               a bare summit he can reach
+        3. shelf + timber              the settlement is behind a cliff
+        4. shelf                       ...and there is no wood either
+        5. `hermit_home()`             no shelf anywhere in the band
+
+    Rungs 3 and 4 are the honest admission that a colony can be walled in: the
+    alternative is refusing to give him a camp at all, and a hermit with no camp
+    is the feature not shipping on that seed. They do NOT ignore the route, they
+    minimise it - see `_pick` - and they compare the two shoulders rather than
+    taking the seeded one, because with no clean walk anywhere the two sides
+    stop being interchangeable.
+
+    HOW OFTEN HE ENDS UP ACROSS A CLIFF FROM THE COLONY: 17 OF 60, 28%, on a
+    direct probe over 60 freshly generated worlds - rung 1 on 43, rung 3 on 16,
+    rung 5 on 1, rungs 2 and 4 never. In live runs it is 9 of 28 stakings, 32%,
+    over 16 seeds x 45 sim-min, which is the same number inside its own noise.
+    Both are worse than the 6-of-35 (17%) an earlier note recorded, and that
+    note was reading a smaller sample of the same thing.
+    It is not the 38% a later probe reported either - that figure was measured
+    against the inset corridor alone, before the widening pass above existed,
+    and 38% is exactly what this probe gives with that pass removed.
+
+    IT IS ACCEPTED RATHER THAN FIXED, and the reason is that on most of those
+    seeds there is nothing to fix. Locating the blocking face on each of them:
+    on 13 of the 17 there is a cliff in the APPROACH - between the settlement
+    and the near wall of the band - on BOTH shoulders. The colony is in a bowl.
+    `worst[]` is a running max outward from the settlement, so a face at 300 px
+    poisons every column beyond it on that side, and no camp anywhere at 530 px
+    or more can route around a wall that stands inside 530. Widening the search
+    further cannot help; the only thing that would is not putting him outside
+    the bowl, which is the whole feature. Of the remaining 4, three have one
+    clean shoulder with no walkable shelf on it and one has the face inside the
+    band itself.
+
+    WHAT IT COSTS, measured: ZERO fall deaths for the hermit on any seed,
+    against 7 among the villagers over 16 runs x 45 sim-min. The exposure is a
+    look-and-feel one and a trap waiting for a terrain event, not a body count -
+    `_pick` still minimises the worst face on those rungs, so what he crosses is
+    the gentlest face available rather than an arbitrary one.
+
+    THE SAFETY TESTS MOVE HIM OFF THE OUTRIGHT SUMMIT ROUTINELY, and that is the
+    number to watch rather than the average: the summit of a band is very often
+    a place with no shelf on it. Zero fall deaths followed, which is what the
+    shelf test is for.
+
+    Deterministic: the scan is over the heightmap, the tie-break is a strict
+    ``<`` on height, and `props_of` iterates in registry order. Two processes on
+    one seed pick the same column. Falls back to `hermit_home` on anything
+    unexpected - a hermit in the wrong place is a disappointment, a raised
+    exception on a director pass is a disabled subsystem.
     """
     x = float(hermit_home(world))
+    _LAST_CAMP_PICK.clear()
+    _LAST_CAMP_PICK["fallback"] = x
     try:
-        if find_prop(world, _TREE_KINDS, x, max_dist=HERMIT_FELL_REACH) is not None:
+        terrain = getattr(world, "terrain", None)
+        surf = terrain.surface() if terrain is not None else None
+        if surf is None:
             return x
+        n = int(surf.size)
+        key = (int(getattr(world, "seed", 0) or 0), int(getattr(terrain, "epoch", 0)))
+        shelf = _SHELF_MEMO.get(key)
+        if shelf is None or getattr(shelf, "size", 0) != n:
+            shelf = _shelf_mask(terrain)
+            if shelf is None:
+                return x
+            _SHELF_MEMO.clear()          # one terrain at a time; never grows
+            _SHELF_MEMO[key] = shelf
+
+        cs = np.abs(terrain.column_slope())
         base = float(_hermit_base(world))
+        bi = int(min(max(round(base), 0), n - 1))
+        # THE WORST FACE ON THE WALK HOME, for every column, in two passes.
+        # A running max outward from the settlement IS the corridor maximum:
+        # `worst[i]` is the steepest ground anywhere between column i and the
+        # village. That gives the cliff test (`worst > MAX_SLOPE_CLIMB`) and the
+        # fallback's ranking from one array, and it is exact rather than sampled
+        # - a one-column face cannot hide between two probes.
+        worst = np.empty(n, dtype=np.float64)
+        worst[bi:] = np.maximum.accumulate(cs[bi:])
+        worst[: bi + 1] = np.maximum.accumulate(cs[bi::-1])[::-1]
+
+        trees = _tree_xs(world)
         edge_lo = float(HERMIT_EDGE_MARGIN)
-        edge_hi = float(WORLD_W) - float(HERMIT_EDGE_MARGIN)
-        near = HERMIT_STANDOFF_MIN - HERMIT_RESITE_SLACK
-        far = HERMIT_STANDOFF_MAX + HERMIT_RESITE_SLACK
-        # The seeded shoulder first, then the other one. `hermit_home` already
-        # flips sides rather than clamping when a shoulder runs out of MAP; this
-        # is the same rule for running out of WOOD, and it matters just as much.
-        # Seed 11 seats its colony at x=4851 with all 44 of the map's trees to
-        # the east, starting 695 px out, and seeds the hermit to the west - so
-        # searching only his own shoulder finds nothing and he stands beside an
-        # empty frame for 45 minutes. Which side of the village he lives on is
-        # cosmetic; whether there is anything to build with is not.
+        edge_hi = float(WORLD_W) - edge_lo
+
+        # The seeded shoulder first, then the other one, exactly as
+        # `hermit_home` flips sides rather than clamping when a shoulder runs
+        # out of map. Which side he lives on is cosmetic; whether he can stand
+        # on it is not.
         first = 1.0 if x >= base else -1.0
-        for side in (first, -first):
-            ends = (base + side * near, base + side * far)
-            lo, hi = min(ends), max(ends)
-            lo, hi = max(lo, edge_lo), min(hi, edge_hi)
-            if hi <= lo:
-                continue
-            best = None
-            best_d = float("inf")
-            for p in props_of(world):
-                if not prop_alive(p):
+
+        def _shoulders(d_lo: float, d_hi: float):
+            """Both shoulders of a corridor `d_lo`..`d_hi` px out, seeded first.
+
+            Returns ``(sides, band_top)``, where each side carries its shelf
+            columns, their worst face on the walk home, whether they have timber
+            in reach, and that shoulder's outright summit.
+            """
+            sides: list[tuple[float, Any, Any, Any, int]] = []
+            band_top: int | None = None
+            for side in (first, -first):
+                ends = (base + side * float(d_lo), base + side * float(d_hi))
+                lo = max(min(ends), edge_lo)
+                hi = min(max(ends), edge_hi)
+                i0 = int(min(max(math.ceil(lo), 0), n - 1))
+                i1 = int(min(max(math.floor(hi), 0), n - 1))
+                if i1 < i0:
                     continue
-                if str(getattr(p, "kind", "")).lower() not in _TREE_KINDS:
+                idx = np.arange(i0, i1 + 1, dtype=np.int64)
+                # The band's OUTRIGHT summit, safe or not, recorded before
+                # anything is filtered. It is the number the diagnostic compares
+                # against, so "the highest point had to be rejected" means what
+                # it says rather than "the highest point that already passed".
+                top = int(idx[int(np.argmin(surf[idx]))])
+                if band_top is None or surf[top] < surf[band_top]:
+                    band_top = top
+                ok = shelf[i0 : i1 + 1]
+                if not bool(ok.any()):
                     continue
-                try:
-                    px = float(getattr(p, "x", 0.0))
-                except (TypeError, ValueError):
-                    continue
-                if not (lo <= px <= hi):
-                    continue
-                d = abs(px - (base + side * far))
-                if d < best_d:
-                    best_d, best = d, px
-            if best is not None:
-                return min(max(best, lo), hi)
+                keep = idx[ok]
+                if trees.size:
+                    j = np.searchsorted(trees, keep.astype(np.float64))
+                    left = np.where(j > 0,
+                                    trees[np.clip(j - 1, 0, trees.size - 1)],
+                                    -1e18)
+                    right = np.where(j < trees.size,
+                                     trees[np.clip(j, 0, trees.size - 1)], 1e18)
+                    near = np.minimum(np.abs(keep - left), np.abs(right - keep))
+                    timber = near <= float(HERMIT_FELL_REACH)
+                else:
+                    timber = np.zeros(keep.size, dtype=bool)
+                sides.append((side, keep, worst[keep], timber, top))
+            return sides, band_top
+
+        def _pick(cand: Any, w_worst: Any, gentlest: bool) -> int:
+            """Highest column in *cand*; on the fallback rungs, gentlest first.
+
+            The two upper rungs already know the route is cliff-free, so there
+            height is the only question. The fallback rungs are the case the
+            brief calls out - "if the highest point in the band is unreachable
+            or lethal, fall back to the highest point that is not" - and
+            ignoring the route there would hand him the summit at the far end of
+            the worst face on the map. So they minimise the steepest ground on
+            the walk home FIRST (rounded to 0.1, which is finer than any face
+            this matters on) and take the highest of what is left.
+            """
+            if not gentlest:
+                return int(cand[int(np.argmin(surf[cand]))])
+            key = np.round(w_worst, 1)
+            tie = cand[key <= key.min()]
+            return int(tie[int(np.argmin(surf[tie]))])
+
+        def _ladder(sides, band_top, rungs, widened: bool):
+            """Walk *rungs* over *sides*; return the winning column or None."""
+            for rung, need_route, need_timber, gentlest in rungs:
+                # WHICH SHOULDER, and the two kinds of rung answer it
+                # differently on purpose. On the route-clean rungs the walk home
+                # is cliff-free either way, so the seeded side wins and the
+                # choice stays cosmetic - `sides` is already in that order. On
+                # the fallback rungs there IS no clean route and the sides are
+                # not interchangeable: one shoulder may be behind a face of
+                # |slope| 16 and the other behind nothing worse than 3, and
+                # taking the seeded one regardless would pick the worse walk
+                # half the time for no reason at all. So those rungs compare the
+                # shoulders and take the gentler, seeded side breaking a tie.
+                order = sides
+                if gentlest and len(sides) > 1:
+                    order = sorted(sides, key=lambda t: float(np.min(t[2])))
+                for side, keep, w_worst, timber, top in order:
+                    m = np.ones(keep.size, dtype=bool)
+                    if need_route:
+                        m &= (w_worst <= float(MAX_SLOPE_CLIMB))
+                    if need_timber:
+                        m &= timber
+                    if not bool(m.any()):
+                        continue
+                    pick = _pick(keep[m], w_worst[m], gentlest)
+                    _LAST_CAMP_PICK.update(
+                        fallback=x, rung=rung, side=side, x=float(pick),
+                        y=float(surf[pick]), route_worst=float(worst[pick]),
+                        widened=bool(widened),
+                        # The band's unconstrained summit on this shoulder, and
+                        # the best on either, so the harness can say how far the
+                        # safety tests moved him and how high that cost.
+                        top_x=float(top), top_y=float(surf[top]),
+                        band_top_x=float(band_top if band_top is not None
+                                         else pick),
+                    )
+                    return float(pick)
+            return None
+
+        clean = ((1, True, True, False), (2, True, False, False))
+        rough = ((3, False, True, True), (4, False, False, True))
+
+        # PASS ONE: the staking corridor, and only the rungs with a clean walk
+        # home. This is the ordinary answer and it keeps HERMIT_RESITE_SLACK px
+        # of drift in hand at both walls of the band.
+        inner, inner_top = _shoulders(HERMIT_STAKE_MIN, HERMIT_STAKE_MAX)
+        got = _ladder(inner, inner_top, clean, False)
+        if got is not None:
+            return got
+
+        # PASS TWO: THE FULL BAND, still route-clean. Insetting the corridor to
+        # buy drift give also threw away 180 px of candidate shelf, and that is
+        # not free: measured over 60 fresh worlds, cliff-crossing sites went
+        # from 17 to 23 out of 60 when the corridor narrowed, six seeds moving
+        # to rung 3 purely because the shelf they would have used sat in the
+        # 90 px the inset removed. A clean walk home is worth more than a wide
+        # margin against churn - the margin only saves a re-site, the route is
+        # a slip roll every time he goes for timber - so when nothing inside the
+        # corridor has one, the search widens to the whole of 530..1060 before
+        # it settles for a face. The camp is still in band; it simply starts
+        # nearer a wall, and may re-site sooner if the settlement drifts that
+        # way. `widened` in the diagnostic is how often this fires.
+        outer, outer_top = _shoulders(HERMIT_STANDOFF_MIN, HERMIT_STANDOFF_MAX)
+        got = _ladder(outer, outer_top, clean, True)
+        if got is not None:
+            return got
+
+        # PASS THREE: no clean route anywhere in the band on either shoulder -
+        # the colony is walled in. Take the whole band for this too, since a
+        # wider search can only find a gentler face than a narrower one.
+        got = _ladder(outer, outer_top, rough, True)
+        if got is not None:
+            return got
     except Exception:
         log.debug("camp siting fell back to the derived offset", exc_info=True)
     return x
 
 
-def _ensure_hermit_house(world: Any, reg: StructureRegistry) -> None:
-    """Stake the hermit's shack at his camp when he has none. Never raises.
+def _ensure_hermit_hut(world: Any, reg: StructureRegistry) -> None:
+    """Stake the hermit's hut at his camp when he has none. Never raises.
 
-    ONE UNBUILT SHACK AT A TIME AND NOBODY ELSE'S BUSINESS. This is the whole of
-    the colony's involvement in his house: it puts stakes in the ground where he
+    ONE UNBUILT HUT AT A TIME AND NOBODY ELSE'S BUSINESS. This is the whole of
+    the colony's involvement in his hut: it puts stakes in the ground where he
     lives, and `_colony_sites` then hides those stakes from the build queue, the
     build needs and the concurrency cap, so no villager is ever sent to work on
     it. He builds it himself out of wood he cuts himself - see
@@ -3039,65 +3381,72 @@ def _ensure_hermit_house(world: Any, reg: StructureRegistry) -> None:
     and it is proof the role is running at all.
 
     WHERE: `hermit_home`, which is the derived seeded offset the first time and
-    the standing shack's own x every time after - so this fires once per shack,
-    and the successor to a dead hermit walks out to the house the last one built
-    instead of founding a new camp. It fires again only when the shack is gone:
+    the standing hut's own x every time after - so this fires once per hut,
+    and the successor to a dead hermit walks out to the hut the last one built
+    instead of founding a new camp. It fires again only when the hut is gone:
     burned by a dragon or by lightning, ruined, and cleared away by
     `purge_ruins`. Then the offset is re-derived and he may well rebuild
     somewhere slightly different, because the settlement has moved since.
 
     Costs exactly one draw from the seeded stream (the variant roll inside
-    ``reg.create``) and only on the tick a shack is staked.
+    ``reg.create``) and only on the tick a hut is staked.
     """
-    if not HERMIT_HOUSE:
+    if not HERMIT_HUT:
         return
     try:
         # ANY hermit_hut, RUBBLE INCLUDED, and that word is the whole of the
-        # cooldown. `hermit_house` deliberately skips ruins - a burned shack is
+        # cooldown. `hermit_hut` deliberately skips ruins - a burned hut is
         # not shelter and must not go on anchoring the camp - but asking it here
         # would mean re-staking on the very next director pass, 15 s later, into
         # whatever destroyed the last one. Measured, and not hypothetically: seed
         # 7 runs a lava front across the hermit's camp, and this loop staked and
-        # lost eleven shacks in 135 s, one chronicle line and one rng draw each.
+        # lost eleven huts in 135 s, one chronicle line and one rng draw each.
         # Rubble lingers for RUIN_LINGER (240 s), so counting it buys a real
         # cooldown out of machinery that already exists.
         herm = living_hermit(world)
-        standing = hermit_house(world)
+        standing = hermit_hut(world)
         if standing is not None:
-            # HAS THE VILLAGE WALKED AWAY FROM HIM? The shack does not move and
+            # HAS THE VILLAGE WALKED AWAY FROM HIM? The hut does not move and
             # the settlement does: `settlement_center` is a mean over buildings,
             # and a colony that keeps expanding one way drags it. Measured on
             # seed 7: staked at a correct 642 px, and 25 minutes later the same
-            # shack stood 974 px from a settlement that had grown six more huts
+            # hut stood 974 px from a settlement that had grown six more huts
             # eastward - past the frame edge, which is the one failure the
             # standoff numbers exist to prevent.
             #
-            # So he moves camp, rather than the house teleporting or the
-            # distance being allowed to drift. The old shack is COLLAPSED, not
+            # So he moves camp, rather than the hut teleporting or the
+            # distance being allowed to drift. The old hut is COLLAPSED, not
             # deleted: it falls down, stands as rubble for RUIN_LINGER and is
             # swept up by `purge_ruins` like anything else, so a building the
             # user watched go up never simply vanishes.
             #
-            # The band is deliberately wider than the staking band itself -
-            # HERMIT_RESITE_SLACK px of give at each end, so the test below is
-            # STANDOFF_MIN-SLACK .. STANDOFF_MAX+SLACK against a staking band of
-            # STANDOFF_MIN..STANDOFF_MAX - and it is a rare event rather than a
-            # tremor because of that give: anything narrower and a colony
-            # oscillating around the threshold would rebuild his house every few
-            # minutes. THE NUMBERS ARE DERIVED, so read them off the constants
-            # rather than off this comment; a previous version of it quoted
-            # "460..920 against 620..760", which matched neither the code beside
-            # it nor the constants it named. At the values shipping today
-            # (standoff 520..650, HERMIT_RESITE_SLACK 90) the real test is
-            # 430..740 against a staking band of 520..650.
+            # THE TEST IS THE BAND ITSELF, WITH NO SLACK ON EITHER SIDE, and
+            # that is the fix to a measured breach of the rule the user chose
+            # ("always at least 530 px out, never further than 1060"). It used
+            # to read MIN-SLACK <= d <= MAX+SLACK, i.e. 440..1150, so a hut
+            # staked correctly inside the band was then allowed to STAND well
+            # outside it: 20.4% of samples over 16 seeds, ten of the sixteen
+            # affected, as near as 446 px and as far as 1147.
+            #
+            # The give the slack was written for has not gone away, it has
+            # MOVED: `_camp_site` and `hermit_home` now stake inside
+            # HERMIT_STAKE_MIN..HERMIT_STAKE_MAX, the band inset by
+            # HERMIT_RESITE_SLACK at each end, so every new hut begins with 90
+            # px of drift in hand at both walls and a colony wandering a few
+            # metres still does not cost him a hut. What it no longer does is
+            # let him end up NEARER than the distance he started at.
+            #
+            # THE NUMBERS ARE DERIVED, so read them off the constants rather
+            # than off this comment; a previous version of it quoted
+            # "430..740 against a staking band of 520..650", which matched
+            # neither the code beside it nor the constants it named.
             if herm is None:
                 return
             try:
                 d = abs(float(standing.x) - float(_hermit_base(world)))
             except (TypeError, ValueError):
                 return
-            if (HERMIT_STANDOFF_MIN - HERMIT_RESITE_SLACK <= d
-                    <= HERMIT_STANDOFF_MAX + HERMIT_RESITE_SLACK):
+            if HERMIT_STANDOFF_MIN <= d <= HERMIT_STANDOFF_MAX:
                 return
             standing.collapse("moved")
             standing.state["ruin_cause"] = "moved"
@@ -3105,12 +3454,12 @@ def _ensure_hermit_house(world: Any, reg: StructureRegistry) -> None:
                              f"{getattr(herm, 'name', 'the hermit')} struck camp.")
         else:
             # ANY hermit_hut, RUBBLE INCLUDED, and that word is the whole of the
-            # cooldown. `hermit_house` deliberately skips ruins - a burned shack
+            # cooldown. `hermit_hut` deliberately skips ruins - a burned hut
             # is not shelter and must not go on anchoring the camp - but asking
             # only it here would mean re-staking on the very next director pass,
             # 15 s later, into whatever destroyed the last one. Measured, and not
             # hypothetically: seed 7 runs a lava front across the hermit's camp,
-            # and this loop staked and lost eleven shacks in 135 s, one chronicle
+            # and this loop staked and lost eleven huts in 135 s, one chronicle
             # line and one rng draw each. Rubble lingers for RUIN_LINGER (240 s),
             # so counting it buys a real cooldown out of machinery that already
             # exists. A camp he STRUCK himself is exempt - that rubble is a
@@ -3136,15 +3485,15 @@ def _ensure_hermit_house(world: Any, reg: StructureRegistry) -> None:
                 return
         reg.create("hermit_hut", x, y, rng=rng_of(world))
         chronicle(world, f"{getattr(herm, 'name', 'The hermit')} began raising a "
-                         f"shack of his own, out past the last of the huts.")
+                         f"hut of his own, on the high ground past the village.")
     except Exception:
-        log.debug("hermit house staking failed", exc_info=True)
+        log.debug("hermit hut staking failed", exc_info=True)
 
 
 def _ensure_hermit_fire(world: Any, reg: StructureRegistry) -> None:
     """Stake his firepit at his camp when he has none. Never raises.
 
-    The shack's sibling, and everything `_ensure_hermit_house` says about being
+    The hut's sibling, and everything `_ensure_hermit_hut` says about being
     staked rather than conjured, about `_colony_sites` hiding it from the build
     queue, and about him raising it himself out of wood he cut himself, applies
     here word for word.
@@ -3152,20 +3501,20 @@ def _ensure_hermit_fire(world: Any, reg: StructureRegistry) -> None:
     THREE DIFFERENCES, and each of them is why this is a separate function
     rather than a second `reg.create` inside that one:
 
-    1. IT IS ANCHORED TO THE SHACK, not to `hermit_home`. The fire goes a few
+    1. IT IS ANCHORED TO THE HUT, not to `hermit_home`. The fire goes a few
        paces off his own doorstep, on the settlement side, so the two read as
        one camp rather than as two buildings that happen to share a hillside -
        and so that a resited camp takes its fire with it. That means it waits
-       for the shack: with no shack standing or staked there is no doorstep to
+       for the hut: with no hut standing or staked there is no doorstep to
        put it beside, and `hermit_worksite` would have him building a fire in
        the middle of nowhere and then walking away from it.
-    2. IT DOES NOT RE-SITE ITSELF. `_ensure_hermit_house` moves camp when the
+    2. IT DOES NOT RE-SITE ITSELF. `_ensure_hermit_hut` moves camp when the
        village has grown away from him; this one is collapsed by that move, one
-       tick later, by the orphan test below - the fire whose shack is gone or is
+       tick later, by the orphan test below - the fire whose hut is gone or is
        now 300 px away is rubble, and a fresh one is staked at the new door.
-       Two rules for one camp would fight; one rule that follows the house
+       Two rules for one camp would fight; one rule that follows the hut
        cannot.
-    3. RUBBLE IS NOT A COOLDOWN HERE. The shack counts its own ruins to avoid
+    3. RUBBLE IS NOT A COOLDOWN HERE. The hut counts its own ruins to avoid
        re-staking into whatever burned it down, at a cost of RUIN_LINGER (240 s)
        of a hermit with no roof. A firepit is `flammable=False` and cannot burn,
        so the only things that ruin it are the hazards this function already
@@ -3175,13 +3524,13 @@ def _ensure_hermit_fire(world: Any, reg: StructureRegistry) -> None:
     Costs one draw from the seeded stream (the variant roll in ``reg.create``)
     and only on the tick a fire is staked.
     """
-    if not HERMIT_HOUSE:
+    if not HERMIT_HUT:
         return
     try:
         herm = living_hermit(world)
         if herm is None:
             return
-        house = hermit_house(world)
+        house = hermit_hut(world)
         fire = hermit_fire(world)
         if fire is not None:
             # ORPHANED? A fire standing on its own in the middle of nowhere is
@@ -3189,37 +3538,37 @@ def _ensure_hermit_fire(world: Any, reg: StructureRegistry) -> None:
             # but the test is "is there a camp here", NOT "is there a roof
             # here", AND RUBBLE COUNTS AS A CAMP.
             #
-            # That distinction is a bug fix, not a nicety. `hermit_house` skips
+            # That distinction is a bug fix, not a nicety. `hermit_hut` skips
             # ruins by design, so asking it alone meant that the tick a dragon
-            # finished burning his shack down, this line decided the fire was
+            # finished burning his hut down, this line decided the fire was
             # orphaned and collapsed it too: the user watches a dragon burn a
-            # house and the fire beside it silently vanishes in the same second,
+            # hut and the fire beside it silently vanishes in the same second,
             # having been neither burned nor touched (the spec is
             # `flammable=False` precisely so it cannot burn). Measured on seed 7
-            # - shack ignited, gone in 10 s, fire gone with it.
+            # - hut ignited, gone in 10 s, fire gone with it.
             #
             # What should happen, and now does, is that he loses his roof and
             # keeps his hearth: he sleeps rough beside a fire he still has while
             # he rebuilds the walls. So the scan below counts ANY hermit_hut
             # within reach, ruined or not. The fire is only given up when the
             # camp itself is gone - the rubble swept away by `purge_ruins` with
-            # no new shack near it, or a shack re-staked somewhere else because
+            # no new hut near it, or a hut re-staked somewhere else because
             # the village walked away.
-            # A STANDING SHACK WINS OVER RUBBLE, and that precedence is the whole
+            # A STANDING HUT WINS OVER RUBBLE, and that precedence is the whole
             # of this test. Both halves were measured:
             #
-            #   * rubble has to count, or a dragon burning his shack down takes
+            #   * rubble has to count, or a dragon burning his hut down takes
             #     his fire with it in the same second - see the note above.
-            #   * but rubble must not count while a standing shack exists
+            #   * but rubble must not count while a standing hut exists
             #     SOMEWHERE ELSE. When the village grows away from him
-            #     `_ensure_hermit_house` collapses the old shack and stakes a new
+            #     `_ensure_hermit_hut` collapses the old hut and stakes a new
             #     one further along; the old rubble lingers for RUIN_LINGER
             #     (240 s) right beside the fire, so a test that accepts any
             #     hermit_hut kept the fire pinned to the abandoned camp for four
             #     minutes while he lived at the new one. Measured on seeds 42 and
             #     1234: the fire was clipped by the frame edge in 43% and 46% of
-            #     frames against the shack's 8% and 15% - a firepit stranded
-            #     further out than the house it belongs to, which is exactly the
+            #     frames against the hut's 8% and 15% - a firepit stranded
+            #     further out than the hut it belongs to, which is exactly the
             #     mis-sited building this function exists to prevent.
             #
             # So: if he has a roof, the fire belongs beside THAT roof. If he has
@@ -3247,7 +3596,7 @@ def _ensure_hermit_fire(world: Any, reg: StructureRegistry) -> None:
             return
         if house is None:
             return                      # no doorstep yet - see (1) above
-        # A few paces toward town, so the shack sits between the fire and the
+        # A few paces toward town, so the hut sits between the fire and the
         # wilderness and the camp reads as facing the colony it turned its back
         # on. Falls back to the far side if the near one is unwalkable.
         try:
@@ -3316,7 +3665,7 @@ def _tick_hermit_visit(world: Any) -> None:
     enough to be seen.
 
     Two preconditions beyond the clock, and both are about it being a VISIT
-    rather than an errand: there has to be a hermit, and his shack has to be
+    rather than an errand: there has to be a hermit, and his hut has to be
     STANDING. Somebody walking out to a patch of hillside is a man going for a
     walk; somebody walking out to a house is calling on a neighbour. It also
     means the first visit never lands during the twenty minutes he is still
@@ -3369,7 +3718,7 @@ def _tick_hermit_visit(world: Any) -> None:
             return
         if living_hermit(world) is None:
             return
-        if hermit_house(world, built_only=True) is None:
+        if hermit_hut(world, built_only=True) is None:
             return
         # Never the elder (he is the colony's centre, and sending him out is the
         # one absence a small colony notices), never a child, never the hermit.

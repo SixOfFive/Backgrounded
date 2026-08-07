@@ -863,13 +863,13 @@ BARRICADE_MIN_POP = 4       # colony builds them once it is this many strong
 #: CLIPPING WAS NEVER THE CONSTRAINT, AND THE FIRST VERSION OF THIS NOTE SAID
 #: IT WAS. It quoted a clipping rate of 10.6% for the man and picked the band to
 #: dodge it, on sprite pads that were GUESSED: +/-12 px for the figure, +/-23
-#: for the shack, +/-15 for the fire. Every one of them is wrong. INK-DIFFED
+#: for the hut, +/-15 for the fire. Every one of them is wrong. INK-DIFFED
 #: against the real renderer - draw the thing on a transparent surface and read
 #: the columns whose alpha is non-zero, relative to the anchor the renderer
 #: blits on - the true drawn extents are:
 #:
 #:     figure   -29 .. +29 px worst frame (p95 -27/+20, median +/-7)
-#:     shack    -21 .. +18 px over every baked stage and variant
+#:     hut    -21 .. +18 px over every baked stage and variant
 #:     fire     -13 .. +12 px
 #:
 #: i.e. the figure is more than twice as wide as assumed and the two buildings
@@ -914,26 +914,127 @@ BARRICADE_MIN_POP = 4       # colony builds them once it is this many strong
 #: picked for.
 #:
 #: The floor is the other half of the request: he has to read as living apart.
-#: STANDOFF_MIN - ROAM = 440 px is well past the far side of any settlement
+#: STANDOFF_MIN - ROAM = 450 px is well past the far side of any settlement
 #: (huts, fire and store all sit within ~200 px of settlement_center), so at his
 #: closest he is a long way outside the town rather than at the edge of it. And
-#: see `behavior._ensure_hermit_house` for the rest of the answer: the shack has
+#: see `behavior._ensure_hermit_hut` for the rest of the answer: the hut has
 #: to be allowed to MOVE, because the settlement it is measured from does.
-HERMIT_STANDOFF_MIN = 520.0
-HERMIT_STANDOFF_MAX = 650.0
+#:
+#: THE BAND IS NOW A SEARCH RANGE, NOT A SEEDED PICK, AND IT IS TWICE AS WIDE.
+#: The user read the six-band table above, accepted the visibility it costs, and
+#: asked for double the distance with the site chosen by the TERRAIN: "the
+#: highest point beyond 530px (if the highest point is 25% of the double
+#: distance, they can build there)". So 530..1060 is a corridor and
+#: `behavior._camp_site` takes the HIGHEST SAFE GROUND inside it - always at
+#: least 530 out, never more than 1060, and where in between is the hillside's
+#: decision rather than a crc32's.
+#:
+#: WHAT IT COSTS, re-measured on the code that ships. 16 seeds x 45 sim-min,
+#: pooled and never read off one seed; visibility against the real camera with
+#: INK-DIFFED sprite pads (man +/-29, hut +/-26, fire +/-17 - the hut and fire
+#: re-measured here, since the old table never carried a hut column):
+#:
+#:   band              camp out   MAN full   off   HUT full  FIRE full  alight
+#:   520-650 control     577 px     90.3%    5.9%   88.5%       96.3%   100.0%
+#:   530-1060 ships      762 px     65.3%   25.6%   59.3%       67.9%    98.1%
+#:
+#: The control row is a live A/B on these same 16 seeds, not the old note's
+#: numbers - and it lands on 90.3% against the 90.6% that note recorded for the
+#: man, which is the cross-check that says this harness is measuring the same
+#: thing theirs did.
+#:
+#: He is wholly off frame a quarter of the time, against one frame in thirteen
+#: before. THAT IS THE TRADE THE USER MADE, with the six-band table above in
+#: front of them, and it is not to be quietly walked back: the frames lost are
+#: frames he is entirely absent rather than clipped, because past a certain
+#: distance `render/camera.py` stops counting him in the cluster it follows. The
+#: cost is not evenly spread - it is almost entirely the far half of the band.
+#: On the eight seeds whose camp landed under 700 px he is on frame 76-100%; on
+#: the four past 950 px, 13-41%.
+#:
+#: THE TWO THINGS THAT WERE NOT NEGOTIABLE BOTH HELD, and both are measurements:
+#:
+#:   * ZERO fall deaths, on any seed, against 18 among the villagers over the
+#:     same 16 runs. `_camp_site` will not stake a camp whose +/-40 px shelf is
+#:     unwalkable, and prefers one whose route to the village crosses no cliff.
+#:   * He is still safer than a villager, and the fire is why: 98.1% alight
+#:     against 91.4% at half the distance. See HERMIT_WOODPILE for the change
+#:     that bought that, and the A/B table under HERMIT_FIRE_WARD for the death
+#:     rates - including the honest news that the margin is now thin.
+HERMIT_STANDOFF_MIN = 530.0
+HERMIT_STANDOFF_MAX = 1060.0
+#: Half-width of the level shelf a camp needs, in px. The hut sprite is 46 px
+#: wide and `_ensure_hermit_fire` puts the fire 34 px off the door, so a site
+#: has to be walkable across +/-40 px or one of the two buildings ends up on a
+#: face. A peak is by definition surrounded by descent, which is exactly why
+#: this test exists: "highest point in the band" without it is an invitation to
+#: stake a camp on a knife edge and let him fall off his own doorstep. Measured
+#: - see the fall-death column in `behavior._camp_site`.
+HERMIT_SHELF_HALF = 40.0
 #: How far he mills about his own camp - now his own doorstep. Small, and see
 #: the roam paragraph above for why: it buys 6 px of distance, costs 5.7 points
 #: of his own visibility and 5.5 of his fire's, and costs him 51 hp/hermit-hour
 #: of mauling by taking him out of the ward.
 HERMIT_ROAM = 80.0
-#: How far the standing shack may drift out of the standoff band before he
-#: strikes camp and builds a new one - see `behavior._ensure_hermit_house`. The
-#: shack does not move and the settlement does, so without this the distance is
+#: How far the standing hut may drift out of the standoff band before he
+#: strikes camp and builds a new one - see `behavior._ensure_hermit_hut`. The
+#: hut does not move and the settlement does, so without this the distance is
 #: unbounded in both directions: measured at 974 px on seed 7, which is off the
-#: frame entirely. Wide enough that re-siting is a rare event rather than a
-#: tremor (the whole permitted band is 470..770, against a staking band of
-#: 560..680), narrow enough that the tail never reaches the border.
+#: frame entirely.
+#:
+#: THE SLACK USED TO BE SPENT ON THE WRONG SIDE OF THE BAND, and that was a
+#: measured breach of the rule the user chose. The test read
+#: ``MIN - SLACK <= d <= MAX + SLACK``, so a hut staked correctly inside
+#: 530..1060 was then allowed to STAND anywhere in 440..1150 as the settlement
+#: drifted under it. Measured, 16 seeds x 45 sim-min, sampled twice a second
+#: over every tick a built hut stood: 20.4% of samples out of band, and TEN OF
+#: SIXTEEN SEEDS spent time outside it - 5.0% below 530 (seeds 3, 9, 14, worst
+#: 446 px, which is NEARER than the 532 px baseline this whole change moved him
+#: away from) and 15.4% above 1060 (seeds 1, 4, 8, 10, 12, 13, 16, worst
+#: 1147 px). The earlier report of "3 seeds of 16" was reading the FINAL tick
+#: only; the standing hut leaves the band far more often than it ends outside
+#: it.
+#:
+#: So the give now comes out of the STAKING range instead. `_camp_site` and
+#: `hermit_home` search HERMIT_STAKE_MIN..HERMIT_STAKE_MAX (below), which is
+#: the band inset by this much at each end, and `_ensure_hermit_hut` permits
+#: exactly HERMIT_STANDOFF_MIN..HERMIT_STANDOFF_MAX with no slack at all. A new
+#: hut therefore starts at least SLACK px inside both walls, the settlement may
+#: drift that far in either direction before he moves, and the standing hut is
+#: never out of band whatever the colony does. The intent the slack was written
+#: for - a colony wandering a few metres must not make him abandon a good hut -
+#: is unchanged; what changed is that it is no longer paid for by letting him
+#: end up nearer than he started.
+#:
+#: AFTER, same 16 seeds, same sampling: 0 of 16293 samples out of band, on ZERO
+#: seeds. The extremes the hut ever reached are 535 and 1043 px against a band
+#: of 530..1060, and the mean distance is unmoved (802 -> 807 px), so this
+#: bought compliance without quietly pulling him in.
+#:
+#: WHAT IT COSTS, and a re-site is a visible event (he collapses a hut he was
+#: watched building and stakes another), so churn is its own failure: the
+#: permitted range narrows from 710 px wide to 530, and re-sites go from 4 to 8
+#: over those 16 seeds - 0.59 to 1.21 per hermit-hour, i.e. from one every hour
+#: and three quarters to one every fifty minutes. Twice as often, still rare
+#: enough to be an event rather than a tremor.
+#:
+#: The staking corridor also narrows from 530 px to 350, and THAT cost had to be
+#: paid back rather than absorbed: 180 px less shelf to search moved six seeds
+#: of sixty off a cliff-free walk home. `_camp_site` widens to the full band
+#: when the corridor has nothing clean in it, which restores that exactly (17 of
+#: 60, the same as before) at the price of ~10% of stakings starting nearer a
+#: wall with less give. See the two-pass note there.
 HERMIT_RESITE_SLACK = 90.0
+#: The corridor a NEW camp may be staked in: the standoff band inset by
+#: HERMIT_RESITE_SLACK at each end, so every hut starts with that much room to
+#: give before the settlement's drift pushes it out of band. Derived rather
+#: than written down, because two numbers that must not disagree should only be
+#: written once - a previous comment in `_ensure_hermit_hut` quoted a band that
+#: matched neither the code beside it nor the constants it named.
+HERMIT_STAKE_MIN = HERMIT_STANDOFF_MIN + HERMIT_RESITE_SLACK   # 620
+HERMIT_STAKE_MAX = HERMIT_STANDOFF_MAX - HERMIT_RESITE_SLACK   # 970
+if HERMIT_STAKE_MIN >= HERMIT_STAKE_MAX:                       # pragma: no cover
+    raise ValueError("HERMIT_RESITE_SLACK is wider than half the standoff band")
 #: His camp is never staked inside this of a world edge, so a colony founded
 #: near x=0 gets a hermit on its inland shoulder instead of one pressed flat
 #: against the wall (and `hermit_home` flips sides to honour it).
@@ -968,7 +1069,7 @@ HERMIT_HOMESICK = 0.45
 #: fire is scored UNDAMPED (and keeps the cold-scene arm the colony's score has,
 #: so a blizzard can still drive it to 1.0) because it is at his doorstep rather
 #: than 700 px away; `_h_sleep_rough` still pays warmth back at a hut's rate;
-#: and the fire is the FIRST thing he builds, at 4 wood against the shack's 12.
+#: and the fire is the FIRST thing he builds, at 4 wood against the hut's 12.
 #:
 #: "ZERO DEATHS OF ANY CAUSE ON ANY SEED" USED TO BE WRITTEN HERE AND IT WAS
 #: NOT TRUE. Re-measured with the `entities.on_death` hook, cross-checked so the
@@ -988,11 +1089,11 @@ HERMIT_HOMESICK = 0.45
 #: FOUR, against the colony pit's 6 wood + 6 stone. It is a ring of stones and
 #: an armful of sticks a single man laid, not the settlement's hearth, and the
 #: price has to be payable by one gather at his own camp - he has no stockpile
-#: and nobody hauls for him. Stone is excluded for the same reason the shack
+#: and nobody hauls for him. Stone is excluded for the same reason the hut
 #: excludes it: quarries are sited in town by MINE_KEEP_OUT.
 HERMIT_FIRE_WOOD = 4
 #: Placed just above HERMIT_BUILD_URGE (0.66) so that when both his fire and his
-#: shack are unbuilt he lays the fire first. That ordering is load-bearing, not
+#: hut are unbuilt he lays the fire first. That ordering is load-bearing, not
 #: taste: the fire is a third of the price and it is the thing that replaces the
 #: deleted damp, so the cheap warmth has to land before the expensive walls.
 HERMIT_FIRE_URGE = 0.68
@@ -1086,6 +1187,84 @@ HERMIT_STOKE_URGE = 0.52
 #: something. He takes ~29% more wolf damage per hour than a villager and dies
 #: barely half as often, which is the shape a man with one small advantage and
 #: no neighbours should have.
+#:
+#: ------------------------------------------------------------------------
+#: THE TABLE ABOVE NO LONGER REPRODUCES, AND THAT IS NOT THIS FEATURE'S DOING.
+#: Re-measured on 2026-08-07 when the camp moved out to 530..1060, as a true
+#: A/B: the SAME 16 seeds, the SAME code, the SAME 45 sim-min, the only
+#: difference being the two standoff constants rebound in `actions` and
+#: `behavior`. Deaths from the `entities.on_death` hook; reconcile residual 0
+#: on all 32 runs.
+#:
+#:   band                  camp    deaths/hermit-h   vs villager  safer  alight
+#:   520-650 seeded       577 px        1.32             1.60       17%   100.0%
+#:   530-1060 peak        762 px        1.69             1.78        5%    98.1%
+#:
+#: The CONTROL arm - the band that shipped - gives 17%, not the 47% written
+#: above. The world got four times wider, dragons and relics landed, and the
+#: villager's own rate fell from 2.23 to 1.60; the old row was measured against
+#: a different game and should be read as history. The number to compare the
+#: shipping band against is the 17% on the line above it, measured the same
+#: afternoon on the same seeds.
+#:
+#: AGAINST THAT CONTROL, MOVING OUT COSTS HIM. Two extra deaths over 5.9
+#: hermit-hours (10 against 8), which at this sample is inside the noise a
+#: Poisson count carries - but it is a real direction and it is stated rather
+#: than rounded away. He still clears the bar the role has to clear: he is
+#: safer than a villager in both arms. Where the deaths went is the more useful
+#: reading, because it says the ward is not what slipped:
+#:
+#:   hermit, 530-1060:  5 drown, 2 mauled, 1 mudslide, 1 fire, 1 meteor
+#:   hermit, 520-650 :  3 drown, 2 mauled, 1 mudslide, 1 fire, 1 meteor
+#:
+#: MAULINGS ARE FLAT AT TWO IN BOTH ARMS, against 40 among the villagers. The
+#: fire ward is doing exactly its job at twice the distance, which is what
+#: HERMIT_WOODPILE was added to guarantee. The whole difference is DROWNING in
+#: the flood scene, and three of the five are 400-690 px from his hut with him
+#: out foraging - two of those are the same seed drowning at the same spot in
+#: BOTH arms. Whether a hilltop camp should protect a man from a flood, and why
+#: it does not, is a question about the flood scene's water model and not about
+#: where he lives. Left alone deliberately rather than tuned against n=5.
+#:
+#: ------------------------------------------------------------------------
+#: THE FLOOD QUESTION WAS CHASED AND IT WAS A GENERAL BUG - see FLOOD_COVER in
+#: `sim/events.py`. The surge was anchored to the single lowest column in a
+#: world four times wider than the one that number was chosen in, with a depth
+#: clamp that saturated on 51 of 60 seeds, so it drowned 3% of the map on one
+#: seed and 57% on another. The settlement's own column was under the line on 14
+#: seeds of 40 against the hermit's camp on 8: he was never the one the flood
+#: was picking on, he was just the only man who reliably stands on a peak and so
+#: the only one it looked wrong for. Fixed there, generally, not here.
+#:
+#: WHAT THAT DID, 16 seeds x 45 sim-min before and after, same seeds:
+#:
+#:                      deaths/hermit-h   villager   drownings (herm / vill)
+#:   before                   1.04          2.24            2 / 44
+#:   after                    1.51          1.76            2 / 17
+#:
+#: VILLAGER DROWNINGS FELL BY 61% and the villager death rate with them, which
+#: is the general fix landing. The hermit's own drownings did not move - two
+#: either way - and his overall rate went UP, which looks like a loss and is not
+#: readable as one: FIVE OF HIS TEN DEATHS ARE ONE SEED (15: mauled, meteor, two
+#: lightning, cold, none of them water), and without it he is at 0.81/h. At ten
+#: events over 6.6 hermit-hours a Poisson count carries +/-0.48/h, so 1.51
+#: against 1.76 is a margin this sample cannot resolve in either direction.
+#:
+#: SO THE HONEST STATEMENT OF THE BAR IS: he is safer than a villager in every
+#: pooled measurement taken so far (1.04 v 2.24, 1.51 v 1.76, and 1.85 v 2.49 on
+#: the first eight seeds alone), and NOT ONE of those margins is established at
+#: this sample size. Settling it needs 40+ seeds and it has not been spent; do
+#: not quote a percentage off any single run of 16.
+#:
+#: ONE THING DID CHANGE THAT THE OLD NOTES CALLED NON-NEGOTIABLE: the hermit
+#: took his FIRST fall death (1 in 16 runs, seed 4). Villager falls rose from 7
+#: to 11 over the same runs and villagers are not affected by where his camp is,
+#: so this reads as the flood change - a deeper surge on the seeds that used to
+#: get a shallow one means more people running uphill over steep ground - rather
+#: than as anything about the camp. His doorstep is provably no steeper: over 60
+#: worlds the max |slope| within HERMIT_SHELF_HALF of the picked column is 0.66
+#: median against MAX_SLOPE_WALK 0.9, and the single seed over it (34, 5.67) is
+#: the rung-5 fallback that has no shelf test at all and always has not had one.
 HERMIT_FIRE_WARD = 110.0
 #: What cooking his own supper is worth to him. Deliberately modest and
 #: deliberately BELOW the Eat score a hungry man carries (`hunger**2`, forced to
@@ -1096,22 +1275,129 @@ HERMIT_FIRE_WARD = 110.0
 #: since `actions._h_cook` needs the fire alight to cook at all.
 HERMIT_COOK_URGE = 0.42
 
-# --------------------------------------------------------- hermit's house --
-#: Whether the hermit builds himself a shack at all. A kill switch for the
+# --------------------------------------------------------- hermit's stash --
+#: HIS PRIVATE STORE, AND IT DID NOT EXIST UNTIL NOW. Read the docstring of
+#: `actions._deposit_step` for what it replaces: a hermit kept FOOD IN HIS HANDS
+#: and everything else he picked was DESTROYED on delivery - "what the hermit
+#: picks, the colony never sees" was literally true, including of the hermit.
+#: He could cut four logs, spend one on his fire and lose three.
+#:
+#: WHERE IT LIVES: on the WORLD (`World.hermit_stash`), keyed to the camp rather
+#: than to the hut. Hanging it off the hut is the more dramatic shape - a dragon
+#: burning the roof would take the winter stores with it - and it was rejected
+#: on a mechanical rather than an aesthetic point: he has no hut for the first
+#: minutes of his life, none for the RUIN_LINGER + rebuild after one burns, and
+#: none across the tick `_ensure_hermit_hut` strikes camp and re-stakes. A
+#: store that cannot exist during the three moments he most needs one is not a
+#: store. At world level the successor inherits it exactly as he inherits the
+#: hut, and for the same reason: the camp outlives the man.
+#:
+#: IT IS NOT THE COLONY'S AND THE COLONY'S IS NOT HIS. `stock_add`/`stock_take`
+#: never touch it and `hermit_stash_*` never touch them, so the two books cannot
+#: meet. `World.reconcile` conserves PEOPLE and not resources, so there is no
+#: accounting hazard here - the gate is about the ROLE, not the arithmetic.
+#:
+#: WHAT IT BOUGHT, and it is not decoration: at 530..1060 he walks twice as far
+#: for timber, which is twice as long outside HERMIT_FIRE_WARD, which is what
+#: killed him the last time the band moved out. The stash pays that back by
+#: making him need fewer walks, not shorter ones - he banks a surplus armful and
+#: draws on it for the next stoke. It took HERMIT_WOODPILE as well - a stash he
+#: never fills is a stash that buys nothing, and the first measurement said
+#: exactly that. See `actions._stoke_wood`.
+#:
+#: RE-MEASURED, 16 seeds x 45 sim-min, sampled twice a second, ON THE SHIPPING
+#: CODE. The fire is alight 99.9% of the samples a built one stands - the note
+#: that said 98.1% and the re-check that said 97.3% were both reading the same
+#: thing and both a little pessimistic.
+#:
+#: THE WARD FIGURE NEEDS ITS DENOMINATOR SAID OUT LOUD, which is why three
+#: different numbers have been written for it. He is inside a LIT ward on 73.8%
+#: of the samples where a lit fire of his stands, and on 32.2% of ALL his
+#: samples - the gap is the opening minutes of every hermit's life, before he
+#: has cut the wood for a fire at all. Neither is the 63.9% recorded before, and
+#: "63.9%" with no denominator cannot be checked; quote one of these two.
+#:
+#: WHAT ENDS UP IN IT, same runs: 8.9 wood, 32.5 food, 23.5 fibre and 2.6 stone
+#: at the final tick on average, wood non-zero on 15 seeds of 16, food on 16,
+#: fibre on 16 and stone on 9. (The earlier note said stone on 3 of 16; it is 9.
+#: He still has almost no reason to mine - MINE_KEEP_OUT sites quarries in town
+#: - so what lands there is incidental.)
+#:
+#: COOKED IS ZERO ON EVERY SEED, and that is not a broken column: he cooks and
+#: then eats or carries the meal, and a cooked surplus over CARRY_CAP has never
+#: arisen in 45 minutes. `_stash_line` DROPS zero fields rather than padding
+#: them, so `ck` does not render at all on his row - the panel says "stash wd 4
+#: fd 8", never "ck 0". The route exists (`_h_cook` and `_hermit_bias` both go
+#: through the stash) and would show if it ever filled; there is nothing here to
+#: fix, only something not to expect.
+HERMIT_STASH_CAP = 60
+#: HOW MUCH WOOD HE LIKES TO HAVE BY THE DOOR, and what filling the pile is
+#: worth. This is the fuel economy fix the longer standoff needed, and it exists
+#: because the first measurement of the new band said so: with a stash he could
+#: bank into but no reason to fill it, his woodpile peaked at FIVE units across
+#: eight seeds and his fire was alight 74.8% of the time it stood, against 91.4%
+#: at half the distance. He only ever cut wood REACTIVELY - when the frame
+#: wanted it, or when the fire was already low - so at twice the walk each
+#: reactive trip was twice as long outside HERMIT_FIRE_WARD and the fire was out
+#: for more of it.
+#:
+#: So he lays a woodpile in. Eight units is two stokes plus change against
+#: HERMIT_FIRE_WOOD's 4, and one gather fills it (`_h_gather` stops at CARRY_CAP
+#: and berries/logs yield 3 a swing), so this is one trip that buys several
+#: quiet hours rather than a standing errand.
+#:
+#: MEASURED, 16 seeds x 45 sim-min, against the same code with this urge absent:
+#: the alight fraction goes 74.8% -> 98.1% and the fraction of his ticks spent
+#: inside a LIT ward goes 34.2% -> 63.9%. His banked wood still reads empty on
+#: 60% of samples and that is not a failure - it is a BUFFER, spent as fast as
+#: it is filled, and the fire being lit is the thing it was bought for.
+#:
+#: THE URGE IS THE DELICATE PART. 0.50 sits above HERMIT_HOMESICK (0.45), so
+#: stocking up beats drifting back to the doorstep and actually happens; below
+#: HERMIT_STOKE_URGE (0.52), so a fire that is ALREADY low gets fed before he
+#: goes to cut more; below HERMIT_FELL_URGE (0.58), so an unfinished hut still
+#: outranks the woodpile; and far below every survival score, so he never
+#: stockpiles through a blizzard or a wolf. It is the lowest-priority job he
+#: has that is not idling.
+HERMIT_WOODPILE = 8
+HERMIT_WOODPILE_URGE = 0.50
+#: HERMIT_LARDER_HAND USED TO LIVE HERE AND IT IS GONE, because it was never a
+#: knob. It was 8, `actions._deposit_step` read it as
+#: ``max(int(HERMIT_LARDER_HAND), CARRY_CAP)`` and CARRY_CAP is also 8, so the
+#: constant could not take any other value and the banking branch under it was
+#: unreachable. Instrumented over 16 seeds x 45 sim-min, the highest food a
+#: hermit ever carried was exactly 8 and that branch never ran.
+#:
+#: The reason it could not was worth keeping and now lives beside the code it
+#: explains: food arrives in fours (BERRY_YIELD 4, FARM_HARVEST_FOOD 4) and
+#: `_hermit_bias` stops him foraging at ``carry_qty >= CARRY_CAP``, so his food
+#: hands go 0, 4, 8 and stop exactly ON the cap rather than over it. `_deposit_step`
+#: keeps a one-line clamp at CARRY_CAP against a future yield that does not
+#: divide it, and says so in as many words instead of forty lines describing a
+#: mechanism that never fired.
+#:
+#: The measurement that made it look like a knob is still true and still the
+#: reason nothing here may go BELOW CARRY_CAP: at 6, seed 1 put 60 food and 60
+#: fibre (both at HERMIT_STASH_CAP) in the pile and walked the man 3172 px from
+#: a camp 800 px out, because handing him back under the foraging ceiling
+#: restarts the forage every delivery and it never terminates.
+
+# ----------------------------------------------------------- hermit's hut --
+#: Whether the hermit builds himself a hut at all. A kill switch for the
 #: A/B, and the thing the control run flips - see tools/smoke.py and the
-#: measurement note in behavior._ensure_hermit_house. Never flipped at runtime.
-HERMIT_HOUSE = True
+#: measurement note in behavior._ensure_hermit_hut. Never flipped at runtime.
+HERMIT_HUT = True
 #: Seconds of applied work per stage of it, and how much wood the whole thing
 #: costs (three stages, so this is split across them by StructureSpec).
 #: WOOD ONLY, deliberately. He has no stockpile to draw on and no colony to
-#: haul for him: everything in that shack is something he personally carried
+#: haul for him: everything in that hut is something he personally carried
 #: there, so the bill has to be payable by the one gather he actually does at
 #: his own camp. Stone would mean a quarry (sited in town by MINE_KEEP_OUT) and
 #: fibre would mean the colony's fields.
-HERMIT_HOUSE_WOOD = 12
+HERMIT_HUT_WOOD = 12
 #: What raising it is worth to him, and what cutting the wood for it is worth.
 #: Both are handed back to two scores `_hermit_bias` otherwise zeroes, and only
-#: while the shack is unfinished. Placed above HERMIT_HOMESICK (0.45) so the
+#: while the hut is unfinished. Placed above HERMIT_HOMESICK (0.45) so the
 #: work outranks drifting home and below every survival score, so it never
 #: outranks eating, sleeping or running - a hermit must not build through a
 #: blizzard. Felling sits under building so a man holding a log goes and puts it
@@ -1119,7 +1405,7 @@ HERMIT_HOUSE_WOOD = 12
 HERMIT_BUILD_URGE = 0.66
 HERMIT_FELL_URGE = 0.58
 #: How far from HIS CAMP - not from him - a tree may be for him to go and fell
-#: it for the shack. This number is the difference between a hermit and a
+#: it for the hut. This number is the difference between a hermit and a
 #: lumberjack, and it was measured the hard way: without it he takes
 #: `find_prop`'s nearest tree to HIMSELF, walks to it, is nearest to the next
 #: one from there, and ranges 1300 px from his own camp inside four minutes -
@@ -1128,7 +1414,7 @@ HERMIT_FELL_URGE = 0.58
 #: the site was by then further away than `_h_build`'s approach budget.
 #:
 #: 300 px is about two roam radii plus a walk. Too small and a camp on bare
-#: hillside never gets a shack at all; too large and the role dissolves. If no
+#: hillside never gets a hut at all; too large and the role dissolves. If no
 #: tree is inside it, `_hermit_bias` does not score the fell in the first place,
 #: so he waits rather than thrashing against an action that fails on sight -
 #: and `behavior._camp_site` sites the camp itself toward the nearest timber in

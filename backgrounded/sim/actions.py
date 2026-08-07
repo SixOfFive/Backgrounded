@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
 from ..constants import (
+    ALL_RESOURCES,
     CLIMB_SPEED,
     DAY_LENGTH_SEC,
     FARM_FIELD_SIZE,
@@ -30,8 +31,9 @@ from ..constants import (
     HERMIT_EDGE_MARGIN,
     HERMIT_FELL_REACH,
     HERMIT_ROAM,
-    HERMIT_STANDOFF_MAX,
-    HERMIT_STANDOFF_MIN,
+    HERMIT_STASH_CAP,
+    HERMIT_STAKE_MAX,
+    HERMIT_STAKE_MIN,
     HERMIT_VISIT_GIFT,
     HERMIT_VISIT_MORALE_GUEST,
     HERMIT_VISIT_MORALE_HOST,
@@ -133,7 +135,7 @@ CLIMB_TIME = 2.5
 #: Seconds a hermit will spend walking to his own front door before giving up
 #: and lying down where he stands. Generous against the distance he actually has
 #: to cover (HERMIT_ROAM is 90 px, ~3 s of clear ground) and deliberately so:
-#: the number is not a travel budget, it is the guard that stops a shack he
+#: the number is not a travel budget, it is the guard that stops a hut he
 #: cannot reach - over a ledge, behind a fire - from costing him the night's
 #: sleep. Fatigue is the one need with no field remedy; see `_h_sleep_rough`.
 HERMIT_BED_WALK = 26.0
@@ -369,6 +371,101 @@ def stock_take(world: Any, res: str, qty: int) -> int:
     return 0
 
 
+# ------------------------------------------------------- the hermit's stash --
+#: WHAT HE KEEPS AT HIS OWN CAMP, and the four functions below are the whole of
+#: it. They are a deliberate mirror of `stockpile_of`/`stock_qty`/`stock_add`/
+#: `stock_take` above rather than a mode on them, because the ONE property this
+#: subsystem has to have is that the two books cannot meet: nothing in the
+#: colony's half ever names `hermit_stash` and nothing here ever names
+#: `stockpile`. A flag on the existing functions would be one wrong argument
+#: away from a villager eating the hermit's winter stores.
+#:
+#: `World.reconcile` conserves PEOPLE, not resources, so there is no accounting
+#: hazard in a second pile - the gate is about the ROLE. See the note in
+#: `World._init_colony_state` for why the store lives on the world rather than
+#: on the hut, and `_deposit_step` for what it replaced.
+def hermit_stash_of(world: Any) -> dict[str, int]:
+    """His camp store as a plain dict. Creates one if a world somehow lacks it.
+
+    The fallback is not decoration. `_init_colony_state` puts this on both
+    construction paths, but every other consumer in this file reaches worlds
+    built by test harnesses and stub objects too, and a stash subsystem that
+    raises AttributeError on the gather path would take the whole action down.
+    """
+    st = getattr(world, "hermit_stash", None)
+    if not isinstance(st, dict):
+        st = {}
+        try:
+            setattr(world, "hermit_stash", st)
+        except Exception:
+            pass
+    return st
+
+
+def hermit_stash_qty(world: Any, res: str) -> int:
+    try:
+        return max(0, int(hermit_stash_of(world).get(res, 0) or 0))
+    except Exception:
+        return 0
+
+
+def hermit_stash_add(world: Any, res: str, qty: int) -> int:
+    """Bank up to *qty*. Returns how much actually went in.
+
+    Capped at HERMIT_STASH_CAP per resource, and the cap is what stops a hermit
+    who outlives three villages from banking four thousand logs into a HUD row
+    that then does not fit on the panel. Garbage is refused for the same reason
+    `stock_add` refuses it: sweepings are not wealth, and letting them in here
+    would put an `rb 0` on his row forever.
+    """
+    if qty <= 0 or not res or res == RES_GARBAGE:
+        return 0
+    if res not in ALL_RESOURCES:
+        return 0
+    st = hermit_stash_of(world)
+    try:
+        have = max(0, int(st.get(res, 0) or 0))
+        room = max(0, int(HERMIT_STASH_CAP) - have)
+        put = min(room, int(qty))
+        if put > 0:
+            st[res] = have + put
+        return put
+    except Exception:
+        log.debug("hermit_stash_add failed", exc_info=True)
+        return 0
+
+
+def hermit_stash_take(world: Any, res: str, qty: int) -> int:
+    """Draw up to *qty* out. Returns how much was actually taken."""
+    if qty <= 0 or not res:
+        return 0
+    st = hermit_stash_of(world)
+    try:
+        have = max(0, int(st.get(res, 0) or 0))
+        take = min(have, int(qty))
+        if take > 0:
+            st[res] = have - take
+        return take
+    except Exception:
+        log.debug("hermit_stash_take failed", exc_info=True)
+        return 0
+
+
+def hermit_stash_food(world: Any) -> tuple[str | None, int]:
+    """Best edible thing in his stash and how much of it - cooked wins.
+
+    The stash twin of `food_in_store`, and the reason `_h_eat` can feed him
+    without the walk into town that function's callers make.
+    """
+    ck = hermit_stash_qty(world, RES_COOKED)
+    if ck > 0:
+        return RES_COOKED, ck
+    raw = hermit_stash_qty(world, RES_FOOD)
+    if raw > 0:
+        return RES_FOOD, raw
+    return None, 0
+
+
 def food_in_store(world: Any) -> tuple[str | None, int]:
     """Best available food resource and its quantity - cooked wins."""
     ck = stock_qty(world, RES_COOKED)
@@ -531,10 +628,10 @@ def colony_center(world: Any) -> float:
 #: whole point of them is to sit a long way from that answer.
 #:
 #: ``hermit_hut`` is here for a sharper version of the same reason and one extra
-#: one. A barricade folded into the mean merely moves it; the hermit's shack
+#: one. A barricade folded into the mean merely moves it; the hermit's hut
 #: folded into the mean moves it and then feeds back, because ``hermit_home``
 #: below is *derived* from ``settlement_center`` plus a fixed standoff. Leave
-#: the shack in and every director pass sites the camp a little further out
+#: the hut in and every director pass sites the camp a little further out
 #: than the last, a runaway with a 760 px step. See also
 #: ``structures.NON_SETTLEMENT_KINDS``, which carries the same exclusion for the
 #: registry's own average (the camera's fallback, and stage_bounds').
@@ -642,7 +739,7 @@ def _hermit_owned(world: Any, kind: str, built_only: bool) -> Any | None:
     with the lowest id, deterministically, rather than whichever the dict
     happened to yield first.
 
-    Ruins are never returned. A burned-out shack is not shelter, is not a build
+    Ruins are never returned. A burned-out hut is not shelter, is not a build
     target, and must not go on anchoring the camp - and it lingers as rubble for
     RUIN_LINGER (240 s) before ``purge_ruins`` takes it away, which is 240 s of
     a hermit who would otherwise be sleeping in a pile of ash.
@@ -667,8 +764,8 @@ def _hermit_owned(world: Any, kind: str, built_only: bool) -> Any | None:
     return best
 
 
-def hermit_house(world: Any, *, built_only: bool = False) -> Any | None:
-    """The hermit's shack, or None. Never raises."""
+def hermit_hut(world: Any, *, built_only: bool = False) -> Any | None:
+    """The hermit's hut, or None. Never raises."""
     return _hermit_owned(world, "hermit_hut", built_only)
 
 
@@ -691,14 +788,14 @@ def hermit_worksite(world: Any) -> Any | None:
     """The unfinished building at his camp he should be working on, or None.
 
     FIRE FIRST, THEN WALLS, and that order is the whole of this function. The
-    fire is 4 wood against the shack's 12 and it is what replaced the deleted
+    fire is 4 wood against the hut's 12 and it is what replaced the deleted
     HERMIT_FIRE_DAMP safety valve, so the cheap warmth has to land before the
     expensive roof or a hermit appointed on the eve of a blizzard has neither.
     """
     fire = hermit_fire(world)
     if fire is not None and not getattr(fire, "built", False):
         return fire
-    house = hermit_house(world)
+    house = hermit_hut(world)
     if house is not None and not getattr(house, "built", False):
         return house
     return None
@@ -754,8 +851,8 @@ def colony_repairable(reg: Any, *, threshold: float = 0.9) -> list[Any]:
     """Damaged buildings THE COLONY is allowed to mend. Never raises.
 
     ``StructureRegistry.damaged`` walks every structure there is, so it hands
-    back the hermit's shack along with the huts - and `_mk_repair` then picks
-    ``min(..., abs(s.x - ax))`` over the result, which on a shack chewed by a
+    back the hermit's hut along with the huts - and `_mk_repair` then picks
+    ``min(..., abs(s.x - ax))`` over the result, which on a hut chewed by a
     wolf is a villager sent on a 600 px walk to mend a building he may not
     enter, for a man who did not ask. That is the same "the colony does his work
     for him" failure `_colony_sites` exists to prevent, arriving through a
@@ -763,8 +860,8 @@ def colony_repairable(reg: Any, *, threshold: float = 0.9) -> list[Any]:
     separate-kind trick does not cover it and an explicit filter has to.
 
     Nobody mends his camp, including him - RepairStructure is one of the keys
-    `_hermit_bias` zeroes. A shack that takes damage stays damaged and, if it
-    is hit enough, falls down, and `_ensure_hermit_house` stakes him another.
+    `_hermit_bias` zeroes. A hut that takes damage stays damaged and, if it
+    is hit enough, falls down, and `_ensure_hermit_hut` stakes him another.
     Rebuilding is the loop this role already has and it is the one worth
     watching; a repair loop would be a second one that looks identical.
     """
@@ -855,14 +952,32 @@ def _walked_for(a: Any) -> float:
 
 
 def _stoke_wood(ag: Any, w: Any, want: int) -> int:
-    """Wood for a fire: out of his hands first, then out of the store.
+    """Wood for a fire: hands first, then HIS OWN STASH or the colony's store.
 
-    A HERMIT NEVER TOUCHES THE STORE. He has no claim on it - the whole role is
-    built on "what the hermit picks, the colony never sees" - and the store is
-    700 px away besides, so a hermit permitted to draw on it would walk into
-    town every time his fire guttered, which is the commute this feature exists
-    to end. He feeds his fire out of the armful he cut himself, or it stays out
-    and he goes and cuts more (`behavior._hermit_bias` scores exactly that).
+    A HERMIT NEVER TOUCHES THE COLONY STORE. He has no claim on it - the whole
+    role is built on "what the hermit picks, the colony never sees" - and it is
+    most of a kilometre away besides, so a hermit permitted to draw on it would
+    walk into town every time his fire guttered, which is the commute this
+    feature exists to end.
+
+    WHAT HE DRAWS ON INSTEAD IS HIS OWN PILE, and that line is why the camp
+    could move out to 530..1060 without killing him. HERMIT_FIRE_WARD only holds
+    while the fire is BURNING, and at the old band the only fuel he had was
+    whatever was in his hands, so every stoke meant a walk to timber and every
+    walk to timber meant time outside the ward - the mechanism that made every
+    band past 540 px measurably more lethal. Banking the surplus and spending it
+    here means he needs FEWER walks rather than shorter ones, which is the one
+    shape that pays at twice the distance. Measured over 16 seeds x 45 sim-min:
+    the fire is alight 98.1% of the ticks a BUILT one stands, against 91.4% at
+    half the range, and he is inside a LIT ward for 63.9% of his ticks.
+
+    THE STASH ALONE WAS NOT ENOUGH AND THE FIRST MEASUREMENT SAID SO. With a
+    pile he could draw on but no reason to fill it, his banked wood peaked at 5
+    units and the alight fraction was 74.8% - WORSE than the old band, because
+    he still only cut wood when something already wanted it and every one of
+    those trips was now twice as long. HERMIT_WOODPILE is the other half: it
+    gives him a reason to cut ahead of the need. This function is where that
+    pile is spent.
     """
     got = 0
     if getattr(ag, "carrying", None) == RES_WOOD:
@@ -871,15 +986,16 @@ def _stoke_wood(ag: Any, w: Any, want: int) -> int:
             ag.carry_qty = int(ag.carry_qty) - got
             if ag.carry_qty <= 0:
                 ag.carrying = None
-    if got <= 0 and not is_hermit(ag):
-        got = stock_take(w, RES_WOOD, int(want))
+    if got <= 0:
+        got = (hermit_stash_take(w, RES_WOOD, int(want)) if is_hermit(ag)
+               else stock_take(w, RES_WOOD, int(want)))
     return int(got)
 
 
 def hermit_home(world: Any) -> float:
     """Where the colony's hermit lives, in WORLD px. Never raises.
 
-    ONCE THE SHACK IS STANDING, THE SHACK IS THE ANSWER. Everything below this
+    ONCE THE HUT IS STANDING, THE HUT IS THE ANSWER. Everything below this
     paragraph describes how the camp is *sited in the first place*; from the
     moment there is a building on it, the building is the single source of truth
     about where the camp is, and the derivation stops running.
@@ -888,11 +1004,11 @@ def hermit_home(world: Any) -> float:
     ``_hermit_base``, which is a mean over the colony's buildings, so it drifts
     every time the colony puts a hut up - and a camp that drifts is a hermit who
     walks a little further from his own front door every ten minutes. It is also
-    the answer to what succession does with the house: the next hermit inherits
+    the answer to what succession does with the hut: the next hermit inherits
     it, because ``hermit_home`` keeps returning the same x whoever holds the
     title, so he walks out to the place the last one lived rather than founding a
     new camp somewhere else. The seeded offset only decides where the FIRST one
-    goes, and where the next one goes if the shack has burned down and been
+    goes, and where the next one goes if the hut has burned down and been
     cleared away.
 
     DERIVED, not stored, and that is a deliberate choice against adding a world
@@ -915,7 +1031,7 @@ def hermit_home(world: Any) -> float:
     edge - the one place the standoff matters most - and a colony founded at
     x=200 would get a "hermit" living 200 px away, which is to say in town.
     """
-    house = hermit_house(world)
+    house = hermit_hut(world)
     if house is not None:
         try:
             hx = float(getattr(house, "x", 0.0))
@@ -930,7 +1046,12 @@ def hermit_home(world: Any) -> float:
         seed = 0
     h = zlib.crc32(b"hermit:" + str(seed).encode("ascii"))
     frac = ((h >> 8) & 0xFFFF) / 65535.0
-    dist = HERMIT_STANDOFF_MIN + frac * (HERMIT_STANDOFF_MAX - HERMIT_STANDOFF_MIN)
+    # HERMIT_STAKE_*, not HERMIT_STANDOFF_*: the derived offset sites a camp, and
+    # a camp is staked inside the standoff band inset by HERMIT_RESITE_SLACK so
+    # that the settlement can drift under it without putting the standing hut out
+    # of band. `behavior._camp_site` searches the same corridor, and
+    # `_ensure_hermit_hut` enforces the full band with no slack.
+    dist = HERMIT_STAKE_MIN + frac * (HERMIT_STAKE_MAX - HERMIT_STAKE_MIN)
     side = 1.0 if (h & 1) else -1.0
     lo = float(HERMIT_EDGE_MARGIN)
     hi = float(WORLD_W) - float(HERMIT_EDGE_MARGIN)
@@ -1910,15 +2031,21 @@ def _deposit_step(action: "Action", agent: Any, world: Any, dt: float) -> bool:
         # a last resort (see HERMIT_HOMESICK - the pull home loses to a really
         # hungry man).
         #
-        # Everything else is spent out there and does not come back. There is no
-        # book this breaks: World.reconcile conserves PEOPLE, not resources, and
-        # the stockpile is a counter rather than an inventory of objects. It is
-        # the cost of the role stated honestly - what the hermit picks, the
-        # colony never sees - and it is nearly hypothetical anyway, because his
-        # build/mine/cleanup affinities are 0.05-0.10. Clearing the slot rather
-        # than keeping it is load-bearing: a hermit left holding wood forever
-        # could never pick up food again.
-        # ...UNLESS HIS OWN SHACK IS SHORT OF IT, in which case THIS is his
+        # EVERYTHING ELSE USED TO BE DESTROYED HERE AND NOW GOES IN HIS STASH.
+        # The line this replaces read "what the hermit picks, the colony never
+        # sees", which was true of the colony and, it turned out, also true of
+        # the hermit: the surplus was deleted at the bottom of this branch, so a
+        # man who cut four logs for a fire that wanted one lost three of them.
+        # He now banks them at his camp (`hermit_stash_add`, and see the note on
+        # those functions), draws on them to build, to stoke and to eat, and his
+        # successor inherits the pile. The colony still never sees it - the two
+        # stores are separate dicts touched by disjoint sets of functions - so
+        # the role's promise is intact and only the waste is gone.
+        #
+        # There is no book this breaks either way: World.reconcile conserves
+        # PEOPLE, not resources, and both stores are counters rather than
+        # inventories of objects.
+        # ...UNLESS HIS OWN HUT IS SHORT OF IT, in which case THIS is his
         # delivery. The whole build loop for the hermit lives inside the gather
         # action rather than being handed to `BuildStructure`, and that is not an
         # optimisation, it is the only shape that works.
@@ -1935,13 +2062,13 @@ def _deposit_step(action: "Action", agent: Any, world: Any, dt: float) -> bool:
         # entire 45 minutes. Delivering here, inside the action that still owns
         # the stash, is what lets him carry a meal in one hand and a log in the
         # other.
-        # `hermit_worksite`, NOT `hermit_house`, AND THE DIFFERENCE IS A
+        # `hermit_worksite`, NOT `hermit_hut`, AND THE DIFFERENCE IS A
         # DEADLOCK. This delivery and `behavior._mk_build`'s target have to name
         # the same building, because the hermit's whole build loop is the two of
         # them in a ring: the gather delivers the wood, the build spends it, and
         # `_hermit_bias` only scores BuildStructure once the frame is stocked.
         # Point them at different frames and the ring opens - measured on seed 7
-        # with this line still saying `hermit_house`: he cut wood for 45 minutes
+        # with this line still saying `hermit_hut`: he cut wood for 45 minutes
         # (396 GatherWood samples), delivered 6 of it into a HOUSE nobody was
         # building, while `_mk_build` sat pointed at a FIRE that never received
         # a single log, and scored BuildStructure exactly zero times in the
@@ -1978,15 +2105,75 @@ def _deposit_step(action: "Action", agent: Any, world: Any, dt: float) -> bool:
                     if stash[r] <= 0:
                         stash.pop(r, None)
 
+        # AND WHAT IS LEFT GOES IN HIS OWN STASH, WHICH IS THE NEW PART. Every
+        # line above this one is what the role always did; everything the
+        # delivery did not want used to be DELETED here, and the paragraph at
+        # the top of this branch said so in as many words. That was honest about
+        # the cost and wrong about the man: he could cut four logs, put one on
+        # his fire and lose three, and a hermit who cannot keep what he gathers
+        # has no reason to gather anything.
+        #
+        # `hermit_stash_add` is his camp store and only his - see the note above
+        # it, and `World._init_colony_state` for why it lives on the world
+        # rather than on a hut he does not always have. The colony's stockpile is
+        # not touched on this path and never was.
+        stash = action.data.get("stash")
+        if isinstance(stash, dict):
+            for r, q in list(stash.items()):
+                hermit_stash_add(world, str(r), int(q))
+        action.data["stash"] = {}
+
         res = getattr(agent, "carrying", None)
         qty = int(getattr(agent, "carry_qty", 0) or 0)
-        action.data["stash"] = {}
-        if qty <= 0 or res not in (RES_FOOD, RES_COOKED):
-            try:
+        try:
+            if qty > 0 and res in (RES_FOOD, RES_COOKED):
+                # HIS LARDER, AND THE STARVATION GUARD LIVES INSIDE IT. Food in
+                # his hands is why he cannot starve: `_score_wants` forces Eat to
+                # 1.0 past 0.85 hunger only for a man who is `holding_food`, so
+                # emptying his hands into the stash would have deleted that guard
+                # while looking like a tidy-up. So a hermit KEEPS HIS FOOD, and
+                # only an overflow past CARRY_CAP is banked.
+                #
+                # THIS OVERFLOW HAS NEVER FIRED, and the honest reading is that
+                # this is a CLAMP rather than a mechanism. There used to be a
+                # HERMIT_LARDER_HAND constant here carrying forty lines about
+                # how much he banks; it was 8, it was wrapped in
+                # ``max(.., CARRY_CAP)`` with CARRY_CAP also 8, so it could not
+                # take any other value, and the branch under it was dead. It is
+                # dead for a reason that is worth writing down instead: food
+                # arrives in fours (BERRY_YIELD 4, FARM_HARVEST_FOOD 4) and
+                # `_hermit_bias` stops him foraging at ``carry_qty >=
+                # CARRY_CAP``, so his food hands go 0, 4, 8 and stop exactly ON
+                # the cap, never over it. Instrumented over 16 seeds x 45
+                # sim-min: the highest food carry ever seen is 8 and this branch
+                # never ran once.
+                #
+                # It is kept, one line, because the ceiling is not guaranteed by
+                # anything but that arithmetic - change BERRY_YIELD to 3 and a
+                # hermit walks around with 9 - and an overflow left in his hands
+                # would never reach the stash at all. Food still gets into the
+                # pile in quantity (30.1 units at the final tick on average, on
+                # 15 seeds of 16): it goes by the MIXED-CARRY path a few lines
+                # up, where berries picked while he is already holding wood land
+                # in ``action.data["stash"]`` and are banked wholesale.
+                if qty > CARRY_CAP:
+                    banked = hermit_stash_add(world, str(res), qty - CARRY_CAP)
+                    if banked > 0:
+                        agent.carry_qty = qty - banked
+            elif qty > 0 and res:
+                # Wood, stone, fibre: all of it into the store, and the HANDS ARE
+                # CLEARED WHETHER OR NOT IT FITS. Leaving an unbanked remainder in
+                # them would resurrect the exact bug the old comment here warned
+                # about - "a hermit left holding wood forever could never pick up
+                # food again" - the moment the stash hit HERMIT_STASH_CAP.
+                hermit_stash_add(world, str(res), qty)
                 agent.carrying = None
                 agent.carry_qty = 0
-            except Exception:
-                pass
+            else:
+                agent.carrying = None
+                agent.carry_qty = 0
+        except Exception:
+            log.debug("hermit stash deposit failed", exc_info=True)
         _halt(agent)
         return True
     sp = nearest_structure(world, "stockpile", agent.x, built_only=True)
@@ -2372,19 +2559,38 @@ def _h_build(a: Action, ag: Any, w: Any, dt: float) -> None:
 
     if a.phase == "fetch":
         if is_hermit(ag):
-            # THERE IS NO FETCH FOR A HERMIT. "fetch" means walk to the colony's
-            # stockpile and draw on it, and he has neither a stockpile nor any
-            # business at theirs - `_deposit_step` spends a whole docstring on
-            # why he does not make that walk in the other direction either.
+            # THERE IS NO WALK TO TOWN FOR A HERMIT. "fetch" means walk to the
+            # colony's stockpile and draw on it, and he has no business at
+            # theirs - `_deposit_step` spends a whole docstring on why he does
+            # not make that walk in the other direction either.
             #
-            # Failing here is not a dead end, it is the handoff. A failed action
-            # drops him straight back into `choose_action`, where `_hermit_bias`
-            # has GatherWood scored for exactly this case, and `_deposit_step`
-            # then leaves the load in his hands instead of destroying it. He
-            # goes and cuts his own, and arrives back here in "approach".
-            a.data["short"] = {k: int(v) for k, v in need.items()}
-            a.failed = True
-            return
+            # HIS OWN STASH IS THE FETCH, and it is a fetch with no walk in it:
+            # the pile is at the camp and the frame is at the camp, so he takes
+            # what the stage is short of straight out of it and goes to
+            # "approach". Before the stash existed this branch could only fail,
+            # which meant a hermit whose fire was one log short went and cut a
+            # whole tree for it even with three logs banked ten paces away.
+            # CARRY_CAP-bounded like every other fetch in this function, so the
+            # hands he arrives with are hands the delivery can actually empty.
+            got_any = False
+            for res, qty in sorted(need.items(), key=lambda kv: -kv[1]):
+                got = hermit_stash_take(w, res, min(int(qty), CARRY_CAP))
+                if got > 0:
+                    _carry_add(ag, a, res, got)
+                    got_any = True
+                    break
+            if got_any:
+                a.phase = "approach"
+            else:
+                # Nothing banked either. Failing here is not a dead end, it is
+                # the handoff: a failed action drops him straight back into
+                # `choose_action`, where `_hermit_bias` has GatherWood scored for
+                # exactly this case, and `_deposit_step` then banks or keeps the
+                # load instead of destroying it. He goes and cuts his own, and
+                # arrives back here in "approach".
+                a.data["short"] = {k: int(v) for k, v in need.items()}
+                a.failed = True
+                return
         want_res, want_qty = None, 0
         for res, qty in sorted(need.items(), key=lambda kv: -kv[1]):
             have = stock_qty(w, res)
@@ -2447,7 +2653,7 @@ def _h_build(a: Action, ag: Any, w: Any, dt: float) -> None:
             # NO CELEBRATION AT THE HERMITAGE. `_fresh_celebration` is read by
             # every colonist's Celebrate score, and a celebration is a POINT ON
             # THE MAP they walk to - so pushing one when the hermit finishes his
-            # own shack summons the entire colony 600 px out to his door to
+            # own hut summons the entire colony 600 px out to his door to
             # dance outside the house of the man who left to get away from them.
             # It is also the one build in the game nobody but the builder knows
             # happened, which is the better reason: he raised it alone.
@@ -2460,6 +2666,36 @@ def _h_build(a: Action, ag: Any, w: Any, dt: float) -> None:
         return
 
     a.phase = "fetch"
+
+
+def _c_build(a: Action, ag: Any, w: Any) -> None:
+    """Put a HERMIT'S un-delivered fetch back in his pile. Never raises.
+
+    The fetch phase above draws out of `hermit_stash_take`, and an Action's
+    ``data["stash"]`` does not outlive the action that made it. So a build
+    abandoned between the fetch and the delivery - a wolf, a blizzard, a
+    re-score - would DESTROY wood that was already his, which is the bug this
+    whole feature was written to stop, reintroduced one level down. Villagers
+    are deliberately left alone: their surplus goes back to the colony store by
+    `_drop_all` on the paths that have one, and reaching into `stock_add` from
+    here would double-credit it.
+    """
+    if not is_hermit(ag):
+        return
+    try:
+        held = a.data.get("stash")
+        if isinstance(held, dict):
+            for r, q in list(held.items()):
+                hermit_stash_add(w, str(r), int(q))
+            held.clear()
+        res = getattr(ag, "carrying", None)
+        qty = int(getattr(ag, "carry_qty", 0) or 0)
+        if qty > 0 and res not in (RES_FOOD, RES_COOKED) and res:
+            hermit_stash_add(w, str(res), qty)
+            ag.carrying = None
+            ag.carry_qty = 0
+    except Exception:
+        log.debug("hermit build cleanup failed", exc_info=True)
 
 
 def _h_upgrade(a: Action, ag: Any, w: Any, dt: float) -> None:
@@ -2637,6 +2873,23 @@ def _h_repair(a: Action, ag: Any, w: Any, dt: float) -> None:
 
 
 def _h_eat(a: Action, ag: Any, w: Any, dt: float) -> None:
+    """Eat what is in hand, then - for a hermit - what is in his stash.
+
+    THE ORDER IS THE STARVATION GUARD AND IT IS UNCHANGED. Hands first, exactly
+    as before: `_score_wants` forces Eat to 1.0 past 0.85 hunger for a man who
+    is `holding_food`, `_deposit_step` leaves a hermit's food IN HIS HANDS
+    rather than banking it, and this branch is what turns that into a meal. Nothing in the stash work below can reach a hermit who still
+    has food on him.
+
+    The stash arm is a NEW rung under the old one, not a replacement for it. A
+    hermit with empty hands used to fall straight through to the "approach"
+    phase, which is a walk to the COLONY'S stockpile - the one errand the role
+    exists to end, kept only because starving out there is worse than breaking
+    character. Now his own camp store is tried first, so that walk happens only
+    when his hands and his pile are both empty. It is strictly a safer path than
+    the one it precedes: it can feed him where the old code could only start
+    walking.
+    """
     if a.phase == "start":
         held = getattr(ag, "carrying", None)
         if held in (RES_FOOD, RES_COOKED) and int(getattr(ag, "carry_qty", 0) or 0) > 0:
@@ -2646,6 +2899,14 @@ def _h_eat(a: Action, ag: Any, w: Any, dt: float) -> None:
             a.data["res"] = held
             a.phase = "eat"
             a.data["et"] = 0.0
+        elif is_hermit(ag) and hermit_stash_food(w)[0] is not None:
+            sres, _ = hermit_stash_food(w)
+            if sres is None or hermit_stash_take(w, sres, 1) <= 0:
+                a.failed = True
+                return
+            a.data["res"] = sres
+            a.data["et"] = 0.0
+            a.phase = "eat"
         else:
             res, qty = food_in_store(w)
             if res is None or qty <= 0:
@@ -2708,20 +2969,20 @@ def _h_sleep_rough(a: Action, ag: Any, w: Any, dt: float) -> None:
     The alternative was letting him use a hut, and a hermit who walks back into
     town every single night is not a hermit.
 
-    HE NOW HAS A SHACK, and when it is standing he sleeps IN it - `hermit_house`,
+    HE NOW HAS A HUT, and when it is standing he sleeps IN it - `hermit_hut`,
     `enter()`, `ag.inside`, the lot, exactly the way a villager uses a hut, so
     the renderer lights his doorway at night for free and he is not sprawled on
     his own doorstep. Two guards make that safe rather than merely nicer:
     HERMIT_BED_WALK bounds the walk (he lies down where he stands if the door is
     somehow unreachable, which is the guarantee this whole function exists to
-    keep), and a shack that burns down mid-sleep drops him back out onto the
+    keep), and a hut that burns down mid-sleep drops him back out onto the
     ground instead of leaving him flagged inside a building that no longer
     exists - which is invisible forever.
     Indoors he gets a HUT's fatigue and morale rates rather than the rough ones
     below, so the role's measured safety margin can only widen: a bed he built
     himself is strictly better than the ground beside it, never worse.
 
-    SO HIS CAMP IS SHELTER even before the shack goes up, and it shelters him
+    SO HIS CAMP IS SHELTER even before the hut goes up, and it shelters him
     from the cold at the same rate a
     hut does (0.030/s). That is a grant - he gets a roof he never built - and it
     was arrived at the hard way. The first cut paid warmth back at half a hut's
@@ -2738,7 +2999,7 @@ def _h_sleep_rough(a: Action, ag: Any, w: Any, dt: float) -> None:
     more of the night to rest, and a blizzard (0.008/s) out-chills the camp and
     can still drive him in to the fire. See `behavior._hermit_bias`.
     """
-    house = hermit_house(w, built_only=True)
+    house = hermit_hut(w, built_only=True)
     if a.data.get("in"):
         # Already in bed. If the roof has come off in the night - burned by a
         # dragon, or simply gone - get him out of it now. `ag.inside` pointing
@@ -2759,7 +3020,7 @@ def _h_sleep_rough(a: Action, ag: Any, w: Any, dt: float) -> None:
                     ag.inside = int(house.id)
                 except Exception:
                     pass
-            else:                       # somebody else's shack, or no room
+            else:                       # somebody else's hut, or no room
                 a.phase = "rough"
         elif a.t > HERMIT_BED_WALK:
             # Out of walking budget. Lying down here beats pacing toward a door
@@ -2771,7 +3032,7 @@ def _h_sleep_rough(a: Action, ag: Any, w: Any, dt: float) -> None:
     a.pose = "sleep"
     _halt(ag)
     if indoors:
-        # Park him at the shack, as `_h_sleep` does with a hut: he is not drawn
+        # Park him at the hut, as `_h_sleep` does with a hut: he is not drawn
         # in there, but the position is where he reappears on waking and where
         # anything he carries shines from.
         try:
@@ -2801,7 +3062,7 @@ def _h_sleep_rough(a: Action, ag: Any, w: Any, dt: float) -> None:
 
 def _h_sleep(a: Action, ag: Any, w: Any, dt: float) -> None:
     if is_hermit(ag):
-        # He never claims a HUT. He does claim his own shack when he has one,
+        # He never claims a HUT. He does claim his own hut when he has one,
         # and `_h_sleep_rough` sets a.target and a.data["in"] for it, so the
         # shared `_c_sleep` cleanup releases the right building either way -
         # and is still a no-op on the nights he sleeps on the ground.
@@ -2930,9 +3191,17 @@ def _h_cook(a: Action, ag: Any, w: Any, dt: float) -> None:
         # (`_deposit_step` hands a hermit his forage back instead of shelving
         # it), so nothing raw in hand means nothing to cook, full stop.
         if is_hermit(ag):
+            # ...but his own stash counts as "in hand". It sits at the camp, the
+            # fire sits at the camp, and taking three berries out of his own pile
+            # is not the walk to the stockpile this branch refuses - it is the
+            # thing that makes a full larder worth cooking down into meals
+            # instead of eaten raw one at a time.
             if not held_food:
-                a.failed = True
-                return
+                got = hermit_stash_take(w, RES_FOOD, 3)
+                if got <= 0:
+                    a.failed = True
+                    return
+                _carry_add(ag, a, RES_FOOD, got)
             a.phase = "approach"
         elif stock_qty(w, RES_FOOD) <= 0 and not held_food:
             a.failed = True
@@ -3169,7 +3438,7 @@ def _arrive_at_hermit(w: Any, guest: Any, host: Any) -> None:
             except Exception:
                 gave = 0
         if gave > 0:
-            chronicle(w, f"{gname} walked out to the hermit's shack and left "
+            chronicle(w, f"{gname} walked out to the hermit's hut and left "
                          f"{hname} some food.")
         else:
             chronicle(w, f"{gname} walked out to sit a while with {hname}.")
@@ -4370,6 +4639,7 @@ _HANDLERS: dict[str, Callable[[Action, Any, Any, float], None]] = {
 }
 
 _CLEANUP: dict[str, Callable[[Action, Any, Any], None]] = {
+    "BuildStructure": _c_build,
     "Sleep": _c_sleep,
     "Lookout": _c_lookout,
     "Mine": _c_mine,

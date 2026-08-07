@@ -169,9 +169,81 @@ FLOOD_RISE = 28.0
 FLOOD_HOLD = 12.0
 FLOOD_FALL = 24.0
 FLOOD_DRY = 95.0                 # dry spell before the next surge
-FLOOD_DEPTH_FRAC = 0.45          # share of the terrain's relief the water covers
+
+#: HOW MUCH OF THE WORLD THE SURGE PUTS UNDER WATER, as a share of terrain
+#: columns. This replaces ``FLOOD_DEPTH_FRAC = 0.45``, which was documented as
+#: "share of the terrain's relief the water covers" and had stopped being that.
+#:
+#: The old line was ``depth = clamp(0.45 * (max(h) - min(h)), 40, 170)``, i.e.
+#: a rise measured up from the SINGLE LOWEST COLUMN IN THE WORLD. Two things
+#: broke it when the world went from 1600 px to WORLD_W = 6400:
+#:
+#:   * THE CLAMP ATE THE DIAL. A wider world has more relief, so 0.45 x relief
+#:     went past 170 and stayed there: measured over 60 seeds, the clamp bound
+#:     on 51 of them. The "share" model did not run - the flood was a flat 170
+#:     px rise with a fraction written beside it that changed nothing.
+#:   * THE ANCHOR STOPPED MEANING ANYTHING. `max(h)` is one column, and in a
+#:     6400 px world it can be a sink three thousand pixels from anywhere the
+#:     colony has ever stood. Rising a fixed 170 px from it covered whatever it
+#:     happened to cover: 3.1% of the map on one seed and 57.2% on another,
+#:     from the same named event, with no seed choosing either.
+#:
+#: The consequence was the bug this was found by. A man on high ground drowns,
+#: because "high ground" is local and the water line is global: over 40 seeds
+#: the hermit's camp column - the highest safe ground in his band - was under
+#: the line on 8, and THE SETTLEMENT'S OWN COLUMN was under it on 14. It has
+#: been drowning colonists on hills since the widening; the hermit only made it
+#: visible by being the one man who reliably stands on a peak.
+#:
+#: A quantile fixes all three. The water rises until this share of the world's
+#: columns are beneath it, so the dial is real, the severity is the same on
+#: every seed and at any world width, and whether you drown depends on standing
+#: HIGHER THAN OTHER GROUND rather than on your distance from one freak sink.
+#:
+#: 0.34 IS THE MEDIAN OF WHAT SHIPPED (34.5% over those 60 seeds), chosen so
+#: this is not a stealth nerf: the median seed's flood is exactly as deep as it
+#: was. What changes is the spread and that the number can now be turned. The
+#: old envelope above is untouched.
+#:
+#: MEASURED AFTER: cover 33.9% mean over 40 seeds, sd 0.4 points against 13.9,
+#: range 31.4-34.0% against 3.1-57.2%. The residual spread is the FLOOD_MIN_DEPTH
+#: floor on the flattest worlds and nothing else.
+#:
+#: AND IN PLAY, 16 seeds x 45 sim-min before and after, deaths from the
+#: `entities.on_death` hook cross-checked against `World.reconcile()["deaths"]`
+#: on every run: VILLAGER DROWNINGS FALL FROM 44 TO 17 and the villager death
+#: rate from 2.24 to 1.76 per villager-hour. Read that as the seeds that used to
+#: get a 57%-cover flood no longer getting one, not as the flood going soft -
+#: the seeds that used to get a 3% puddle now get a real surge, and villager
+#: FALL deaths rose 7 -> 11 with more people running uphill over steep ground.
+#: This is a redistribution with a lower total, not a nerf.
+FLOOD_COVER = 0.34
+#: Floor on the surge's depth, for a world flat enough that a quantile lands
+#: within a few px of the ground. The lower half of the old clamp, kept for the
+#: same reason it existed: water you cannot see is not weather.
+FLOOD_MIN_DEPTH = 40.0
 DROWN_SEC = 5.5
-DROWN_DEPTH = 8.0                # px below the line before you are actually under
+#: Two thresholds where there used to be one, because they are two questions.
+#:
+#: WADE_DEPTH is px of water over the feet before a man RUNS FOR HIGH GROUND.
+#: Ankle-deep is the right moment to start running, so this keeps the old value.
+#:
+#: DROWN_DEPTH is px of water over the feet before the DROWNING CLOCK runs, and
+#: it used to be the same 8. A stickman is AGENT_HEIGHT = 26 px tall with his
+#: head from about 0.77 of that upward, so 8 px is knee-deep - and DROWN_SEC is
+#: 5.5, so the old code killed a man for standing in knee-deep water for five
+#: and a half seconds. Measured over 8 seeds of forced flood, 22 drownings: 17
+#: were genuinely submerged, but 5 were not, the shallowest in 20.3 px. 20.0 is
+#: the chin on a 26 px figure, so the clock now starts when the water is over
+#: his head and not before. Not imported from `entities` - events.py already
+#: keeps its geometry local - but that is where the 26 lives.
+#:
+#: After, same probe: 26 drownings, 25 of them over the head, shallowest 23.1 px.
+#: A small correction rather than a big one, and it is here because "drowned"
+#: should mean drowned - most people the flood takes are 50 px under, and the
+#: handful who were not were being killed by a puddle.
+DROWN_DEPTH = 20.0
+WADE_DEPTH = 8.0
 FLOOD_PANIC = 2.0                # panic seconds while under the water
 
 SNOW_MAX_DEPTH = 3.2             # px the ground rises under a full snow layer
@@ -2671,14 +2743,28 @@ class EventSystem:
         self._flood_effects(world, dt, float(self.water_level))
 
     def _arm_flood(self, world: Any) -> None:
-        """Fix the still-water line for one surge: y0 dry, y1 at full height."""
+        """Fix the still-water line for one surge: y0 dry, y1 at full height.
+
+        THE FULL-HEIGHT LINE IS A QUANTILE OF THE TERRAIN, not a rise off the
+        world's lowest column - see FLOOD_COVER for the measurements that moved
+        it. y grows downward, so the water covers the columns whose ground is
+        BELOW the line, and `np.quantile(h, 1 - FLOOD_COVER)` is the y that puts
+        exactly that share of the world under it. The line is still a single
+        flat y, which is what standing water is and what `render._draw_water`
+        draws; what changed is the height it settles at.
+
+        One quantile over WORLD_W columns, once per surge (`_scene_flood` calls
+        this only when `flood_y0` is None), so this is not on any hot path.
+        """
         h = _height(world)
         if h is not None:
             low = float(np.max(h))                  # y grows downward: lowest ground
-            high = float(np.min(h))
+            line = float(np.quantile(h, 1.0 - _clamp(FLOOD_COVER, 0.01, 0.95)))
         else:
-            low, high = RENDER_H * 0.8, RENDER_H * 0.4
-        depth = _clamp(FLOOD_DEPTH_FRAC * (low - high), 40.0, 170.0)
+            # No heightmap at all: a stub world in a test. Keep the old shape so
+            # the envelope still runs and nothing downstream sees a None.
+            low, line = RENDER_H * 0.8, RENDER_H * 0.8 - 90.0
+        depth = max(FLOOD_MIN_DEPTH, low - line)
         self.flood_y0 = low + 4.0
         self.flood_y1 = low - depth
         self._submerged.clear()
@@ -2698,7 +2784,7 @@ class EventSystem:
             ax = _fnum(getattr(ag, "x", 0.0))
             ay = _fnum(getattr(ag, "y", 0.0))
             aid = _aid(ag)
-            if ay <= level + DROWN_DEPTH:
+            if ay <= level + WADE_DEPTH:
                 # Dry, or no worse than ankle deep. The clock unwinds faster
                 # than it filled: reaching the shore is meant to save you.
                 if aid is not None and aid in self._submerged:
@@ -2706,12 +2792,21 @@ class EventSystem:
                     if self._submerged[aid] <= 0.0:
                         self._submerged.pop(aid, None)
                 continue
-            # Under the line. Run for the nearest ground above the water; the
-            # drowning timer only pays out for whoever does not make it. The
-            # panic flag is what interrupts a job mid-swing - hazards() handles
-            # the ones who are merely near the water, without the recklessness.
+            # In the water. Run for the nearest ground above it; the panic flag
+            # is what interrupts a job mid-swing - hazards() handles the ones
+            # who are merely near the water, without the recklessness.
             _panic(world, ag, self._high_ground(world, ax, dry), FLOOD_PANIC, "flood")
             if aid is None:
+                continue
+            # ...but the DROWNING clock is a second, deeper threshold, and it
+            # used to be this same one. A man wading at the knee ran the clock
+            # and died in DROWN_SEC; now he runs, gets wet and lives, and only a
+            # man the water has closed over is drowning. See DROWN_DEPTH.
+            if ay <= level + DROWN_DEPTH:
+                if aid in self._submerged:
+                    self._submerged[aid] = max(0.0, self._submerged[aid] - dt * 1.5)
+                    if self._submerged[aid] <= 0.0:
+                        self._submerged.pop(aid, None)
                 continue
             sub = self._submerged.get(aid, 0.0) + dt
             self._submerged[aid] = sub

@@ -29,7 +29,7 @@ from ..constants import (
     DAY_LENGTH_SEC, MAX_HEALTH, RES_COOKED, RES_FIBRE, RES_FOOD, RES_STONE,
     RES_WOOD, SCENE_LABELS, SCENE_ROTATE_SEC,
 )
-from ..sim.names import role_label
+from ..sim.names import ROLE_HERMIT, role_label
 
 log = logging.getLogger(__name__)
 
@@ -445,6 +445,16 @@ def _doing(agent) -> str:
 _panel_cache: pygame.Surface | None = None
 _panel_key: tuple | None = None
 
+#: budget -> (content key, panel, zones). The panel is now built against the
+#: height it has to fit into (see :func:`draw_stats`), and this function is
+#: called TWICE PER FRAME with two different targets on the wallpaper path - the
+#: window and the 1600x1000 world surface - so a single slot would thrash and
+#: pay the ~5 ms build on every one of those calls. Two entries is all that is
+#: ever live; four is room for a resize in flight. Bounded by construction, so
+#: it cannot grow with the number of windows that have ever existed.
+_panels: dict[int, tuple[tuple, pygame.Surface, list]] = {}
+_PANELS_MAX = 4
+
 # ================================================================== tooltips ==
 # Hover detail for the stats panel: "wd 12" is compact enough to read at a
 # glance and opaque enough to be useless until you know what it means, so the
@@ -583,6 +593,12 @@ def _content_key(world, show_roster: bool) -> tuple:
         world.stats.get("abducted", 0),
         world.stats.get("returned", 0),
         tuple(sorted(world.stockpile.items())),
+        # His pile moves independently of the colony's, so it needs its own term
+        # or the panel would show a stale row for up to a rebuild period after
+        # every stoke - and, worse, would never grow the panel on the tick a
+        # hermit is first appointed.
+        tuple(sorted(_stash_of(world).items())),
+        sum(1 for a in agents if _is_hermit(a)),
         show_roster,
     )
 
@@ -617,12 +633,31 @@ def draw_stats(surf: pygame.Surface, world, show_roster: bool = True,
     """
     global _panel_cache, _panel_key, _panel_zones
     try:
+        # THE HEIGHT THE PANEL HAS TO FIT INTO, in the panel's own authored px.
+        # `_build` lays out at authored size and `_scaled` then multiplies the
+        # finished surface by HUD_SCALE, so anything past the bottom of the
+        # target is simply blitted off the edge and lost. Handing the budget
+        # down is what lets `_build` decide whether the hermit's extra line can
+        # be afforded - see the stash-row note there. Quantised to whole px so
+        # a sub-pixel wobble in the window height cannot miss the cache.
+        budget = int((surf.get_height() - MARGIN * 2) / max(0.01, float(HUD_SCALE)))
         key = _content_key(world, show_roster)
-        if _panel_cache is None or key != _panel_key:
-            _panel_cache, _panel_zones = _build(world, show_roster)
-            _panel_key = key
+        hit = _panels.get(budget)
+        if hit is None or hit[0] != key:
+            panel_src, zones = _build(world, show_roster, budget)
+            if len(_panels) >= _PANELS_MAX:
+                for stale in _panels:
+                    _SCALED.pop(f"stats:{stale}", None)
+                _panels.clear()
+            _panels[budget] = (key, panel_src, zones)
+        else:
+            panel_src, zones = hit[1], hit[2]
+        # The module globals stay live: `_hover` reads `_panel_zones`, and the
+        # probes and tools/smoke.py read both. They track the panel that was
+        # drawn most recently, which is the one the pointer is over.
+        _panel_cache, _panel_zones, _panel_key = panel_src, zones, key
         if _panel_cache is not None:
-            panel = _scaled(_panel_cache, "stats")
+            panel = _scaled(_panel_cache, f"stats:{budget}")
             # max(0, ...) so a window narrower than the panel still shows its
             # left edge rather than pushing it off screen entirely. Measured off
             # the *scaled* width, or the anchor would drift by the scale factor.
@@ -780,7 +815,65 @@ _RES_FIELDS = (
 )
 
 
-def _build(world, show_roster: bool) -> tuple[pygame.Surface, list]:
+def _is_hermit(a) -> bool:
+    try:
+        return str(getattr(a, "role", "")) == ROLE_HERMIT
+    except Exception:
+        return False
+
+
+def _stash_of(world) -> dict:
+    """The hermit's camp store, read-only and never assumed to exist.
+
+    A save written before the stash existed loads with an all-zero dict from
+    `World._init_colony_state`, but this panel is also handed stub worlds by the
+    probe and by `tools/smoke.py`, and a HUD that raises is a lost frame.
+    """
+    try:
+        st = getattr(world, "hermit_stash", None)
+        return st if isinstance(st, dict) else {}
+    except Exception:
+        return {}
+
+
+def _stash_line(stash: dict) -> tuple[str, list[str]]:
+    """``("stash wd 4 fd 8", [...detail...])`` for the row under his name.
+
+    THE SAME IDIOM AS THE STOCKPILE and deliberately so: the panel already
+    teaches `wd`/`st`/`fd`/`ck`/`fb` two lines further up, so his row costs the
+    reader no new vocabulary. Zeroes are DROPPED rather than padded, which is
+    the one departure: the stockpile line is a fixed set of columns whose widths
+    must not jitter, while this one sits inside a roster row that is already
+    ragged, and "stash wd 4 fd 8" reads better than five fields of mostly zero.
+    """
+    parts: list[str] = []
+    detail: list[str] = []
+    for key, res, title, _why in _RES_FIELDS:
+        qty = int(stash.get(res, 0) or 0)
+        if qty > 0:
+            parts.append(f"{key} {qty}")
+            detail.append(f"   {qty} x {title.lower()}")
+    if not parts:
+        return "stash empty", []
+    return "stash " + " ".join(parts), detail
+
+
+def _stash_tip(name: str, stash: dict) -> tuple[str, tuple[str, ...]]:
+    _line, detail = _stash_line(stash)
+    body = ["what he keeps at his own camp"]
+    body += detail if detail else ["   nothing yet"]
+    body += ["",
+             "his, not the colony's: the stockpile above",
+             "cannot draw on this and he never draws on it",
+             "",
+             "he builds his hut from it, feeds his fire",
+             "from it and eats out of it - and whoever",
+             "takes the title after him inherits the pile"]
+    return f"{name}'s stash", tuple(body)
+
+
+def _build(world, show_roster: bool,
+           budget: int | None = None) -> tuple[pygame.Surface, list]:
     agents = [a for a in world.population.alive_agents()]
     agents.sort(key=lambda a: a.id)
 
@@ -791,6 +884,13 @@ def _build(world, show_roster: bool) -> tuple[pygame.Surface, list]:
     f11 = _font(11)
 
     rows = len(agents) if show_roster else 0
+    # The hermit's row is one line taller than everybody else's - it carries his
+    # stash under his name - and the panel's height is computed up front, so the
+    # extra line has to be counted here or the roster runs off the bottom of the
+    # surface. At most one hermit is ever appointed; `min(1, ..)` is belt and
+    # braces against a mangled save carrying two, which `assign_roles` demotes on
+    # its next pass but which must not clip the panel in the meantime.
+    stash_rows = min(1, sum(1 for a in agents if _is_hermit(a))) if show_roster else 0
 
     # The ufo's books, kept apart from "lost": an abduction takes somebody off
     # the roster alive and leaves no grave, so counting it as a death would be
@@ -806,8 +906,32 @@ def _build(world, show_roster: bool) -> tuple[pygame.Surface, list]:
 
     # Footer now wraps to two lines, so reserve LINE * 3 for it (divider +
     # two text lines) instead of LINE * 2.
-    height = (PAD * 2 + LINE * 3 + 6 + (rows * (LINE + 9)) + LINE * 3 + 8
-              + (LINE - 2 if show_roster else 0) + (LINE if ufo_line else 0))
+    def _height_for(extra_rows: int) -> int:
+        return (PAD * 2 + LINE * 3 + 6 + (rows * (LINE + 9)) + LINE * 3 + 8
+                + (LINE - 2 if show_roster else 0) + (LINE if ufo_line else 0)
+                + extra_rows * (LINE - 3))
+
+    # THE STASH LINE IS AFFORDABLE OR IT IS NOT, and this is the fix to a claim
+    # that was exactly inverted. It was said to cost a roster slot only where
+    # capacity already exceeded MAX_POP; measured against the real panel it did
+    # the opposite - 36 rows with and without at HUD_SCALE 1.0, 20 and 20 at
+    # 1.6, but 11 without and 10 WITH at 2.5, and 6 against 5 at 3.5. MAX_POP is
+    # 20, so the one extra line cost a colonist precisely at the scales where
+    # rows were already scarce and never at the scales with room to spare.
+    #
+    # The cause is that a taller panel is not clipped, it is blitted off the
+    # bottom of the target: `_build` lays out at authored size and `_scaled`
+    # multiplies the finished surface by HUD_SCALE, so 11 authored px become 27
+    # at 2.5 and push the last colonist past the frame edge. `draw_stats` now
+    # measures the target and hands the budget down, so the extra line is taken
+    # only when the panel still fits with it. When it does not, the row is not
+    # lost - the stash zone moves onto his NAME, so the pointer still explains
+    # his pile, and the panel keeps the colonist instead.
+    height = _height_for(stash_rows)
+    if stash_rows and budget is not None and height > int(budget):
+        stash_rows = 0
+        height = _height_for(0)
+    show_stash_line = bool(stash_rows)
     panel = pygame.Surface((PANEL_W, height), pygame.SRCALPHA)
     panel.fill((*BG, BG_ALPHA))
     pygame.draw.rect(panel, EDGE, panel.get_rect(), 1)
@@ -910,7 +1034,9 @@ def _build(world, show_roster: bool) -> tuple[pygame.Surface, list]:
                 pygame.draw.circle(panel, (255, 210, 120), (PAD + 4, y + 5), 6, 1)
 
             name = str(a.name)[:11]
-            panel.blit(_text(name, TITLE, 11, True), (PAD + 13, y - 1))
+            name_s = _text(name, TITLE, 11, True)
+            panel.blit(name_s, (PAD + 13, y - 1))
+            name_rect = pygame.Rect(PAD + 13, y - 2, name_s.get_width(), LINE - 2)
 
             doing = _doing(a)
             maxw = PANEL_W - PAD - 78
@@ -951,6 +1077,41 @@ def _build(world, show_roster: bool) -> tuple[pygame.Surface, list]:
             rs = _text(role, DIM, 9)
             panel.blit(rs, (PANEL_W - PAD - rs.get_width(), y - 2))
             y += 11
+
+            # ---- and, for the one man who has one, his stash ---------------
+            # A third line on a two-line row, and only on his, and only when the
+            # frame has the height for it (`show_stash_line`, decided up in the
+            # height block). It is the only private store in the game and the
+            # panel has nowhere else to say so: the stockpile line at the top is
+            # the COLONY's and cannot include his without lying about who can
+            # spend it. When the line cannot be afforded the tooltip still can,
+            # so the information is never lost, only moved under the pointer.
+            if _is_hermit(a):
+                stash = _stash_of(world)
+                # APPENDED BEFORE THE AGENT ZONE, WHICH IS LOAD-BEARING.
+                # `_hover` returns the FIRST zone the pointer is inside, and the
+                # agent zone below covers this whole block - so a stash zone
+                # added after it could never be reached and the one row on the
+                # panel that most needs explaining would be the one row that
+                # does not explain itself.
+                if show_stash_line:
+                    line, _detail = _stash_line(stash)
+                    sl = _text(line, DIM, 9)
+                    panel.blit(sl, (PAD + 13, y - 1))
+                    zones.append((pygame.Rect(PAD + 13, y - 2,
+                                              max(sl.get_width(), 60), LINE - 2),
+                                  *_stash_tip(str(getattr(a, "name", "?")),
+                                              stash)))
+                    y += LINE - 3
+                else:
+                    # No room for the line at this HUD_SCALE - see the height
+                    # block above. The pile is still one hover away: the zone
+                    # goes over his NAME, and only his name, so the rest of his
+                    # row still shows the ordinary agent tooltip. It costs the
+                    # panel nothing.
+                    zones.append((name_rect,
+                                  *_stash_tip(str(getattr(a, "name", "?")),
+                                              stash)))
 
             # One zone for the whole two-line block rather than four small ones
             # per agent. Splitting it would mean the tooltip changed under the

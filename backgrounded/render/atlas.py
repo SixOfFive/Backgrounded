@@ -222,9 +222,9 @@ KIND_SIZE: dict[str, tuple[int, int]] = {
     "totem": (30, 90),
     "stockpile": (52, 38),
     "barricade": (60, 58),
-    # The hermit's shack. Deliberately much smaller than a hut (78x64) and a
-    # different shape: see _bake_hermit_hut for why a lone lean-to must not
-    # resolve to village housing.
+    # The hermit's hut. Deliberately much smaller than a VILLAGE hut (78x64)
+    # and a different shape: see _bake_hermit_hut for why a lone lean-to must
+    # not resolve to village housing.
     "hermit_hut": (46, 40),
     # His fire, against the colony pit's (46, 28). Two thirds the width and a
     # good deal lower: see _bake_hermit_fire for why a scrape must not resolve
@@ -1315,7 +1315,7 @@ def _bake_hermit_fire(stage: int, rng: random.Random) -> pygame.Surface:
     """The hermit's fire: a scrape with stones round it, and NOT a firepit.
 
     Same argument as ``_bake_hermit_hut``, one building along. This is drawn a
-    few px from his shack at the far edge of the frame, and if it reads as the
+    few px from his hut at the far edge of the frame, and if it reads as the
     colony's hearth then what the user sees out there is a second settlement
     rather than one man living alone - which is worse than drawing nothing,
     because it is wrong rather than missing.
@@ -1380,12 +1380,12 @@ def _bake_hermit_fire(stage: int, rng: random.Random) -> pygame.Surface:
 
 
 def _bake_hermit_hut(stage: int, rng: random.Random) -> pygame.Surface:
-    """The hermit's shack: a single-pitch lean-to, and NOT a small hut.
+    """The hermit's hut: a single-pitch lean-to, and NOT a small village hut.
 
     THE SILHOUETTE IS THE WHOLE POINT, for the same reason his staff is. This
     building is drawn at the far edge of the frame with the settlement a long way
     off to one side, and the one thing it must never do is read as "the colony
-    put up another hut over there". A hut is symmetric: two slopes meeting at a
+    put up another hut over there". A village hut is symmetric: two slopes at a
     ridge over the middle of its walls. This is deliberately the opposite -
     ONE slope, running from a tall open mouth down to a back wall barely off the
     ground, with no gable and no ridge line anywhere. At thirty px across in the

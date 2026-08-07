@@ -41,7 +41,7 @@ from ..constants import (
     HUT_SCALE_MIN,
     HERMIT_FIRE_BURN,
     HERMIT_FIRE_WOOD,
-    HERMIT_HOUSE_WOOD,
+    HERMIT_HUT_WOOD,
     HUT_STORE_WEIGHT,
     RENDER_H,
     RES_FIBRE,
@@ -122,15 +122,15 @@ CROSSING_KINDS: tuple[str, ...] = ("bridge", "ladder")
 
 #: Buildings that are NOT part of "where the colony is", for the purpose of
 #: averaging structure positions. Graves because they are sited out of the way;
-#: the hermit's shack because being a long way from the settlement is the entire
+#: the hermit's hut because being a long way from the settlement is the entire
 #: point of it, and folding it into the mean would move the settlement toward it.
 #:
 #: That is not a tidiness argument, it is two feedback loops. ``colony_center``
 #: below is what render/camera.py falls back to, what ``actions.stage_bounds``
 #: derives the visible slice from, and what the quarry keep-out and the
-#: barricade band are measured from - a shack 760 px out with six other
+#: barricade band are measured from - a hut 760 px out with six other
 #: buildings standing drags all of them ~110 px toward the wilderness. And
-#: ``actions.hermit_home`` is *derived* from the settlement mean, so a shack
+#: ``actions.hermit_home`` is *derived* from the settlement mean, so a hut
 #: inside that mean pushes the next camp further out again, every pass.
 #: ``actions.OUTWORK_KINDS`` carries the same exclusion for
 #: ``settlement_center``; the two lists are separate because they answer to
@@ -172,7 +172,7 @@ FIRE_KINDS: tuple[str, ...] = ("firepit", "hermit_fire")
 #: It is consulted by :meth:`Structure.label` and nothing else reads it, so a
 #: kind added without a row degrades to the identifier, exactly as today.
 KIND_LABELS: dict[str, str] = {
-    "hermit_hut": "hermit's shack",
+    "hermit_hut": "hermit's hut",
     "hermit_fire": "hermit's fire",
     "firepit": "firepit",
 }
@@ -280,20 +280,20 @@ STRUCTURE_SPECS: dict[str, StructureSpec] = {
         width=46.0, height=38.0, capacity=3, flammable=True,
         build_time=9.0, spacing=58.0, variants=4,
     ),
-    # THE HERMIT'S SHACK, AND IT IS ITS OWN KIND RATHER THAN A FLAGGED HUT.
+    # THE HERMIT'S HUT, AND IT IS ITS OWN KIND RATHER THAN A FLAGGED HUT.
     # That is the opposite of the choice HUT_MATERIALS documents above, and for
     # the opposite reason. A stone hut wants to BE a hut everywhere: it houses
     # people, it satisfies the colony's demand for housing, it raises the birth
     # cap. This does none of those things, and every one of the eight literal
     # `kind == "hut"` comparisons that note complains about is a site where a
-    # hermit's shack must NOT count:
+    # hermit's hut must NOT count:
     #
-    #   world.py             the birth gate. A shack counted here raises the
+    #   world.py             the birth gate. A hut counted here raises the
     #                        colony's population cap on a house nobody lives in.
     #   behavior/actions     `nearest_structure(..., "hut")` - how a tired
     #                        colonist finds a bed. Counted, villagers would trek
     #                        800 px to sleep in it.
-    #   behavior             the hut ladder and want_huts. Counted, the shack
+    #   behavior             the hut ladder and want_huts. Counted, the hut
     #                        satisfies the colony's own demand for roofs and
     #                        they stop building for themselves.
     #   behavior/actions     the build-queue entry and the celebration table.
@@ -305,7 +305,7 @@ STRUCTURE_SPECS: dict[str, StructureSpec] = {
     # construction, and the only places that have to learn about it are the two
     # hermit-only code paths written for it anyway (he sleeps in it, he builds
     # it). The failure modes are not symmetric either: a site missed here means
-    # "the shack is not special-cased somewhere", which is cosmetic. A site
+    # "the hut is not special-cased somewhere", which is cosmetic. A site
     # missed the other way means the colony's own arithmetic is wrong.
     #
     # Three stages, wood only, one occupant, and small: it is a lean-to a single
@@ -314,13 +314,13 @@ STRUCTURE_SPECS: dict[str, StructureSpec] = {
     # derives from this flag, and dragons._raze_target, which takes the nearest
     # built structure. It can burn, and he rebuilds it.
     "hermit_hut": StructureSpec(
-        "hermit_hut", 2, 90.0, {RES_WOOD: HERMIT_HOUSE_WOOD},
+        "hermit_hut", 2, 90.0, {RES_WOOD: HERMIT_HUT_WOOD},
         width=34.0, height=30.0, capacity=1, flammable=True,
         build_time=8.0, spacing=40.0, variants=2,
     ),
-    # HIS FIRE, AND IT IS ITS OWN KIND FOR THE SAME REASON THE SHACK IS.
+    # HIS FIRE, AND IT IS ITS OWN KIND FOR THE SAME REASON THE HUT IS.
     # The note on `hermit_hut` above lists the eight `kind == "hut"` sites a
-    # shack must not be counted by; this kind's list is shorter and one entry on
+    # hut must not be counted by; this kind's list is shorter and one entry on
     # it is worse than any of them:
     #
     #   behavior.next_build_kind   `built("firepit") < 1` is the FIRST thing the
@@ -345,7 +345,7 @@ STRUCTURE_SPECS: dict[str, StructureSpec] = {
     # sticks, laid in an afternoon by one man out of what he cut himself. It is
     # `flammable=False` exactly as the colony's pit is - a firepit is the thing
     # that sets other things alight, not a thing that catches - so the dragon
-    # that burns his shack down leaves his fire standing, and he still has
+    # that burns his hut down leaves his fire standing, and he still has
     # somewhere to cook while he rebuilds.
     #
     # It IS in FIRE_KINDS, which is what makes it a fire rather than a prop:
