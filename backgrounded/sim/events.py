@@ -3591,18 +3591,67 @@ class EventSystem:
 
     @classmethod
     def from_dict(cls, d: Any) -> "EventSystem":
-        ev = cls()
+        """Rebuild from a save section, or RAISE so the caller can regenerate.
+
+        Raising is the whole point of this method's contract, and it is worth
+        being explicit about because the obvious defensive shape - swallow the
+        bad input, return something - is exactly what was wrong here for six
+        instances of this bug.
+
+        ``World.from_dict`` loads every subsystem through ``_sub(key, loader,
+        fallback)``, which only calls ``fallback`` if ``loader`` RAISES. Its
+        fallback for this section is ``EventSystem(seed=w.seed ^ 0x513)``: a
+        SEEDED object, because a bare ``EventSystem()`` takes its seed from the
+        global ``random`` module and comes back different in every process.
+        Returning a half-built object from here therefore does not merely lose
+        the weather - it silently defeats that seeded fallback and makes the
+        whole world permanently non-reproducible, because weather drives
+        behaviour and every downstream section (build_queue, chronicle,
+        lighting, population, props, stats, stockpile, structures, terrain)
+        diverges with it. It also swallows _sub's "save section %r unusable;
+        regenerating" warning, so nothing anywhere says a word about it.
+
+        The version this replaced returned ``cls()`` for a non-dict, which is
+        why an ABSENT section verified clean (``_sub`` raises KeyError before
+        the loader ever runs) while a CORRUPT one did not. Measured on
+        ``World(seed=4242)``, corrupt ``d["events"]``, two separate processes:
+        the events seed came back 812301690 vs 965172001 and nine sections
+        diverged with it.
+
+        Two shapes are unusable, and the second was the wider hole:
+
+        * anything that is not a dict at all;
+        * a dict with no usable ``seed`` - missing, boolean, non-numeric, NaN or
+          infinite. ``to_dict`` always writes an int here, so a section without
+          one is not a section this class wrote, and there is nothing to rebuild
+          a reproducible stream from. ``{}``, ``{"scene": ...}`` with no seed and
+          ``{"seed": "banana"}`` all used to load as unseeded objects.
+
+        Everything past the seed stays forgiving: individual fields are coerced
+        and re-clamped as before, because a single bad float is worth exactly
+        the field it sits in, not the whole colony's weather.
+        """
         if not isinstance(d, dict):
-            return ev
+            raise TypeError(
+                f"events section must be a dict, got {type(d).__name__}")
+        seed = d.get("seed")
+        if isinstance(seed, bool) or not isinstance(seed, (int, float)):
+            raise TypeError(f"events section seed must be a number, "
+                            f"got {type(seed).__name__}")
+        if not math.isfinite(seed):
+            raise ValueError(f"events section seed is not finite: {seed!r}")
+        ev = cls(seed=int(seed))
+        # __init__ drew next_strike and next_meteor off the fresh stream; both
+        # are overwritten from the save below, so rewind to position 0 and keep
+        # a loaded system's rng phase byte-identical to what it was before this
+        # method learned to raise. Without this every load would silently shift
+        # two draws and no seed would replay as it used to.
+        ev._rng = random.Random(ev.seed)
         scene = d.get("scene")
         ev.scene = scene if isinstance(scene, str) and scene in SCENES else SCENE_NIGHT_STORM
         ev.scene_t = max(0.0, _fnum(d.get("scene_t"), 0.0))
         ev.intensity = _clamp(_fnum(d.get("intensity"), 1.0))
         ev.t = max(0.0, _fnum(d.get("t"), 0.0))
-        seed = d.get("seed")
-        if isinstance(seed, (int, float)) and not isinstance(seed, bool):
-            ev.seed = int(seed)
-            ev._rng = random.Random(ev.seed)
         ev.wind = _clamp(_fnum(d.get("wind"), 0.0), -1.0, 1.0)
         ev.rain = _clamp(_fnum(d.get("rain"), 0.0))
         ev.snow = _clamp(_fnum(d.get("snow"), 0.0))
@@ -3771,6 +3820,18 @@ if __name__ == "__main__":                                  # pragma: no cover
     blob = ev.to_dict()
     back = EventSystem.from_dict(blob)
     print("roundtrip scene:", back.scene, "keys:", len(blob))
-    print("degenerate from_dict:", EventSystem.from_dict({"scene": "nope"}).scene)
+    # A dict WITH a seed and a nonsense scene is repairable, so it loads and
+    # falls back to the default scene. A dict with no usable seed is not
+    # repairable and must raise, so World._sub's seeded fallback fires instead
+    # of this class quietly inventing an unseeded stream - both shown here
+    # because the second one is the bug this method exists to not have.
+    print("degenerate from_dict:",
+          EventSystem.from_dict({"seed": 7, "scene": "nope"}).scene)
+    for bad in ("not a dict", {}, {"seed": "banana"}):
+        try:
+            EventSystem.from_dict(bad)
+            print("UNSEEDED HAZARD: from_dict swallowed", repr(bad))
+        except (TypeError, ValueError) as exc:
+            print(f"unusable from_dict raises as designed: {exc}")
     ev.tick(None, 1 / 30)                    # must not raise with no world
     print("null-world tick ok; errors:", ev._errors)

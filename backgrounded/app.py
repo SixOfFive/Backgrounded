@@ -21,13 +21,17 @@ import pygame
 from . import paths, persist
 from .config import Config
 from .constants import (
-    AUTOSAVE_SEC, RENDER_SIZE, SCENES, SIM_DT, TARGET_FPS,
+    AUTOSAVE_SEC, FOLLOW_PICK_RADIUS, RENDER_SIZE, SCENES, SIM_ACCUM_MAX_SEC,
+    SIM_DT, SIM_SPEED_HEADROOM, SIM_STEPS_MAX, SIM_TICK_BUDGET_SEC, TARGET_FPS,
+    TOOLS, TOOL_NONE,
 )
+from .render import toolbar
 from .render.renderer import Renderer
 from .shell.preview import Preview
 from .shell.tools import ToolController
 from .shell.tray import Tray
 from .shell.wallpaper import WallpaperWriter
+from .sim.entities import AGENT_HEIGHT
 from .sim.world import World
 
 log = logging.getLogger(__name__)
@@ -204,6 +208,10 @@ class App:
 
         self.clock = pygame.time.Clock()
         self._sim_accum = 0.0
+        #: Sim-seconds the loop asked for and could not afford, and so threw
+        #: away. Counted rather than ignored - see :meth:`_advance_sim`.
+        self._sim_dropped = 0.0
+        self._sim_drop_log = 0.0
         self._last_save = time.monotonic()
         self._last_wall = 0.0
         self._captures = 0
@@ -309,6 +317,69 @@ class App:
         except Exception:
             log.exception("--fresh: could not keep a copy of the existing save; "
                           "starting fresh anyway")
+
+    def _keep_a_copy_before_reset(self) -> None:
+        """"Start Over" means "start a new colony", not "destroy the old one".
+
+        --fresh got :meth:`_keep_a_copy_before_fresh` and the tray's "Start
+        Over" reaches the same destruction by a different road with none of it.
+        The shape of the loss is the same one that made --fresh so hard to
+        notice: nothing is destroyed at the moment it is clicked, because the
+        handler calls ``save_world`` first, so save.json holds the old colony
+        for one more minute - and then the autosave lands and it is gone with no
+        copy anywhere. Measured on the unfixed path exactly as it was for
+        --fresh: a byte-for-byte search of the whole app directory afterwards
+        finds nothing.
+
+        SOURCED FROM MEMORY, NOT FROM DISK, and that is what makes the ordering
+        safe rather than merely lucky. ``_keep_a_copy_before_fresh`` has to read
+        save.json because --fresh never loaded a world and there is nothing else
+        to copy. Here there is: ``self.world`` IS the colony being walked away
+        from, and it is up to sixty seconds newer than the file. Serialising it
+        means this call can sit first in the handler - before the save, before
+        the new World exists - and still preserve the exact world the user was
+        looking at when they clicked. Reading the file instead would make the
+        copy's contents depend on where in the handler the call happened to be
+        put: before the save it would be up to a minute stale, and anywhere
+        after the new world existed it would be a race against the autosave to
+        avoid preserving the *new* world instead of the old one.
+
+        Written into the ``save.prefresh.`` family so there is one place to look
+        and one restore instruction, and like the rest of that family it is
+        never pruned. It also does not go through ``persist``: a session that
+        has blocked saves (an unreadable save.json - see ``persist._block_saves``)
+        must still be able to set this aside, since it is writing a new file
+        under a new name and cannot overwrite anything.
+
+        Never raises and never blocks the reset: "Start Over" must still start
+        over even if the copy cannot be made, and it says so loudly if not.
+        """
+        world = self.world
+        if world is None:
+            return
+        payload = None
+        try:
+            payload = json.dumps(world.to_dict(),
+                                 separators=(",", ":")).encode("utf-8")
+        except Exception:
+            log.exception("Start Over: could not serialise the world to copy it "
+                          "aside; falling back to the bytes on disk")
+        if payload is None:
+            # Older and possibly by a whole autosave interval, but a stale
+            # colony is a colony and the alternative here is nothing at all.
+            self._keep_a_copy_before_fresh()
+            return
+        try:
+            paths.ensure_dirs()
+            dst = _free_name(PREFRESH_PREFIX)
+            _write_atomic(dst, payload)
+            log.warning("Start Over: beginning a NEW world; the colony that was "
+                        "running (%d bytes) has been copied to %s. To go back, "
+                        "close Backgrounded and rename that file to %s.",
+                        len(payload), dst, paths.SAVE_PATH.name)
+        except Exception:
+            log.exception("Start Over: could not keep a copy of the running "
+                          "colony; starting over anyway")
 
     def _set_aside(self, prefix: str, payload: bytes, why: str):
         """Write *payload* to a fresh ``<prefix><stamp>.json``. Never raises."""
@@ -487,6 +558,11 @@ class App:
         elif kind == "save":
             persist.save_world(self.world)
         elif kind == "reset":
+            # FIRST, before the save and before the new world exists. The save
+            # below is not what destroys the colony - the autosave a minute
+            # later is - but putting the copy first means the ordering of the
+            # rest of this branch cannot silently change what gets preserved.
+            self._keep_a_copy_before_reset()
             persist.save_world(self.world)
             # Drop any Hand drag first: the Grab holds ids belonging to the
             # world about to be thrown away, and the next mouse move would drag
@@ -546,8 +622,12 @@ class App:
                   + float(pointer.get("pan_residual") or 0.0),
                   pointer.get("reset_view"))
         self._fullscreen = bool(pointer.get("fullscreen", self._fullscreen))
-        self.tools.handle(self._to_world(pointer.get("pointer")),
-                          self.world, self.world.world_time)
+        # One list of pointer events, read twice: the camera lock gets first
+        # refusal (it only acts when NO tool is selected, so it can never take
+        # a click a tool wanted), then the tools take it as they always have.
+        events = self._to_world(pointer.get("pointer"))
+        self._follow_click(events)
+        self.tools.handle(events, self.world, self.world.world_time)
         step = pointer.get("hud_scale")
         if step:
             self._nudge_hud_scale(int(step))
@@ -558,14 +638,15 @@ class App:
 
         # fixed-timestep sim, scaled by the speed setting
         if not self.cfg.paused:
-            self._sim_accum += dt * self.cfg.sim_speed
-            steps = 0
-            while self._sim_accum >= SIM_DT and steps < 8:
-                self.world.tick(SIM_DT)
-                self._sim_accum -= SIM_DT
-                steps += 1
+            self._advance_sim(dt)
 
         frame = self.renderer.draw(self.world, dt)
+        # AFTER draw, not before: Renderer.draw calls camera.follow as its first
+        # statement, and that is where a lock releases itself when its man dies
+        # or is abducted. Reading lock_id beforehand would leave the ring on a
+        # dead colonist for one frame - on the 4 Hz wallpaper, a quarter of a
+        # second of pointing at somebody who is not there.
+        self._sync_follow_hud()
 
         # One render, two destinations, and the HUD has to land differently on
         # each - so the ordering below is load-bearing. The window gets it as a
@@ -604,6 +685,106 @@ class App:
         if self.args.exit_after and self.world.world_time >= self.args.exit_after:
             log.info("exit-after reached")
             self.running = False
+
+    # ------------------------------------------------------- pacing the sim --
+    def _advance_sim(self, dt: float) -> int:
+        """Turn *dt* real seconds into whole SIM_DT ticks. Returns the count.
+
+        WHAT THIS REPLACED, and why it had to go. The loop used to read::
+
+            self._sim_accum += dt * self.cfg.sim_speed
+            steps = 0
+            while self._sim_accum >= SIM_DT and steps < 8:
+                self.world.tick(SIM_DT); self._sim_accum -= SIM_DT; steps += 1
+
+        Do the arithmetic on the cap. At TARGET_FPS 60, dt is 1/60, so 16x asks
+        for 0.0167 * 16 = 0.267 s of sim per frame, and 0.267 / SIM_DT is
+        EXACTLY 8. The cap therefore sat precisely on 16x's requirement with
+        zero margin, and every frame slower than 60 fps - which is every frame
+        at 16x on a machine that has to work for it - asked for more than eight
+        ticks, got eight, and dropped the rest on the floor. Nothing was logged
+        and nothing was shown: the world simply ran slower than the menu said it
+        was running. That silent loss is what this method exists to replace with
+        a trade the user can see.
+
+        THE TRADE, in the terms it was asked for: do not fight the frame rate.
+
+        * **A WALL-CLOCK BUDGET, NOT A STEP COUNT.** Tick until the accumulator
+          drains or ``SIM_TICK_BUDGET_SEC`` of real time is gone. A count cannot
+          know what a tick costs and a tick is not one price - measured on two
+          warm colonies it is 0.7 ms typical and 4 ms at p95, so any fixed count
+          wastes the cheap frames or truncates the expensive ones. The budget
+          gets the right answer on both without being told which it is in.
+        * **THE CHECK IS AFTER THE FIRST TICK, DELIBERATELY.** At least one tick
+          always runs when one is owed, so a machine where a single tick costs
+          more than the whole budget still advances instead of freezing, and
+          0.5x/1x - which want well under one tick a frame - can never be
+          starved by a slow neighbour frame.
+        * **FRAME RATE IS ALLOWED TO FALL.** Nothing here shortens the budget
+          when frames get long. A frame that spends its whole budget ticking is
+          a frame that took budget + render, and that is the point: fps drops,
+          the sim keeps its speed, and what is protected is the *event pump*,
+          which still runs once per frame at a period bounded by that budget.
+        * **AIM SLIGHTLY UNDER, BUT ONLY WHEN IT IS NEEDED.** ``lagging`` below
+          is exactly the condition "the budget stopped me last frame" - the
+          drain loop cannot leave a whole tick owed for any other reason - and
+          only then is the request scaled by ``SIM_SPEED_HEADROOM``. A machine
+          that can deliver 16x delivers 16x; one that cannot asks for 15.04x so
+          it has slack to repay the shortfall instead of ratcheting into the
+          discard below on every hitch.
+        * **THE DEBT IS BOUNDED, AND SHEDDING IT IS COUNTED.** Past
+          ``SIM_ACCUM_MAX_SEC`` the surplus is thrown away, in one line, and
+          added up so the log can say how much. Dropping sim time is honest when
+          it is deliberate and bounded; the version this replaced was neither.
+
+        DETERMINISM IS UNTOUCHED AND THAT IS NOT AN ACCIDENT: every tick is
+        still exactly ``SIM_DT`` and nothing in the world's update reads a wall
+        clock, so speed changes how fast the colony is *watched* and never what
+        happens in it. The same seed run for the same number of ticks lands in
+        the same state at 1x and at 16x. Anything added here that varies the
+        step size - "catch up with one big tick" is the usual temptation -
+        breaks that, and with it every A/B measurement in this project.
+        """
+        world = self.world
+        if world is None:
+            return 0
+        try:
+            speed = float(self.cfg.sim_speed)
+        except (TypeError, ValueError):
+            speed = 1.0
+        if not (speed > 0.0):
+            return 0
+
+        lagging = self._sim_accum >= SIM_DT
+        self._sim_accum += dt * speed * (SIM_SPEED_HEADROOM if lagging else 1.0)
+        if self._sim_accum > SIM_ACCUM_MAX_SEC:
+            self._sim_dropped += self._sim_accum - SIM_ACCUM_MAX_SEC
+            self._sim_accum = SIM_ACCUM_MAX_SEC
+
+        started = time.perf_counter()
+        steps = 0
+        while self._sim_accum >= SIM_DT and steps < SIM_STEPS_MAX:
+            world.tick(SIM_DT)
+            self._sim_accum -= SIM_DT
+            steps += 1
+            if (time.perf_counter() - started) >= SIM_TICK_BUDGET_SEC:
+                break
+
+        # Said out loud, at most twice a minute, and only once it amounts to a
+        # tick. The whole complaint about the old cap was that it never said.
+        if self._sim_dropped >= SIM_DT:
+            now = time.monotonic()
+            if self._sim_drop_log <= 0.0:
+                self._sim_drop_log = now      # start the window, say nothing yet
+            elif now - self._sim_drop_log >= 30.0:
+                log.info("sim speed %.1fx: %.1f s of sim time discarded over the "
+                         "last %.0f s. This machine cannot render %.1fx, so the "
+                         "world is running slower than the menu says rather than "
+                         "skipping about.",
+                         speed, self._sim_dropped, now - self._sim_drop_log, speed)
+                self._sim_drop_log = now
+                self._sim_dropped = 0.0
+        return steps
 
     # ------------------------------------------------- the two-camera seam --
     # The world is 6400 px wide and the frame is 1600, so there are now two
@@ -656,6 +837,139 @@ class App:
         except Exception:
             log.debug("camera cut failed", exc_info=True)
 
+    # -------------------------------------------- click a man, watch that man --
+    def _follow_click(self, events) -> None:
+        """Left click a stickman with no tool selected: the view follows him.
+
+        WHICH BUTTON, and the argument for it, because both readings of "if I
+        click a stickman" were available and only one of them is safe.
+
+        Left, but ONLY IN WATCH MODE - that is, only while ``tools.tool`` is
+        ``TOOL_NONE``. The alternative was "a left click that HITS a stickman
+        outranks the selected tool", and that alternative breaks the palette on
+        exactly the clicks it exists for. TOOL_HAND's entire purpose is to pick a
+        colonist up and throw him; TOOL_LIGHTNING's most obvious use is smiting
+        one. Under the priority rule neither could ever be aimed at a person
+        again - the two most-used tools would silently become camera controls
+        the moment you pointed them at something alive.
+
+        Watch mode is where this belongs anyway, and constants.py has said so
+        since the palette was written: TOOL_NONE is documented as "just watch;
+        clicks do nothing". So this fills a mode that currently does nothing at
+        all rather than taking a click away from one that does something, the
+        rule is one sentence the user can hold ("no tool selected? clicking a
+        person watches them"), the palette itself is the mode indicator, and
+        clicking the selected tool again already puts it away and drops you back
+        here. Right/middle are untouched: they pan, and panning while locked is
+        deliberately still allowed (see Camera.follow).
+
+        RELEASING, in three ways, because a lock the user cannot get out of is
+        worse than no lock: click bare ground, press 0/Home (which already
+        reaches ``Camera.resume_follow``), or lose the man - Camera drops the
+        lock itself when he dies OR is abducted, which are different code paths
+        and are tested separately.
+
+        A click on bare ground releases only if something is actually locked. A
+        left click in watch mode did nothing before, and it is better that it
+        keeps doing nothing than that it quietly cancels a right-drag's manual
+        hold and yanks the view back to the colony.
+        """
+        cam = self._camera()
+        if cam is None or self.world is None or not events:
+            return
+        if self.tools.tool != TOOL_NONE:
+            return
+        for ev in events:
+            try:
+                if ev.get("type") != "down" or int(ev.get("button") or 0) != 1:
+                    continue
+                # The palette is drawn in window px over the top of the scene,
+                # so a click that lands on an icon is a tool choice and never a
+                # world click. tools.py makes the same test; it has to be made
+                # here too because this runs first.
+                if toolbar.hit_test((ev.get("sx", 0), ev.get("sy", 0)),
+                                    len(TOOLS)) is not None:
+                    continue
+                wx, wy = ev.get("wx"), ev.get("wy")
+                if wx is None or wy is None:
+                    continue                  # a letterbox bar, not the world
+                agent = self._pick_agent(float(wx), float(wy))
+                if agent is not None:
+                    if cam.lock_to(agent.id):
+                        log.info("following %s (id %d)",
+                                 getattr(agent, "name", "?"), int(agent.id))
+                elif cam.locked:
+                    cam.resume_follow()
+                    log.info("released the view back to the colony")
+            except Exception:
+                log.debug("follow click failed", exc_info=True)
+
+    def _pick_agent(self, wx: float, wy: float):
+        """The living colonist under a world-space click, or None.
+
+        FOLLOW_PICK_RADIUS carries the whole justification for the number (it is
+        the figure's ink-diffed worst-frame half-width, +/-29 px, not a guess).
+        What is decided here is the geometry it is applied to and the crowd rule:
+
+        * measured from the MID-TORSO, ``a.y`` being the feet and the body about
+          AGENT_HEIGHT tall, so one radius covers the man in both axes and a
+          click on somebody's head is a hit rather than a near miss;
+        * overlapping agents resolve to the NEAREST centre - in a crowd the man
+          you clicked closest to is the man you meant - with the lowest id as
+          the tie-break, so two colonists standing in the same place always give
+          the same answer for the same click instead of depending on roster
+          order.
+        """
+        best = None
+        best_d = None
+        r2 = FOLLOW_PICK_RADIUS * FOLLOW_PICK_RADIUS
+        mid = AGENT_HEIGHT * 0.5
+        try:
+            agents = self.world.population.alive_agents()
+        except Exception:
+            return None
+        for a in agents:
+            try:
+                dx = float(a.x) - wx
+                dy = (float(a.y) - mid) - wy
+            except (AttributeError, TypeError, ValueError):
+                continue
+            d = dx * dx + dy * dy
+            if d > r2:
+                continue
+            if (best is None or d < best_d
+                    or (d == best_d and int(a.id) < int(best.id))):
+                best, best_d = a, d
+        return best
+
+    def _sync_follow_hud(self) -> None:
+        """Tell the HUD who is being followed, so the roster can say so.
+
+        A module dial rather than a draw argument for the reason hud.FOLLOW_ID
+        gives: the wallpaper is where this app is actually watched, it has no
+        window and no caption, and it goes through the same draw_hud. The
+        caption gets the name as well, for the preview window - two channels,
+        because the two outputs have different amounts of room.
+        """
+        try:
+            from .render import hud
+            cam = self._camera()
+            hud.FOLLOW_ID = None if cam is None else cam.lock_id
+        except Exception:
+            log.debug("could not publish the follow id", exc_info=True)
+
+    def _followed_name(self) -> str:
+        """Name of the locked colonist, or "" - for the window caption."""
+        try:
+            cam = self._camera()
+            wanted = None if cam is None else cam.lock_id
+            if wanted is None or self.world is None:
+                return ""
+            a = self.world.population.by_id(wanted)
+            return "" if a is None else str(getattr(a, "name", ""))
+        except Exception:
+            return ""
+
     def _pan(self, residual: float, reset: bool = False) -> None:
         """Spill the preview's leftover pan into the world camera.
 
@@ -673,7 +987,12 @@ class App:
 
         nudge() arms the camera's manual hold, so follow() stops fighting the
         user for a few seconds; 0/Home resets the preview's view *and* hands the
-        colony back to follow(), because half a reset is worse than none.
+        colony back to follow(), because half a reset is worse than none - which
+        now includes dropping a click-to-follow lock, since a key that undid the
+        pan but left the camera welded to one colonist would look broken. A pan
+        on its own does NOT drop the lock: looking around while following
+        somebody is a thing people do, and the lock resumes when the hold
+        lapses.
         """
         cam = self._camera()
         if cam is None:
@@ -762,7 +1081,11 @@ class App:
         # caption from the right, and a paused world that has been paused since
         # some previous session looks exactly like a broken one.
         paused = "[PAUSED] " if self.cfg.paused else ""
-        return (f"{paused}Backgrounded - {w.events.scene} - pop {pop} "
+        # Leading too, and for the same reason: it is the state most likely to
+        # be mistaken for the app misbehaving ("why won't the view go back?").
+        who = self._followed_name()
+        follow = f"[following {who}] " if who else ""
+        return (f"{paused}{follow}Backgrounded - {w.events.scene} - pop {pop} "
                 f"gen {w.population.generation} - "
                 f"wood {w.stockpile.get('wood',0)} stone {w.stockpile.get('stone',0)} "
                 f"food {w.stockpile.get('food',0)}{zoom} - "

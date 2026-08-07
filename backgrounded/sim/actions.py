@@ -323,8 +323,20 @@ def stock_qty(world: Any, res: str) -> int:
 
 
 def stock_add(world: Any, res: str, qty: int) -> int:
+    """Put `qty` in the colony store. Returns how much went in.
+
+    THE OTHER HALF OF THE TILL GATE, and leaving it out would have turned the
+    withdrawal fix into a slow donation. `combat_actions._c_craft` refunds an
+    abandoned craft through here, and once `stock_take` bills a hermit's craft
+    to his own stash an un-gated refund credits the COLONY - so every wolf that
+    interrupted him at the workbench would have moved wood, stone, hide and
+    fibre out of his pile and into theirs, one craft at a time, in the same
+    direction as the bug being fixed. Same gate, same reason: see `_TILL_ACTOR`.
+    """
     if qty <= 0 or not res:
         return 0
+    if _hermit_at_till():
+        return hermit_stash_add(world, res, qty)
     if res == RES_GARBAGE:
         # The one resource the stockpile refuses. Enforced here, at the single
         # choke point every deposit path goes through (_drop_all, the build
@@ -350,10 +362,95 @@ def stock_add(world: Any, res: str, qty: int) -> int:
     return 0
 
 
+# ------------------------------------------------------- who is at the till --
+#: THE ACTING AGENT, and the whole reason this exists is that `stock_take` was
+#: never told who was withdrawing. The hermit gate was written as a set of
+#: per-handler `is_hermit` branches - `_hermit_bias` zeroing his colony jobs,
+#: `_deposit_step` declining the walk, `_h_build`'s fetch arm - and a gate made
+#: of branches leaks by exactly one route: a handler nobody remembered to
+#: branch. `_h_upgrade` and `_h_repair` carry fetch blocks byte-identical to
+#: `_h_build`'s with no `is_hermit` in them at all, `_h_craft` pays through a
+#: helper (`combat_actions._pay`) that does not contain the string `stock_take`,
+#: and an agent promoted to hermit MID-ACTION walks into any of them holding a
+#: job the scorer would never have given him. Measured over 5 seeds x 45 min,
+#: every one of those routes fired.
+#:
+#: So the gate moves to the one place every withdrawal passes through. This is
+#: NOT the "flag on the existing functions" the stash note below rejects: there
+#: is no argument to get wrong, because the caller does not supply the answer -
+#: the identity of the agent whose handler is running does. And it is ONE-WAY.
+#: A hermit is diverted to his own stash; nothing here can ever route a villager
+#: INTO it, so "a villager eating the hermit's winter stores" stays
+#: unrepresentable, which was the property that note was protecting.
+#:
+#: A list rather than a single slot because handlers nest (`_h_craft` -> `_pay`,
+#: a cleanup fired from inside another action's update), and pure transient
+#: state: nothing here is saved, `SAVE_VERSION` is untouched, and an empty stack
+#: means "no handler is running" - which is what every call from the director,
+#: the scorer and the HUD sees, so none of their reads change.
+_TILL_ACTOR: list[Any] = []
+
+#: Depth of the deliberate colony-till exemption - see `colony_till`.
+_TILL_OPEN: list[int] = []
+
+
+def till_actor() -> Any | None:
+    """The agent whose action handler is currently running, or None."""
+    return _TILL_ACTOR[-1] if _TILL_ACTOR else None
+
+
+class colony_till:
+    """Context manager: this withdrawal really is from the COLONY'S store.
+
+    THE ONE DELIBERATE EXCEPTION, WRITTEN DOWN RATHER THAN LEFT TO OMISSION.
+    `_h_eat`'s last rung is a starving hermit walking into town to eat somebody
+    else's dinner, and it is not a bug - `HERMIT_HOMESICK` is tuned so "the pull
+    home loses to a really hungry man", and a hermit who starves beside his
+    principles is a worse outcome than one who occasionally eats a meal he did
+    not grow. It is reached only after his hands AND his stash are both empty.
+
+    Anything that wants the colony's store while a hermit is acting has to say
+    so here, in one line, at the call site. A future handler that forgets is
+    routed to his stash and fails honestly; a future handler that MEANS it says
+    `with colony_till():` and is visible to grep forever.
+
+    Not a `contextlib.contextmanager`: this is on the frame path and a plain
+    class with two methods costs no generator machinery.
+    """
+
+    __slots__ = ()
+
+    def __enter__(self) -> "colony_till":
+        _TILL_OPEN.append(1)
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        if _TILL_OPEN:
+            _TILL_OPEN.pop()
+        return False
+
+
+def _hermit_at_till() -> bool:
+    """True when a hermit's handler is running and has not claimed the exception."""
+    if _TILL_OPEN:
+        return False
+    ag = _TILL_ACTOR[-1] if _TILL_ACTOR else None
+    return ag is not None and is_hermit(ag)
+
+
 def stock_take(world: Any, res: str, qty: int) -> int:
-    """Remove up to `qty`. Returns how much was actually taken."""
+    """Remove up to `qty`. Returns how much was actually taken.
+
+    THE TILL, and the hermit gate is enforced here rather than at the call
+    sites - see `_TILL_ACTOR` for the four routes that proved a per-handler
+    gate cannot hold. A hermit withdrawing draws on his own camp store instead,
+    whatever handler he is inside and however he got there; the colony's pile is
+    not touched and cannot be.
+    """
     if qty <= 0 or not res:
         return 0
+    if _hermit_at_till():
+        return hermit_stash_take(world, res, qty)
     sp = stockpile_of(world)
     try:
         if isinstance(sp, dict):
@@ -2221,6 +2318,12 @@ class Action:
             log.debug("unknown action kind %r", self.kind)
             self.failed = True
             return
+        # WHO IS AT THE TILL. Every handler runs through this one line, so this
+        # is where the acting agent is published for `stock_take`/`stock_add` to
+        # gate on - see `_TILL_ACTOR`. try/finally, and a stack rather than a
+        # slot, because a handler that raises must not leave a stale actor
+        # standing at the till for the next agent in the loop.
+        _TILL_ACTOR.append(agent)
         try:
             handler(self, agent, world, float(dt))
         except Exception:
@@ -2230,15 +2333,24 @@ class Action:
                 _halt(agent)
             except Exception:
                 pass
+        finally:
+            _TILL_ACTOR.pop()
 
     def abandon(self, agent: Any, world: Any) -> None:
         """Release anything held (hut slot, tower slot) before being replaced."""
         cleanup = _CLEANUP.get(self.kind)
         if cleanup is not None:
+            # Cleanups move goods too - `_c_craft` refunds a part-paid craft
+            # straight into `stock_add` - and they are NOT reached through
+            # `update`, so without this the refund half of the gate would be
+            # blind on the one path that uses it most. Same stack, same reason.
+            _TILL_ACTOR.append(agent)
             try:
                 cleanup(self, agent, world)
             except Exception:
                 log.debug("cleanup for %s failed", self.kind, exc_info=True)
+            finally:
+                _TILL_ACTOR.pop()
         self.done = True
 
     @property
@@ -2580,7 +2692,18 @@ def _h_build(a: Action, ag: Any, w: Any, dt: float) -> None:
                     got_any = True
                     break
             if got_any:
+                # RETURN, and its absence was a confirmed leak. This branch set
+                # the phase and then FELL THROUGH into the colony fetch below,
+                # so a hermit who had just drawn a log out of his own pile
+                # walked to the colony's stockpile and drew a second armful out
+                # of theirs: 6 wood on seed 7 over 45 sim-min, from the one
+                # handler that already had a hermit guard in it. The till gate
+                # in `stock_take` now bills that second draw to his stash rather
+                # than the colony's, so the leak is closed either way - but
+                # falling through would still charge him twice for one delivery
+                # and walk him into town to do it.
                 a.phase = "approach"
+                return
             else:
                 # Nothing banked either. Failing here is not a dead end, it is
                 # the handoff: a failed action drops him straight back into
@@ -2712,6 +2835,17 @@ def _h_upgrade(a: Action, ag: Any, w: Any, dt: float) -> None:
     for this kind. An abandoned upgrade leaves the delivered stone in the hut
     and the job open, exactly as an abandoned build leaves a site standing; the
     director hands it straight back out on its next pass.
+
+    THERE IS NO `is_hermit` IN THE FETCH BELOW AND THAT IS ON PURPOSE. This
+    handler and `_h_repair` used to be the two identical twins of `_h_build`'s
+    fetch block with the hermit branch missing, and one of them quietly took 10
+    stone off the colony on seed 11 when a gatherer was promoted mid-action.
+    Adding a third copy of the branch is what the bug was made of; the gate is
+    at the till now (`stock_take`, and see `_TILL_ACTOR`), so a hermit who ends
+    up in here draws on his own pile, comes up empty, and fails the action back
+    into `choose_action` where `_hermit_bias` has never scored this job for him
+    in the first place. One wasted walk on a role transition, and no branch to
+    forget.
     """
     s = structure_by_id(w, a.target)
     if s is None:
@@ -2862,6 +2996,11 @@ def _h_repair(a: Action, ag: Any, w: Any, dt: float) -> None:
     if a.data["mat_t"] >= 2.0:
         a.data["mat_t"] = 0.0
         primary = RES_STONE if s.kind in ("wall", "grave") else RES_WOOD
+        # No hermit branch here either - the till gate covers it. A hermit
+        # patching a colony wall (only reachable by a mid-action promotion;
+        # `_hermit_bias` zeroes RepairStructure and `is_hermit_built` already
+        # keeps him off his own camp) draws on his own pile or patches at the
+        # 0.35 rate with what is to hand. See `_h_upgrade` and `_TILL_ACTOR`.
         if stock_take(w, primary, 1) <= 0:
             rate *= 0.35        # patching with what is to hand: slow
     s.repair(rate * dt)
@@ -2922,7 +3061,19 @@ def _h_eat(a: Action, ag: Any, w: Any, dt: float) -> None:
         rem = step_toward(ag, w, tx, dt, speed=WALK_SPEED * 1.05)
         if rem <= REACH:
             res, qty = food_in_store(w)
-            if res is None or stock_take(w, res, 1) <= 0:
+            # THE ONE WITHDRAWAL A HERMIT IS ALLOWED TO MAKE, and it is claimed
+            # explicitly rather than inherited by omission - see `colony_till`.
+            # The till gate would otherwise route this back into his stash, and
+            # his stash is empty: that is the only way execution reaches this
+            # phase at all (the "start" branch above tries his hands, then his
+            # pile, and only falls through to a walk into town when both are
+            # bare). Sending him home to eat nothing is how a man starves
+            # standing on his principles, which is a worse bug than the one
+            # this file is fixing. `with`, not a flag argument, so an exception
+            # inside cannot leave the till propped open for the next agent.
+            with colony_till():
+                got = stock_take(w, res, 1) if res is not None else 0
+            if res is None or got <= 0:
                 a.failed = True
                 return
             a.data["res"] = res

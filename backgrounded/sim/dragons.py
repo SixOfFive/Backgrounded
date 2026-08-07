@@ -111,14 +111,22 @@ never feed is an immortal monster parked on the map forever:
   or while not alive - so "everyone hides in the huts" is a legal, complete
   defence that must not deadlock.
 * ``DRAGON_STARVE_SEC``: every dragon that CAN feed runs ``starve_t`` on any
-  tick with no eligible victim, and at 90 s it latches ``sated`` anyway and
-  becomes mortal. The clock resets the moment somebody is reachable, so it only
-  runs while the colony is genuinely out of reach. Hiding indoors stays a real
-  strategy; it costs ninety seconds and turns the monster killable.
+  tick with no eligible victim, and at 90 s it BREAKS OFF AND LEAVES. The clock
+  resets the moment somebody is reachable, so it only runs while the colony is
+  genuinely out of reach. Hiding indoors stays a real strategy; it costs ninety
+  seconds and it ends the visit.
+
+  That hatch used to latch ``sated`` instead, which made an unreachable dragon
+  MORTAL - an undeclared exception to the rule above, and the only way in the
+  game to get a killable dragon that had eaten nobody. See ``_tick_starve``:
+  what the hatch is for is a monster parked on the map forever, and the answer
+  to parked is leave, not killable.
 
 ``skeletal`` is constructed with ``sated = True``. That one field is the ENTIRE
 implementation of "the undead do not eat" - ``hurt()`` has no special case and
-so cannot drift.
+so cannot drift. With the starve hatch no longer touching the latch, ``sated``
+has exactly two ways to become True: ``_devour``, which is the rule, and this,
+which is the one declared exception.
 
 The gorge, and why the rule shipped with only half of itself
 ------------------------------------------------------------
@@ -409,6 +417,62 @@ GORGE_WALLOW = 48.0
 #: payoff), so it owns its own upper bound or it owns a hang.
 GORGE_MAX_SEC = DRAGON_GORGE_SEC + 40.0
 
+# -- breaking off: the errand a dying animal should be allowed to abandon -----
+# TODO(backlog): DRAGON_FLEE_FRAC belongs in constants.py
+#
+#: Health fraction at or below which a dragon abandons a COMMITTED ERRAND and
+#: leaves. Nothing else in this module reads a health bar, and that was the bug.
+#:
+#: The bar this feature was written against has two halves and only the first
+#: was ever true: zero kills is a fail, AND every visit ending in a kill is a
+#: fail. Measured on the shipped tree, 6 seeds x 4 kinds x 18 sim-min of forced
+#: visits into 70-sim-minute colonies - 648 visits, with deaths counted on the
+#: line ``_reap`` actually removes the dragon on rather than by scanning the
+#: survivors (the roster-scan version of this probe reported 0 kills in 648
+#: visits, because combat runs earlier in World.tick than the dragon subsystem
+#: and a dragon killed on tick T is gone before tick T ends):
+#:
+#:     quadruped  92.1% killed      serpent   34.9%
+#:     skeletal  100.0%             wyvern    47.9%
+#:
+#: THE SPREAD IS THE DIAGNOSIS, NOT THE MEAN. Of 431 kills, 68 were a quadruped
+#: in `roost`/`raze` and 141 a skeletal in `scour`. Those are the two phases in
+#: this file that a dragon cannot leave until a fixed clock runs out -
+#: DRAGON_SIEGE_SEC is 150 s at alt 0 inside every weapon the colony owns, and
+#: a scour is DRAGON_SCOUR_SEC per stone up to DRAGON_SCOUR_MAX. The wyvern and
+#: the serpent, which die in `gorge`, are already at 48% and 35%: near enough
+#: the target that touching them would be the redesign this was not supposed to
+#: be. This was never a damage problem. It is that the two kinds with no way to
+#: stop being shot at are the two kinds that die, and a creature with 15% of
+#: its bar left stood in the open and finished its errand anyway.
+#:
+#: So: ONLY the committed errands (see :data:`_FLEE_PHASES`), and only for a
+#: dragon that has already taken what it came for - ``fed_count`` for the
+#: eaters, ``graves_taken`` for the revenant, which is exactly the query the
+#: :attr:`Dragon.graves_taken` split exists to make askable. A dragon that has
+#: taken nothing cannot be hurt at all, so it can never reach this and can
+#: never use it to escape the feeding rule.
+#:
+#: THE GORGE IS DELIBERATELY NOT ON THAT LIST, and an earlier cut that applied
+#: this to every phase is why the exclusion is written down: it took the smoke
+#: block's "a colony that fights really does bring one down" bench from 2 of 8
+#: armed colonies to 0 of 8. The gorge is the payoff window, it already ends by
+#: itself, and letting a wyvern quit it turns the second half of the bar into a
+#: violation of the first.
+#:
+#: 0.30, swept: the colony still has to take seven tenths of the bar off before
+#: the animal will quit, and the retreat is not safety - PHASE_LEAVE stops
+#: throwers spending spears on a departing target, but melee and the barricade
+#: spikes reach a walking quadruped for the whole 960 px it has to cross.
+DRAGON_FLEE_FRAC = 0.30
+
+#: The committed errands. A dragon in one of these is working to a clock it
+#: cannot shorten, in reach of everything, which is the only situation this
+#: module has where "run away" is a behaviour the animal is missing rather than
+#: a difficulty setting. Every other phase either ends by itself in seconds or
+#: is already a departure.
+_FLEE_PHASES: tuple[str, ...] = (PHASE_ROOST, PHASE_RAZE, PHASE_SCOUR)
+
 QUAD_ALT = (90.0, 130.0)
 #: Px/s a roosting quadruped walks between the buildings it is wrecking.
 QUAD_WALK = 18.0
@@ -444,11 +508,18 @@ MIN_STEP_FRAC = 0.12
 
 #: Seconds a visit may last before the dragon gives up and goes, whatever it is
 #: doing. This is ``ANIMAL_LEAVE_SEC``'s job ("patience runs out whatever it was
-#: doing") and it is NOT optional here, because the starve hatch alone does not
-#: close the hiding-indoors case: DRAGON_STARVE_SEC makes an unreachable dragon
-#: MORTAL, but nothing in the feeding rule makes it LEAVE, so a colony that
-#: locked itself in the huts got a killable wyvern circling the camp forever.
-#: Measured before this existed: 260 s of everyone indoors, still hunting.
+#: doing") and it is NOT optional here, even though the starve hatch now sends
+#: a hungry dragon home by itself at DRAGON_STARVE_SEC. That hatch only runs for
+#: kinds that EAT and only while nobody is reachable, so it says nothing about a
+#: skeletal circling a graveyard it cannot close on, or a quadruped whose siege
+#: somehow will not end. This is the backstop that covers every phase of every
+#: kind, which is what "patience runs out whatever it was doing" means.
+#:
+#: It was written because the starve hatch used to make an unreachable dragon
+#: MORTAL and nothing made it LEAVE, so a colony that locked itself in the huts
+#: got a killable wyvern circling the camp forever - measured at 260 s of
+#: everyone indoors, still hunting. The hatch has since been given the job it
+#: was actually for (see _tick_starve); this stays as the outer bound.
 #:
 #: The quadruped's own DRAGON_SIEGE_SEC ends its roost long before this; the
 #: entry here is the backstop for a siege that somehow cannot end.
@@ -877,7 +948,28 @@ class Dragon:
     told_unsated: bool = False
     #: Seconds accumulated with NO eligible victim. The deadlock hatch.
     starve_t: float = 0.0
+    #: PEOPLE EATEN, and nothing else. See :attr:`graves_taken` for why that
+    #: sentence has to be written down.
     fed_count: int = 0
+    #: Headstones robbed. A SEPARATE counter, and the split is the bug fix.
+    #:
+    #: This field used to be ``fed_count`` as well - ``_tick_scour`` incremented
+    #: it and tested it against ``DRAGON_SCOUR_MAX``, with a comment arguing
+    #: that "how many times has it taken what it came for" is honestly the same
+    #: question. It is not, because one other line in this file asks a DIFFERENT
+    #: question of the same field: ``from_dict``'s ``if g.fed_count > 0:
+    #: g.sated = True`` means "has this dragon fed, and is it therefore
+    #: killable". Under the overload, a bone-wyrm that had taken one stone
+    #: answered "yes, it has fed" to a question about eating people, and
+    #: ``_pick_victim``'s ``fed_count >= max_fed`` cap was being spent by
+    #: masonry for any kind that ever did both.
+    #:
+    #: Nothing observable was wrong TODAY - skeletal is the only kind that
+    #: scours and it is born ``sated`` anyway, so the two wrong answers happened
+    #: to cancel. That is the same shape as the UFO abduction counter this
+    #: project fixed the same week: one counter meaning two things, harmless
+    #: until the second kind that scours, or the first skeletal that eats.
+    graves_taken: int = 0
     #: Chasm mouth, graveyard centroid, or roost - whatever this kind orbits.
     home_x: float = 0.0
     #: Seconds since damage was last refused; -1.0 while it never has been.
@@ -949,6 +1041,8 @@ class Dragon:
         bits.append("sated" if self.sated else "unfed")
         if self.fed_count:
             bits.append(f"ate {self.fed_count}")
+        if self.graves_taken:
+            bits.append(f"robbed {self.graves_taken}")
         return " ".join(bits)
 
     # -------------------------------------------------------------- combat --
@@ -1006,6 +1100,7 @@ class Dragon:
             "told_unsated": bool(self.told_unsated),
             "starve_t": float(self.starve_t),
             "fed_count": int(self.fed_count),
+            "graves_taken": int(self.graves_taken),
             "home_x": float(self.home_x),
             "refused_t": float(self.refused_t),
         }
@@ -1052,8 +1147,28 @@ class Dragon:
             g.told_unsated = _b(d.get("told_unsated"), False)
             g.starve_t = _clamp(_f(d.get("starve_t"), 0.0), 0.0, DRAGON_STARVE_SEC)
             g.fed_count = max(0, _i(d.get("fed_count"), 0))
+            g.graves_taken = max(0, _i(d.get("graves_taken"), 0))
             g.home_x = _clamp_x(d.get("home_x"))
             g.refused_t = _f(d.get("refused_t"), -1.0)
+
+            # SAVE COMPAT for the counter split, and it costs no SAVE_VERSION
+            # bump because the old value is recoverable without one. A save
+            # written before the split has NO "graves_taken" and carries the
+            # scour count in "fed_count"; a save written after it has
+            # "graves_taken" set and "fed_count" at 0 for this kind, because
+            # skeletal never eats. max() of the two is right on both, and the
+            # clamp afterwards is what makes a hand-edited record harmless.
+            if g.kind == KIND_SKELETAL:
+                g.graves_taken = max(g.graves_taken, g.fed_count)
+                g.fed_count = 0
+            # A kind cannot have eaten more people than its own cap allows -
+            # that cap is what ends its visit - and it cannot have taken more
+            # stones than DRAGON_SCOUR_MAX, which is what ends a scour. Both
+            # clamps exist so an out-of-range save cannot produce a dragon that
+            # is stuck in a phase whose exit test is already satisfied, or one
+            # whose exit test can never be satisfied.
+            g.fed_count = min(g.fed_count, _cap_for(g.kind))
+            g.graves_taken = min(g.graves_taken, max(0, _i(DRAGON_SCOUR_MAX, 0)))
 
             # The feeding exemption is ONE FIELD, and it is re-asserted here so
             # a hand-edited save cannot turn the undead into something that has
@@ -1667,6 +1782,8 @@ class DragonRegistry:
                 and d.age >= _VISIT_MAX.get(d.kind, 180.0):
             self._enter(d, PHASE_LEAVE)
 
+        self._tick_flee(world, d)
+
         handler = {
             PHASE_CROSS: self._tick_cross,
             PHASE_ARRIVE: self._tick_arrive,
@@ -1705,6 +1822,50 @@ class DragonRegistry:
             return _band(d, SKELETAL_ALT)
         return d.cruise_alt
 
+    def _tick_flee(self, world: Any, d: Dragon) -> None:
+        """A wounded dragon that has taken what it came for breaks off.
+
+        See :data:`DRAGON_FLEE_FRAC` for the measurement this exists to answer.
+        The short version: the kinds that were dying are the ones with no way
+        to stop being shot at, and giving one of them a way is a behaviour the
+        animal was missing rather than a number that was too big.
+
+        Two guards, and both are load-bearing:
+
+        * the phase must be a COMMITTED ERRAND - roost, raze or scour, the
+          three this file runs to a clock the animal cannot shorten. Every
+          other phase is either seconds long or already a departure, and the
+          gorge in particular is excluded on measured evidence: applying this
+          everywhere took the armed-colony bench below from 2 kills in 8 to 0,
+          which is the first half of the bar broken to satisfy the second.
+        * ``fed_count`` or ``graves_taken`` must be non-zero. An animal that has
+          taken NOTHING must not be able to run: for the eating kinds that case
+          cannot arise at all - an unfed dragon refuses damage, so its bar never
+          moves - but writing the guard down is what stops a future kind with a
+          different latch turning this into an escape hatch from the feeding
+          rule. This is the query the counter split was for: asking
+          ``fed_count`` alone would say "no" to a bone-wyrm holding three
+          headstones, and asking the OLD overloaded ``fed_count`` would have
+          said "yes, it has eaten somebody", which is worse.
+
+        Draws no randomness. It cannot: ``behavior.choose_action`` scores off
+        ``world.pyrng`` with a tiebreak per candidate, and a single extra draw
+        per tick from anywhere re-phases every wolf in the game (24 seeds, mean
+        deaths 11.33 -> 13.17). This is a threshold on a number the dragon
+        already has, and it adds no scored candidate anywhere.
+        """
+        if d.state not in _FLEE_PHASES:
+            return
+        if d.fed_count <= 0 and d.graves_taken <= 0:
+            return
+        if d.health_frac > max(0.0, _f(DRAGON_FLEE_FRAC, 0.0)):
+            return
+        self._enter(d, PHASE_LEAVE)
+        # Said once, and only once, because the guard above is now permanently
+        # true for this dragon - the same shape as told_unsated, without the
+        # extra field.
+        _log(world, f"The {d.noun} breaks off, bleeding, and goes.")
+
     # -- the feeding rule's two chronicle lines ---------------------------
     def _tell_unsated(self, world: Any, d: Dragon) -> None:
         """Signal 1: one sentence, once per dragon, the first time it refuses.
@@ -1722,13 +1883,48 @@ class DragonRegistry:
         _log(world, f"The spear glances off the {d.noun}. It has not fed.")
 
     def _tick_starve(self, world: Any, d: Dragon, dt: float) -> None:
-        """The deadlock hatch, and the drama that falls out of it.
+        """The deadlock hatch: an unreachable dragon gives up and GOES.
 
         Only kinds that CAN feed run this clock. flyover never feeds and is
         unreachable; skeletal is sated at birth and never wants a person, so a
         starve line for either would be a sentence about nothing.
+
+        THIS USED TO LATCH ``sated``, and that was an undeclared exception to
+        the one rule the whole feature is built on. The rule is "a dragon gets
+        one of you before it can be killed"; ``hurt()`` implements it by
+        refusing damage while ``sated`` is False; and this method quietly set
+        ``sated = True`` after ninety seconds with nobody reachable. A wyvern
+        that had eaten NOBODY - ``fed_count == 0`` - therefore became killable,
+        and the colony collected a dragon it had not paid for. Nobody wrote that
+        down as a design decision. It is not the skeletal exception, which IS
+        deliberate, is one field wide, and is recorded in three places; it was a
+        deadlock hatch that reached for the nearest latch and happened to grab
+        the one the rule turns on.
+
+        So the hatch now does the thing it was actually for. What the hatch has
+        to prevent is an immortal monster PARKED on the map forever - and the
+        fix for parked is leave, not killable. At ninety seconds with nobody it
+        can reach, the dragon breaks off and takes ``PHASE_LEAVE``: no kill, no
+        grave, no latch, and nothing left circling. Hiding indoors is still a
+        legal and complete defence and it still costs ninety seconds; what it
+        buys is now the visit ending rather than a free dragon.
+
+        Three things make that strictly safer than the version it replaces:
+
+        * it TERMINATES SOONER. ``_VISIT_MAX`` was already the thing that got an
+          unfed dragon off a colony that would not come outside (180 s for a
+          wyvern); this fires at 90 and hands to the same phase.
+        * an unfed dragon in ``PHASE_LEAVE`` is unreachable in both directions -
+          ``hurt()`` still refuses, and ``combat_actions.animal_leaving`` reads
+          the word "leave" and will not spend a spear chasing it - so the colony
+          is not left swinging at something it cannot hurt.
+        * ``sated`` now has exactly two ways to become True: eating somebody
+          (``_devour``) and being born undead (``skeletal``). One is the rule,
+          one is the declared exception, and there is no third.
         """
-        if d.sated or not d.eats:
+        if d.sated or not d.eats or d.state in (PHASE_LEAVE, PHASE_IDLE):
+            # Already fed, never eats, or already going. The clock is only
+            # meaningful for a hungry dragon that is still trying.
             d.starve_t = 0.0
             return
         if self._pick_victim(world, d) is not None:
@@ -1737,9 +1933,9 @@ class DragonRegistry:
         d.starve_t += dt
         if d.starve_t < DRAGON_STARVE_SEC:
             return
-        d.sated = True
         d.starve_t = 0.0
-        _log(world, f"Nothing came out. Hunger has made the {d.noun} careless.")
+        _log(world, f"Nothing came out. The {d.noun} gives up and turns away.")
+        self._enter(d, PHASE_LEAVE)
 
     # -- eligibility ------------------------------------------------------
     def _pick_victim(self, world: Any, d: Dragon) -> Any:
@@ -1884,8 +2080,8 @@ class DragonRegistry:
                 self._enter(d, PHASE_LEAVE)      # it got what it came for
                 return
             # Nobody reachable. Loiter over the colony while the starve clock
-            # runs. That clock is what makes it mortal; _VISIT_MAX is what
-            # eventually sends it home.
+            # runs; at DRAGON_STARVE_SEC that clock breaks the visit off and
+            # sends it home, and _VISIT_MAX is the outer bound behind it.
             self._drift(world, d, d.home_x, dt, d.speed * 0.55)
             return
 
@@ -2086,7 +2282,7 @@ class DragonRegistry:
         comes first - a colony with three graves loses three, not four.
         """
         stones = _graves(world)
-        if not stones or d.fed_count >= DRAGON_SCOUR_MAX:
+        if not stones or d.graves_taken >= DRAGON_SCOUR_MAX:
             self._enter(d, PHASE_LEAVE)
             return
         d.alt = _clamp(d.cruise_alt + 14.0 * math.sin(d.anim_t * 0.7),
@@ -2114,11 +2310,14 @@ class DragonRegistry:
         except Exception:
             name = ""
         if _remove_prop(world, best):
-            # fed_count is the scour counter for this kind. Reusing the field
-            # rather than adding a sixth counter keeps to_dict one shape for all
-            # five, and "how many times has it taken what it came for" is
-            # honestly the same question.
-            d.fed_count += 1
+            # graves_taken, NOT fed_count. This line used to bump fed_count on
+            # the argument that "how many times has it taken what it came for"
+            # is the same question for a grave-robber as for an eater. It is
+            # not: fed_count is the input to the ONE query the whole feeding
+            # rule turns on - has this dragon eaten somebody, and is it
+            # therefore killable - and a headstone is not a person. See
+            # Dragon.graves_taken.
+            d.graves_taken += 1
             if name:
                 _log(world, f"The {d.noun} takes {name}'s stone.")
             else:
@@ -2453,6 +2652,17 @@ class DragonRegistry:
         reg = cls(seed=base)
         if not isinstance(d, dict):
             return reg
+
+        # TWO GUARDS, NOT ONE, and the split is the point. Fuzzed at 5248
+        # malformed records - every top-level key and every dragon key crossed
+        # with 23 hostile values, plus 4000 random multi-key soups - this raised
+        # 0 times, so nothing here quarantines a save today. What it DID do was
+        # all-or-nothing: one throw anywhere below discarded the dragons that
+        # had already parsed cleanly and returned an empty registry. The three
+        # keys the dragon work added were individually careful and the six
+        # pre-existing ones inherited that care only as long as the single try
+        # block never fired. Losing the roster because `visits` was a dict is
+        # the same trade the events lane rejected.
         try:
             raw = d.get("dragons")
             if isinstance(raw, (list, tuple)):
@@ -2464,6 +2674,11 @@ class DragonRegistry:
                         continue
                     if g.alive:
                         reg.dragons.append(g)
+        except Exception:
+            log.warning("dragon roster unreadable; loading none of it",
+                        exc_info=True)
+
+        try:
             reg.next_id = max(1, _i(d.get("next_id"), 1))
             for g in reg.dragons:
                 reg.next_id = max(reg.next_id, g.id + 1)
@@ -2483,9 +2698,12 @@ class DragonRegistry:
                 reg._rng.random()
             reg.draws = int(want)
         except Exception:
-            log.warning("dragon registry save unreadable; starting empty",
+            # The scalars fall back to a fresh registry's defaults; the roster
+            # above is KEPT. A colony reloading with the right dragons and a
+            # wrong visit counter is a cosmetic loss. Reloading with none of its
+            # dragons is a live event deleted.
+            log.warning("dragon registry scalars unreadable; using defaults",
                         exc_info=True)
-            return cls(seed=base)
         return reg
 
 
@@ -2764,8 +2982,16 @@ if __name__ == "__main__":   # pragma: no cover - headless, drives a real World
     w = World(seed=48)
     reg = DragonRegistry(seed=48)
     w.dragons = reg
+    # AT THE COLONY, not at x=800. This bench was written when the world was
+    # one 1600 px frame and 800 was the middle of it; on a WORLD_W map the
+    # colony for this seed sits near x=3500 and _spawn anchors the quadruped's
+    # home_x on _colony_x, so huts at 800 were 2700 px behind it. Measured on
+    # the shipped tree: the siege ran its full DRAGON_SIEGE_SEC roosting at
+    # x 2786-4226 and razed for 0.0 s, i.e. the razing path this bench exists
+    # to pin was not being executed at all and the assert below was red.
+    base = reg._colony_x(w)
     for i in range(3):
-        gx = 800.0 + 90.0 * i
+        gx = _clamp_x(base + 90.0 * (i - 1))
         w.structures.create("hut", gx, w.terrain.ground_y(gx), built=True)
     before = [st.hp for st in w.structures.all()]
     reg.summon(KIND_QUADRUPED, 0.0)
@@ -2955,29 +3181,35 @@ if __name__ == "__main__":   # pragma: no cover - headless, drives a real World
     assert reg.seen_gate and reg.count() == 1, (reg.seen_gate, reg.count())
 
     print("-- the starve hatch, and the visit that has to end ---------------")
-    # Everyone hides in the huts. Two things must happen, and the second one is
-    # the half the feeding rule does NOT give you: it becomes mortal, and then
-    # it goes home. Before _VISIT_MAX it did the first and never the second, so
-    # a colony that locked its doors got a killable wyvern circling forever.
+    # Everyone hides in the huts. The hatch must break the visit off at
+    # DRAGON_STARVE_SEC and the dragon must actually be gone - and it must do
+    # that WITHOUT ever becoming killable, because it has eaten nobody. The
+    # hatch used to latch `sated` here, which handed the colony a dragon it had
+    # not paid for; that was the undeclared exception to the feeding rule.
     w = World(seed=23)
     reg = DragonRegistry(seed=23)
     w.dragons = reg
     reg.summon(KIND_WYVERN, 0.0)
-    hatch_at = left_at = None
+    broke_at = left_at = None
+    ever_sated = False
     for i in range(int(400.0 / DT)):
         for a in w.population.alive_agents():
             a.inside = 1                     # before the tick - see drive()
         w.tick(DT)
         beast = reg.all()[0] if reg.all() else None
-        if hatch_at is None and beast is not None and beast.sated:
-            hatch_at = i * DT
-        if left_at is None and hatch_at is not None and not reg.all():
+        if beast is not None and beast.sated:
+            ever_sated = True
+        if broke_at is None and beast is not None and beast.state == PHASE_LEAVE:
+            broke_at = i * DT
+        if left_at is None and broke_at is not None and not reg.all():
             left_at = i * DT
             break
-    print(f"  turned mortal at {hatch_at}s, gone by {left_at}s")
-    assert hatch_at is not None and abs(hatch_at - DRAGON_STARVE_SEC) < 2.0, hatch_at
+    print(f"  broke off at {broke_at}s, gone by {left_at}s, "
+          f"ever killable: {ever_sated}")
+    assert broke_at is not None and abs(broke_at - DRAGON_STARVE_SEC) < 2.0, broke_at
     assert left_at is not None, "it never left a colony that stayed indoors"
-    assert any("careless" in ln for ln in w.chronicle), list(w.chronicle)[-4:]
+    assert not ever_sated, "a dragon that ate nobody was made killable"
+    assert any("gives up" in ln for ln in w.chronicle), list(w.chronicle)[-4:]
     assert not any("has fed" in ln for ln in w.chronicle), "it fed on nobody"
 
     print("-- the unsated line is said once --------------------------------")
@@ -3046,6 +3278,91 @@ if __name__ == "__main__":   # pragma: no cover - headless, drives a real World
     junk = Dragon.from_dict({"x": float("nan"), "alt": "boom", "health": None})
     assert math.isfinite(junk.x) and math.isfinite(junk.alt)
     assert Dragon.from_dict({"kind": KIND_SKELETAL, "sated": False}).sated is True
+
+    # EVERY key, not only the ones the dragon work added. The three it added
+    # were individually careful and the six pre-existing top-level keys
+    # inherited that care only from the single try block that used to wrap them
+    # all - which meant one throw discarded a roster that had already parsed.
+    # from_dict is now two guards; this is what pins both of them.
+    _JUNK = [None, True, False, 0, -1, 1e18, -1e18, float("nan"), float("inf"),
+             "", "x" * 300, "nonsense", [], {}, [1, 2], {"a": 1}, (), 3.5,
+             b"bytes", {"nested": {"deep": [None]}}, 10 ** 30, "NaN", " 12 "]
+    _TOP = ["seed", "draws", "dragons", "next_id", "t", "seen_gate", "next_in",
+            "herald_done", "visits"]
+    _DK = list(Dragon().to_dict().keys())
+    _n = 0
+    for _k in _TOP:
+        for _j in _JUNK:
+            _n += 1
+            DragonRegistry.from_dict({_k: _j}).to_dict()
+    for _k in _DK:
+        for _j in _JUNK:
+            _n += 2
+            Dragon.from_dict({_k: _j}).to_dict()
+            DragonRegistry.from_dict({"dragons": [{_k: _j}]}).to_dict()
+    _soup = random.Random(7)
+    for _ in range(600):
+        _rec: dict[str, Any] = {_soup.choice(_TOP): _soup.choice(_JUNK)
+                                for _ in range(3)}
+        _rec["dragons"] = [{_soup.choice(_DK): _soup.choice(_JUNK)
+                            for _ in range(3)} for _ in range(_soup.randint(0, 3))]
+        _n += 1
+        DragonRegistry.from_dict(_rec).to_dict()
+    # ...and the roster SURVIVES a scalar that throws. A dict is not a number,
+    # and losing a live dragon over a bad visit counter is a deleted event.
+    _good = Dragon(id=4, kind=KIND_WYVERN, health=90.0, max_health=180.0).to_dict()
+    _kept = DragonRegistry.from_dict({"dragons": [_good], "visits": {"bad": 1},
+                                      "next_id": [], "t": "later"})
+    print(f"  {_n} malformed records, 0 raises; "
+          f"roster kept through bad scalars: {_kept.count()}")
+    assert _kept.count() == 1, _kept.to_dict()
+
+    print("-- the two counters are two counters ----------------------------")
+    # fed_count is PEOPLE and graves_taken is STONES, and the split has to
+    # survive a save written before it existed - which carried the scour count
+    # in fed_count, the field the whole feeding rule reads.
+    _old = {"kind": KIND_SKELETAL, "fed_count": 5, "health": 150.0,
+            "max_health": 150.0, "state": PHASE_SCOUR}
+    _mig = Dragon.from_dict(_old)
+    print(f"  old save fed_count=5 -> ate {_mig.fed_count}, "
+          f"robbed {_mig.graves_taken}")
+    assert (_mig.fed_count, _mig.graves_taken) == (0, 5), _mig.summary()
+    assert Dragon.from_dict(_mig.to_dict()).graves_taken == 5, "split did not persist"
+    # A wyvern's cap is 1, so a hand-edited 99 must not survive as 99.
+    assert Dragon.from_dict({"kind": KIND_WYVERN, "fed_count": 99}).fed_count == 1
+    assert Dragon.from_dict({"kind": KIND_SKELETAL,
+                             "graves_taken": 999}).graves_taken == DRAGON_SCOUR_MAX
+
+    print("-- a wounded dragon that has fed breaks off ---------------------")
+    # The half of the bar that was never true: zero kills is a fail AND every
+    # visit ending in a kill is a fail. An animal with nothing left has to be
+    # able to stop being shot at, and no dragon in this game ever could.
+    _reg = DragonRegistry(seed=5)
+    _w = World(seed=5)
+    _w.dragons = _reg
+    # home_x MATTERS and leaving it at 0.0 cost a debugging round: _tick_leave
+    # measures "which side am I on" and the despawn line against home_x, so a
+    # dragon standing at the colony with home_x 0 is already past its own exit
+    # and retires to PHASE_IDLE on the very tick it breaks off.
+    _cx = _reg._colony_x(_w)
+    _fled = Dragon(id=9, kind=KIND_QUADRUPED, x=_cx, home_x=_cx, alt=0.0,
+                   health=320.0, max_health=320.0, sated=True, fed_count=1,
+                   state=PHASE_ROOST)
+    _reg.add(_fled)
+    _reg.tick(_w, DT)
+    assert _fled.state == PHASE_ROOST, "a healthy one must finish its errand"
+    _fled.health = 320.0 * (DRAGON_FLEE_FRAC - 0.02)
+    _reg.tick(_w, DT)
+    print(f"  quadruped at {100 * _fled.health_frac:.0f}% -> {_fled.state}")
+    assert _fled.state == PHASE_LEAVE, _fled.summary()
+    assert any("breaks off" in ln for ln in _w.chronicle), list(_w.chronicle)[-3:]
+    # ...but never a dragon that has taken nothing. That one cannot be hurt at
+    # all, and an escape hatch here would be an escape from the feeding rule.
+    _unfed = Dragon(id=10, kind=KIND_WYVERN, x=800.0, alt=180.0,
+                    health=1.0, max_health=180.0, state=PHASE_HUNT)
+    DragonRegistry(seed=5)._tick_flee(None, _unfed)
+    assert _unfed.state == PHASE_HUNT, "an unfed dragon ran away"
+
     lone = DragonRegistry(seed=3)
     lone.tick(None, 0.05)                  # no world at all
     lone.tick(object(), 0.05)              # a world with nothing on it

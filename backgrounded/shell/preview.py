@@ -92,6 +92,21 @@ class Preview:
         #: Window px travelled since the current press. What separates a click
         #: from a drag for the double-right-click test.
         self._pan_travel: float = 0.0
+        # --- left-button (tool) gesture state --------------------------
+        # The same lost-button-up problem as the pan latch above, on the other
+        # button and with a different consequence: the Hand tool's grab.
+        # See _apply_lmb for why it is NOT simply a copy of the pan machinery.
+        #: True between a MOUSEBUTTONDOWN(1) this window saw and its release.
+        self._lmb_down: bool = False
+        #: Down, but no report has said so lately. A holding pen, like
+        #: _pan_suspended - except that its EXPIRY emits a release rather than
+        #: merely forgetting the gesture, because a forgotten grab is the bug.
+        self._lmb_suspended: bool = False
+        #: pygame tick at which the suspension began, so it can expire.
+        self._lmb_suspend_ms: int = 0
+        #: Last window px the pointer was seen at, so a synthesised release has
+        #: somewhere to happen. Set down where it was carried to, not (0, 0).
+        self._lmb_pos: tuple[int, int] = (0, 0)
         #: Set when the window geometry changes mid-drag: the next motion
         #: event's delta spans two coordinate spaces and is dropped.
         self._pan_reanchor: bool = False
@@ -751,6 +766,136 @@ class Preview:
         self._pan_reanchor = False
         self._pan_travel = 0.0
 
+    # --- left-button bookkeeping -----------------------------------------
+    # Button 1 had none of the machinery above and needed the same reconcile,
+    # for the same reason and by the same three ways of losing an up-event: any
+    # set_mode mid-drag - F11, Alt+Enter, the tray's Window Size, a VIDEORESIZE
+    # - swallows the MOUSEBUTTONUP. The pan latch survives that; the tool grab
+    # did not. ToolController releases only on a pointer event of kind "up", and
+    # this loop only ever produced one from a real MOUSEBUTTONUP(1), so a grab
+    # that lost its release stayed grabbed: the held entity followed the cursor
+    # with no button down, frozen out of its own behaviour tree, until the user
+    # clicked again. Self-healing on the next click, which is why it is a
+    # medium and not the stuck-pan emergency, but it is the same defect.
+    #
+    # WHAT IS NOT COPIED FROM THE PAN PATH, AND WHY. The suspension pen is
+    # kept, because the case it exists for is exactly this bug's trigger: after
+    # a display-mode switch SDL emits a burst of MOUSEMOTION carrying
+    # buttons=(0,0,0) with the button still physically down (17 consecutive,
+    # measured - see _apply_held). Releasing on the first of those would mean
+    # pressing F11 mid-drag ALWAYS drops what you are carrying, which is a more
+    # visible failure than the one being fixed and would look like the fix
+    # broke dragging across a mode switch.
+    #
+    # But two things about it are deliberately different:
+    #
+    # * The pen is 250 ms, not _PAN_SUSPEND_MS's 1000. That constant's own
+    #   docstring names its cost - a button held down in ANOTHER window and
+    #   moved over ours inside the window revives a dead gesture - and the
+    #   stakes are worse here. A revived pan moves the view; a revived grab
+    #   picks a colonist back up and carries them off under a button this
+    #   window never saw pressed. 250 ms is still ~2x the measured 136 ms
+    #   worst case for the SDL burst, and quarters the revival window.
+    # * Expiry RELEASES rather than forgetting. For a pan, dropping the latch
+    #   ends the gesture completely - there is nothing left holding anything.
+    #   A grab is an object in someone's hands: forgetting it is precisely the
+    #   stranding. So _apply_lmb reports "up" on expiry and pump_events
+    #   synthesises the pointer event that ToolController is waiting for.
+
+    #: How long a left button may go unreported before the gesture is ended.
+    _LMB_SUSPEND_MS: int = 250
+
+    def _lmb_held(self, ev=None) -> "bool | None":
+        """Is button 1 reported down? None means "cannot tell".
+
+        Same two-source union as :meth:`_held_pan_buttons`, and the same
+        argument for it: the event snapshot lies after a display-mode switch,
+        the live poll lies about an event that is a frame old, and each is only
+        ever wrong in the "up" direction - so the union is right where both are
+        individually wrong. None survives as the fallback's fallback so that a
+        platform where pygame declines to answer keeps the old behaviour rather
+        than losing grabs to a poll that cannot speak.
+        """
+        sources = []
+        b = getattr(ev, "buttons", None)
+        if b is not None and len(b) >= 1:
+            sources.append(b)
+        try:
+            sources.append(pygame.mouse.get_pressed())
+        except Exception:
+            pass
+        if not sources:
+            return None
+        for b in sources:
+            try:
+                if b[0]:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _apply_lmb(self, held: bool) -> str:
+        """Reconcile the left-button latch. Returns "up" when the gesture must
+        be ended now, "" otherwise.
+
+        Restoration is an intersection with what this window saw, never an
+        assignment: a button pressed somewhere else and dragged in is neither
+        latched nor suspended here, so ``held`` alone can never start or revive
+        a gesture we never saw begin.
+        """
+        now = pygame.time.get_ticks()
+        if held:
+            if self._lmb_suspended:
+                # Reported down again: those were lying events, not a release.
+                self._lmb_suspended = False
+                self._lmb_down = True
+            return ""
+        if self._lmb_down:
+            # Stop feeding the gesture at once - the reports say the button is
+            # up - but do not end it yet; that is what the pen is for.
+            self._lmb_down = False
+            self._lmb_suspended = True
+            self._lmb_suspend_ms = now
+            return ""
+        if self._lmb_suspended and now - self._lmb_suspend_ms >= self._LMB_SUSPEND_MS:
+            self._lmb_suspended = False
+            return "up"
+        return ""
+
+    def _sync_lmb(self, ev=None) -> str:
+        """Reconcile against an event snapshot unioned with the device."""
+        held = self._lmb_held(ev)
+        if held is None:
+            return ""
+        return self._apply_lmb(held)
+
+    def _poll_lmb_device(self) -> str:
+        """Reconcile against the DEVICE alone, at the end of every pump.
+
+        The pen must not depend on a MOUSEMOTION arriving to expire, or a user
+        who loses the button-up and then holds perfectly still keeps the grab
+        for ever - which is the original bug with extra steps.
+        """
+        if not (self._lmb_down or self._lmb_suspended):
+            return ""
+        held = self._lmb_held()              # device only - no event snapshot
+        if held is None:
+            return ""
+        return self._apply_lmb(held)
+
+    def _begin_lmb(self, pos) -> None:
+        """A real press is authoritative, whatever was suspected before."""
+        self._lmb_down = True
+        self._lmb_suspended = False
+        self._lmb_pos = (int(pos[0]), int(pos[1]))
+
+    def _end_lmb(self, pos=None) -> None:
+        """A real MOUSEBUTTONUP(1) outranks any suspicion."""
+        self._lmb_down = False
+        self._lmb_suspended = False
+        if pos is not None:
+            self._lmb_pos = (int(pos[0]), int(pos[1]))
+
     # --- held-key panning ------------------------------------------------
     # WASD and the arrow keys, polled rather than driven off KEYDOWN. Key repeat
     # would deliver a nudge, a ~500 ms pause and then a stutter of nudges, which
@@ -1189,9 +1334,13 @@ class Preview:
                     out["zoom"] = self.zoom_at(int(ev.y), pygame.mouse.get_pos())
                 elif ev.type == pygame.MOUSEMOTION:
                     # Right/middle drag pans; left never does - left belongs to
-                    # the tool palette now. The sync call is what stops a bare
-                    # mouse movement panning the world after a lost button-up.
+                    # the tool palette now. The sync calls are what stop a bare
+                    # mouse movement panning the world, or dragging a colonist
+                    # around, after a lost button-up.
                     self._sync_pan_buttons(ev)
+                    self._lmb_pos = (int(ev.pos[0]), int(ev.pos[1]))
+                    if self._sync_lmb(ev) == "up":
+                        out["pointer"].append(self._pointer("up", 1, ev.pos))
                     if self._pan_from is not None and (
                             self._panning or self._pan_suspended):
                         dx = ev.pos[0] - self._pan_from[0]
@@ -1222,11 +1371,22 @@ class Preview:
                         # reported down again the drag resumes from where the
                         # pointer actually is, rather than spending the whole
                         # suspended stretch as one teleport on its first event.
-                    out["pointer"].append(self._pointer("move", 0, ev.pos))
+                    if not self._lmb_suspended:
+                        out["pointer"].append(self._pointer("move", 0, ev.pos))
+                    # else: the left gesture is SUSPENDED - the reports say the
+                    # button is up, so nothing here may move a held entity. If
+                    # the button really is still down the pen restores it within
+                    # a few motions and the entity resumes from under the
+                    # cursor; if it really is up, it is set down where it froze
+                    # rather than 400 px further on. A move dropped here costs
+                    # nothing else: ToolController's "move" branch drives
+                    # interact.move_held and nothing besides, and the toolbar
+                    # hover reads pygame.mouse.get_pos() directly.
                 elif ev.type == pygame.MOUSEBUTTONUP:
                     if ev.button in (2, 3):
                         self._release_pan_button(ev.button)
                     if ev.button == 1:
+                        self._end_lmb(ev.pos)
                         out["pointer"].append(self._pointer("up", 1, ev.pos))
                 elif ev.type == pygame.MOUSEBUTTONDOWN:
                     if ev.button in (2, 3):
@@ -1235,6 +1395,7 @@ class Preview:
                         if self._begin_pan(ev):
                             out["fullscreen"] = self.toggle_fullscreen()
                     elif ev.button == 1:
+                        self._begin_lmb(ev.pos)
                         out["pointer"].append(self._pointer("down", 1, ev.pos))
         except Exception as exc:
             log.debug("preview: event pump failed: %s", exc)
@@ -1278,6 +1439,15 @@ class Preview:
         # a motion event, which is the other half of item 2: a burst of lying
         # zero-button motions followed by the user simply holding still used to
         # need a 1-px twitch before the drag came back.
+        # --- and the same reconcile for button 1 -------------------------
+        # Runs every pump, whether or not the mouse moved, so a lost button-up
+        # is noticed and the pen expires on the clock rather than on the next
+        # motion event. The synthesised release is appended AFTER the loop on
+        # purpose: it must be the last pointer event of the pump, or a "move"
+        # queued behind it would arrive at a ToolController that has already
+        # dropped the grab and mean nothing.
+        if self._poll_lmb_device() == "up":
+            out["pointer"].append(self._pointer("up", 1, self._lmb_pos))
         if self._poll_pan_device():
             pan_hold = True
         if pan_hold and abs(out["pan_residual"]) < self._PAN_HOLD_MAX:

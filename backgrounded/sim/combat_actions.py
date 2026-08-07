@@ -123,9 +123,18 @@ write this file):
   :func:`make_combat_action` for any kind absent from ``_MAKERS``.
   :func:`install_makers` still splices all six in for a caller that would rather
   be explicit.
-* ``behavior.emergency_override`` should return True when an animal is inside
-  ``FLEE_RADIUS``, or an agent will finish chopping its tree while a wolf eats
-  it. :func:`under_attack` is the predicate to use.
+* ``behavior.emergency_override`` returns True when an animal is inside
+  ``FLEE_RADIUS``, or an agent finishes chopping its tree while a wolf eats it.
+  :func:`under_attack` is the predicate it calls. This was the one piece of the
+  wiring that stayed a *should* for several releases, and while it did, every
+  number in the table above was unreachable for anyone already holding a job:
+  of 424 agent-seconds where an armed colonist scored FightAnimal above
+  ``behavior.OVERRIDE_FLOOR``, 77.6% were locked inside an unfinished
+  non-combat action and 0.9% were free to switch. Now wired, and measured -
+  32 same-seed pairs put mauling deaths down a third (15.60 -> 10.16 per 1000
+  colonist-minutes, 17 seeds down against 4) with fall deaths unmoved, which
+  was the trade that had to be ruled out. The table lives in
+  ``behavior.emergency_override``.
 """
 from __future__ import annotations
 
@@ -161,6 +170,8 @@ from .actions import (
     chronicle,
     colony_center,
     emit_speech,
+    hermit_stash_qty,
+    is_hermit,
     make_action,
     nearest_structure,
     step_toward,
@@ -1067,9 +1078,28 @@ def _clear_target(agent: Any) -> None:
         pass
 
 
-def _can_afford(world: Any, cost: dict[str, int]) -> bool:
+def _can_afford(world: Any, cost: dict[str, int], agent: Any = None) -> bool:
+    """Can *agent* pay this bill out of the store they actually draw on?
+
+    WHOSE STORE, and the answer stopped being "the colony's" the moment
+    `actions.stock_take` grew its till gate. A hermit's `_pay` is billed to his
+    own camp stash, so asking the colony's stockpile here would let
+    `score_combat` promise a craft the workbench cannot deliver: he scores
+    CraftSpear at 0.87 off the village's woodpile, walks the whole standoff,
+    `_pay` finds his stash empty, the action fails, and the score is still 0.87
+    on the next tick. That is a hermit pacing to the workbench and back for the
+    rest of the run. The standing rule for every score in `_hermit_bias` is that
+    the score and the handler must ask the SAME question; this is that rule
+    reaching across into combat.
+
+    `agent=None` keeps the colony's answer, so every caller that has not got an
+    agent in hand - and every colonist who is not a hermit - draws exactly what
+    it drew before.
+    """
     try:
-        return all(stock_qty(world, str(res)) >= int(qty)
+        qty_of = (hermit_stash_qty if (agent is not None and is_hermit(agent))
+                  else stock_qty)
+        return all(qty_of(world, str(res)) >= int(qty)
                    for res, qty in cost.items())
     except Exception:
         return False
@@ -1138,7 +1168,18 @@ def _craft_apply(kind: str, agent: Any) -> None:
 
 def _pay(world: Any, a: Action, cost: dict[str, int]) -> bool:
     """Spend `cost` atomically. Records the bill on the action so an abandoned
-    craft refunds instead of quietly eating the colony's wood."""
+    craft refunds instead of quietly eating the colony's wood.
+
+    WHOSE WOOD IS DECIDED AT THE TILL, NOT HERE, and that is why this function
+    is unchanged apart from these five lines. It contains no literal
+    ``stock_take(`` at the call sites people grep for - it is two calls into
+    `actions` - which is exactly how the hermit's largest leak survived a static
+    scan and had to be found by runtime attribution instead: `_h_craft` was
+    buying his spear and his armour with the village's wood, stone, hide and
+    fibre on all five measured seeds. `actions.stock_take`/`stock_add` now bill
+    whichever agent's handler is running, so a hermit at the bench pays out of
+    his own camp stash and an interrupted craft refunds back into it.
+    """
     taken: dict[str, int] = {}
     for res, qty in cost.items():
         want = int(qty)
@@ -1198,7 +1239,7 @@ def _h_craft(a: Action, ag: Any, w: Any, dt: float) -> None:
         if _craft_satisfied(a.kind, ag):
             a.done = True
             return
-        if not _can_afford(w, cost):
+        if not _can_afford(w, cost, ag):
             a.failed = True
             return
         a.phase = "approach"
@@ -3073,10 +3114,10 @@ def score_combat(agent: Any, world: Any) -> dict[str, float]:
             # armed` for everybody who has never held a relic, so a colony
             # without one draws exactly the same random numbers as before.
             if not _craft_satisfied("CraftSpear", agent) \
-                    and (_can_afford(world, SPEAR_COST)
+                    and (_can_afford(world, SPEAR_COST, agent)
                          or _paid_up(agent, "CraftSpear")):
                 out["CraftSpear"] = _clamp01(0.55 + 0.32 * fresh)
-            if not armoured and (_can_afford(world, ARMOUR_COST)
+            if not armoured and (_can_afford(world, ARMOUR_COST, agent)
                                  or _paid_up(agent, "CraftArmour")):
                 out["CraftArmour"] = _clamp01(0.50 + 0.25 * fresh)
     except Exception:
@@ -3154,12 +3195,12 @@ def make_combat_action(kind: str, agent: Any, world: Any) -> Action | None:
 
         if kind == "CraftSpear":
             if _craft_satisfied("CraftSpear", agent) \
-                    or not _can_afford(world, SPEAR_COST):
+                    or not _can_afford(world, SPEAR_COST, agent):
                 return None
             return make_action("CraftSpear", pose="walk")
 
         if kind == "CraftArmour":
-            if _armoured(agent) or not _can_afford(world, ARMOUR_COST):
+            if _armoured(agent) or not _can_afford(world, ARMOUR_COST, agent):
                 return None
             return make_action("CraftArmour", pose="walk")
     except Exception:

@@ -1608,9 +1608,21 @@ class Renderer:
         ``_rate`` carries the leftover fraction between frames rather than
         rounding it away, which is what makes a 60/s emitter still emit at 240
         fps (0.25 of a particle a frame, one every fourth) instead of truncating
-        to nothing - the failure mode ``rain`` still has and is left with,
-        because it is already dt-driven and changing what light rain looks like
-        is not this change's business.
+        to nothing.
+
+        ``rain`` was the one emitter left out of that when the rest moved over,
+        on the grounds that it was already dt-driven and that changing the look
+        of light rain was not that change's business. It was: being dt-driven is
+        not enough on its own, and the truncation made LIGHT RAIN INVISIBLE.
+        ``int(90 * ev.rain * step)`` at 60 fps is ``int(1.5 * ev.rain)``, which
+        is zero for every ``ev.rain`` below 0.67 - so two thirds of the rain
+        range emitted not one drop, forever, while the sky darkened and the
+        ground got wet around it. Below 0.014 it was empty even on the 4 Hz
+        wallpaper path. With the carry it emits at 90/s at any framerate and any
+        intensity, and heavy rain at 60 fps gets 50% denser than it used to be
+        because 90/s is what it always asked for and 60/s is what truncation
+        gave it - the wallpaper path was already showing the honest density, so
+        this makes the preview agree with it rather than the other way round.
 
         The accumulator dict is rebuilt each frame from the keys that were
         actually used, so it holds exactly the live emitters - it cannot grow
@@ -1646,7 +1658,7 @@ class Renderer:
             if lava:
                 self._emit_lava_sparks(lava, step, rate)
             if getattr(ev, "rain", 0) > 0.01:
-                self.particles.emit("rain", int(90 * ev.rain * step),
+                self.particles.emit("rain", rate("rain", 90.0 * ev.rain),
                                     wind=ev.wind)
             if getattr(ev, "snow", 0) > 0.01:
                 self.particles.emit("snow", rate("snow", 2400.0 * ev.snow),

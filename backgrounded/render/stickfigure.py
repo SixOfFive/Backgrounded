@@ -123,6 +123,53 @@ _HEADR = 0.115
 _GIRTH_SPREAD_K = 0.70
 _GIRTH_HEAD_K = 0.60
 
+# TODO(live): belongs in constants.py
+#: Head-only size multiplier for the roles that carry a special function. This
+#: multiplies ``head_r`` and NOTHING else - the whole-figure role scaling lives
+#: in :func:`_height_of` (child 0.68, elder 0.94) and is a different knob. The
+#: warning above applies in reverse here: a head grown as hard as this would
+#: read as a toddler if the shoulders came with it, so they must not.
+#:
+#: 1.55 was picked by rendering the candidates and looking at the pixels, not by
+#: arithmetic. At AGENT_HEIGHT 26 it takes the elder's head radius from 2.81 px
+#: to 4.36 px - a 9 px disc. The sweep that chose it, all idle, all same seed:
+#:
+#:   1.30  7 px head, the outer eye lands ON the rim
+#:   1.40  8 px head, the outer eye still touches the edge
+#:   1.45  8 px head, two marks and a gap at last, but both are faint
+#:   1.55  9 px head, two marks at full ink, a lit pixel between them, and a
+#:         whole pixel of skull outside the outer one          <- chosen
+#:   1.65  9 px head, as good, one row taller
+#:   1.75 10 px head, eyes wash out again and against a 3 px torso the head has
+#:         become a lollipop
+#:
+#: Every role NOT in this table gets exactly 1.0 - a float multiply by 1.0 is
+#: exact, so an ordinary adult, a child and a lookout are pixel-for-pixel what
+#: they were before this existed.
+_ROLE_HEAD_K: dict[str, float] = {
+    ROLE_ELDER: 1.55,
+    ROLE_HERMIT: 1.55,
+}
+
+# TODO(live): belongs in constants.py
+#: Eye geometry, all as fractions of the (already grown) head radius. ``UP`` is
+#: how far above the head centre the pair sits, ``FWD`` how far the pair's
+#: midpoint is biased toward the face, ``SEP`` the half-separation between the
+#: two dots along the facing axis.
+_EYE_UP = 0.20
+_EYE_FWD = 0.24
+_EYE_SEP = 0.30
+#: Eye size, as a fraction of the head radius - about 1.3 px on a stock elder.
+#: It is a SUB-PIXEL SQUARE, not a ``_disc``. aacircle cannot draw an eye at
+#: this scale at all: its documented r<1 clamp makes the smallest circle it will
+#: paint a 3 px blob, and two of those 3 px apart merge into a solid 6 px bar
+#: across a 9 px head. That bar is what the first render of this change actually
+#: produced, which is why it was measured instead of assumed.
+_EYE_D = 0.30
+#: How dark the eyes are against the skin. Multiplies the agent's own colour, so
+#: a pale villager and a dark one both keep the same contrast ratio.
+_EYE_INK_K = 0.18
+
 #: Default silhouette colour for agents outside every light source.
 SILHOUETTE: tuple[int, int, int] = (9, 10, 14)
 
@@ -201,6 +248,38 @@ def _disc(surf: pygame.Surface, col: Sequence[int],
         _AACIRCLE(surf, col, c, max(1.0, r), width)
     else:                                             # pragma: no cover
         pygame.draw.circle(surf, col, (int(c[0]), int(c[1])), max(1, int(r)), width)
+
+
+def _dot(surf: pygame.Surface, col: Sequence[int],
+         x: float, y: float, d: float) -> None:
+    """Paint a sub-pixel square of side *d* centred on *(x, y)*, antialiased.
+
+    Exists because nothing else in this file can draw a mark this small. ``_disc``
+    clamps to aacircle's 3 px minimum, and a hard 1 px ``fill`` would have the
+    mark JUMP a whole pixel as the figure breathes - an idle head moves by
+    fractions of a pixel every frame, so a rounded dot pops between columns and
+    the face twitches. Coverage-weighted blending makes that motion continuous
+    instead, which is the same reason the limbs are aalines.
+    """
+    if d <= 0.0:
+        return
+    half = d * 0.5
+    x0, x1, y0, y1 = x - half, x + half, y - half, y + half
+    w, h = surf.get_size()
+    for py in range(max(0, int(math.floor(y0))), min(h, int(math.ceil(y1)))):
+        cy = min(y1, py + 1.0) - max(y0, float(py))
+        if cy <= 0.0:
+            continue
+        for px in range(max(0, int(math.floor(x0))), min(w, int(math.ceil(x1)))):
+            cx = min(x1, px + 1.0) - max(x0, float(px))
+            if cx <= 0.0:
+                continue
+            a = cx * cy
+            old = surf.get_at((px, py))
+            surf.set_at((px, py), (
+                int(old[0] + (col[0] - old[0]) * a),
+                int(old[1] + (col[1] - old[1]) * a),
+                int(old[2] + (col[2] - old[2]) * a)))
 
 
 # ------------------------------------------------------------------- pose --
@@ -623,7 +702,15 @@ def _solve(s: Stickman, p: _Pose, h: float, name: str,
     l_thigh, l_shin = h * _THIGH, h * _SHIN
     l_torso = h * _TORSO
     l_ua, l_fa = h * _UARM, h * _FARM
-    head_r = h * _HEADR * head_g
+    # The special roles get a bigger head and nothing else bigger. It lands here
+    # rather than in _height_of because that scales the WHOLE figure, and an
+    # elder scaled up entire is just a taller man - the read we want is a head
+    # that has outgrown the body. Everything downstream keys off head_r and so
+    # follows for free: the neck gap opens to keep daylight under the skull, the
+    # prone drop (lie_dy) deepens so the head still rests on the ground, and the
+    # speech bubble stands further off the face.
+    head_r = h * _HEADR * head_g * _ROLE_HEAD_K.get(
+        str(getattr(s, "role", "")), 1.0)
 
     sin, cos = math.sin, math.cos
     hip = (0.0, -hip_h)
@@ -681,38 +768,28 @@ def _solve(s: Stickman, p: _Pose, h: float, name: str,
 
 
 # -------------------------------------------------------------- worn gear --
-#: Poses that plant the hands or lay the body flat, where a held spear ends up
-#: buried. ``creatures._draw_spear`` aims the shaft down the elbow->hand vector,
-#: which is what makes it obey every pose for free, but it is 0.98 body-heights
-#: long and nothing clamps it at the ground.
-#:
-#: Measured by rendering, not by modelling the geometry: an armed agent and an
-#: unarmed one drawn into the same surface for 240 samples of each pose, and the
-#: gear-only pixels below the lowest foot counted. Worst sample per pose:
-#:
-#:   cartwheel 73   handstand 63   split 43   sleep 40   dead 38
-#:   idle      22   walk       4   fall   0
-#:
-#: A geometry sweep is the obvious way to measure this and it disagreed with the
-#: render on exactly one pose, so the pixels win. ``split`` is the pose in
-#: question: it looks upright and was first grouped with idle and walk, but the
-#: hands go to the floor beside the hips and it buries MORE than ``sleep`` or
-#: ``dead``, both of which were never in doubt. ``fall`` is deliberately absent
-#: despite being airborne - a falling body has its arms up and the shaft never
-#: reaches the feet at all.
-#:
-#: ``idle`` at 22 px is the one real case left, and it is not fixable from here:
-#: gating it would mean nobody ever visibly carries a spear while standing
-#: still. It wants a ground clamp inside ``creatures._draw_spear``, which is a
-#: look decision (a clamped spear becomes a stub; carrying it butt-down like a
-#: staff is the other answer) rather than a bug to quietly pick a side on.
-#:
-#: The jerkin stays on in every case: it is worn, it follows the torso through
-#: any rotation, and dropping the whole call here would strip armour off every
-#: sleeper whether or not they ever owned a spear.
-_SPEAR_GROUNDED: frozenset[str] = frozenset({
-    "cartwheel", "handstand", "flip", "backflip", "sleep", "dead", "split",
-})
+# Whether a held spear ends up buried is asked of the SKELETON, by
+# ``creatures.spear_grounded``, and is no longer a list of pose names kept here.
+#
+# The list is worth recording because of how it failed. It was honestly measured
+# - an armed agent and an unarmed one drawn into the same surface for 240
+# samples of each pose, gear-only pixels below the lowest foot counted, worst
+# sample per pose - and it named cartwheel, handstand, flip, backflip, sleep,
+# dead and split. What a measurement of the poses that existed cannot do is
+# cover a pose that does not exist yet, and it already did not: ``mourn``
+# kneels, buries 29 px in the same harness, and was never on the list. Any new
+# pose that plants the hands or lies the body down would have joined it, silently
+# and forever, because nothing fails when the list is incomplete - it just draws
+# a spear tip on the hillside.
+#
+# ``creatures.spear_span`` now clamps both ends of the shaft at the lowest foot,
+# so the burial is fixed for EVERY pose rather than suppressed for seven of
+# them, and the only thing left to decide is when the surviving stub is too
+# short to read as a weapon. That is a length, and a length can be asked.
+#
+# The jerkin stays on in every case: it is worn, it follows the torso through
+# any rotation, and dropping the whole call here would strip armour off every
+# sleeper whether or not they ever owned a spear.
 
 
 @dataclass(slots=True, frozen=True)
@@ -869,7 +946,34 @@ def _draw(surf: pygame.Surface, s: Stickman, t: float,
     _line(surf, base, sk.shoulder, sk.elbows[0], w)
     _line(surf, base, sk.elbows[0], sk.hands[0], w)
 
+    # The hermit's staff passes BEHIND his head, and that is a measurement, not
+    # a taste call. Its upper segment runs from the front hand to a point above
+    # the skull, and in the idle pose - the one he holds most of the time - that
+    # line passes 0.39 px from where his front eye goes, with a 2 px shaft. Drawn
+    # after the head, as it used to be, it painted the eye out completely: the
+    # ink-diff for a hermit idle showed one eye instead of two. The old 3 px head
+    # was small enough to sit inside the gap; a 4.6 px one is not.
+    #
+    # Behind the head costs about nine pixels of a thirty-plus pixel shaft and
+    # costs the tell nothing, because the tell is the part that stands ABOVE
+    # him. In front of the head cost him an eye in idle, build, panic and dance.
+    #
+    # ONE MEASURED SIDE EFFECT, recorded rather than hidden. Moving the call up
+    # here also puts the staff behind the gear and the carried icon, which used
+    # to sit under it. For an unarmed hermit that changes nothing at all - the
+    # old and new orders were compared over twelve poses and both facings and
+    # differ ONLY inside the head disc. For a hermit who has picked up a spear
+    # and a jerkin the two shafts swap depth (12-68 px across those poses): the
+    # spear in his fist now crosses in front of the staff in his hand, which is
+    # the right way round anyway, and is the same rule the comment below states
+    # for everything else held in the front hand.
+    staff = (str(getattr(s, "role", "")) == ROLE_HERMIT
+             and getattr(s, "alive", True))
+    if staff:
+        _draw_staff(surf, s, sk, base, silhouette)
+
     _disc(surf, base, sk.head, sk.head_r)
+    _draw_eyes(surf, s, sk, base, silhouette)
 
     # Worn gear goes between the body and whatever is in the hand. The jerkin
     # has to land after the torso line to read as covering the chest rather
@@ -888,7 +992,7 @@ def _draw(surf: pygame.Surface, s: Stickman, t: float,
         from . import creatures as _c        # local: see _creatures above
         _creatures = _c
     gear_of: Any = s
-    if sk.pose in _SPEAR_GROUNDED and getattr(s, "weapon", None):
+    if getattr(s, "weapon", None) and _creatures.spear_grounded(sk):
         # Held things go down; worn things stay on. Only the BFG is filtered out
         # of the relic slot - see _Disarmed for the measured reason it has to be.
         rel = str(getattr(s, "relic", "") or "")
@@ -905,15 +1009,68 @@ def _draw(surf: pygame.Surface, s: Stickman, t: float,
     # or, for the elder, a candle, so at night the settlement is a cluster of
     # little fires and the hermit is a dark shape a long way off with a stick
     # taller than he is. By day the staff carries it on its own.
-    if str(getattr(s, "role", "")) == ROLE_HERMIT and getattr(s, "alive", True):
-        _draw_staff(surf, s, sk, base, silhouette)
-    elif getattr(s, "holds_candle", False) and getattr(s, "alive", True):
-        _draw_candle(surf, s, sk, t, base)
-    elif getattr(s, "holds_torch", False) and getattr(s, "alive", True):
-        _draw_torch(surf, s, sk, t, base)
+    #
+    # ``staff`` was drawn above, before the head - see there for why. It still
+    # EXCLUDES this branch, so the hermit is still the one figure in the colony
+    # with no flame on him.
+    if not staff and getattr(s, "alive", True):
+        if getattr(s, "holds_candle", False):
+            _draw_candle(surf, s, sk, t, base)
+        elif getattr(s, "holds_torch", False):
+            _draw_torch(surf, s, sk, t, base)
     speech = getattr(s, "speech", None)
     if isinstance(speech, str) and speech and getattr(s, "alive", True):
         _draw_bubble(surf, sk, speech, silhouette)
+
+
+# -------------------------------------------------------------------- eyes --
+def _draw_eyes(surf: pygame.Surface, s: Stickman, sk: Skeleton,
+               base: Sequence[int], silhouette: bool) -> None:
+    """Two dots on the roles whose heads are big enough to hold them.
+
+    Gated on the SAME table that grew the head, deliberately. Two eyes do not
+    fit on an ordinary 6 px head, so the eyes and the bigger head are one change
+    and not two: give every stickman eyes and you have to grow every head, which
+    changes the silhouette of the whole game.
+
+    Orientation is taken from the skeleton, not from ``facing`` alone. "Up" is
+    the neck->head vector, which is already mirrored, rotated and laid down by
+    ``_solve``; "forward" is that turned a quarter turn toward the facing side.
+    A corpse rotated flat therefore gets eyes on the side of its head that is
+    still the face, instead of two dots stuck on its ear.
+
+    NIGHT IS A DELIBERATE OMISSION. When an agent stands outside every light
+    source the renderer hands us ``alpha_color`` and the whole figure collapses
+    to one flat SILHOUETTE; eyes are drawn by being darker than the skin, and
+    there is nothing darker than that colour to be. Rather than let them alias
+    into a smudge, they are simply not drawn - you cannot see someone's eyes
+    across a dark valley, and the figure still reads as an elder because the
+    head kept its size. A lit agent at night keeps them: the scene light
+    multiplies eye and skin by the same term, so the contrast ratio survives.
+    """
+    if silhouette:
+        return
+    if str(getattr(s, "role", "")) not in _ROLE_HEAD_K:
+        return
+    hx, hy = sk.head
+    nx, ny = sk.neck
+    ux, uy = hx - nx, hy - ny
+    m = math.hypot(ux, uy)
+    if m < 1e-6:                    # degenerate neck; fall back to screen-up
+        ux, uy = 0.0, -1.0
+    else:
+        ux, uy = ux / m, uy / m
+    # quarter turn, signed by facing: upright (0,-1) -> (facing, 0)
+    fwx, fwy = -uy * sk.facing, ux * sk.facing
+
+    r = sk.head_r
+    cx = hx + ux * r * _EYE_UP + fwx * r * _EYE_FWD
+    cy = hy + uy * r * _EYE_UP + fwy * r * _EYE_FWD
+    ink = _dim(base, _EYE_INK_K)
+    d = r * _EYE_D
+    for k in (-1.0, 1.0):
+        _dot(surf, ink, cx + fwx * r * _EYE_SEP * k,
+             cy + fwy * r * _EYE_SEP * k, d)
 
 
 # ------------------------------------------------------------ held items --

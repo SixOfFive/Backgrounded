@@ -1303,13 +1303,56 @@ def _draw_armour(surf: pygame.Surface, sk: Any, flat: Color | None, fade: float)
         _line(surf, rim, at(0.84, w_sh, +1.0), at(0.84, w_sh, -1.0), 1)
 
 
-def _draw_spear(surf: pygame.Surface, sk: Any, flat: Color | None, fade: float) -> None:
-    """A shaft through the fist, aligned with the forearm.
+#: How much of the full shaft has to survive the ground clamp for the spear to
+#: still read as a weapon rather than as a floating arrowhead.
+#:
+#: Not a taste knob: the knapped head is 0.16 body-heights long, so a shaft that
+#: reads as "haft plus point" rather than as "point" needs at least twice that,
+#: 0.32h, and the full shaft is 0.98h - which is 0.327 of it. Rounded to 0.34.
+#: Below it the stub is shorter than two heads and there is nothing left to see.
+# TODO(backlog): belongs in constants.py
+_SPEAR_MIN_VISIBLE: float = 0.34
 
-    Taking the angle from the elbow->hand vector is what makes the spear obey
-    every pose for free: it hangs like a staff when idle, swings overhead on a
-    chop, and points at whatever the agent is stabbing during a fight, without
-    the poser knowing spears exist.
+#: How far ABOVE the foot line the clamp actually stops, in px. A geometric
+#: clamp puts the tip exactly on the ground line and then the STROKE straddles
+#: it: the shaft is 2 px wide and the knapped head is 1.5 px off the axis either
+#: way, so a near-horizontal shaft ending on the line still painted a 19 px
+#: smear of dirt-coloured spear below it (ink-diff, ``flip``). This is half a
+#: stroke plus the head's half-width, and it is why the measured floor is 0 and
+#: not "a couple of pixels". At 26 px tall the shift is invisible.
+# TODO(backlog): belongs in constants.py
+_SPEAR_GROUND_PAD: float = 2.6
+
+
+def spear_span(sk: Any) -> tuple[tuple[float, float], tuple[float, float], float]:
+    """Butt, tip and the surviving fraction of a held spear, CLAMPED AT THE DIRT.
+
+    The shaft is aimed down the elbow->hand vector, which is what makes it obey
+    every pose for free - it hangs like a staff when idle, swings overhead on a
+    chop, points at whatever is being stabbed - but it is 0.98 body-heights long
+    and the renderer draws agents at step 7 and terrain at step 4. So anything
+    the shaft pushes below the ground paints *over* the dirt: a spear tip
+    floating on the hillside in front of a standing man. Measured by ink-diff
+    (an armed and an unarmed agent into the same surface, gear-only pixels below
+    the lowest foot counted), the worst sample was 121 px on ``handstand`` and
+    28 px on plain ``idle``.
+
+    The ground line is the lowest foot, which is the only ground reference a
+    skeleton carries - and the right one, because it is where this figure is
+    standing rather than where the terrain is somewhere else.
+
+    Both ends clamp, independently: the tip when it points down and the butt
+    when the shaft is inverted and the *butt* is the low end. What is returned
+    is the surviving length as a fraction of the full shaft, which is what makes
+    :func:`spear_grounded` a derived test instead of a list of pose names that
+    rots the moment somebody adds a pose that plants the hands.
+
+    A fist at or below the ground line (a handstand, a corpse lying on its face)
+    has no direction left in which the shaft stays above the dirt, so the
+    fraction is 0.0 and the caller is expected to drop the weapon entirely.
+
+    Never raises; a skeleton with no feet is treated as having no ground at all
+    and comes back unclamped, which is the right answer for a contact sheet.
     """
     hx, hy = sk.front_hand
     ex, ey = (sk.elbows[0] if getattr(sk, "elbows", None) else (hx, hy + 1.0))
@@ -1321,8 +1364,59 @@ def _draw_spear(surf: pygame.Surface, sk: Any, flat: Color | None, fade: float) 
 
     h = float(getattr(sk, "height", 26.0))
     ln = h * 0.98
-    butt = (hx - ux * ln * 0.26, hy - uy * ln * 0.26)
-    tip = (hx + ux * ln * 0.72, hy + uy * ln * 0.72)
+    fwd, back = ln * 0.72, ln * 0.26
+    feet = getattr(sk, "feet", None)
+    gy = (max(p[1] for p in feet) - _SPEAR_GROUND_PAD) if feet else float("inf")
+    if hy >= gy:
+        # The fist itself is in the dirt. Any length in either direction is
+        # buried, so there is nothing to clamp to - report a zero-length span
+        # at the hand and let the caller decide (it drops the spear). This test
+        # carries the pad too, which is what keeps the 2 px GRIP - centred on
+        # the fist, so no endpoint clamp can move it - out of the ground.
+        return (hx, hy), (hx, hy), 0.0
+    if uy > 1e-3:
+        fwd = min(fwd, (gy - hy) / uy)
+    elif uy < -1e-3:
+        back = min(back, (gy - hy) / -uy)
+    butt = (hx - ux * back, hy - uy * back)
+    tip = (hx + ux * fwd, hy + uy * fwd)
+    return butt, tip, (fwd + back) / ln if ln > 1e-6 else 0.0
+
+
+def spear_grounded(sk: Any) -> bool:
+    """True when a held spear would be too buried to be worth drawing.
+
+    Replaces ``stickfigure._SPEAR_GROUNDED``, which was a static list of pose
+    names and therefore already wrong: it named the five acrobatic and lying
+    poses somebody thought of, and ``mourn`` - which kneels, and buries 29 px -
+    was never on it. This asks the geometry instead, so a pose invented next
+    year is covered on the frame it first draws.
+    """
+    try:
+        return spear_span(sk)[2] < _SPEAR_MIN_VISIBLE
+    except Exception:
+        return False
+
+
+def _draw_spear(surf: pygame.Surface, sk: Any, flat: Color | None, fade: float) -> None:
+    """A shaft through the fist, aligned with the forearm and clamped at the dirt.
+
+    Geometry is :func:`spear_span`; this only paints it. A clamped spear becomes
+    a stub, which is the price of the other half of the read: the hermit's
+    walking staff is a vertical line planted at his feet and rising past his
+    head, and it is his silhouette marker. Flipping every idle spear butt-down
+    (the other way to keep it out of the ground) would hand that exact
+    silhouette to every armed colonist and destroy the tell.
+    """
+    butt, tip, frac = spear_span(sk)
+    if frac < _SPEAR_MIN_VISIBLE:
+        return
+    hx, hy = sk.front_hand
+    d = math.hypot(tip[0] - butt[0], tip[1] - butt[1])
+    if d < 1e-6:
+        return
+    ux, uy = (tip[0] - butt[0]) / d, (tip[1] - butt[1]) / d
+    h = float(getattr(sk, "height", 26.0))
 
     shaft = flat if flat is not None else _dim(_SHAFT, fade)
     head = flat if flat is not None else _dim(_SPEAR_HEAD, fade)
@@ -1331,8 +1425,12 @@ def _draw_spear(surf: pygame.Surface, sk: Any, flat: Color | None, fade: float) 
     _line(surf, shaft, butt, tip, 2 if h >= 22.0 else 1)
     # Knapped head: a small triangle rather than a blob, so the pointy end is
     # obvious even when the whole figure is 26 px tall.
+    # The head is bounded by the span, not just by the body height: a shaft the
+    # ground clamp has cut to a stub must not grow a head longer than the stub,
+    # which would put the knapped point out behind the butt.
     px, py = -uy, ux
-    base_pt = (tip[0] - ux * h * 0.16, tip[1] - uy * h * 0.16)
+    hl = min(h * 0.16, d)
+    base_pt = (tip[0] - ux * hl, tip[1] - uy * hl)
     _poly(surf, head, [
         (base_pt[0] + px * 1.5, base_pt[1] + py * 1.5),
         tip,

@@ -226,6 +226,22 @@ DOWNTIME_PEAK = 0.62
 MIN_COMMIT_SEC = 7.0
 TIEBREAK = 0.03             # random jitter so identical scores do not lock step
 OVERRIDE_FLOOR = 0.95       # scores at or above this ignore hysteresis
+
+#: Let an animal interrupt an in-flight job. See :func:`emergency_override`,
+#: which carries the paired A/B this was turned on by. Module-level rather than
+#: inlined so a measurement harness can set it in one process and the paired arm
+#: in another, which is the only way to compare the two on one seed.
+#: TODO(backlog): belongs in constants.py
+UNDER_ATTACK_OVERRIDE = True
+#: Action kinds that already ARE the response to an animal. Re-deciding one of
+#: these every AI tick cannot improve it - ``choose_action`` returns the running
+#: machine untouched whenever the winning kind matches - but it does draw a
+#: fresh tiebreak per scored candidate on the way, which re-phases the world RNG
+#: for everyone else. Cheap to exclude, and it keeps a fight from being re-rolled
+#: 60 times while it lasts.
+_ANIMAL_BUSY_KINDS = frozenset((
+    "FightAnimal", "FleeAnimal", "ThrowSpear", "FireBfg",
+))
 DIRECTOR_PERIOD = 2.0       # seconds between director passes
 MAX_CONCURRENT_SITES = 2    # unfinished buildings the colony tolerates at once
 #: Raised 6 -> 7 with MAX_POP 10 -> 20, and it is not a taste change: growth is
@@ -1313,6 +1329,18 @@ def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
        himself, because a hermit who will not defend himself is just a slow
        death (measured at 137 s of workbench time in 75 min, which is a visit,
        not a commute).
+
+       THIS LIST IS NOT THE GATE ON GOODS, and reading it as one is what let
+       him rob the colony for a fortnight. Every key here is a SCORE, so it only
+       ever stops him CHOOSING the job - and a man promoted to hermit MID-ACTION
+       is already inside one. `_h_craft` in particular is deliberately NOT
+       zeroed (the workbench visit above), and it was the largest leak of the
+       five: it paid for his spear and his armour out of the village stores on
+       all five measured seeds. The gate on goods lives at the till instead,
+       in `actions.stock_take`/`stock_add`, which every withdrawal passes
+       through and which bills whichever agent's handler is running. See
+       `actions._TILL_ACTOR`. Nothing here needs to know about it; that is the
+       point of putting it there.
 
     2. THE TWO GATHERS THAT ARE NOT HIS. This is the correction that mattered
        most, and it was measured, not guessed. `gather` is ONE affinity feeding
@@ -2497,6 +2525,49 @@ def emergency_override(agent: Any, world: Any) -> bool:
     agent drops what it is doing. Keep the bar high: anything that returns True
     too readily reintroduces the walk-there-change-mind-walk-back shuffle this
     exists to prevent.
+
+    The animal clause and its A/B
+    -----------------------------
+    ``combat_actions.under_attack`` was written for this function and then never
+    called from it, which left ``score_combat``'s whole above-the-floor design
+    unreachable for anybody mid-job. Wiring it in re-decides an action already
+    in flight, so it re-phases the world RNG and cannot be judged on a death
+    *total*. 32 same-seed pairs, 30 sim-min each, deaths counted through the
+    ``entities.on_death`` hook and cross-checked against ``reconcile["deaths"]``
+    (0 disagreements in 64 runs), normalised per 1000 colonist-minutes lived:
+
+    ====================  ==========  ==========  =======  =========
+    cause                 off /1000   on /1000    seeds    sign p
+                                                  -/0/+
+    ====================  ==========  ==========  =======  =========
+    mauled                    15.60       10.16   17/10/4      0.007
+    fall                       6.41        4.98    6/19/6      1.000
+    lightning                 11.33        8.92    6/24/1      0.125
+    mudslide                   0.86        3.32    2/25/4      0.688
+    all causes                42.10       36.92   17/ 1/13     0.585
+    ====================  ==========  ==========  =======  =========
+
+    Read it this way. Mauling is the only cause that moves *systematically* -
+    it falls a third, on 17 seeds against 4, and the per-seed drops are small
+    and everywhere (3->1, 5->1, 4->2) rather than one seed carrying the column.
+    Every other row is one or two seeds: the lightning row is the useful
+    control, because nothing here can touch lightning and it still came out
+    6-down/1-up at p=0.125, which is the drift floor this design has. Mauling
+    sits well outside it; nothing else does.
+
+    The row that had to be checked is ``fall``. The prior change of this class
+    took fall deaths from 0 to 12 by sending rescuers across cliff faces, and a
+    mauling traded for a fall is not a win. It did not happen: falls went 30 ->
+    24 on a 6/6 seed split, i.e. unmoved.
+
+    What this does NOT claim: that fewer people die. All-causes is 197 -> 178 at
+    p=0.585 and survivors 270 -> 272. The honest statement is that the colony
+    answers animals instead of watching them, at no measured cost in any other
+    cause. Proving a total-mortality change would need far more than 32 seeds.
+
+    (Figures above drop seed 20, which flooded in the ``on`` arm and alone
+    turned 9 drownings into 40; with it kept, all-causes is 211 -> 215 and every
+    conclusion above is unchanged.)
     """
     try:
         cur = getattr(agent, "action", None)
@@ -2505,6 +2576,23 @@ def emergency_override(agent: Any, world: Any) -> bool:
         # Already responding to the emergency.
         if kind in ("FleeFrom", "Panic", "Eat", "Sleep"):
             return False
+
+        # An animal close enough to matter. This is the only override that is
+        # not about the agent's own body, and it is the one the whole combat
+        # module was written expecting: score_combat puts FightAnimal and
+        # FleeAnimal above OVERRIDE_FLOOR precisely so they can beat the
+        # hysteresis bonus, but nothing above ever re-scored a live action for
+        # an animal, so those numbers were unreachable for anyone mid-job.
+        # Measured: of 424 agent-seconds where an armed colonist scored
+        # FightAnimal above the floor, 77.6% were locked inside an unfinished
+        # non-combat action and 0.9% were free to switch.
+        if UNDER_ATTACK_OVERRIDE and kind not in _ANIMAL_BUSY_KINDS:
+            try:
+                from .combat_actions import under_attack
+                if under_attack(agent, world):
+                    return True
+            except Exception:
+                log.debug("under_attack override failed", exc_info=True)
 
         if float(getattr(agent, "panic", 0.0) or 0.0) > 0.0:
             return True
@@ -4372,10 +4460,56 @@ def _bool_runs(mask: Any) -> list[tuple[int, int]]:
 #: cannot prevent a first fall by construction - it answers a death that has
 #: already happened, and spends a colony's wood doing it.
 #:
-#: Left in place rather than deleted because the analysis and the geometry are
-#: worth keeping: making it act on the *risk* rather than on a corpse - and
-#: proving that pays for the wood - is the work that would make it earn its
-#: place. Turn this on again with that measurement in hand.
+#: THE RISK-BASED VERSION HAS NOW ALSO BEEN MEASURED, AND IT DOES NOT PAY.
+#: Attempt 2 spent its effort on the measurement instead of the implementation,
+#: and the measurement says the idea fails on arithmetic, not on plumbing. Four
+#: probes, 8 'cliffs' seeds x 30 sim-min each, falls counted through the
+#: ``entities.on_death`` hook:
+#:
+#:   1. *The geometry is right.* Stamp ``terrain.stamp_climb`` across EVERY face
+#:      this survey reports, at t=0, for free - an oracle with perfect siting,
+#:      no wood and no build time - and falls go **29 -> 2**, seven of the eight
+#:      seeds to zero. So these faces really are where people die and defeating
+#:      one really does work. That is the new fact and it is worth keeping.
+#:   2. *Delivery is not the blocker either.* With this switch ON, the colony
+#:      staked 16 crossings and FINISHED 12, and they land on the right rock:
+#:      seven of them within 31 px of a body, typically 70-240 s after staking.
+#:      Falls came out 29 -> 24, which is the same null the 40-seed A/B above
+#:      reported. Ladders get built, at the right place, reasonably fast, and it
+#:      still does not matter.
+#:   3. *There is a risk signal, and it is too weak to aim with.* Counting how
+#:      often an agent's x crosses each face's ``edge`` - the cheapest thing a
+#:      pre-emptive detector could use - ranks the faces that go on to kill
+#:      somebody above chance, but only just: the busiest face contains 2 of the
+#:      12 killer faces, the top 3 contain 5, and you need the top TEN per map
+#:      to contain all 12.
+#:   4. *And here is the arithmetic that ends it.* 228 faces surveyed over the 8
+#:      maps - 18 to 40 per map, not the 9.6 recorded above, because the world is
+#:      now 6400 px wide - of which **12 (5.3%) ever killed anyone**. A ladder
+#:      defeats exactly one face. So the oracle in (1) only works because it
+#:      fixes all 28-odd at once; any affordable subset leaves people walking
+#:      over the ones it did not fix, which is precisely what (2) measured. To
+#:      buy the oracle honestly is ~28 ladders x (8 wood + 2 fibre) = ~224 wood
+#:      and 56 fibre per map, laid one crossing at a time at 70-240 s each - more
+#:      than the entire build economy of a 30-minute run, spent on rock.
+#:
+#: Falls are ~7.3 deaths per 1000 colonist-minutes against 44 from all causes
+#: (32-seed all-styles pool), 'cliffs' is 31 of 200 seeds, and 5 of the 29 falls
+#: above were not within 40 px of ANY surveyed face. Even a perfect three-ladder
+#: detector is therefore worth a low-single-digit fraction of one percent of
+#: deaths - far under what any seed count anyone will pay for can resolve. Say
+#: so rather than measuring it again.
+#:
+#: If someone wants this to work, (1) says where to look: the win is in making
+#: the *ground* survivable wholesale - a cheaper primitive than a per-face
+#: ladder, or a fall model that self-arrests more often - not in choosing which
+#: face to build at. Choosing better is not the missing piece.
+#:
+#: Left in place rather than deleted because the geometry is the part that was
+#: right: ``_hazard_faces`` finds the rock people actually go over, which is what
+#: probe (1) leans on, and anything that attacks falls will want it. What is
+#: dead is the plan that hung off it - stake a crossing at the dangerous face -
+#: on a corpse OR on a risk score. Do not turn this on to answer falls.
 HAZARD_FACES_ENABLED = False
 
 

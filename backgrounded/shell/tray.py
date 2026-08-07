@@ -113,11 +113,23 @@ ID_SCENE_BASE = 2000
 ID_SPEED_BASE = 3000
 ID_SCALE_BASE = 4000
 
+#: Sim speed multipliers offered in the tray. The list is the whole of the
+#: menu: entries are appended, radio-checked and dispatched by INDEX off
+#: ID_SPEED_BASE, so adding a row here is all that is needed.
+#:
+#: 8x and 16x are honest offers rather than aspirations, and what makes them
+#: honest is App._advance_sim: the frame loop ticks against a wall-clock budget
+#: instead of a fixed step count, so a speed the machine cannot fully deliver
+#: comes out a little under - measurably and on purpose - rather than silently
+#: losing sim time behind a cap. 16.0 is also exactly config.SIM_SPEED_MAX, so
+#: the menu now reaches the top of the range the config has always permitted.
 SPEEDS: tuple[tuple[str, float], ...] = (
     ("0.5x", 0.5),
     ("1x", 1.0),
     ("2x", 2.0),
     ("4x", 4.0),
+    ("8x", 8.0),
+    ("16x", 16.0),
 )
 
 # Preview window size, as a multiple of the render surface. Offered as fixed

@@ -48,10 +48,37 @@ class ToolController:
                 picked = TOOLS[hit]
                 # Click the selected tool again to put it away.
                 self.tool = TOOL_NONE if picked == self.tool else picked
+                # Putting the hand away while it is still holding someone would
+                # strand them exactly as above: nothing else in this class can
+                # reach a Grab once self.tool has moved on.
+                if self.tool != TOOL_HAND:
+                    self.release_all(world)
                 return
             if wx is None:                       # clicked a letterbox bar
                 return
             if self.tool == TOOL_HAND:
+                # A press while something is ALREADY held has to let go of it
+                # first. It should not be reachable - a press follows a release
+                # - but it was, and it left a colonist frozen for the rest of
+                # the session. interact.grab marks its target held and ONLY
+                # interact.release clears that flag, while world.tick skips the
+                # physics and the behaviour tree of anything held; so
+                # overwriting self._grab dropped the only reference to the last
+                # one and stranded them mid-air, out of their own life, with
+                # nothing left that could ever put them down.
+                #
+                # The way in was the lost-button-up bug in Preview: with no
+                # release event the grab persisted, and the "it self-heals on
+                # the next click" consolation healed the CURSOR, not the person
+                # it had been carrying. Preview now reconciles button 1 against
+                # the device so that release arrives on its own, which closes
+                # the ordinary road here - but this is the last line before an
+                # entity is unreachable, and it costs one branch on a mouse
+                # press.
+                if self._grab is not None:
+                    interact.release(world, self._grab,
+                                     getattr(world, "terrain", None))
+                    self._grab = None
                 self._grab = interact.grab(world, wx, wy)
             elif self.tool != TOOL_NONE:
                 msg = interact.use_tool(world, self.tool, wx, wy)

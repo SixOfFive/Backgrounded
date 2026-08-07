@@ -53,6 +53,96 @@ WALLPAPER_FPS = 4           # desktop wallpaper push rate (I/O bound, ~200ms eac
 AUTOSAVE_SEC = 60.0
 DAY_LENGTH_SEC = 20 * 60    # one full day/night cycle in real seconds
 
+# ------------------------------------------------- pacing the sim at speed --
+# The tray offers up to 16x. Everything below is about the ONE frame-loop rule
+# that turns a requested multiplier into ticks, and it replaces a fixed cap of
+# 8 steps per frame that was silently lossy - see App._advance_sim, which is
+# the only reader of any of it.
+#
+# THE ARITHMETIC THE OLD CAP GOT WRONG. At TARGET_FPS 60 a frame is 1/60 s, so
+# 16x asks for 0.0167 * 16 = 0.267 s of sim per frame, and 0.267 / SIM_DT is
+# EXACTLY 8 ticks. The cap of 8 therefore sat precisely on the requirement with
+# no margin at all: any frame slower than 60 fps - which is every frame at 16x
+# on any machine that has to work for it - asked for more than 8 ticks, got 8,
+# and threw the rest away with nothing logged. The world simply ran slower than
+# the menu said, and the menu never admitted it.
+
+#: Wall-clock seconds of ticking one frame may spend before the loop breaks and
+#: goes back to the event pump and the present. THE responsiveness dial.
+#:
+#: The loop is single-threaded, so the frame period IS the input latency: a
+#: drag or a menu click waits for whatever the sim is doing. Frame period is
+#: budget + render, and render was measured at 7-8 ms mean (two seeds, 20
+#: sim-min warm colonies, 120 frames each).
+#:
+#: MEASURED AT 22 ms, end to end, driving the real frame loop for 6 s a seed
+#: with the 4 Hz wallpaper push running - frame period in ms, p50/p95:
+#:
+#:     1x   9.6 / 18.8      8x  16.2 / 30.4
+#:     4x  11.4 / 20.8     16x  24.9 / 47.7
+#:
+#: So at 16x the event pump still runs 20-40 times a second and a drag is
+#: answered within ~25 ms typical. The rare much longer frames (76 ms at 16x)
+#: are render-side cache rebuilds that happen at 1x too - the 1x row's own
+#: worst frame in the same run was 192 ms - so they are not this budget's
+#: doing and are not fixed by shrinking it.
+#:
+#: Doubling it would roughly double the achievable multiplier on a machine that
+#: is struggling, and roughly double the latency with it; that is the whole
+#: trade and this is where it is set.
+#:
+#: It is a wall-clock budget rather than a step count on purpose. A step count
+#: cannot know what a tick costs, and a tick costs 0.7 ms on a quiet colony and
+#: 4 ms on a busy one (measured p95), so any fixed count is either wasteful on
+#: the cheap frames or lossy on the expensive ones. 22 ms buys ~25 ticks of a
+#: quiet colony and ~5 of a storm, which is the right answer in both cases.
+SIM_TICK_BUDGET_SEC = 0.022
+
+#: Hard ceiling on ticks per frame, whatever the clock says. Not the governor -
+#: the budget is - purely a stop against a broken/coarse perf_counter reading
+#: zero elapsed forever and the loop never returning. Sized well clear of real
+#: demand: 16x needs 8 ticks a frame at 60 fps and 24 at 20 fps, so 48 is only
+#: reachable below 12 fps, by which point the budget has long since bitten.
+SIM_STEPS_MAX = 48
+
+#: Most sim-seconds of unpaid work the accumulator may carry. Past this the
+#: surplus is DISCARDED - deliberately, in one place, and countable.
+#:
+#: This is the honest replacement for what the old cap did by accident. Some
+#: dropping is unavoidable when a machine cannot deliver the requested speed;
+#: the difference is that this drop is bounded, is decided in one line, and is
+#: reported (App logs the rate), whereas the old one was invisible.
+#:
+#: 0.5 s is a catch-up budget, not a tolerance: at 16x it is 15 ticks of
+#: backlog, roughly two frames' worth of the budget above, so a single hitch -
+#: a scene change, a save, a window resize - is fully repaid on the next frame
+#: or two. Beyond half a sim-second behind, "catching up" would itself be a
+#: visible burst of double-speed motion, which is worse than admitting the loss.
+SIM_ACCUM_MAX_SEC = 0.50
+
+#: What the loop asks for while it is ALREADY BEHIND, as a fraction of the
+#: requested speed. This is the "aim slightly under" the request calls for.
+#:
+#: Applied only when the previous frame failed to drain the accumulator, which
+#: is exactly the condition "the budget stopped me". That test needs no extra
+#: state: the drain loop only exits with SIM_DT or more left over if the budget
+#: broke it. So a machine that can deliver 16x delivers 16x, and one that
+#: cannot backs off to 15.04x instead of thrashing at 100% of its budget with
+#: every hitch turning straight into discarded sim time.
+#:
+#: 0.94 is a sixteenth off. Enough that a frame has slack to repay the previous
+#: frame's shortfall (which is what stops the accumulator ratcheting up to
+#: SIM_ACCUM_MAX_SEC and shedding), small enough that the achieved multiplier
+#: the user sees is not visibly short of the one they picked.
+#:
+#: MEASURED, requested against achieved (and the frame rate it came at), two
+#: seeds x 6 s of the real loop: 1x -> 0.99x @ 58 fps, 4x -> 3.99x @ 59 fps,
+#: 8x -> 7.90x @ 53 fps, 16x -> 14.53x @ 40 fps. 16x is the only setting that
+#: lands materially under, and it lands there because this machine genuinely
+#: cannot render it - which is the outcome the request asked for, said out loud
+#: rather than hidden.
+SIM_SPEED_HEADROOM = 0.94
+
 # --------------------------------------------------------------- materials --
 MAT_GRASS = 0
 MAT_DIRT = 1
@@ -785,6 +875,32 @@ TOOL_LABELS = {
 }
 #: How close to the click a grab looks for something to pick up, in px.
 GRAB_RADIUS = 46.0
+
+#: How close to the click, in WORLD px, a "follow this stickman" pick looks -
+#: measured from the middle of his body, not from his feet (see below).
+#:
+#: NOT INVENTED: it is the figure's own worst-frame drawn half-width, read by
+#: ink-diff against the real renderer - draw the man on a transparent surface
+#: and take the columns whose alpha is non-zero, relative to the anchor the
+#: renderer blits on. That measurement is -29..+29 px worst frame (p95 -27/+20,
+#: median +/-7); the same one the hermit's standoff band is measured against,
+#: and the same one a previous pass in this project guessed at +/-12 and was
+#: 2.4x wrong about. So the rule the number expresses is exactly "you clicked
+#: on ink that belongs to him", at his widest pose.
+#:
+#: It is a RADIUS about the mid-torso (feet minus AGENT_HEIGHT/2 = 13 px up)
+#: rather than a box, because one number then covers both axes honestly: a man
+#: is ~26 px tall, so a 29 px circle centred halfway up him already contains
+#: his whole body, and the tallest morph in MORPH_TABLE (giant, 1.45 scale,
+#: clamped at MORPH_SCALE_MAX 1.6) tops out 41.6 px above his feet - 28.6 px
+#: from that centre, still inside. Anchoring at the feet instead would need a
+#: second vertical number and would make a click on somebody's head a miss.
+#:
+#: Overlaps are resolved by NEAREST CENTRE, ties by lowest id: in a crowd the
+#: man you clicked closest to is the man you meant, and the id tie-break keeps
+#: the answer stable when two people are standing in the same place - the same
+#: frame clicked twice must not pick different colonists.
+FOLLOW_PICK_RADIUS = 29.0
 #: A release faster than this (px/s) is a throw, not a placement. A hard throw
 #: can hurt: a stickman flung off a cliff still takes fall damage on landing.
 TOSS_SPEED = 240.0

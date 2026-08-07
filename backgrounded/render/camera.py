@@ -63,7 +63,7 @@ class Camera:
     for hours behind a wallpaper.
     """
 
-    __slots__ = ("x", "_manual_t", "_frac")
+    __slots__ = ("x", "_manual_t", "_frac", "_lock_id")
 
     #: How far the target has to move before the camera does. This is the
     #: single most important number in the file. The follow target is a *mean
@@ -120,6 +120,31 @@ class Camera:
     #: practice, so the floor sits two orders above the worst of that and three
     #: below the 1e-9 token pan_world actually sends.
     HOLD_EPS: float = 1e-12
+    #: Deadzone used while LOCKED ON ONE PERSON, in place of ``DEADZONE``.
+    #:
+    #: It is a different number because it is guarding against a different
+    #: thing. ``DEADZONE`` (160) exists because the auto-follow target is a
+    #: *mean over wandering agents* that is never still, so the camera would
+    #: chase its own jitter forever. A locked target is one man: his x moves
+    #: when he walks and stops when he stands, so there is no mean to jitter -
+    #: what is left to guard against is the pixel quantiser turning a tiny ease
+    #: step into 0/1/0/1 chatter on cam.x.
+    #:
+    #: So it is set exactly at that chatter threshold rather than by taste. The
+    #: ease moves ``gap * EASE * dt`` per frame; at TARGET_FPS 60 that is under
+    #: half a pixel - i.e. rounds to no movement at all - whenever
+    #: ``gap < 0.5 * 60 / EASE`` = 12.5 px. 12.0 sits just inside that, so the
+    #: deadzone only ever suppresses motion the rounding was going to discard,
+    #: and a locked man is never more than 12 px off centre while he is walking.
+    #: (At a lower frame rate the ease step is larger, so the threshold falls
+    #: and this stays conservative.)
+    #:
+    #: DEADZONE would have worked and would have looked wrong: at 160 px the
+    #: camera holds still while a colonist walks a tenth of the frame away, then
+    #: catches up in a rush, over and over - a stutter every 160/WALK_SPEED =
+    #: 4.7 s. The auto-follow target never moves in one direction long enough
+    #: for that to show; a man walking to the quarry does nothing else.
+    LOCK_DEADZONE: float = 12.0
 
     def __init__(self, x: float = 0.0) -> None:
         self.x: float = float(round(_clamp(float(x), 0.0, MAX_LEFT)))
@@ -127,6 +152,12 @@ class Camera:
         #: Sub-pixel pan the user has asked for and not yet been shown. Always
         #: in (-0.5, 0.5); see the module docstring.
         self._frac: float = 0.0
+        #: Stickman id the view is locked onto, or None for the cluster rule.
+        #: An ID and not the agent itself, deliberately: holding the object
+        #: would keep a corpse - or an abductee the roster has already dropped -
+        #: alive in the renderer, and would make "is my target still there?" a
+        #: question about python references rather than about the colony.
+        self._lock_id: int | None = None
 
     # ------------------------------------------------------ the conversion --
     def sx(self, wx: float) -> float:
@@ -150,7 +181,25 @@ class Camera:
     def follow(self, world: Any, dt: float) -> None:
         """Point the camera at the biggest cluster of people. Never raises.
 
-        Deliberately NOT ``actions.colony_center()``, which is the obvious
+        THERE ARE THREE MODES AND THIS METHOD ARBITRATES ALL OF THEM, in a
+        fixed order that is the whole of the policy:
+
+        1. **manual pan** - a WASD key or a right/middle drag armed
+           MANUAL_HOLD, and it wins outright for MANUAL_HOLD seconds. It does
+           NOT cancel a lock: looking around while following somebody is a
+           thing people do, and the lock resumes when the hold lapses. Only an
+           explicit release (``resume_follow``, i.e. 0/Home or a click on bare
+           ground) clears it.
+        2. **locked on one colonist** - :meth:`lock_to`, from a left click that
+           hit a stickman. Centres on that one agent, and releases itself the
+           moment he is no longer a living member of the roster; see
+           :meth:`_locked_agent` for why that one test covers both of the ways
+           a colonist leaves.
+        3. **auto-follow** - the cluster rule below, which is what the camera
+           has always done and what it falls back to.
+
+        The auto-follow target is deliberately NOT ``actions.colony_center()``,
+        which is the obvious
         choice and is wrong twice over:
 
         * it prefers ``structures.colony_center()``, a mean over every
@@ -188,15 +237,28 @@ class Camera:
             # added to the *next* unrelated drag.
             self._frac = 0.0
 
-            xs = self._agent_xs(world)
-            if xs:
-                centre = self._cluster_centre(xs)
-            else:
-                centre = self._fallback_centre(world)
+            centre = None
+            dead = self.DEADZONE
+            if self._lock_id is not None:
+                agent = self._locked_agent(world)
+                if agent is None:
+                    # He died, or the saucer took him. Either way there is
+                    # nothing left to point at, so hand the view back rather
+                    # than parking it over an empty hillside for ever.
+                    self._lock_id = None
+                else:
+                    centre = float(agent.x)
+                    dead = self.LOCK_DEADZONE
+            if centre is None:
+                xs = self._agent_xs(world)
+                if xs:
+                    centre = self._cluster_centre(xs)
+                else:
+                    centre = self._fallback_centre(world)
 
             target = _clamp(centre - RENDER_W * 0.5, 0.0, MAX_LEFT)
             gap = target - self.x
-            if abs(gap) < self.DEADZONE:
+            if abs(gap) < dead:
                 return                      # the whole anti-shimmer story
             if abs(gap) >= self.SNAP_DIST:
                 self.x = float(round(target))
@@ -232,6 +294,44 @@ class Camera:
             return xs
         except Exception:
             return []
+
+    def _locked_agent(self, world: Any) -> Any:
+        """The locked stickman, or None if there is no longer one. Never raises.
+
+        ONE TEST COVERS BOTH WAYS OUT, and that is the point of writing it here
+        rather than asking the app to notice. A colonist stops being followable
+        by two completely different routes:
+
+        * he **dies** - ``alive`` goes False and he stays in ``population.agents``
+          as a corpse until a grave is raised over him, so he is still findable
+          by id and must be rejected on ``alive``;
+        * he is **abducted** - ``Ufo._complete_abduction`` calls
+          ``population.remove()``, so he is gone from the roster outright and
+          ``by_id`` returns None. An abduction is not a death: no grave, no body,
+          ``stats["abducted"]`` rather than a death, and a quarter of them are
+          dropped back later. This project has already had one accounting bug
+          from exactly that distinction (see sim/ufo.py's module docstring), so
+          a camera that released on ``alive`` alone would follow a saucer's
+          empty hover point until the manual hold or a restart saved it.
+
+        Note what is deliberately NOT a release: an agent held in the UFO's beam
+        is alive and still on the roster, so the camera rides the lift with him
+        and lets go at the instant he is actually taken. Same for the Hand tool
+        carrying him around.
+        """
+        try:
+            pop = getattr(world, "population", None)
+            if pop is None:
+                return None
+            fn = getattr(pop, "by_id", None)
+            agent = fn(self._lock_id) if callable(fn) else None
+            if agent is None or not getattr(agent, "alive", False):
+                return None
+            if not math.isfinite(float(agent.x)):
+                return None
+            return agent
+        except Exception:
+            return None
 
     @staticmethod
     def _fallback_centre(world: Any) -> float:
@@ -375,21 +475,72 @@ class Camera:
             centre = self._cluster_centre(xs) if xs else self._fallback_centre(world)
             self.snap_to(centre)
             self._manual_t = 0.0
+            # ...and any lock, for a stronger reason than the hold: two of the
+            # three call sites (Start Over, world load) replace the roster
+            # wholesale, so the id we were locked to now belongs to a different
+            # person or to nobody. Keeping it would silently follow a stranger.
+            self._lock_id = None
         except Exception:
             return
 
     def resume_follow(self) -> None:
-        """Cancel a manual hold, so the next ``follow`` takes effect."""
+        """Hand the view back to the cluster rule: drop the hold AND the lock.
+
+        Both, because "give me the colony back" is one intention and a
+        half-reset is worse than none - 0/Home clearing a manual pan but
+        leaving the camera welded to one colonist would look exactly like the
+        key not working. The same call is what a click on bare ground makes.
+        """
         self._manual_t = 0.0
         self._frac = 0.0
+        self._lock_id = None
+
+    def lock_to(self, agent_id: Any) -> bool:
+        """Follow one colonist by id until told otherwise. Never raises.
+
+        Clears any manual hold, because a lock is a fresh instruction about
+        where to look and there is no earlier pan left to protect - the same
+        argument :meth:`cut_to` makes. It does *not* cut: the target is
+        somewhere the user just clicked, so it is on screen by construction and
+        an ease reads as the camera turning to him rather than as a jump.
+        Passing None (or anything that is not an int) releases instead, so a
+        caller never has to special-case a miss.
+        """
+        try:
+            if agent_id is None:
+                self._lock_id = None
+                return False
+            wanted = int(agent_id)
+        except (TypeError, ValueError):
+            self._lock_id = None
+            return False
+        self._lock_id = wanted
+        self._manual_t = 0.0
+        self._frac = 0.0
+        return True
 
     @property
     def manual(self) -> bool:
         """True while a manual pan is suppressing ``follow``."""
         return self._manual_t > 0.0
 
+    @property
+    def lock_id(self) -> int | None:
+        """Stickman id the view is locked onto, or None. Read-only on purpose.
+
+        The HUD and the window caption read this to say *who* is being followed;
+        writing it goes through :meth:`lock_to` / :meth:`resume_follow` so the
+        manual hold is always cleared with it.
+        """
+        return self._lock_id
+
+    @property
+    def locked(self) -> bool:
+        return self._lock_id is not None
+
     def __repr__(self) -> str:      # pragma: no cover - diagnostics only
-        return f"Camera(x={self.x:.0f}{', manual' if self.manual else ''})"
+        lock = f", lock={self._lock_id}" if self._lock_id is not None else ""
+        return f"Camera(x={self.x:.0f}{', manual' if self.manual else ''}{lock})"
 
 
 class _IdentityCamera(Camera):
@@ -451,6 +602,7 @@ class _IdentityCamera(Camera):
         object.__setattr__(self, "x", 0.0)
         object.__setattr__(self, "_manual_t", 0.0)
         object.__setattr__(self, "_frac", 0.0)
+        object.__setattr__(self, "_lock_id", None)
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError(
@@ -478,6 +630,14 @@ class _IdentityCamera(Camera):
     def resume_follow(self) -> None:
         return
 
+    def lock_to(self, agent_id: Any) -> bool:
+        # A silent no-op, like the other mutators: App calls this on whatever
+        # camera the renderer handed it, and an identity camera's honest answer
+        # to "follow that man" is "I did not move", not an exception on the
+        # frame path. It reports False, so a caller that echoes the lock in the
+        # HUD shows nothing rather than showing a lock that does not exist.
+        return False
+
 
 #: The no-op camera. ``IDENTITY.x`` is 0.0 and stays 0.0.
 IDENTITY: Camera = _IdentityCamera(0.0)
@@ -485,11 +645,19 @@ IDENTITY: Camera = _IdentityCamera(0.0)
 
 if __name__ == "__main__":      # pragma: no cover - smoke test
     class _A:
-        def __init__(self, x): self.x, self.alive = float(x), True
+        def __init__(self, x, aid=0):
+            self.x, self.alive, self.id = float(x), True, int(aid)
 
     class _Pop:
-        def __init__(self, xs): self._a = [_A(x) for x in xs]
-        def alive_agents(self): return list(self._a)
+        def __init__(self, xs): self._a = [_A(x, i + 1) for i, x in enumerate(xs)]
+        def alive_agents(self): return [a for a in self._a if a.alive]
+        def by_id(self, i):
+            for a in self._a:
+                if a.id == int(i):
+                    return a
+            return None
+        def remove(self, i):
+            self._a = [a for a in self._a if a.id != int(i)]
 
     class _W:
         def __init__(self, xs): self.population = _Pop(xs)
@@ -552,11 +720,84 @@ if __name__ == "__main__":      # pragma: no cover - smoke test
         eased.follow(far, 1.0 / 60.0)
     print("cut_to:", cut.x, " ten seconds of ease:", eased.x)
 
+    # --- locking on one colonist ----------------------------------------
+    # The hermit case: a settlement at 3200 and one man 900 px out. Auto-follow
+    # centres on the settlement; a lock has to abandon it and frame him.
+    def _hermit_world():
+        return _W([3150, 3180, 3200, 3220, 3250, 4100])   # id 6 is the hermit
+
+    hw = _hermit_world()
+    auto = Camera()
+    auto.cut_to(hw)
+    for _ in range(600):
+        auto.follow(hw, 1.0 / 60.0)
+    lock = Camera()
+    lock.cut_to(hw)
+    lock.lock_to(6)
+    for _ in range(600):
+        lock.follow(hw, 1.0 / 60.0)
+    print("hermit: auto centre", auto.x + RENDER_W * 0.5,
+          " locked centre", lock.x + RENDER_W * 0.5, "(want 4100)")
+
+    # ...and he must stay centred while he walks, without the 4.7 s stutter a
+    # 160 px deadzone would give a single walker.
+    worst = 0.0
+    for _ in range(int(30 * 60)):            # 30 s at WALK_SPEED
+        hw.population.by_id(6).x += 34.0 / 60.0
+        lock.follow(hw, 1.0 / 60.0)
+        worst = max(worst, abs((lock.x + RENDER_W * 0.5) - hw.population.by_id(6).x))
+    print("locked walker: worst off-centre over 30 s of walking:",
+          round(worst, 1), "px")
+
+    # RELEASE 1: he dies. The corpse stays on the roster, so `alive` is the test.
+    d = _hermit_world()
+    cd = Camera()
+    cd.cut_to(d)
+    cd.lock_to(6)
+    cd.follow(d, 1 / 60)
+    d.population.by_id(6).alive = False
+    cd.follow(d, 1 / 60)
+    print("released on death:", cd.lock_id is None)
+
+    # RELEASE 2: he is ABDUCTED. Not a death - no corpse, no `alive` flag to
+    # read, he is simply gone from the roster. Different code path, same rule.
+    u = _hermit_world()
+    cu = Camera()
+    cu.cut_to(u)
+    cu.lock_to(6)
+    cu.follow(u, 1 / 60)
+    u.population.remove(6)
+    cu.follow(u, 1 / 60)
+    print("released on abduction:", cu.lock_id is None)
+
+    # A manual pan must NOT drop the lock - it suspends it, and it comes back.
+    m = _hermit_world()
+    cm = Camera()
+    cm.cut_to(m)
+    cm.lock_to(6)
+    cm.nudge(-400.0)
+    print("lock survives a pan:", cm.lock_id == 6, "held:", cm.manual)
+    for _ in range(int(Camera.MANUAL_HOLD * 60) + 600):
+        cm.follow(m, 1.0 / 60.0)
+    print("lock resumes after the hold:", cm.x + RENDER_W * 0.5, "(want 4100)")
+
+    # ...but an explicit release does drop it, and so does a cut.
+    cm.resume_follow()
+    print("resume_follow releases:", cm.lock_id is None)
+    cc = Camera()
+    cc.lock_to(6)
+    cc.cut_to(m)
+    print("cut_to releases:", cc.lock_id is None)
+    cn = Camera()
+    cn.lock_to(None)
+    print("lock_to(None) is a release:", cn.lock_id is None)
+
     print("identity:", IDENTITY, "sx(5000) =", IDENTITY.sx(5000.0))
     IDENTITY.follow(w, 1.0)
     IDENTITY.nudge(500.0)
     IDENTITY.cut_to(far)
-    print("identity after follow+nudge+cut_to:", IDENTITY.x)
+    print("identity after follow+nudge+cut_to:", IDENTITY.x,
+          "lock_to ->", IDENTITY.lock_to(6), "locked", IDENTITY.locked)
 
     # ...and "immutable on purpose" now means it, not just that the mutating
     # methods were overridden. Both of these used to succeed silently.

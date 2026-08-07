@@ -21,6 +21,9 @@ of the world, so it must stay legible when the scene is nearly black.
 from __future__ import annotations
 
 import logging
+import re                      # also imported locally in two helpers below;
+                               # the module-level one is what their return
+                               # annotations resolve against.
 from collections import Counter
 
 import pygame
@@ -51,6 +54,26 @@ PAD = 9
 #: cost of some softness in the glyphs. The panels are rebuilt at ~6 Hz and the
 #: scaled copy is cached alongside, so this costs one smoothscale per rebuild.
 HUD_SCALE = 1.6
+
+#: Stickman id the camera is locked onto, or None. Set by App once a frame.
+#:
+#: A MODULE DIAL, exactly like HUD_SCALE above, and for the same reason: the
+#: window overlay and the wallpaper bake go through this one draw function and
+#: must agree, and the wallpaper path has no window, no pointer and no caption
+#: to carry the information any other way. If the ring were a draw_stats
+#: argument the wallpaper - which is where this app is actually watched - would
+#: be the copy that never said who was being followed.
+#:
+#: It is a plain id and not the Camera: hud.py must not learn what a camera is,
+#: and a stale id simply rings nobody. App writes it from ``camera.lock_id``;
+#: nothing here writes it. It is part of :func:`_content_key`, or the panel
+#: cache would keep serving a ring for the man you stopped following.
+FOLLOW_ID: int | None = None
+#: Colour of that ring. Deliberately cool and deliberately not the candle's
+#: amber (255, 210, 120), which rings the same dot one pixel further in: the
+#: two marks mean completely different things - "he carries the light" against
+#: "the view is on him" - and a colonist can easily be both at once.
+FOLLOW_RING = (150, 214, 255)
 
 #: slot -> (source surface, scale it was built at, scaled result). The source is
 #: held by reference deliberately: comparing by id() alone would be unsound,
@@ -600,6 +623,12 @@ def _content_key(world, show_roster: bool) -> tuple:
         tuple(sorted(_stash_of(world).items())),
         sum(1 for a in agents if _is_hermit(a)),
         show_roster,
+        # The follow ring is drawn into the cached panel, so the id it was
+        # drawn for has to be part of the fingerprint. Without this the ring
+        # would stay on the man you stopped following - and never appear on the
+        # one you started - until some unrelated change happened to invalidate
+        # the cache, which on a settled colony is up to a whole rebuild period.
+        FOLLOW_ID,
     )
 
 
@@ -1032,6 +1061,13 @@ def _build(world, show_roster: bool,
             pygame.draw.circle(panel, col, (PAD + 4, y + 5), 4)
             if getattr(a, "holds_candle", False):
                 pygame.draw.circle(panel, (255, 210, 120), (PAD + 4, y + 5), 6, 1)
+            # ...and, outside that, the camera lock. Same idiom as the candle
+            # ring one radius further out, so a candle-carrying hermit who is
+            # also being followed reads as two rings rather than as one mark
+            # that changed colour. r=8 from a centre at x=PAD+4=13 leaves 5 px
+            # of panel to its left, so nothing clips.
+            if FOLLOW_ID is not None and getattr(a, "id", None) == FOLLOW_ID:
+                pygame.draw.circle(panel, FOLLOW_RING, (PAD + 4, y + 5), 8, 1)
 
             name = str(a.name)[:11]
             name_s = _text(name, TITLE, 11, True)
@@ -1182,7 +1218,7 @@ LOG_LOSS = BAD
 LOG_GAIN = GOOD
 
 
-def _template_res(keys) -> "list[Any]":
+def _template_res(keys) -> "list[re.Pattern[str]]":
     """Regexes matching any rendered form of the named event templates.
 
     Built from ``sim.names.EVENT_TEMPLATES``, which is the actual source of
@@ -1215,7 +1251,7 @@ def _template_res(keys) -> "list[Any]":
     return out
 
 
-def _extra_res(patterns) -> "list[Any]":
+def _extra_res(patterns) -> "list[re.Pattern[str]]":
     import re
     return [re.compile(p, re.I) for p in patterns]
 
