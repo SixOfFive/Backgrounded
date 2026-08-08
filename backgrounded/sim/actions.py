@@ -30,13 +30,14 @@ from ..constants import (
     FARM_TILL_SEC,
     HERMIT_EDGE_MARGIN,
     HERMIT_FELL_REACH,
+    HERMIT_RESITE_SLACK,
     HERMIT_ROAM,
+    HERMIT_STANDOFF_FRAC,
     HERMIT_STASH_CAP,
-    HERMIT_STAKE_MAX,
-    HERMIT_STAKE_MIN,
     HERMIT_VISIT_GIFT,
     HERMIT_VISIT_MORALE_GUEST,
     HERMIT_VISIT_MORALE_HOST,
+    HERMIT_VISIT_PACE,
     HERMIT_VISIT_TIMEOUT,
     LITTER_CLUSTER_MIN,
     LITTER_CLUSTER_R,
@@ -1089,6 +1090,99 @@ def _stoke_wood(ag: Any, w: Any, want: int) -> int:
     return int(got)
 
 
+def hermit_visit_budget(world: Any) -> float:
+    """Seconds a visitor gets to reach the hermit. Never raises.
+
+    The walk, at ``distance / WALK_SPEED``, multiplied by HERMIT_VISIT_PACE for
+    the fact that nobody walks a hillside at WALK_SPEED, floored at
+    HERMIT_VISIT_TIMEOUT so a camp that happens to be close still gets the old
+    generous budget.
+
+    DERIVED BECAUSE THE DISTANCE IS NOW A FRACTION OF THE MAP. A fixed budget is
+    a distance limit wearing a clock's clothes, and once the camp moved to 3/4
+    of the available run the old 260 s stopped covering the walk: 35 visits
+    opened over 6 seeds and 1 was paid, the other 34 being men who walked
+    3000-4000 px and turned round short of the door. Deriving it means the
+    standoff can move again without this quietly switching the feature off.
+
+    Both the visitor's own approach budget (`_h_converse`) and the director's
+    watchdog (`behavior._tick_hermit_visit`) read it, so the two cannot disagree
+    about when an appointment has expired - the watchdog allows a margin on top
+    for the stay itself.
+    """
+    try:
+        d = abs(float(hermit_home(world)) - float(colony_center(world)))
+        if not math.isfinite(d):
+            d = 0.0
+    except Exception:
+        d = 0.0
+    walk = (d / float(WALK_SPEED)) * float(HERMIT_VISIT_PACE) if WALK_SPEED else 0.0
+    return max(float(HERMIT_VISIT_TIMEOUT), walk)
+
+
+def hermit_reach(world: Any, side: float | None = None) -> float:
+    """How much run there IS for a camp, in px. Never raises, never negative.
+
+    The distance from the settlement to the world edge on *side*, less
+    HERMIT_EDGE_MARGIN - the room his hut, his fire and his roam need at the
+    far wall. This is the denominator the standoff is a fraction OF, and the
+    whole reason the standoff stopped being a pixel count: the user asked for
+    "3/4 of the way across the map away from the colony", and 3/4 of 6400 px is
+    not available to a colony seated mid-map, where the furthest edge is
+    ~2900 px off. A fraction of what is actually there means the same thing on
+    every world and is achievable on all of them.
+
+    *side* ``None`` answers for the ROOMIER shoulder, which is the one a new
+    camp is staked on ("pick the side with the most room"). ``+1``/``-1`` asks
+    about that shoulder specifically, which is what the standing-hut band test
+    needs - see `behavior._ensure_hermit_hut` for why it must not be allowed to
+    switch shoulders under a hut that is already up.
+    """
+    try:
+        base = float(_hermit_base(world))
+        if not math.isfinite(base):
+            return 0.0
+    except Exception:
+        return 0.0
+    m = float(HERMIT_EDGE_MARGIN)
+    right = (float(WORLD_W) - m) - base
+    left = base - m
+    if side is None:
+        return max(0.0, right, left)
+    return max(0.0, right if float(side) >= 0.0 else left)
+
+
+def hermit_band(world: Any, side: float | None = None,
+                stake: bool = False) -> tuple[float, float]:
+    """``(lo, hi)`` - how far out the camp may be, in px. Never raises.
+
+    ``HERMIT_STANDOFF_FRAC * reach .. reach``, and the top of the band is the
+    edge rather than a second fraction because the ask was "3/4 OR MORE":
+    three quarters is a floor, not a target. Where inside the band he actually
+    lives is `behavior._camp_site`'s decision and it takes the highest safe
+    ground, which on most maps lands well past the floor.
+
+    *stake* insets the INNER wall by HERMIT_RESITE_SLACK, and only the inner
+    wall. That asymmetry is not a shortcut - see HERMIT_STANDOFF_FRAC for the
+    algebra: with the hut fixed and the settlement drifting, the hut's distance
+    and the outer wall move together px for px, so the outer wall cannot be
+    crossed by drift at all and there is nothing to reserve against there.
+
+    THE SAME BAND APPLIES TO BOTH SHOULDERS when *side* is None, and that is
+    deliberate. Deriving a cramped shoulder's band from its own small reach
+    would let the fallback rungs of `_camp_site` stake a "hermit" 200 px from a
+    colony seated near a wall - which is to say in town, the one thing the
+    standoff exists to prevent. Asking the roomier shoulder instead means the
+    cramped side simply has no columns in band, so it drops out of the search
+    rather than offering a bad answer.
+    """
+    reach = hermit_reach(world, side)
+    lo = float(HERMIT_STANDOFF_FRAC) * reach
+    if stake:
+        lo = min(lo + float(HERMIT_RESITE_SLACK), reach)
+    return lo, reach
+
+
 def hermit_home(world: Any) -> float:
     """Where the colony's hermit lives, in WORLD px. Never raises.
 
@@ -1123,10 +1217,13 @@ def hermit_home(world: Any) -> float:
     same seed in two processes would put the hermit on opposite sides of the map
     and no two-process digest comparison could ever match.
 
-    The side flips rather than clamps when the chosen shoulder runs out of map.
-    Clamping would silently pull the camp in toward the settlement near a world
-    edge - the one place the standoff matters most - and a colony founded at
-    x=200 would get a "hermit" living 200 px away, which is to say in town.
+    THE SIDE IS THE ROOMIER SHOULDER, not a coin flip, and that changed when
+    the standoff became a fraction of the run (see `hermit_band`). A seeded
+    side would put him on the cramped shoulder half the time, where three
+    quarters of the available run is three quarters of very little - a colony
+    founded at x=200 would get a "hermit" living 200 px away, which is to say
+    in town. Which side he lives on stops being cosmetic the moment the
+    distance is measured against the room, so it is measured too.
     """
     house = hermit_hut(world)
     if house is not None:
@@ -1143,18 +1240,22 @@ def hermit_home(world: Any) -> float:
         seed = 0
     h = zlib.crc32(b"hermit:" + str(seed).encode("ascii"))
     frac = ((h >> 8) & 0xFFFF) / 65535.0
-    # HERMIT_STAKE_*, not HERMIT_STANDOFF_*: the derived offset sites a camp, and
-    # a camp is staked inside the standoff band inset by HERMIT_RESITE_SLACK so
-    # that the settlement can drift under it without putting the standing hut out
-    # of band. `behavior._camp_site` searches the same corridor, and
-    # `_ensure_hermit_hut` enforces the full band with no slack.
-    dist = HERMIT_STAKE_MIN + frac * (HERMIT_STAKE_MAX - HERMIT_STAKE_MIN)
-    side = 1.0 if (h & 1) else -1.0
+    # The STAKING band, not the standing one: a camp is staked inside the band
+    # inset by HERMIT_RESITE_SLACK at the inner wall so the settlement can drift
+    # under it without putting the hut out of band. `behavior._camp_site`
+    # searches the same corridor, and `_ensure_hermit_hut` enforces the full
+    # band with no inset.
+    d_lo, d_hi = hermit_band(world, None, stake=True)
+    dist = d_lo + frac * max(0.0, d_hi - d_lo)
+    # THE SIDE IS NO LONGER THE CRC'S TO CHOOSE. It is the shoulder with the
+    # most room, because the standoff is now a fraction of that room and the
+    # seeded side would have halved it on any colony that is not dead centre.
+    # The crc keeps the one job the terrain does not do for it - where in the
+    # band a camp with no readable heightmap goes.
+    side = 1.0 if hermit_reach(world, 1.0) >= hermit_reach(world, -1.0) else -1.0
     lo = float(HERMIT_EDGE_MARGIN)
     hi = float(WORLD_W) - float(HERMIT_EDGE_MARGIN)
     home = base + side * dist
-    if not (lo <= home <= hi):
-        home = base - side * dist       # the other shoulder has the room
     if not math.isfinite(home):
         home = float(WORLD_W) * 0.5
     return _clamp(home, lo, hi)
@@ -3474,10 +3575,14 @@ def _h_converse(a: Action, ag: Any, w: Any, dt: float) -> None:
     Three things change when ``a.data["visit"]`` is set, all of them because the
     partner is 700 px away instead of 30:
 
-    * the approach budget goes from 30 s to HERMIT_VISIT_TIMEOUT. Thirty seconds
-      does not cross the standoff even on flat ground, so a visit under the
-      ordinary budget would be a man who sets off, gives up halfway and turns
-      round - which is worse than no feature at all;
+    * the approach budget goes from 30 s to `hermit_visit_budget`, which scales
+      with the walk. Thirty seconds does not cross the standoff even on flat
+      ground, so a visit under the ordinary budget would be a man who sets off,
+      gives up halfway and turns round - which is worse than no feature at all.
+      A FIXED budget turned out to be the same bug with a longer fuse: 260 s
+      covered the old 530..1060 px band and covered about 3900 px of broken
+      ground, which is inside the new one, so 34 visits in 35 ended as exactly
+      the man this bullet says must not exist. See HERMIT_VISIT_TIMEOUT;
     * the talk runs longer, because somebody who walked a quarter of a mile does
       not say hello and leave;
     * it pays out once, on contact: a chronicle line, morale for both (more for
@@ -3522,7 +3627,7 @@ def _h_converse(a: Action, ag: Any, w: Any, dt: float) -> None:
                 # and never closed looks like from his end.
                 a.data["until"] = float(a.t) + CONVERSE_TIME * 3.0
                 _arrive_at_hermit(w, ag, other)
-        elif a.t > (HERMIT_VISIT_TIMEOUT if visit else 30.0):
+        elif a.t > (hermit_visit_budget(w) if visit else 30.0):
             if visit:
                 _close_hermit_visit(w)
             a.done = True

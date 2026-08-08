@@ -65,15 +65,10 @@ from ..constants import (
     HERMIT_MIN_ADULTS,
     HERMIT_ROAM,
     HERMIT_SHELF_HALF,
-    HERMIT_STAKE_MAX,
-    HERMIT_STAKE_MIN,
-    HERMIT_STANDOFF_MAX,
-    HERMIT_STANDOFF_MIN,
     HERMIT_STOKE_BELOW,
     HERMIT_STOKE_URGE,
     HERMIT_VISIT_JITTER,
     HERMIT_VISIT_PERIOD,
-    HERMIT_VISIT_TIMEOUT,
     HERMIT_VISIT_URGE,
     HERMIT_WOODPILE,
     HERMIT_WOODPILE_URGE,
@@ -118,7 +113,6 @@ from ..constants import (
 )
 from .actions import (
     CARRY_CAP,
-    CONVERSE_TIME,
     TALK_REACH,
     Action,
     # Private and imported anyway: the one clamp to WORLD bounds every siting
@@ -142,11 +136,13 @@ from .actions import (
     colony_repairable,
     fire_for,
     hazards_of,
+    hermit_band,
     hermit_fire,
     hermit_home,
     hermit_hut,
     hermit_stash_food,
     hermit_stash_qty,
+    hermit_visit_budget,
     hermit_worksite,
     is_hermit,
     is_night,
@@ -1281,7 +1277,7 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
     # Not applied while anything dangerous is on the map. A man who keeps
     # walking toward the far edge of the world with a wolf behind him is not
     # being sociable, he is being killed by a feature, and the visit slot's own
-    # watchdog will hand the appointment back inside HERMIT_VISIT_TIMEOUT.
+    # watchdog will hand the appointment back inside `hermit_visit_budget`.
     elif danger is None and hermit_guest(world) is agent:
         s["Converse"] = HERMIT_VISIT_URGE
     return s
@@ -3080,6 +3076,13 @@ VISIT_PICKUP_GRACE = 20.0
 #: because the appointment failing is not the same event as a visit having just
 #: happened, and the full period is the spacing between VISITS.
 VISIT_RETRY = 120.0
+#: Margin the SLOT watchdog allows on top of the visitor's own approach budget,
+#: covering the stay itself (`_h_converse` gives him CONVERSE_TIME * 3 from the
+#: moment of contact) and a few seconds of slop. It exists so the watchdog is
+#: strictly the outer bound: the ordinary exits are the action's own, and this
+#: only catches an appointment with no exit at all - a guest eaten on the walk
+#: out, a host who dies while he is still coming.
+VISIT_STAY = 60.0
 
 
 def living_hermit(world: Any) -> Any | None:
@@ -3171,22 +3174,35 @@ def _camp_site(world: Any) -> float:
 
     The band stopped being a seeded pick and became a SEARCH RANGE. The ask was
     "double that distance away ... at the highest point beyond 530px", so the
-    distance is a corridor - HERMIT_STANDOFF_MIN..HERMIT_STANDOFF_MAX, 530..1060
-    px from `_hermit_base` - and which point inside it he lives on is the
-    hillside's decision. He is always at least 530 px out, never past 1060, and
-    in between he takes the summit.
+    distance is a corridor and which point inside it he lives on is the
+    hillside's decision.
 
-    THE SEARCH RUNS TWICE, over two corridors, and the reason is
-    HERMIT_RESITE_SLACK. The first pass takes HERMIT_STAKE_MIN..HERMIT_STAKE_MAX
-    (620..970), the band inset by the slack, so a new hut starts with room to
-    give at both walls and `_ensure_hermit_hut` can enforce 530..1060 strictly.
-    The second takes the WHOLE band, and it exists because the inset is not
-    free: it throws away 180 px of candidate shelf, and measured over 60 fresh
-    worlds that alone moved six seeds off a clean walk home (17 cliff-crossing
-    sites became 23). A clean route is worth more than a wide margin against
-    churn, so when nothing inside the corridor has one the search widens before
-    it settles for a face. With both passes in, cliff-crossing is back to 17 of
-    60 - the same as before the corridor narrowed.
+    THEN THE CORRIDOR STOPPED BEING PIXELS AND BECAME A FRACTION OF THE RUN.
+    "Lets send him 3/4 of the way across the map away from the colony ... 3/4 or
+    more": see `actions.hermit_band`, which is now the only place the two walls
+    are computed. The band is ``0.75 * reach .. reach``, where reach is the room
+    between the settlement and the world edge on the roomier shoulder, less
+    HERMIT_EDGE_MARGIN. NOTHING IN THIS FUNCTION'S RULE CHANGED - it is the same
+    search for the highest safe ground, over a corridor that is now 2200-5200 px
+    out instead of 530-1060 and 700-1300 px wide instead of 350. Measured over
+    60 fresh worlds: mean camp 3548 px out, 0.55 of WORLD_W, 0.86 of the
+    available reach, never below the 0.75 floor, and still standing higher than
+    82% of the columns in its own band - the same figure the narrow band gave.
+
+    THE SEARCH RUNS TWICE OVER TWO CORRIDORS AT EACH LEVEL OF THE LADDER, and
+    the reason is HERMIT_RESITE_SLACK. The odd passes take the STAKING corridor
+    (the band with its inner wall inset by the slack), so a new hut starts with
+    room to give and `_ensure_hermit_hut` can enforce the band strictly. The
+    even passes take the whole band, because the inset is not free - it throws
+    away candidate shelf, and measured on the old narrow band that alone moved
+    six seeds of sixty off a clean walk home. A clean route is worth more than a
+    wide margin against churn, so the search widens before it settles.
+
+    THE SCAN IS MEMOISED ON (seed, terrain.epoch) AND THE WIDER BAND DID NOT
+    COST ANYTHING WORTH NAMING. `_shelf_mask` was always computed over the whole
+    heightmap rather than over the band, so widening the band changed only the
+    numpy slices taken out of it: 1.01 ms cold (mask included) and 0.42 ms warm,
+    over 60 worlds, on a function that runs once per hut staked.
 
     A PEAK IS SURROUNDED BY DESCENT, WHICH IS WHY MOST OF THIS FUNCTION IS A
     SAFETY TEST. "Highest point in the band" taken literally is an instruction
@@ -3217,8 +3233,8 @@ def _camp_site(world: Any) -> float:
         still the highest that wins, so this reorders the shortlist rather than
         replacing the rule.
 
-    THE LADDER, in order, first match wins, seeded shoulder before the other one
-    inside each rung:
+    THE LADDER, in order, first match wins, roomier shoulder before the other
+    one inside each rung:
 
         1. shelf + route + timber      the ordinary answer
         2. shelf + route               a bare summit he can reach
@@ -3230,36 +3246,46 @@ def _camp_site(world: Any) -> float:
     alternative is refusing to give him a camp at all, and a hermit with no camp
     is the feature not shipping on that seed. They do NOT ignore the route, they
     minimise it - see `_pick` - and they compare the two shoulders rather than
-    taking the seeded one, because with no clean walk anywhere the two sides
+    taking the roomier one, because with no clean walk anywhere the two sides
     stop being interchangeable.
 
-    HOW OFTEN HE ENDS UP ACROSS A CLIFF FROM THE COLONY: 17 OF 60, 28%, on a
-    direct probe over 60 freshly generated worlds - rung 1 on 43, rung 3 on 16,
-    rung 5 on 1, rungs 2 and 4 never. In live runs it is 9 of 28 stakings, 32%,
-    over 16 seeds x 45 sim-min, which is the same number inside its own noise.
-    Both are worse than the 6-of-35 (17%) an earlier note recorded, and that
-    note was reading a smaller sample of the same thing.
-    It is not the 38% a later probe reported either - that figure was measured
-    against the inset corridor alone, before the widening pass above existed,
-    and 38% is exactly what this probe gives with that pass removed.
+    RUNGS 1 AND 2 ARE NOW DEAD, AND THE MEASUREMENT SAYING SO IS THE MOST
+    IMPORTANT LINE IN THIS DOCSTRING. Over 60 fresh worlds the search lands on
+    rung 3 SIXTY TIMES OUT OF SIXTY, and the cliff-crossing rate is 60/60
+    against 17/60 at the old band. That is not a regression in siting; it is the
+    route test running out of meaning. It asks whether a walk of 2242..5141 px
+    across procedural terrain contains a single column of |slope| > 2.6, and on
+    a 6400 px map the answer is always yes. At 530..1060 px it was a real
+    question with a real answer 72% of the time.
 
-    IT IS ACCEPTED RATHER THAN FIXED, and the reason is that on most of those
-    seeds there is nothing to fix. Locating the blocking face on each of them:
-    on 13 of the 17 there is a cliff in the APPROACH - between the settlement
-    and the near wall of the band - on BOTH shoulders. The colony is in a bowl.
-    `worst[]` is a running max outward from the settlement, so a face at 300 px
-    poisons every column beyond it on that side, and no camp anywhere at 530 px
-    or more can route around a wall that stands inside 530. Widening the search
-    further cannot help; the only thing that would is not putting him outside
-    the bowl, which is the whole feature. Of the remaining 4, three have one
-    clean shoulder with no walkable shelf on it and one has the face inside the
-    band itself.
+    AND THE RANKING UNDERNEATH IT WENT INERT WITH IT, which is the second half
+    of the same measurement and is reported here rather than quietly enjoyed.
+    `_pick(gentlest=True)` is supposed to minimise the worst face on the walk
+    home before it looks at height, and over 530 px it did. Over 3000 px it
+    cannot: `worst[]` is a RUNNING MAX outward from the settlement, so once the
+    band is far enough out that the biggest face on the map lies inside the
+    approach, every candidate in the band carries the same value and the
+    minimisation has nothing to choose between. Measured over 60 fresh worlds,
+    the worst face on his chosen route is a median 11.64 against 12.00 for an
+    arbitrary walk of the same length on the same map - a 3% improvement, i.e.
+    none. Do not cite the route ranking as a safety feature at this range.
 
-    WHAT IT COSTS, measured: ZERO fall deaths for the hermit on any seed,
-    against 7 among the villagers over 16 runs x 45 sim-min. The exposure is a
-    look-and-feel one and a trap waiting for a terrain event, not a body count -
-    `_pick` still minimises the worst face on those rungs, so what he crosses is
-    the gentlest face available rather than an arbitrary one.
+    WHAT DOES STILL HOLD IS THE SHELF, and it is the test that was carrying the
+    outcome all along: every column within HERMIT_SHELF_HALF walkable, 60 of 60
+    fresh worlds, and no hermit fall death on any of 8 seeds x 45 sim-min (his
+    four deaths over that sweep were two starvations and two maulings). The
+    exposure the cliff column represents is a look-and-feel one and a trap
+    waiting for a terrain event, not a body count.
+
+    BOTH TESTS ARE KEPT ANYWAY, and not out of sentiment. They cost two numpy
+    comparisons, they are what makes rungs 1-2 fire on a small map or a smoothed
+    landscape, and deleting them would delete the ordering that makes pass three
+    prefer the corridor - the fallback rungs are the only rungs left, so the
+    passes are what carry HERMIT_RESITE_SLACK now. What must NOT happen is
+    someone reading "cliff-crossing 100%" as a bug and widening the search to
+    fix it: there is nothing to find. One face at 300 px poisons every column
+    beyond it, and no camp at 2200 px or more can route around a wall standing
+    inside 2200.
 
     THE SAFETY TESTS MOVE HIM OFF THE OUTRIGHT SUMMIT ROUTINELY, and that is the
     number to watch rather than the average: the summit of a band is very often
@@ -3307,14 +3333,15 @@ def _camp_site(world: Any) -> float:
         edge_lo = float(HERMIT_EDGE_MARGIN)
         edge_hi = float(WORLD_W) - edge_lo
 
-        # The seeded shoulder first, then the other one, exactly as
-        # `hermit_home` flips sides rather than clamping when a shoulder runs
-        # out of map. Which side he lives on is cosmetic; whether he can stand
-        # on it is not.
+        # THE ROOMIER SHOULDER FIRST, then the other one. `hermit_home` now
+        # picks its side by reach rather than by crc32 (the standoff is a
+        # fraction of the room, so the side with the room is the side with the
+        # distance), and reading `first` off it keeps the two agreeing about
+        # which shoulder that is with one derivation rather than two.
         first = 1.0 if x >= base else -1.0
 
-        def _shoulders(d_lo: float, d_hi: float):
-            """Both shoulders of a corridor `d_lo`..`d_hi` px out, seeded first.
+        def _shoulders(stake: bool):
+            """Both shoulders of the standoff band, the roomier one first.
 
             Returns ``(sides, band_top)``, where each side carries its shelf
             columns, their worst face on the walk home, whether they have timber
@@ -3322,6 +3349,13 @@ def _camp_site(world: Any) -> float:
             """
             sides: list[tuple[float, Any, Any, Any, int]] = []
             band_top: int | None = None
+            # ONE BAND FOR BOTH SHOULDERS, taken from the roomier one - see
+            # `actions.hermit_band`. Giving the cramped shoulder a band derived
+            # from its own small reach would let the fallback rungs below stake
+            # him 200 px from a colony seated near a wall. Off the roomier
+            # shoulder's band the cramped side usually has no columns left in
+            # range at all, which is the correct answer rather than a bad one.
+            d_lo, d_hi = hermit_band(world, None, stake=bool(stake))
             for side in (first, -first):
                 ends = (base + side * float(d_lo), base + side * float(d_hi))
                 lo = max(min(ends), edge_lo)
@@ -3419,7 +3453,7 @@ def _camp_site(world: Any) -> float:
         # PASS ONE: the staking corridor, and only the rungs with a clean walk
         # home. This is the ordinary answer and it keeps HERMIT_RESITE_SLACK px
         # of drift in hand at both walls of the band.
-        inner, inner_top = _shoulders(HERMIT_STAKE_MIN, HERMIT_STAKE_MAX)
+        inner, inner_top = _shoulders(True)
         got = _ladder(inner, inner_top, clean, False)
         if got is not None:
             return got
@@ -3436,14 +3470,31 @@ def _camp_site(world: Any) -> float:
         # it settles for a face. The camp is still in band; it simply starts
         # nearer a wall, and may re-site sooner if the settlement drifts that
         # way. `widened` in the diagnostic is how often this fires.
-        outer, outer_top = _shoulders(HERMIT_STANDOFF_MIN, HERMIT_STANDOFF_MAX)
+        outer, outer_top = _shoulders(False)
         got = _ladder(outer, outer_top, clean, True)
         if got is not None:
             return got
 
-        # PASS THREE: no clean route anywhere in the band on either shoulder -
-        # the colony is walled in. Take the whole band for this too, since a
-        # wider search can only find a gentler face than a narrower one.
+        # PASS THREE: THE STAKING CORRIDOR AGAIN, ON THE FALLBACK RUNGS - and
+        # this pass exists because the fractional band made passes one and two
+        # dead letters. `worst[]` is a running max outward from the settlement,
+        # so the route test asks "is there no |slope| > 2.6 column anywhere
+        # between here and the village". Over the 530..1060 px the band used to
+        # be, that was a real question and it passed 43 times in 60. Over the
+        # 2242..5141 px it is now, procedural terrain has a cliff column in it
+        # essentially always: measured 60 of 60 fresh worlds, rung 3 on every
+        # one. With no pass three the search fell straight through to the full
+        # band every single time, and HERMIT_RESITE_SLACK - which is bought by
+        # staking INSIDE the corridor - was silently never applied to anything.
+        # So the corridor gets its turn on these rungs too, before the widening
+        # does. `widened` in the diagnostic now means what it says again.
+        got = _ladder(inner, inner_top, rough, False)
+        if got is not None:
+            return got
+
+        # PASS FOUR: nothing walkable inside the corridor at all. Take the whole
+        # band, since a wider search can only find a gentler face than a
+        # narrower one.
         got = _ladder(outer, outer_top, rough, True)
         if got is not None:
             return got
@@ -3467,6 +3518,53 @@ def _ensure_hermit_hut(world: Any, reg: StructureRegistry) -> None:
     hermit hauling twelve wood to a frame at the far edge of the frame is
     something to WATCH, it is the only construction in the game done by one man,
     and it is proof the role is running at all.
+
+    A SAVE WRITTEN BEFORE THE STANDOFF BECAME A FRACTION LOADS, AND THEN HE
+    MOVES, and that is stated here because it is the one user-visible
+    consequence of the change that is not in a constant. Measured end to end:
+    a seed-5 save taken with the camp at the old 620 px restores exactly - hut
+    id, hut position, built flag, his private stash, `hermit_home` still
+    returning the hut so the successor still inherits it, SAVE_VERSION 1,
+    reconcile residual 0. On the FIRST director pass after the load the band
+    test below reads 620 px against a new band of 2443..3257 and he strikes
+    camp: the old hut collapses to rubble with ``ruin_cause = "moved"``, the
+    chronicle says the village had grown away from him, `purge_ruins` sweeps it
+    after RUIN_LINGER, and he re-stakes 3205 px out and rebuilds. The stash
+    survives all of it - it is world state, not hut state - and he spends it on
+    the new frame. Nothing is lost and nothing raises; he just emigrates within
+    a quarter of a second of the save opening. That is correct rather than
+    unfortunate: a hut 620 px from the settlement is, under the rule the user
+    chose, a hut in town.
+
+    ...UNLESS THE OLD HUT SITS ON THE CRAMPED SHOULDER, and that exception is
+    real, measured, and deliberately NOT fixed. Re-probed on seed 3, whose
+    settlement sits at 5377 with 683 px of run to the right and 5037 to the
+    left, an old hut planted 530 px out on each side in turn:
+
+        left  (roomier)  530 px vs band 3778..5037  out of band, strikes at
+                                                    t=0.03 s, rebuilds 4090 px
+        right (cramped)  530 px vs band  512.. 683  IN BAND - he stays put
+
+    The right-hand row is not a bug in the band test; it is the fractional rule
+    answering honestly. 530 px of a 683 px run IS 0.78 of the way to that edge,
+    so on his own shoulder he already satisfies "three quarters or more". It
+    looks wrong only against WORLD_W, where it is 8% of the map. The reason it
+    can happen at all is that the standoff used to pick its SIDE with a crc32
+    (see `actions.hermit_home`), so a legacy save can have the hut on the
+    shoulder a fresh siting would now reject; fresh sitings always take the
+    roomier one and cannot land here.
+
+    IT IS LEFT ALONE ON PURPOSE. The obvious fix - judge a standing hut against
+    the roomier shoulder instead of its own - is exactly the churn bug the
+    comment further down refuses: a settlement drifting across the map's
+    midpoint would flip which shoulder is roomier, drop a perfectly good hut
+    below the new inner wall without it having moved, and march him the width
+    of the world to rebuild. Trading a permanent churn risk for a one-off
+    legacy-save cosmetic is a bad trade. In practice it also tends to resolve
+    itself: on that same seed 3 the colony's own drift pushed the cramped-side
+    hut out of band after 95 s and he re-staked at 4095 px unprompted. That is
+    luck rather than design, so it is stated as an observation and not relied
+    on.
 
     WHERE: `hermit_home`, which is the derived seeded offset the first time and
     the standing hut's own x every time after - so this fires once per hut,
@@ -3518,11 +3616,13 @@ def _ensure_hermit_hut(world: Any, reg: StructureRegistry) -> None:
             #
             # The give the slack was written for has not gone away, it has
             # MOVED: `_camp_site` and `hermit_home` now stake inside
-            # HERMIT_STAKE_MIN..HERMIT_STAKE_MAX, the band inset by
-            # HERMIT_RESITE_SLACK at each end, so every new hut begins with 90
-            # px of drift in hand at both walls and a colony wandering a few
-            # metres still does not cost him a hut. What it no longer does is
-            # let him end up NEARER than the distance he started at.
+            # `hermit_band(stake=True)`, the band inset by HERMIT_RESITE_SLACK
+            # at the inner wall, so every new hut begins with 90 px of drift in
+            # hand there and a colony wandering a few metres still does not cost
+            # him a hut. The outer wall needs no inset: on a fractional band it
+            # moves with the hut's own distance px for px, so drift cannot cross
+            # it. What this no longer does is let him end up NEARER than the
+            # distance he started at.
             #
             # THE NUMBERS ARE DERIVED, so read them off the constants rather
             # than off this comment; a previous version of it quoted
@@ -3531,10 +3631,25 @@ def _ensure_hermit_hut(world: Any, reg: StructureRegistry) -> None:
             if herm is None:
                 return
             try:
-                d = abs(float(standing.x) - float(_hermit_base(world)))
+                hx = float(standing.x)
+                bx = float(_hermit_base(world))
+                d = abs(hx - bx)
             except (TypeError, ValueError):
                 return
-            if HERMIT_STANDOFF_MIN <= d <= HERMIT_STANDOFF_MAX:
+            # THE HUT'S OWN SHOULDER, NOT THE ROOMIER ONE, and that distinction
+            # is a churn bug that would otherwise be invisible. `hermit_band`
+            # with side=None answers for whichever shoulder has the most room -
+            # correct when SITING a camp, wrong when judging one that is already
+            # standing, because a settlement drifting across the map's midpoint
+            # flips which shoulder that is. The band would jump to the far
+            # side's larger reach, the hut would fall below the new inner wall
+            # without having moved a pixel, and he would strike a perfectly good
+            # camp and march the width of the world to rebuild it. Asked about
+            # the shoulder he is actually on, the outer wall tracks him exactly
+            # (d - reach is invariant under drift) and the inner wall closes at
+            # a quarter of the drift rate.
+            lo, hi = hermit_band(world, 1.0 if hx >= bx else -1.0)
+            if lo <= d <= hi:
                 return
             standing.collapse("moved")
             standing.state["ruin_cause"] = "moved"
@@ -3785,8 +3900,14 @@ def _tick_hermit_visit(world: Any) -> None:
                 # the full watchdog and the hermit spends it trying to talk to
                 # somebody who left - see `_hermit_bias`.
                 stale = not _is_visiting(guest)
+            # The visitor's own budget plus the stay he is entitled to once he
+            # gets there, so the watchdog can only ever fire AFTER the walk has
+            # honestly run out - never during it. Reading a bare
+            # HERMIT_VISIT_TIMEOUT here would have closed the slot under a man
+            # who was still walking and still inside his own budget, which at
+            # the new standoff is most of the walk.
             if (guest is None or living_hermit(world) is None or stale
-                    or now - opened > HERMIT_VISIT_TIMEOUT):
+                    or now - opened > hermit_visit_budget(world) + VISIT_STAY):
                 world.hermit_visit = None
                 # A failed appointment must not cost a whole period. The clock
                 # was advanced when the slot opened, so without this line every

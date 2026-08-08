@@ -1077,8 +1077,94 @@ BARRICADE_MIN_POP = 4       # colony builds them once it is this many strong
 #:     against 91.4% at half the distance. See HERMIT_WOODPILE for the change
 #:     that bought that, and the A/B table under HERMIT_FIRE_WARD for the death
 #:     rates - including the honest news that the margin is now thin.
-HERMIT_STANDOFF_MIN = 530.0
-HERMIT_STANDOFF_MAX = 1060.0
+#:
+#: -------------------------------------------------------------------------
+#: AND THEN THE WHOLE OF THE ABOVE WAS OVERRULED, ON PURPOSE, BY THE USER.
+#: -------------------------------------------------------------------------
+#:
+#: "the hermit is actually really close to the base compared to the entire map.
+#:  Lets send him 3/4 of the way across the map away from the colony" ...
+#:  "3/4 or more".
+#:
+#: 530..1060 px is 8-17% of a 6400 px world. Every visibility number in the
+#: table above is now a DEAD LETTER and is kept only as the record of how the
+#: old band was chosen: at the distance that ships now he is off frame ~100% of
+#: the time with the colony, and that is no longer a defect, because
+#: CLICK-TO-FOLLOW shipped (left-click a stickman in watch mode;
+#: `Camera.lock_to`, FOLLOW_PICK_RADIUS). The camera can be put on him
+#: deliberately, so "the auto-follow cluster drops him" stopped being the
+#: binding constraint the moment that landed. Measured at the new range, seed 3
+#: with the camp 4084 px out: the auto-follow camera sits 4095 px from him, the
+#: lock crosses that in ONE tick on the SNAP_DIST path and lands 0.4 px off
+#: centre, and it holds to within 28 px for the next 90 s while both of them
+#: walk. It releases on his death and on his abduction. Getting the click onto
+#: him first costs 4.1 s of held pan at the shell's 992 px/s, inside the 6 s
+#: MANUAL_HOLD, so pan-then-click is one gesture rather than a race.
+#:
+#: RE-VERIFIED, because if the lock does not reach him the feature is invisible
+#: rather than distant and the whole change is a regression. Seed 3, warmed 30
+#: sim-min, hermit standing 3554 px from the settlement (0.555 of WORLD_W):
+#: the AUTO-follow camera settles with its centre 3777 px away from him and he
+#: is NOT within the 1600 px frame - confirming he is off-screen exactly as
+#: predicted, and that click-to-follow is the only way he is ever seen.
+#: `Camera.lock_to` then converges in ONE 30 fps tick to 0.0 px off centre (the
+#: SNAP_DIST path - the gap is far past 3200), and over the next 90 s of sim,
+#: with both the camera and the man moving, it never drifts more than 12.8 px
+#: off centre and the lock is still held at the end. It reaches him, and it
+#: holds him, at full range.
+#:
+#: A FIXED PIXEL DISTANCE CANNOT EXPRESS THE ASK. 4800 px (3/4 of WORLD_W) is
+#: simply not available when the colony seats mid-map - the furthest edge is
+#: ~2900 px off - so the rule is a FRACTION OF THE AVAILABLE RUN instead:
+#:
+#:     reach = (distance from the settlement to the world edge on the roomier
+#:              shoulder) - HERMIT_EDGE_MARGIN, i.e. the run that is actually
+#:              there, less the room his hut, his fire and his roam need
+#:     band  = HERMIT_STANDOFF_FRAC * reach  ..  reach
+#:
+#: "or more" is why the band runs all the way to `reach` rather than stopping
+#: at the fraction: three quarters is a FLOOR. `behavior._camp_site` keeps
+#: doing exactly what it did inside that band - the highest safe ground wins -
+#: which was an earlier explicit request and is not touched here. See
+#: `actions.hermit_band` for the one place the arithmetic lives, and
+#: `_ensure_hermit_hut` for why the standing-hut test asks the hut's OWN
+#: shoulder rather than the roomier one.
+#:
+#: WHAT IT MEASURES OUT AT. Direct probe, 60 freshly generated worlds, camp
+#: distance at the moment it is sited: mean 3613 px, 0.565 of WORLD_W, and
+#: 0.881 of the available reach - never once below the 0.75 floor, and past it
+#: on every seed, because the highest ground in a band that runs to the edge
+#: usually sits near the far end of it. Range 2431..5141 px, 0.38..0.80 of the
+#: map. Before: 530..1060 px, 0.08..0.17 of the map.
+#:
+#: LIVE, 8 seeds x 45 sim-min, the standing hut sampled every sim-second: mean
+#: 3469 px, 0.542 of WORLD_W, per-seed 2654..4090 px (0.41..0.64). Slightly
+#: nearer than the fresh-world probe because a live colony has grown a few huts
+#: outward by then and `_hermit_base` is a mean over buildings. The MAN averages
+#: 2497 px, i.e. nearer than his own front door - he is dragged into town to eat
+#: and occasionally by a wolf, and that is unchanged behaviour, not slippage.
+#:
+#: RE-MEASURED INDEPENDENTLY after the run that wrote the two paragraphs above
+#: was interrupted, because an unverified number is worth nothing. Fresh-world
+#: probe, 40 worlds (not the 60 above, so the means are not expected to be
+#: identical): mean 3493 px, 0.546 of WORLD_W, 0.852 of reach, range
+#: 2413..5063 px (0.377..0.791 of the map), and ZERO of 40 below the 0.75 floor
+#: - the floor holds. Live, 2 seeds x 45 sim-min: the standing hut sits 4090 px
+#: out on seed 3 and 3823 px on seed 7. Both fall inside the ranges above, so
+#: the interrupted run's figures are corroborated rather than merely inherited.
+#:
+#: THE FRACTION ALSO FIXED THE CHURN IT LOOKED LIKE IT WOULD CAUSE. A band
+#: whose walls move with the settlement sounds worse than fixed walls; it is
+#: four times better, and the algebra is why. With the hut at `hut` and the
+#: settlement at `base`, d = hut - base and the outer wall reach = W - margin -
+#: base, so d - reach = hut - W + margin is INVARIANT under colony drift: the
+#: outer wall can never be crossed by drift alone. The inner wall moves at
+#: 0.75x the drift while d moves at 1x, so HERMIT_RESITE_SLACK px of staking
+#: inset absorbs 4x that much colony movement. Measured on a live A/B, the same
+#: 8 seeds x 45 sim-min run twice: FOUR re-sites at the old band (1.06 per
+#: hermit-hour, three seeds affected, one of them re-sited twice) and ZERO at
+#: this one.
+HERMIT_STANDOFF_FRAC = 0.75
 #: Half-width of the level shelf a camp needs, in px. The hut sprite is 46 px
 #: wide and `_ensure_hermit_fire` puts the fire 34 px off the door, so a site
 #: has to be walkable across +/-40 px or one of the two buildings ends up on a
@@ -1112,9 +1198,12 @@ HERMIT_ROAM = 80.0
 #: it.
 #:
 #: So the give now comes out of the STAKING range instead. `_camp_site` and
-#: `hermit_home` search HERMIT_STAKE_MIN..HERMIT_STAKE_MAX (below), which is
-#: the band inset by this much at each end, and `_ensure_hermit_hut` permits
-#: exactly HERMIT_STANDOFF_MIN..HERMIT_STANDOFF_MAX with no slack at all. A new
+#: `hermit_home` search the STAKING band - on the fixed-pixel band of the day,
+#: that band inset by this much at EACH end - while `_ensure_hermit_hut` permits
+#: the full standoff band with no slack at all. (Both are `actions.hermit_band`
+#: now, `stake=True` and `stake=False`; the two pairs of module constants this
+#: paragraph used to name are gone, and see the note further down for why the
+#: fractional band insets the inner wall only.) A new
 #: hut therefore starts at least SLACK px inside both walls, the settlement may
 #: drift that far in either direction before he moves, and the standing hut is
 #: never out of band whatever the colony does. The intent the slack was written
@@ -1140,20 +1229,27 @@ HERMIT_ROAM = 80.0
 #: when the corridor has nothing clean in it, which restores that exactly (17 of
 #: 60, the same as before) at the price of ~10% of stakings starting nearer a
 #: wall with less give. See the two-pass note there.
+#:
+#: ON THE FRACTIONAL BAND THE SLACK IS SPENT AT THE INNER WALL ONLY, and it
+#: buys four times as much drift as it used to. See the algebra under
+#: HERMIT_STANDOFF_FRAC: the OUTER wall of a fractional band moves with the
+#: settlement exactly as fast as the hut's distance does, so drift can never
+#: push a standing hut past it and there is nothing to inset there. The inner
+#: wall moves at 0.75x, so 90 px of staking inset absorbs 360 px of colony
+#: movement. Measured over 8 seeds x 45 sim-min: zero re-sites, against the one
+#: per 50 minutes recorded above.
 HERMIT_RESITE_SLACK = 90.0
-#: The corridor a NEW camp may be staked in: the standoff band inset by
-#: HERMIT_RESITE_SLACK at each end, so every hut starts with that much room to
-#: give before the settlement's drift pushes it out of band. Derived rather
-#: than written down, because two numbers that must not disagree should only be
-#: written once - a previous comment in `_ensure_hermit_hut` quoted a band that
-#: matched neither the code beside it nor the constants it named.
-HERMIT_STAKE_MIN = HERMIT_STANDOFF_MIN + HERMIT_RESITE_SLACK   # 620
-HERMIT_STAKE_MAX = HERMIT_STANDOFF_MAX - HERMIT_RESITE_SLACK   # 970
-if HERMIT_STAKE_MIN >= HERMIT_STAKE_MAX:                       # pragma: no cover
-    raise ValueError("HERMIT_RESITE_SLACK is wider than half the standoff band")
 #: His camp is never staked inside this of a world edge, so a colony founded
 #: near x=0 gets a hermit on its inland shoulder instead of one pressed flat
 #: against the wall (and `hermit_home` flips sides to honour it).
+#:
+#: IT IS ALSO THE MARGIN THE FRACTIONAL BAND RESERVES AT THE FAR EDGE - the
+#: "less enough room for his hut, his fire and his roam" in `hermit_band`. It
+#: covers all three with room over: the hut ink-diffs at +/-26 px, the fire
+#: sits 34 px off the door and ink-diffs at +/-17, and HERMIT_ROAM is 80, so
+#: 340 px is the widest of those doubled and then some. That matters more now
+#: than it did when the camp sat mid-map: the band runs all the way OUT to
+#: `reach`, so the far wall is where he actually ends up most of the time.
 HERMIT_EDGE_MARGIN = 340.0
 #: Adults needed before the colony appoints one, and the smaller number it may
 #: fall to before he is called back in. A hermit costs the labour pool a whole
@@ -1381,6 +1477,75 @@ HERMIT_STOKE_URGE = 0.52
 #: worlds the max |slope| within HERMIT_SHELF_HALF of the picked column is 0.66
 #: median against MAX_SLOPE_WALK 0.9, and the single seed over it (34, 5.67) is
 #: the rung-5 fallback that has no shelf test at all and always has not had one.
+#:
+#: ------------------------------------------------------------------------
+#: RE-RUN AT 3/4 OF THE MAP (see HERMIT_STANDOFF_FRAC), 8 seeds x 45 sim-min,
+#: live A/B: the same seeds run twice, the only difference being `hermit_band`
+#: pinned back to 530..1060 in the control arm. Deaths from the
+#: `entities.on_death` hook, equal to `reconcile()["deaths"]` on all 16 runs,
+#: residual 0 on all 16.
+#:
+#:   band            camp      deaths/hermit-h   villager   alight   re-sites
+#:   530-1060 ctl     915 px        1.32           1.33      97.8%      4
+#:   fractional      3469 px        1.16-1.79      1.55-2.06 99.3%      0
+#:
+#: The camp column is the HUT's distance from the settlement, sampled every
+#: sim-second over every tick one stood. The hermit HIMSELF averages 2497 px,
+#: nearer than his own house, because the roster still drags him into town to
+#: eat and a wolf still occasionally carries the argument. The death column is a
+#: range because the new arm was run twice - once before and once after the
+#: visit-budget change below - and the two runs give 4 and 6 hermit deaths over
+#: 3.4 hermit-hours. That spread across a change that touches only two visit
+#: constants is exactly the rng re-phasing this project keeps warning about, and
+#: it is wider than the gap to the control. FOUR, FIVE OR SIX DEATHS IS NOT A
+#: MEASUREMENT OF ANYTHING; the columns either side of it are.
+#:
+#: THE FIRE DID NOT GO OUT, WHICH WAS THE PREDICTED WAY THIS CHANGE KILLS HIM.
+#: It went the other way: 99.3% alight against 97.8%, on every one of the eight
+#: seeds (worst 96.3%), because the ground out there has more timber on it than
+#: the ground the colony has been working - 6.26 trees per 1000 px within
+#: HERMIT_FELL_REACH of his camp against the colony's 1.88, and against 4.19 at
+#: the old band. He is felling a forest nobody else has touched. His woodpile
+#: averages 5.9 wood and is empty on 21% of samples, against 6.0 and 25%.
+#:
+#: INDEPENDENTLY RE-CHECKED, because "the fire goes out and the ward dies with
+#: it" is the chain that would kill this feature and it must not rest on one
+#: interrupted run. Two seeds x 45 sim-min: the fire is ALIGHT on 100% of the
+#: samples in which it stood (seeds 3 and 7 both), from the tick it is first
+#: built to the end of the run. Timber, measured directly over 40 fresh worlds
+#: rather than inferred from a sweep - trees AND bushes within
+#: HERMIT_FELL_REACH of the sited camp: mean 12.55 against the colony's 12.93,
+#: minimum 5, and NOT ONE of the 40 worlds put him somewhere with no timber in
+#: reach. So the band is ordinary wooded land, not the unvisited dead zone the
+#: move was expected to strand him in. That is the answer to the whole "wood in
+#: reach -> stash fills -> fire burns -> animals refuse him" chain: it holds at
+#: the first link.
+#:
+#: WHAT DID CHANGE IS HUNGER, and it is the honest cost of the move. Mean 0.492
+#: against 0.404, and STARVATION APPEARS AS A CAUSE OF DEATH where the control
+#: arm had none - two of his six on the shipping run (hunger x2, mauled x2,
+#: fall, mudslide) against a control of mauled x2, fall, fire, meteor. That is
+#: the one column where moving him out is unambiguously worse, and it is not
+#: fixed here. Food within his 720 px
+#: forage reach is 6.02 harvestables per 1000 px against 10.49 around the
+#: colony - but only against 6.62 at the old band, so he is not in a desert, he
+#: is in ordinary wild land while the old camp was close enough to share the
+#: colony's farmed and regrown neighbourhood. props.py was deliberately NOT
+#: touched, and the reason is structural rather than a judgement call:
+#: `props._colonist_xs` feeds the regrow band picker EVERY living agent, the
+#: hermit included, and `_reach_bands` opens the bands within REGROW_REACH
+#: (720 px, the same reach he forages over) of each of them. His neighbourhood
+#: already recovers for him wherever he stands. Seeding the wild for him would
+#: change the world for everybody to fix something the world already handles.
+#:
+#: AND HE IS IN A QUIETER PLACE, but not a dead one. A hostile animal is within
+#: 300 px of him on 0.45% of samples against 1.22%, a hazard on 1.20% against
+#: 6.57% - hazards site inside `stage_bounds` (colony +/- 800) and animals spawn
+#: at `offstage_x` (colony +/- 960) and pick the NEAREST stickman, so at 3469 px
+#: out he is off both siting maps and what reaches him is what wanders. Two of
+#: his deaths were still maulings and one was a mudslide, so "nothing can reach
+#: him" is not true either - which is the answer to the question the move
+#: raises, because a hermit nothing can reach would be furniture.
 HERMIT_FIRE_WARD = 110.0
 #: What cooking his own supper is worth to him. Deliberately modest and
 #: deliberately BELOW the Eat score a hungry man carries (`hunger**2`, forced to
@@ -1541,16 +1706,89 @@ HERMIT_FELL_REACH = 420.0
 #: Mean seconds between one colonist walking out to see him, and the jitter
 #: either side of it. He is the one colonist who never converses; a visit is the
 #: exception that says so out loud, which means it has to be RARE. At ~15 min
-#: mean it fires 3-4 times a colony-hour - often enough that a user watching for
+#: mean it fired 3-4 times a colony-hour - often enough that a user watching for
 #: ten minutes has a fair chance of catching one, seldom enough that it never
-#: becomes traffic. Measured: see the report.
-HERMIT_VISIT_PERIOD = 900.0
-HERMIT_VISIT_JITTER = 420.0
-#: How long a visit may stay open before the director gives up on it. The walk
-#: out is ~25 s of clear ground at WALK_SPEED and a good deal more over broken
-#: terrain, and a visitor who gets waylaid by a wolf on the way must not pin the
-#: slot shut forever.
+#: becomes traffic.
+#:
+#: HALVED WHEN THE CAMP WENT TO 3/4 OF THE MAP, and the halving is the ONE
+#: thing here that a measurement chose rather than an argument. Three arms, the
+#: same 8 seeds x 45 sim-min each, all at the new band, all with the derived
+#: approach budget except the control:
+#:
+#:   arm                       openings  paid  visitor-time away  died en route
+#:   old band, 900 s (control)     48      8         1.52%              0
+#:   new band, 900 s               42      2         2.73%              7
+#:   new band, 1800 s  SHIPS       32      2         1.62%              4
+#:
+#: "visitor-time away" is seconds a visitor spent more than 200 px from the
+#: settlement, as a fraction of all colonist-time. DOUBLING THE RATE BOUGHT
+#: EXACTLY ZERO EXTRA VISITS and 1.7x the labour, so 1800 is not a compromise
+#: against visibility - visibility does not respond to it. What limits paid
+#: visits is not how often one is offered, it is how many survive the walk.
+#: 1800 also lands the labour cost back on the old band's 1.5%, so the
+#: pilgrimage is, per colony-hour, as cheap as the stroll it replaced.
+#:
+#: WHAT HAPPENS TO A VISITOR WHO IS CAUGHT OUT THERE: HE DIES, AND OFTEN.
+#: Splitting the trips by whether the guest actually set off (furthest point
+#: past 1000 px):
+#:
+#:   arm                  committed   arrived   died out there   turned back
+#:   old band, 900 s          3          2            0               1
+#:   new band, 1800 s         8          2            4               2
+#:   new band, 900 s         11          1            7               3
+#:
+#: Cross-checked against the death hook: colonist deaths more than 800 px from
+#: the settlement go from ZERO in the control to 8 and 11 in the two new arms,
+#: which is the same population counted a different way. HALF OF EVERYONE WHO
+#: SETS OFF DOES NOT COME BACK. He is alone, three thousand pixels from the
+#: barricades and from eleven armed neighbours, and HERMIT_VISIT_URGE
+#: deliberately loses to fleeing - so he runs, alone, exactly as the hermit
+#: himself used to before he had a fire. It is the hermit's old problem handed
+#: to a man with no camp to run to.
+#:
+#: IT SHIPS ANYWAY, and that is a judgement, stated so it can be overruled. The
+#: deaths are 8 against 80 colonist deaths over the same runs - a tenth, on a
+#: colony that is growing throughout - and they are the most legible death in
+#: the game: a man walks out of town toward the hermit's smoke and does not come
+#: back. The alternative on the table was dropping the visit, and a hermit
+#: nobody ever calls on is the feature not being there. If this is to be made
+#: safer the lever is an escort or a daylight gate, NOT the rate: the rate has
+#: been measured and it does not move the outcome.
+HERMIT_VISIT_PERIOD = 1800.0
+HERMIT_VISIT_JITTER = 720.0
+#: FLOOR on how long a visit may stay open, in seconds. It is no longer the
+#: whole budget - see HERMIT_VISIT_PACE and `actions.hermit_visit_budget`, which
+#: scale it with the walk the visitor actually has in front of him.
+#:
+#: It was the whole budget, and moving the camp to 3/4 of the run killed the
+#: feature outright with it in place. Measured, 6 seeds x 45 sim-min at the new
+#: band: THIRTY-FIVE visits opened and ONE was paid. The trips are in the data
+#: and they all look the same - the guest sets off, walks 3000-4000 px, runs out
+#: of budget within sight of the hut and turns round. That is precisely the
+#: failure this constant's own docstring warned about ("a man who sets off,
+#: gives up halfway and turns round - which is worse than no feature at all"),
+#: arriving because a fixed 260 s was quietly a distance limit of about
+#: 3900 px of broken ground.
+#:
+#: The derived budget fixed the walk and did NOT fix the visit count, which is
+#: the useful thing it taught: with it in, guests reach 4068 px and are killed
+#: 20 px short of the door instead of turning round at 3900. See
+#: HERMIT_VISIT_PERIOD for where the visits actually go.
 HERMIT_VISIT_TIMEOUT = 260.0
+#: Seconds of budget per second of FLAT-GROUND walk, i.e. how much slower a real
+#: walk is than ``distance / WALK_SPEED``. Measured off the failed trips above:
+#: a guest who ran out of budget had covered 3882 px in 260 s, an effective
+#: 14.9 px/s against a WALK_SPEED of 34 - the difference being climbs, ledges,
+#: the wolf he detoured round and the fact that he starts wherever he was
+#: standing rather than at the settlement mean. 3.5 is that 2.3x with half again
+#: on top, because a budget that is merely typical fails on the seeds with the
+#: worst ground, which are the seeds where the walk is worth watching.
+#:
+#: THE BUDGET IS DERIVED RATHER THAN RETUNED, and that is the point. The band is
+#: now a fraction of the map, so the walk is different on every seed and there
+#: is no single number that fits it; anything written down here would be wrong
+#: again the next time the standoff moves. See `actions.hermit_visit_budget`.
+HERMIT_VISIT_PACE = 3.5
 #: What the visit is worth, to the man who lives alone and to the one who walked
 #: out. The host gets more: he is the one who has not spoken to anybody.
 HERMIT_VISIT_MORALE_HOST = 0.16
