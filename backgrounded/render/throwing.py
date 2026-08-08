@@ -121,6 +121,7 @@ try:
         _SPEAR_HEAD,
         _dim,
         _line,
+        _lit,
         _poly,
     )
 except Exception:                                     # pragma: no cover
@@ -133,6 +134,13 @@ except Exception:                                     # pragma: no cover
 
     def _dim(col: Sequence[int], f: float) -> Color:
         return (int(col[0] * f), int(col[1] * f), int(col[2] * f))
+
+    def _lit(col: Sequence[int], f: float) -> Color:
+        return (
+            int(min(255.0, col[0] + (255 - col[0]) * f)),
+            int(min(255.0, col[1] + (255 - col[1]) * f)),
+            int(min(255.0, col[2] + (255 - col[2]) * f)),
+        )
 
     def _line(surf: pygame.Surface, col: Sequence[int],
               a: tuple[float, float], b: tuple[float, float], w: int = 1) -> None:
@@ -162,6 +170,24 @@ _HEAD_HALF_W = 1.5
 _GRIP_AT = 0.26 / 0.98                    # fraction of _LEN, from the butt
 _GRIP_HALF = 1.6
 _SHAFT_W = 2                              # `2 if h >= 22.0 else 1`, and h is 26
+
+#: How far the silhouette rim is lifted toward white. Same figure the dragon
+#: flyover uses (`dragons._lit(flat, 0.20)`) and for the same reason.
+#:
+#: ``_SIL_COLOR`` is tuned to read against the SKY, and it does - 148 luma of
+#: contrast there. The parallax ridge is dark by design, and over the three
+#: darkest scenes the shaft was DARKER THAN THE BAND IT CROSSED: measured
+#: against the flat ridge tones, night_storm gave 4.7 luma of contrast, aurora
+#: 5.5 and meteor 7.2, where about 10 is the floor for reading a 25 px shape.
+#: So the spear was drawn in full - 80 px of ink at every angle sampled - and
+#: could not be seen. A value shift on ``_SIL_COLOR`` itself was the other
+#: option and was not taken: it would lift every silhouette in the game to fix
+#: one object over one band.
+_SIL_RIM = 0.20
+
+#: Grown by one pixel each side, so the rim survives only as an edge once the
+#: flat shape is painted over it.
+_RIM_GROW = 1.0
 
 #: How far a spear may sit off-screen before it stops being drawn.
 #: creatures._draw_animal uses 80 px for animals; a spear is 25 px long, so 60
@@ -321,12 +347,28 @@ def draw_spear(surf: pygame.Surface, x: float, y: float, angle: float, *,
     head = flat if flat is not None else _dim(_SPEAR_HEAD, fade)
     grip = flat if flat is not None else _dim(_SHAFT_DARK, fade)
 
+    px, py = -uy, ux
+    base = (x - ux * _HEAD_LEN, y - uy * _HEAD_LEN)
+
+    if flat is not None:
+        # Rim first, one pixel proud all round, then the silhouette over it -
+        # so what is left is an edge rather than a lighter spear. See _SIL_RIM:
+        # without this the shaft is invisible against the three darkest ridges,
+        # which is where a spear thrown at a dragon usually is.
+        rim = _lit(flat, _SIL_RIM)
+        _line(surf, rim, butt, tip, _SHAFT_W + int(_RIM_GROW * 2))
+        _poly(surf, rim, [
+            (base[0] + px * (_HEAD_HALF_W + _RIM_GROW),
+             base[1] + py * (_HEAD_HALF_W + _RIM_GROW)),
+            (tip[0] + ux * _RIM_GROW, tip[1] + uy * _RIM_GROW),
+            (base[0] - px * (_HEAD_HALF_W + _RIM_GROW),
+             base[1] - py * (_HEAD_HALF_W + _RIM_GROW)),
+        ])
+
     _line(surf, shaft, butt, tip, _SHAFT_W)
     # Knapped head: a small triangle rather than a blob, so the pointy end is
     # obvious at 25 px - and on a thrown spear it is the only cue for which end
     # is which, since there is no hand to read it from.
-    px, py = -uy, ux
-    base = (x - ux * _HEAD_LEN, y - uy * _HEAD_LEN)
     _poly(surf, head, [
         (base[0] + px * _HEAD_HALF_W, base[1] + py * _HEAD_HALF_W),
         tip,
@@ -410,7 +452,6 @@ if __name__ == "__main__":                             # pragma: no cover
     pygame.init()
     pygame.display.set_mode((320, 200))
 
-    from ..constants import WEAPON_SPEAR as _WS
     from ..sim.world import World
     from .renderer import Renderer
 
