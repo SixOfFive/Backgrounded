@@ -302,6 +302,42 @@ _ANIMAL_BUSY_KINDS = frozenset((
 #: lookout-role agent stops paying for a re-decision every AI tick for as long
 #: as a wolf stands under his tower.
 #: TODO(backlog): belongs in constants.py, beside UNDER_ATTACK_OVERRIDE.
+#: Does a colonist with something hunting him take to a nearby empty tower?
+#:
+#: A module global rather than a constant in constants.py for the same reason
+#: LOOKOUT_IS_ANIMAL_BUSY is one: this RE-PHASES - the Lookout key goes
+#: positive on ticks it was 0.18 and outranks a flee, which changes what the
+#: agent does for the next minute and everything downstream of it - so a
+#: harness has to be able to flip it between two runs in ONE process to A/B it
+#: against itself.
+#:
+#: Only worth having since animals stopped being able to reach a perched man
+#: (see animals.ANIMAL_VERT_REACH). Before that a tower was a gallows: a wolf
+#: bit a lookout 68 px up it for 375 consecutive ticks, so sending a frightened
+#: colonist up one would have been sending him to die.
+TOWER_REFUGE = True
+#: Urge to climb when hunted. Set above the whole combat board on purpose:
+#: FleeAnimal tops out at 0.97, ThrowSpear at 0.985 and FightAnimal at ~0.99.
+#: These all fire on the same trigger, so one of them has to win deliberately
+#: rather than on a tiebreak.
+#:
+#: The deck wins because it is strictly dominant, not merely safer. Fleeing
+#: only puts distance between a man and something faster than he is. Fighting
+#: trades hits. Climbing ends the encounter outright - since
+#: animals.ANIMAL_VERT_REACH an animal cannot touch him up there - AND he can
+#: still throw from it, so an armed man loses nothing by going up and stops
+#: taking damage. First measured at 0.98, which lost to FightAnimal's 0.984:
+#: an armed gatherer stood at the foot of his own tower and traded bites with
+#: a wolf instead of climbing eight feet and killing it for free.
+#:
+#: Not 1.0: the clamp lives there, and a desperate FleeAnimal reaching it
+#: should still be able to win, because a wolf already on top of a man is a
+#: case where the ladder is too slow and running is the honest answer.
+TOWER_REFUGE_URGE = 0.995
+#: Px. How far he will break for a tower. Anything past this and the sprint is
+#: longer than the animal's own approach, so he would be caught in the open.
+TOWER_REFUGE_R = 140.0
+
 #: Appetite for hauling stone up to a rock tower's magazine. Below the build
 #: and upgrade urges deliberately: a tower with an empty rack is a job worth
 #: doing, never a reason to stop raising the building it is guarding.
@@ -1342,6 +1378,13 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
     tower = _free_tower(world, agent)
     if tower is not None:
         s["Lookout"] = _clamp01(aff["watch"] * (0.85 if role == "lookout" else 0.18))
+        # A TOWER IS COVER, not only a job. Anyone being hunted takes the one
+        # beside him rather than running, because the deck ends the chase and
+        # running does not. Applies to every role including the lookout's own -
+        # his 0.85 loses to a flee at 0.97, so without this the watchman
+        # abandons his tower to run past its ladder.
+        if TOWER_REFUGE and _hunted_near(world, agent, tower):
+            s["Lookout"] = TOWER_REFUGE_URGE
     else:
         s["Lookout"] = 0.0
 
@@ -2178,6 +2221,45 @@ def _tower_count(reg: StructureRegistry | None, kinds: tuple[str, ...]) -> int:
         except Exception:
             continue
     return n
+
+
+def _hunted_near(world: Any, agent: Any, tower: Any) -> bool:
+    """Is something hunting *agent*, with *tower* close enough to reach first?
+
+    Two tests, and the second is the one that stops this being a death sentence.
+    A man who breaks for a tower FURTHER AWAY than the animal chasing him has
+    not found cover, he has turned his back and started a race he loses; so the
+    tower has to be nearer to him than the threat is, as well as inside
+    ``TOWER_REFUGE_R``.
+
+    The threat source is ``combat_actions.nearest_animal`` and deliberately not
+    anything wider. Dragons are excluded from it on purpose - see the note at
+    combat_actions.py:657, where a dragon cruising overhead put the whole
+    colony into permanent flight and it stopped ever making another spear - and
+    inheriting that exclusion is the correct behaviour here too: a saucer or a
+    wyrm overhead must not empty the fields into the towers. Raiders will
+    arrive through the same call once they exist, which is what makes this
+    feature grow into the raid without another edit here.
+
+    ``skip_leaving`` because an animal already walking away is not hunting
+    anybody, and climbing a ladder to watch it go is not cover, it is a waste
+    of a minute. Never raises; combat is a lazy import to dodge the cycle.
+    """
+    try:
+        from .combat_actions import FLEE_RADIUS, nearest_animal
+    except Exception:
+        return False
+    try:
+        ax = float(getattr(agent, "x", 0.0))
+        foe = nearest_animal(world, ax, max_dist=FLEE_RADIUS, skip_leaving=True)
+        if foe is None:
+            return False
+        tower_gap = abs(float(getattr(tower, "x", ax)) - ax)
+        if tower_gap > TOWER_REFUGE_R:
+            return False
+        return tower_gap <= abs(float(getattr(foe, "x", ax)) - ax)
+    except Exception:
+        return False
 
 
 def _free_tower(world: Any, agent: Any) -> Structure | None:
