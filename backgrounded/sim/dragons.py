@@ -464,6 +464,32 @@ GORGE_MAX_SEC = DRAGON_GORGE_SEC + 40.0
 #: the animal will quit, and the retreat is not safety - PHASE_LEAVE stops
 #: throwers spending spears on a departing target, but melee and the barricade
 #: spikes reach a walking quadruped for the whole 960 px it has to cross.
+#:
+#: WHAT IT ACTUALLY DID. A/B against itself at 0.0 (which disables the break-off
+#: outright), same seeds, same harness, 1586 visits over 8 seeds x 4 kinds x 25
+#: sim-min of forced visits into armed colonies, counted at ``_reap``:
+#:
+#:                    killed          escapees wounded      escapee mean hp
+#:                  off  ->  on         off -> on             off  ->  on
+#:     quadruped   70.6%   40.9%      26.7%   57.7%          0.89    0.71
+#:     skeletal    84.9%   60.5%      62.5%   82.4%          0.69    0.37
+#:     wyvern      36.8%   36.8%      25.5%   25.5%          0.89    0.89
+#:     serpent     23.4%   23.4%       6.8%    6.8%          0.98    0.98
+#:     overall     38.5%   32.7%
+#:
+#: The two unchanged rows are the result worth having. The wyvern and the
+#: serpent die in ``gorge``, which is deliberately not in :data:`_FLEE_PHASES`,
+#: and they come back bit-identical across the two arms - so this moved exactly
+#: the two kinds it was aimed at and re-phased nothing (a single extra draw
+#: anywhere would have shifted all four).
+#:
+#: The other half of the bar is the escapees, not the kills: the ones that get
+#: away now leave hurt rather than untouched, which is the "usually escapes,
+#: wounded" the brief asked for. Quadruped is there. Skeletal is the one kind
+#: still more likely to die than not - 60.5% - and that is a judgement call
+#: nobody has made rather than a bug: it is sated at birth, so it never "feeds"
+#: in the sense the rule means, and the 39.5% that do get away leave at 0.37 of
+#: their bar.
 DRAGON_FLEE_FRAC = 0.30
 
 #: The committed errands. A dragon in one of these is working to a clock it
