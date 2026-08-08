@@ -214,6 +214,13 @@ def _open_running_instance():
         0, pid)
     if not proc:
         return None, rec, f"pid {pid} is not running"
+    # OpenProcess still succeeds on a process that has exited, as long as
+    # somebody (its parent, usually) still holds a handle keeping the object
+    # alive. A signalled process handle means "already dead" - worth saying
+    # plainly, because this branch is what the user reads in the log.
+    if k.WaitForSingleObject(proc, 0) == _WAIT_OBJECT_0:
+        k.CloseHandle(proc)
+        return None, rec, f"pid {pid} has already exited"
     ident = _identity(proc)
     if ident is None:
         k.CloseHandle(proc)
@@ -945,6 +952,13 @@ class App:
             self._last_save = now
             persist.save_world(self.world)
 
+        if _quit_requested():
+            # A newer copy has started and wants the desktop. Leaving through
+            # the normal door means _shutdown saves the world and puts the real
+            # wallpaper back before the other one captures it.
+            log.info("a newer instance asked us to stand down")
+            self.running = False
+
         if self.args.exit_after and self.world.world_time >= self.args.exit_after:
             log.info("exit-after reached")
             self.running = False
@@ -1439,6 +1453,7 @@ class App:
         except Exception:
             pass
         self._save_config()
+        _clear_instance_record()
 
     def _shutdown_after_crash(self) -> None:
         """What to write when the frame loop DIED rather than ended.
