@@ -84,28 +84,284 @@ def _free_name(prefix: str):
     return paths.APP_DIR / f"{base}-{time.time_ns()}.json"
 
 
-def _acquire_single_instance() -> bool:
-    """Take a named mutex so only one copy ever runs.
+#: Named kernel objects. The "Local\" prefix scopes them to the login session,
+#: so two signed-in users can each run their own colony without a collision.
+_MUTEX_NAME = "Local\\BackgroundedSingleInstance"
+_QUIT_EVENT_NAME = "Local\\BackgroundedQuitRequest"
+_INSTANCE_RECORD = "instance.json"
+
+#: How long an arriving copy waits for the running one to save and go. A clean
+#: exit writes the world; a kill costs up to AUTOSAVE_SEC of colony history, so
+#: the grace period is deliberately generous - it is cheaper to wait twelve
+#: seconds than to throw away a minute of the colony's life.
+TAKEOVER_GRACE_SEC = 12.0
+
+_WAIT_OBJECT_0 = 0x00000000
+_ERROR_ALREADY_EXISTS = 183
+_SYNCHRONIZE = 0x00100000
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_EVENT_MODIFY_STATE = 0x0002
+
+
+class _FILETIME(ctypes.Structure):
+    _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+    def as_int(self) -> int:
+        return (int(self.high) << 32) | int(self.low)
+
+
+def _k32():
+    """kernel32 with argtypes declared. Cached.
+
+    The argtypes are not decoration: HANDLE is a pointer, and letting ctypes
+    default it to c_int truncates every handle above 2GB on 64-bit Windows.
+    """
+    k = globals().get("_K32")
+    if k is not None:
+        return k
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    H, D, B = ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int32
+    FT = ctypes.POINTER(_FILETIME)
+    k.CreateMutexW.restype, k.CreateMutexW.argtypes = H, (H, B, ctypes.c_wchar_p)
+    k.CreateEventW.restype, k.CreateEventW.argtypes = H, (H, B, B, ctypes.c_wchar_p)
+    k.OpenEventW.restype, k.OpenEventW.argtypes = H, (D, B, ctypes.c_wchar_p)
+    k.SetEvent.restype, k.SetEvent.argtypes = B, (H,)
+    k.OpenProcess.restype, k.OpenProcess.argtypes = H, (D, B, D)
+    k.GetCurrentProcess.restype, k.GetCurrentProcess.argtypes = H, ()
+    k.GetProcessTimes.restype, k.GetProcessTimes.argtypes = B, (H, FT, FT, FT, FT)
+    k.QueryFullProcessImageNameW.restype = B
+    k.QueryFullProcessImageNameW.argtypes = (H, D, ctypes.c_wchar_p, ctypes.POINTER(D))
+    k.WaitForSingleObject.restype, k.WaitForSingleObject.argtypes = D, (H, D)
+    k.TerminateProcess.restype, k.TerminateProcess.argtypes = B, (H, ctypes.c_uint32)
+    k.CloseHandle.restype, k.CloseHandle.argtypes = B, (H,)
+    globals()["_K32"] = k
+    return k
+
+
+def _identity(handle) -> "tuple[int, str] | None":
+    """(creation time, full image path) for an already-open process handle.
+
+    The creation time is the part that makes a pid trustworthy. Windows
+    recycles pids freely, so "pid 9312 is alive" says nothing at all; "pid 9312
+    is alive AND started at exactly the 100ns tick we wrote down" identifies
+    one specific process and cannot collide with a later tenant of that pid.
+    """
+    k = _k32()
+    ct, et, kt, ut = _FILETIME(), _FILETIME(), _FILETIME(), _FILETIME()
+    if not k.GetProcessTimes(handle, ctypes.byref(ct), ctypes.byref(et),
+                             ctypes.byref(kt), ctypes.byref(ut)):
+        return None
+    size = ctypes.c_uint32(32768)
+    buf = ctypes.create_unicode_buffer(size.value)
+    if not k.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+        return None
+    return ct.as_int(), buf.value
+
+
+def _write_instance_record() -> None:
+    """Leave behind what a later copy needs to recognise this process."""
+    try:
+        ident = _identity(_k32().GetCurrentProcess())
+        if ident is None:
+            return
+        paths.APP_DIR.mkdir(parents=True, exist_ok=True)
+        (paths.APP_DIR / _INSTANCE_RECORD).write_text(
+            json.dumps({"pid": os.getpid(), "created": ident[0],
+                        "image": ident[1],
+                        "started": time.strftime("%Y-%m-%d %H:%M:%S")}),
+            encoding="utf-8")
+    except Exception:
+        log.debug("could not write the instance record", exc_info=True)
+
+
+def _clear_instance_record() -> None:
+    """Drop our own record on the way out. Never anyone else's."""
+    try:
+        p = paths.APP_DIR / _INSTANCE_RECORD
+        rec = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(rec, dict) and rec.get("pid") == os.getpid():
+            p.unlink()
+    except Exception:
+        pass
+
+
+def _open_running_instance():
+    """Open the recorded process, but only if it is provably our own old copy.
+
+    Returns ``(handle | None, record | None, why)``. A handle comes back only
+    when three separate facts agree: a record exists, its pid is alive, and
+    that live process reports the same creation time *and* the same image path
+    the running copy wrote down. Anything less means the pid may have been
+    recycled onto a stranger's program, and the caller must not terminate it.
+    """
+    k = _k32()
+    try:
+        rec = json.loads((paths.APP_DIR / _INSTANCE_RECORD).read_text(encoding="utf-8"))
+        if not isinstance(rec, dict):
+            return None, None, "the instance record is not an object"
+    except FileNotFoundError:
+        return None, None, "there is no instance record"
+    except Exception:
+        return None, None, "the instance record is unreadable"
+
+    pid = rec.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return None, rec, "the instance record has no usable pid"
+
+    proc = k.OpenProcess(
+        _SYNCHRONIZE | _PROCESS_TERMINATE | _PROCESS_QUERY_LIMITED_INFORMATION,
+        0, pid)
+    if not proc:
+        return None, rec, f"pid {pid} is not running"
+    ident = _identity(proc)
+    if ident is None:
+        k.CloseHandle(proc)
+        return None, rec, f"pid {pid} would not answer for itself"
+    created, image = ident
+    if created != rec.get("created") or image != rec.get("image"):
+        k.CloseHandle(proc)
+        return None, rec, (f"pid {pid} is {image!r} now, not the recorded "
+                           f"{rec.get('image')!r} - the pid has been recycled")
+    return proc, rec, "verified"
+
+
+def _request_quit() -> bool:
+    """Ask a running copy to stand down. Safe: only we own this event name."""
+    k = _k32()
+    h = k.OpenEventW(_EVENT_MODIFY_STATE, 0, _QUIT_EVENT_NAME)
+    if not h:
+        return False
+    try:
+        return bool(k.SetEvent(h))
+    finally:
+        k.CloseHandle(h)
+
+
+def _listen_for_quit() -> None:
+    """Create the event a later instance uses to ask us to hand over."""
+    try:
+        globals()["_QUIT_EVENT"] = _k32().CreateEventW(None, 1, 0, _QUIT_EVENT_NAME)
+    except Exception:
+        log.debug("could not create the quit event", exc_info=True)
+
+
+def _quit_requested() -> bool:
+    h = globals().get("_QUIT_EVENT")
+    if not h:
+        return False
+    try:
+        return _k32().WaitForSingleObject(h, 0) == _WAIT_OBJECT_0
+    except Exception:
+        return False
+
+
+def _grab_mutex():
+    """One CreateMutexW. Returns ``(handle | None, we_are_the_first)``."""
+    k = _k32()
+    h = k.CreateMutexW(None, 0, _MUTEX_NAME)
+    if not h:
+        return None, True                    # cannot tell; let the caller run
+    return h, ctypes.get_last_error() != _ERROR_ALREADY_EXISTS
+
+
+def _claim_mutex_until(deadline: float) -> bool:
+    """Poll until the mutex name is free and ours, or the deadline passes.
+
+    Each losing handle is closed straight away. Holding one would keep the
+    named object alive after the old process died, and we would then wait
+    forever on a name that only we were still propping up.
+    """
+    k = _k32()
+    while True:
+        h, first = _grab_mutex()
+        if h is None:
+            return True
+        if first:
+            globals()["_INSTANCE_MUTEX"] = h
+            return True
+        k.CloseHandle(h)
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
+def _take_over() -> bool:
+    """Displace the copy that is already running. True if we now own the lock.
+
+    Asking always comes before killing. The running copy sees the quit event
+    inside a frame, saves the world and exits the normal way; terminating it
+    instead would discard everything since the last autosave. Terminate is the
+    fallback for a copy that has genuinely hung, and it fires only at a process
+    that :func:`_open_running_instance` has positively identified as ours.
+    """
+    k = _k32()
+    proc, rec, why = _open_running_instance()
+    pid = (rec or {}).get("pid", "?")
+    try:
+        if _request_quit():
+            log.info("another Backgrounded is running (pid %s); "
+                     "asked it to save and exit", pid)
+        elif proc is None:
+            log.error(
+                "Backgrounded is already running, but this copy cannot identify "
+                "it (%s), so it will not kill anything. Close the other copy "
+                "from its tray icon, or start with --allow-multi.", why)
+            return False
+
+        if _claim_mutex_until(time.monotonic() + TAKEOVER_GRACE_SEC):
+            log.info("the running copy exited cleanly; taking over")
+            return True
+
+        if proc is None:
+            log.error(
+                "the running Backgrounded did not exit within %.0fs, and this "
+                "copy cannot identify it (%s), so it will not be killed.",
+                TAKEOVER_GRACE_SEC, why)
+            return False
+
+        log.warning("the running copy (pid %s) ignored the quit request for "
+                    "%.0fs; terminating it", pid, TAKEOVER_GRACE_SEC)
+        k.TerminateProcess(proc, 3)
+        if _claim_mutex_until(time.monotonic() + 5.0):
+            log.warning("took over by force - up to %.0fs of colony history "
+                        "may have been lost", AUTOSAVE_SEC)
+            return True
+        log.error("could not take the single-instance lock even after "
+                  "terminating pid %s", pid)
+        return False
+    finally:
+        if proc:
+            k.CloseHandle(proc)
+
+
+def _acquire_single_instance(takeover: bool = True) -> bool:
+    """Make this the one running copy, displacing an older one if asked.
 
     Two instances both write the wallpaper A/B pair and both call
     SystemParametersInfoW, so they overwrite each other's files mid-write and
     the desktop flickers between two different worlds. Worse, closing the
     preview window only *hides* it (the app lives in the tray), so it is easy
-    to leave orphans running without noticing. The handle is deliberately
-    leaked: it lives as long as the process and Windows frees it on exit.
+    to leave orphans running without noticing - which is exactly why the newer
+    copy now wins instead of giving up: the copy you cannot see should not beat
+    the one you just launched.
+
+    The winning handle is deliberately leaked; it lives as long as the process
+    and Windows frees it on exit.
     """
     try:
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.CreateMutexW.restype = ctypes.c_void_p
-        handle = k32.CreateMutexW(None, False, "Local\\BackgroundedSingleInstance")
-        if not handle:
-            return True                      # cannot tell; allow startup
-        ERROR_ALREADY_EXISTS = 183
-        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
-            return False
-        globals()["_INSTANCE_MUTEX"] = handle
-        return True
+        h, first = _grab_mutex()
+        if h is None:
+            return True
+        if first:
+            globals()["_INSTANCE_MUTEX"] = h
+            return True
+        # Not ours to hold: keeping this handle would keep the name alive after
+        # the old process exits, and _claim_mutex_until would never succeed.
+        _k32().CloseHandle(h)
+        return _take_over() if takeover else False
     except Exception:
+        log.debug("single-instance check failed; starting anyway", exc_info=True)
         return True
 
 
@@ -626,6 +882,13 @@ class App:
         # refusal (it only acts when NO tool is selected, so it can never take
         # a click a tool wanted), then the tools take it as they always have.
         events = self._to_world(pointer.get("pointer"))
+        # A click that landed on the roster is CONSUMED here and never reaches
+        # the tools. It has to be, and not merely deprioritised: the stats panel
+        # is drawn in window px on top of the scene, so a click on a name also
+        # has a perfectly valid world position underneath it, and letting it
+        # through would follow the colonist AND strike lightning wherever he
+        # happens to be standing.
+        events = self._roster_click(events)
         self._follow_click(events)
         self.tools.handle(events, self.world, self.world.world_time)
         step = pointer.get("hud_scale")
@@ -903,6 +1166,47 @@ class App:
                     log.info("released the view back to the colony")
             except Exception:
                 log.debug("follow click failed", exc_info=True)
+
+    def _roster_click(self, events):
+        """Follow whoever's name was clicked in the stats panel.
+
+        Returns the events the rest of the frame should still see, with any
+        click that hit a roster row removed - see the note at the call site for
+        why consuming is required rather than merely going first.
+
+        THE TOOL DOES NOT GET A VETO HERE, unlike the world-side click at
+        :meth:`_follow_click`. Out in the world a selected tool must win, because
+        the hand exists to pick a colonist up and the lightning exists to smite
+        one, and letting follow outrank them would mean neither could ever be
+        aimed at a person again. The panel is not the world: nothing in the
+        palette acts on a HUD row, so there is no click here for a tool to lose.
+
+        Releasing is deliberately NOT wired to a click on empty panel - the
+        panel is mostly empty and a stray click on the stockpile line should not
+        drop the lock. Bare ground, 0/Home, death and abduction already release.
+        """
+        cam = self._camera()
+        if cam is None or self.world is None or not events:
+            return events
+        # Local, like every other hud import in this file - render/ is not on
+        # app.py's module-level import graph and this is not the place to put it
+        # there.
+        from .render import hud
+        kept = []
+        for ev in events:
+            try:
+                if ev.get("type") == "down" and int(ev.get("button") or 0) == 1:
+                    aid = hud.agent_at((ev.get("sx"), ev.get("sy")))
+                    if aid is not None:
+                        if cam.lock_to(int(aid)):
+                            who = self.world.population.by_id(int(aid))
+                            log.info("following %s (id %d) from the roster",
+                                     getattr(who, "name", "?"), int(aid))
+                        continue                  # consumed
+            except Exception:
+                log.debug("roster click failed", exc_info=True)
+            kept.append(ev)
+        return kept
 
     def _pick_agent(self, wx: float, wy: float):
         """The living colonist under a world-space click, or None.
@@ -1250,8 +1554,15 @@ def main(argv: list[str] | None = None) -> int:
         handlers=[logging.FileHandler(paths.LOG_PATH, encoding="utf-8"),
                   logging.StreamHandler(sys.stdout)],
     )
-    if not args.allow_multi and not _acquire_single_instance():
-        log.error("Backgrounded is already running - look for the tray icon. "
-                  "Use --allow-multi to override.")
-        return 2
+    if not args.allow_multi:
+        # Deliberately before App(): the takeover does not return until the old
+        # copy is gone, so by the time the renderer captures the "original"
+        # wallpaper the other instance has already restored the real one.
+        if not _acquire_single_instance():
+            log.error("Backgrounded is already running and could not be taken "
+                      "over - look for the tray icon. Use --allow-multi to "
+                      "run a second copy anyway.")
+            return 2
+        _write_instance_record()
+        _listen_for_quit()
     return App(args).run()

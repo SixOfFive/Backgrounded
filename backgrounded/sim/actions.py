@@ -3506,8 +3506,28 @@ def _h_cook(a: Action, ag: Any, w: Any, dt: float) -> None:
         _adjust(ag, "warmth", -0.03 * dt)
         if a.data["ct"] >= COOK_TIME:
             qty = int(getattr(ag, "carry_qty", 0) or 0)
+            cooked_any = False
             if getattr(ag, "carrying", None) == RES_FOOD and qty > 0:
                 ag.carrying = RES_COOKED
+                cooked_any = True
+            # ...AND THE FOOD THAT NEVER REACHED HIS HANDS. This line used to be
+            # the whole of it, and it silently un-cooked the meal for anybody
+            # already carrying something else. `_carry_add` puts a SECOND
+            # resource in the ACTION's stash rather than the agent's slot, so a
+            # cook who walked up holding wood had his raw food sitting in
+            # `a.data["stash"]` where the test above could not see it - no
+            # conversion, no chronicle line, and then `_deposit_step` banked it
+            # back as FOOD. The hermit is how it surfaced (reported from play as
+            # "it just goes back into food and not cooked") because he is nearly
+            # always holding timber for his fire, but a villager mid-haul hits
+            # exactly the same path into the colony stockpile.
+            st = a.data.get("stash")
+            if isinstance(st, dict):
+                raw = int(st.pop(RES_FOOD, 0) or 0)
+                if raw > 0:
+                    st[RES_COOKED] = int(st.get(RES_COOKED, 0) or 0) + raw
+                    cooked_any = True
+            if cooked_any:
                 chronicle(w, f"{getattr(ag, 'name', 'Someone')} cooked a meal.")
             a.phase = "deliver"
         return

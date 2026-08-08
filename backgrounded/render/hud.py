@@ -497,6 +497,35 @@ _PANELS_MAX = 4
 
 #: (rect in panel-local unscaled px, title, body lines).
 _panel_zones: list[tuple[pygame.Rect, str, tuple[str, ...]]] = []
+#: Roster rows paired with their agent id, for click-to-follow. Same rects as the
+#: agent zones above, in the same panel-local UNSCALED space.
+_panel_agents: list[tuple[pygame.Rect, int]] = []
+#: Where the panel was last blitted ON THE INTERACTIVE PASS. draw_stats runs
+#: twice a frame and only the window overlay can be clicked, so this is written
+#: under `mouse is not None` and never by the wallpaper bake.
+_panel_origin: tuple[int, int] | None = None
+
+
+def agent_at(mouse: "tuple[int, int] | None") -> "int | None":
+    """Which colonist's roster row is under *mouse*, if any. Never raises.
+
+    Screen coords in, agent id out. The rects are stored in the panel's own
+    authored coordinates and scaled at lookup time by HUD_SCALE - the same trick
+    the tooltips use - so this keeps working across a window resize and the
+    [ / ] scale keys with no cache to invalidate.
+    """
+    if mouse is None or _panel_origin is None or not _panel_agents:
+        return None
+    try:
+        s = max(0.01, float(HUD_SCALE))
+        lx = (mouse[0] - _panel_origin[0]) / s
+        ly = (mouse[1] - _panel_origin[1]) / s
+        for rect, aid in _panel_agents:
+            if rect.collidepoint(lx, ly):
+                return int(aid)
+    except Exception:
+        log.debug("hud agent_at failed", exc_info=True)
+    return None
 
 TIP_BG = (16, 19, 26)
 TIP_BG_ALPHA = 242
@@ -660,7 +689,7 @@ def draw_stats(surf: pygame.Surface, world, show_roster: bool = True,
     has a pointer over it. Reading the mouse internally would bake a tooltip
     into the desktop wallpaper, anchored to a window the wallpaper cannot see.
     """
-    global _panel_cache, _panel_key, _panel_zones
+    global _panel_cache, _panel_key, _panel_zones, _panel_agents, _panel_origin
     try:
         # THE HEIGHT THE PANEL HAS TO FIT INTO, in the panel's own authored px.
         # `_build` lays out at authored size and `_scaled` then multiplies the
@@ -673,18 +702,19 @@ def draw_stats(surf: pygame.Surface, world, show_roster: bool = True,
         key = _content_key(world, show_roster)
         hit = _panels.get(budget)
         if hit is None or hit[0] != key:
-            panel_src, zones = _build(world, show_roster, budget)
+            panel_src, zones, agents = _build(world, show_roster, budget)
             if len(_panels) >= _PANELS_MAX:
                 for stale in _panels:
                     _SCALED.pop(f"stats:{stale}", None)
                 _panels.clear()
-            _panels[budget] = (key, panel_src, zones)
+            _panels[budget] = (key, panel_src, zones, agents)
         else:
-            panel_src, zones = hit[1], hit[2]
+            panel_src, zones, agents = hit[1], hit[2], hit[3]
         # The module globals stay live: `_hover` reads `_panel_zones`, and the
         # probes and tools/smoke.py read both. They track the panel that was
         # drawn most recently, which is the one the pointer is over.
         _panel_cache, _panel_zones, _panel_key = panel_src, zones, key
+        _panel_agents = agents
         if _panel_cache is not None:
             panel = _scaled(_panel_cache, f"stats:{budget}")
             # max(0, ...) so a window narrower than the panel still shows its
@@ -694,8 +724,17 @@ def draw_stats(surf: pygame.Surface, world, show_roster: bool = True,
             ox = x + int(offset[0])
             oy = MARGIN + int(offset[1])
             surf.blit(panel, (ox, oy))
-            if mouse is not None and _panel_zones:
-                _hover(surf, mouse, ox, oy)
+            if mouse is not None:
+                # THE INTERACTIVE PASS, AND ONLY IT. draw_stats runs twice a
+                # frame - once as this screen-anchored window overlay and once
+                # baked world-anchored into the wallpaper frame - and the second
+                # one would otherwise leave `_panel_origin` pointing at geometry
+                # nobody can click. `mouse is not None` is exactly the window
+                # pass (app.py hands it a position only there), which is the
+                # same discriminator `_hover` has always relied on.
+                _panel_origin = (ox, oy)
+                if _panel_zones:
+                    _hover(surf, mouse, ox, oy)
     except Exception:
         log.exception("hud draw failed")
 
@@ -902,7 +941,7 @@ def _stash_tip(name: str, stash: dict) -> tuple[str, tuple[str, ...]]:
 
 
 def _build(world, show_roster: bool,
-           budget: int | None = None) -> tuple[pygame.Surface, list]:
+           budget: int | None = None) -> tuple[pygame.Surface, list, list]:
     agents = [a for a in world.population.alive_agents()]
     agents.sort(key=lambda a: a.id)
 
@@ -910,6 +949,10 @@ def _build(world, show_roster: bool,
     # here rather than in a second pass so a zone cannot drift from the text it
     # names: every rect below is measured from the same y the blit above it used.
     zones: list[tuple[pygame.Rect, str, tuple[str, ...]]] = []
+    #: Roster rows only, paired with the agent id they belong to. Same rects,
+    #: same coordinate space, different question: `zones` answers "what do I say
+    #: about this?", `agent_zones` answers "who is this?".
+    agent_zones: list[tuple[pygame.Rect, int]] = []
     f11 = _font(11)
 
     rows = len(agents) if show_roster else 0
@@ -1154,8 +1197,18 @@ def _build(world, show_roster: bool,
             # pointer as it drifted a few pixels between a name and the bar
             # beside it, and everything it would say is on the one plate anyway.
             title, body = _agent_tip(a)
-            zones.append((pygame.Rect(PAD, row_top, PANEL_W - PAD * 2,
-                                      max(1, y - row_top)), title, body))
+            row_rect = pygame.Rect(PAD, row_top, PANEL_W - PAD * 2,
+                                   max(1, y - row_top))
+            zones.append((row_rect, title, body))
+            # ...and the same rect again, on its own list, carrying WHO it is.
+            # Clicking a name follows that colonist, and the hit test wants an
+            # id rather than a tooltip. It is a second list instead of a fourth
+            # tuple element because `_hover` and tools/smoke.py both unpack
+            # `_panel_zones` as a 3-tuple, and widening it to teach one caller
+            # about ids would have made every other caller learn it too.
+            aid = getattr(a, "id", None)
+            if aid is not None:
+                agent_zones.append((row_rect, int(aid)))
 
     # ---- footer: most recent chronicle line -------------------------------
     pygame.draw.line(panel, EDGE, (PAD, y), (PANEL_W - PAD, y))
@@ -1178,7 +1231,7 @@ def _build(world, show_roster: bool,
                       "Latest event",
                       ((last,) if not stamp else (last, "", stamp))))
 
-    return panel, zones
+    return panel, zones, agent_zones
 
 
 def _wrap(text: str, max_w: int, size: int) -> list[str]:
