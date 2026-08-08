@@ -50,6 +50,31 @@ from ..constants import (
     WORLD_W,
 )
 
+# The lookout/rock-tower numbers are Lane 0's, in constants.py, and this module
+# is not allowed to edit that file. Imported behind ImportError with fallbacks
+# that are the SAME literals so this module is correct whether or not the
+# constants commit has landed yet: a merge order must not change behaviour.
+try:                                            # pragma: no cover - see above
+    from ..constants import (
+        ROCK_COOLDOWN,
+        ROCK_DAMAGE,
+        ROCK_DROP_CEILING,
+        ROCK_DROP_RANGE,
+        TOWER_AMMO_MAX,
+        TOWER_AMMO_PER_STONE,
+        TOWER_UPGRADE_COST,
+        TOWER_UPGRADE_WORK,
+    )
+except ImportError:                             # pragma: no cover - see above
+    ROCK_COOLDOWN = 2.4
+    ROCK_DAMAGE = 30.0
+    ROCK_DROP_CEILING = 40.0
+    ROCK_DROP_RANGE = 46.0
+    TOWER_AMMO_MAX = 8
+    TOWER_AMMO_PER_STONE = 2
+    TOWER_UPGRADE_COST = {RES_WOOD: 6, RES_STONE: 12}
+    TOWER_UPGRADE_WORK = 12.0
+
 log = logging.getLogger(__name__)
 
 
@@ -95,6 +120,53 @@ def _clearance():
             _CLEARANCE = _ground_clearance
     return _CLEARANCE
 
+
+def _direct_hurt(world: Any, obj: Any, amount: float, by: Any = None) -> bool:
+    """Fallback damage: call the target's own ``hurt``. Never raises.
+
+    Exactly what :meth:`Structure._tick_barricade` has always done, so a failure
+    to import combat_actions restores the behaviour this module had before the
+    rock tower existed instead of inventing a new one. It still respects a
+    ``hurt`` that refuses damage - which is the whole point: ``Dragon.hurt``
+    discards everything while the dragon is unsated, and a weapon that reached
+    past that would be the only one in the game that kills an unfed dragon.
+    """
+    fn = getattr(obj, "hurt", None)
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn(float(amount)))
+    except Exception:
+        return False
+
+
+_HURT = None
+
+
+def _hurt():
+    """Resolve ``combat_actions.hurt_animal`` once, lazily, and cache it.
+
+    Same reasoning as :func:`_clearance`, and the same cycle:
+    ``structures -> combat_actions -> actions -> structures``. combat_actions is
+    the right place for a killing blow to land because it is the one that marks
+    the target dead, registers the death cause and lets the animals module claim
+    its hides - a rock that wrote ``hp`` itself would leave a corpse nothing had
+    accounted for. Falls back to :func:`_direct_hurt`, which is what the spikes
+    do, so the tower degrades to "damage lands, bookkeeping does not".
+
+    Draws no rng of any kind on either path - checked, because ``_tick_upkeep``
+    is a passive per-frame branch and a single draw there would re-phase
+    ``world.pyrng`` for the whole colony.
+    """
+    global _HURT
+    if _HURT is None:
+        try:
+            from .combat_actions import hurt_animal   # noqa: PLC0415 - see above
+            _HURT = hurt_animal
+        except Exception:
+            _HURT = _direct_hurt
+    return _HURT
+
 __all__ = [
     "Structure",
     "StructureRegistry",
@@ -114,6 +186,12 @@ __all__ = [
     "HUT_UPGRADE_COST",
     "HUT_UPGRADE_WORK",
     "HUT_STONE_MAX_HP",
+    "TOWER_MATERIALS",
+    "TOWER_ROCK_MAX_HP",
+    "KIND_MATERIALS",
+    "UPGRADE_SPECS",
+    "SPIKED_TARGET_SOURCES",
+    "materials_for",
 ]
 
 #: Kinds that write themselves into Terrain's effective-surface overlay when
@@ -135,7 +213,16 @@ CROSSING_KINDS: tuple[str, ...] = ("bridge", "ladder")
 #: ``actions.OUTWORK_KINDS`` carries the same exclusion for
 #: ``settlement_center``; the two lists are separate because they answer to
 #: different callers, and they agree about this kind on purpose.
-NON_SETTLEMENT_KINDS: tuple[str, ...] = ("grave", "hermit_hut", "hermit_fire")
+#:
+#: Both lookout kinds are here for the same reason and it is the sharper case:
+#: a colony lookout is deliberately sited LOOKOUT_STANDOFF (520 px) outside the
+#: settlement on each side, so with six other buildings standing a pair of them
+#: drags the mean ~150 px outward - and then the next site, the camera fallback,
+#: the quarry keep-out, the barricade band and hermit_home all move with it,
+#: every pass, outward again. The hermit's is further out still.
+NON_SETTLEMENT_KINDS: tuple[str, ...] = (
+    "grave", "hermit_hut", "hermit_fire", "lookout", "hermit_lookout",
+)
 
 #: Kinds that BEHAVE like a fire - they hold fuel, they can be lit and stoked,
 #: they burn it down over time and they cast light while they do.
@@ -174,6 +261,8 @@ FIRE_KINDS: tuple[str, ...] = ("firepit", "hermit_fire")
 KIND_LABELS: dict[str, str] = {
     "hermit_hut": "hermit's hut",
     "hermit_fire": "hermit's fire",
+    "hermit_lookout": "hermit's lookout",
+    "lookout": "lookout",
     "firepit": "firepit",
 }
 
@@ -247,6 +336,91 @@ HUT_UPGRADE_WORK: float = 14.0
 #: hut did not. That is intended - a stone hut has more to lose - but it does
 #: mean slightly more repair traffic after the first upgrade lands.
 HUT_STONE_MAX_HP: float = 190.0
+
+#: What a lookout's platform can be made of. Same mechanism as
+#: :data:`HUT_MATERIALS` - a ``material`` key on :attr:`Structure.state`, not a
+#: second kind - and for the sharper version of the same reason: a rock tower
+#: must still BE a lookout to `_free_tower`, to `assign_roles`' tower census and
+#: to `has_room()` for the man standing on it. A second kind would have to be
+#: added back to every one of those by hand, and the one that fails silently is
+#: the role census: no lookout role assigned, so nobody ever climbs it.
+#:
+#: Both ladders start at ``"wood"``, which is what lets :meth:`can_upgrade` ask
+#: one question ("is it still on its first material?") for every kind.
+TOWER_MATERIALS: tuple[str, ...] = ("wood", "rock")
+#: The upgraded tier's name, and the one value :func:`_holds_ammo` accepts. A
+#: tower is only allowed to store rocks once it is actually made of them.
+ROCK_MATERIAL: str = "rock"
+#: A rock tower's max hp, up from the timber spec's 120. Same caveat as
+#: HUT_STONE_MAX_HP: `StructureRegistry.damaged` compares hp/max_hp, so a tower
+#: sitting at 120 hp now reads as damaged where the timber one did not.
+TOWER_ROCK_MAX_HP: float = 160.0
+
+#: Which material ladder each kind climbs. Anything absent answers
+#: :data:`HUT_MATERIALS`, which is exactly what :meth:`Structure.material` and
+#: :func:`_sanitise_upgrade` did for every kind before towers existed - so an
+#: unlisted kind behaves byte-for-byte as it always has.
+KIND_MATERIALS: dict[str, tuple[str, ...]] = {
+    "hut": HUT_MATERIALS,
+    "lookout": TOWER_MATERIALS,
+}
+
+#: Wood the hermit puts into his own lookout. Sized between his hut
+#: (HERMIT_HUT_WOOD) and the colony's 22-wood watchtower: it is a ladder and a
+#: plank platform lashed to a tree, cut and carried by one man.
+HERMIT_LOOKOUT_WOOD: int = 14
+
+#: Per-kind upgrade spec: ``kind -> (to_material, cost, work_seconds,
+#: new_max_hp)``. This table IS the answer to "can this be upgraded" - a kind
+#: absent from it cannot be, which is how :meth:`Structure.can_upgrade` stopped
+#: being a hardcoded ``kind == "hut"`` without any caller learning a new
+#: question.
+#:
+#: ``hermit_lookout`` is deliberately NOT here. The upgrade is hauled stone out
+#: of the colony's stockpile, published through the colony-wide
+#: ``world.upgrade_job`` channel with concurrency 1; the hermit builds out of
+#: what he cuts himself and has no claim on that channel. Adding him would put
+#: a job 800 px into the wilderness at the head of the colony's only upgrade
+#: queue.
+UPGRADE_SPECS: dict[str, tuple[str, dict[str, int], float, float]] = {
+    "hut":     ("stone", HUT_UPGRADE_COST,   HUT_UPGRADE_WORK,   HUT_STONE_MAX_HP),
+    "lookout": (ROCK_MATERIAL, TOWER_UPGRADE_COST, TOWER_UPGRADE_WORK,
+                TOWER_ROCK_MAX_HP),
+}
+
+#: Registry attribute names a passive structure weapon sweeps, IN ORDER.
+#: Append-only. ``"raiders"`` is present from day one and costs a world without
+#: one exactly nothing: :meth:`Structure._spiked_targets` skips an attribute
+#: that is missing or has no ``alive()``, so the list it returns is identical
+#: object-for-object and in the same order as before this entry existed.
+SPIKED_TARGET_SOURCES: tuple[str, ...] = ("animals", "dragons", "raiders")
+
+
+def materials_for(kind: str) -> tuple[str, ...]:
+    """The material ladder *kind* climbs; :data:`HUT_MATERIALS` if it has none.
+
+    Never raises: a non-string kind out of a corrupt save answers the default
+    rather than exploding inside a loader.
+    """
+    try:
+        return KIND_MATERIALS.get(kind, HUT_MATERIALS)
+    except TypeError:                   # unhashable kind from a hand-edited save
+        return HUT_MATERIALS
+
+
+def _holds_ammo(kind: str, material: str) -> bool:
+    """Is a ``kind`` made of ``material`` allowed to store rocks?
+
+    Both halves matter. A timber lookout is a lookout with no rocks in it, and
+    ``ammo`` on a hut, a grave or a bridge is a hand-edited save, not a feature.
+    Answering here rather than on :class:`Structure` is what lets
+    :func:`_sanitise_ammo` decide before a Structure exists.
+    """
+    try:
+        spec = UPGRADE_SPECS.get(kind)
+    except TypeError:
+        return False
+    return bool(spec) and spec[0] == ROCK_MATERIAL and material == ROCK_MATERIAL
 
 
 @dataclass(frozen=True)
@@ -356,6 +530,39 @@ STRUCTURE_SPECS: dict[str, StructureSpec] = {
         width=22.0, height=10.0, capacity=0, flammable=False,
         build_time=5.0, spacing=30.0, variants=2,
     ),
+    # HIS LOOKOUT, AND IT IS ITS OWN KIND FOR THE THIRD TIME AND THE SAME
+    # REASON. The list this one must stay out of is short and one entry on it
+    # decides the whole colony tower arc:
+    #
+    #   behavior.assign_roles   staffs one lookout role per tower it counts. A
+    #                           hermit tower counted there hands a villager a
+    #                           lookout job on a platform 800 px out in the
+    #                           wilderness that he then walks to - and, worse,
+    #                           the colony reads its own perimeter as manned.
+    #   behavior                the build rung and `_free_tower`. Counted, the
+    #                           colony stops raising its own towers because the
+    #                           hermit already built one.
+    #
+    # Two stages and wood only, shorter and flimsier than the colony's: it is a
+    # ladder and a platform one man lashed together, not a framed tower a crew
+    # raised. `flammable=False` for the trap the colony lookout documents above
+    # AND for a second reason specific to this one: it stands beside a
+    # `flammable=True` hermit_hut, which is very likely inside the 70 px
+    # neighbour radius, so a flammable version would put a fresh numpy draw on
+    # the stream every time his hut caught.
+    #
+    # It is deliberately absent from UPGRADE_SPECS - see the note there.
+    # 62.0 is not a free number: render/atlas.py's TOWER_SPEC_H carries the same
+    # value as the fallback it uses before `_sync_with_sim` can read this spec.
+    # The sim is authoritative and the sync overwrites it, so a mismatch would
+    # only show on a partial checkout - but a deck drawn 6 px off the platform
+    # the sim perches a man on is exactly the class of bug trap 6 documents, and
+    # it costs nothing to agree.
+    "hermit_lookout": StructureSpec(
+        "hermit_lookout", 2, 80.0, {RES_WOOD: HERMIT_LOOKOUT_WOOD},
+        width=24.0, height=62.0, capacity=1, flammable=False,
+        build_time=9.0, spacing=34.0, variants=2,
+    ),
     "wall": StructureSpec(
         "wall", 2, 170.0, {RES_STONE: 14, RES_WOOD: 4},
         width=30.0, height=30.0, capacity=0, flammable=False,
@@ -395,6 +602,33 @@ STRUCTURE_SPECS: dict[str, StructureSpec] = {
     "watchtower": StructureSpec(
         "watchtower", 3, 120.0, {RES_WOOD: 22, RES_STONE: 8},
         width=30.0, height=74.0, capacity=1, flammable=True,
+        build_time=11.0, spacing=70.0, variants=2,
+    ),
+    # THE COLONY'S PERIMETER LOOKOUT, AND IT IS ITS OWN KIND RATHER THAN A
+    # SITED WATCHTOWER. The dimensions are the watchtower's on purpose - it is
+    # the same building - but two things about it are not, and both are
+    # per-KIND rather than per-instance:
+    #
+    #   siting     a watchtower is pulled toward the centre on high ground
+    #              (behavior's `+= (ys.max()-ys)/45.0` bias). A lookout is
+    #              staked LOOKOUT_STANDOFF px OUTSIDE the settlement on each
+    #              side, behind its own side's spikes. One `pick_site` cannot
+    #              answer both for one kind.
+    #   census     `built("watchtower") < 1` is the colony's existing build
+    #              rung and `assign_roles` staffs one lookout per watchtower.
+    #              Folding these in as watchtowers would satisfy that rung with
+    #              a perimeter tower and stop the colony ever raising its own.
+    #
+    # `flammable=False`, and that is not tidiness either: StructureRegistry.
+    # update draws `rng.random()` off world.rng once per (burning structure x
+    # in-range flammable candidate) pair, inside BURN_NEIGHBOUR_DIST (70 px).
+    # A flammable tower is a new draw on the numpy stream every time anything
+    # near it catches, which re-phases a stream that has nothing to do with
+    # towers. The barricade, the wall and the firepit are all False for the
+    # same family of reasons.
+    "lookout": StructureSpec(
+        "lookout", 3, 120.0, {RES_WOOD: 22, RES_STONE: 8},
+        width=30.0, height=74.0, capacity=1, flammable=False,
         build_time=11.0, spacing=70.0, variants=2,
     ),
     "totem": StructureSpec(
@@ -775,6 +1009,13 @@ class Structure:
             self.state.setdefault("glow", 1.0)
         elif self.kind == "stockpile":
             self.state.setdefault("shown", {})
+        # Not an `elif` on kind: this asks about MATERIAL, and it is reachable.
+        # `collapse` deliberately keeps `state["material"]` so a building that
+        # burns down and is repaired comes back in the material it had learned -
+        # which means a rock tower rebuilt out of its own rubble arrives here
+        # still made of rock, and needs its cooldown clock back. Its rocks are
+        # not restored: they went down with the platform.
+        self._seed_ammo()
 
     # -------------------------------------------------------------- upgrade --
     # Re-walling a finished hut in stone. The shape below mirrors the build
@@ -795,29 +1036,53 @@ class Structure:
     # capacity and hp all carry on exactly as they were. Somebody can be asleep
     # in the hut while it is being re-walled.
     def material(self) -> str:
-        """What this hut's walls are made of; ``HUT_DEFAULT_MATERIAL`` if unset.
+        """What this building is made of; ``HUT_DEFAULT_MATERIAL`` if unset.
 
-        Answers for non-huts too, so callers need no ``kind == "hut"`` guard.
-        The strip/lower matches ``Atlas.resolve`` exactly - a hand-edited
-        ``"STONE "`` reads as stone in both places, and an unknown material
-        reads as timber in both places rather than as stone here and timber on
-        screen. Never raises.
+        Answers for kinds with no ladder of their own too, so callers need no
+        ``kind == "hut"`` guard. The strip/lower matches ``Atlas.resolve``
+        exactly - a hand-edited ``"STONE "`` reads as stone in both places, and
+        an unknown material reads as timber in both places rather than as stone
+        here and timber on screen. Never raises.
+
+        Per-kind since the rock tower: a lookout's ladder is
+        :data:`TOWER_MATERIALS`, so ``"rock"`` is a real answer on a lookout and
+        still reads as timber on a hut. Both ladders start at ``"wood"``, which
+        is why the fallback is one value rather than a table.
         """
         try:
             mat = str(self.state.get("material") or "").strip().lower()
         except (TypeError, ValueError, AttributeError):
             return HUT_DEFAULT_MATERIAL
-        return mat if mat in HUT_MATERIALS else HUT_DEFAULT_MATERIAL
+        return mat if mat in materials_for(self.kind) else HUT_DEFAULT_MATERIAL
 
     @property
     def is_upgrading(self) -> bool:
         """True while an upgrade job is pending on this structure."""
         return isinstance(self.state.get("upgrade"), dict)
 
+    def upgrade_spec(self) -> tuple[str, dict[str, int], float, float] | None:
+        """This kind's ``(to_material, cost, work, new_max_hp)``, or ``None``.
+
+        ``None`` is the honest answer for every kind that cannot be upgraded,
+        and every method below treats it as "no upgrade exists here" rather than
+        substituting the hut's numbers - a grave must not quietly acquire a
+        10-stone price.
+        """
+        try:
+            return UPGRADE_SPECS.get(self.kind)
+        except TypeError:                 # unhashable kind from a corrupt save
+            return None
+
     def can_upgrade(self) -> bool:
-        """Is this a finished timber hut with nothing already in flight on it?"""
+        """Is this a finished, still-timber building with nothing in flight?
+
+        The kind test is table-driven (:data:`UPGRADE_SPECS`) rather than the
+        ``kind == "hut"`` it used to be, so a lookout answers True for a rock
+        tower on exactly the same terms a hut answers True for stone. Every
+        ladder starts at wood, so "still on its first material" is one question.
+        """
         return (
-            self.kind == "hut"
+            self.upgrade_spec() is not None
             and self.built
             and not self.is_ruined
             and not self.is_burning
@@ -826,8 +1091,13 @@ class Structure:
         )
 
     def upgrade_cost(self) -> dict[str, int]:
-        """A *copy* of the upgrade price, so a caller cannot edit the module."""
-        return dict(HUT_UPGRADE_COST)
+        """A *copy* of the upgrade price, so a caller cannot edit the module.
+
+        ``{}`` for a kind that cannot be upgraded, which is what every consumer
+        of a cost dict already treats as "nothing owed".
+        """
+        spec = self.upgrade_spec()
+        return dict(spec[1]) if spec else {}
 
     def upgrade_delivered(self) -> dict[str, int]:
         """Stone already hauled here for the upgrade. ``{}`` if not upgrading.
@@ -853,7 +1123,7 @@ class Structure:
             return {}
         have = self.upgrade_delivered()
         out: dict[str, int] = {}
-        for res, qty in HUT_UPGRADE_COST.items():
+        for res, qty in self.upgrade_cost().items():
             short = int(qty) - int(have.get(res, 0))
             if short > 0:
                 out[res] = short
@@ -889,7 +1159,10 @@ class Structure:
         """
         if not self.can_upgrade():
             return False
-        self.state["upgrade"] = {"to": "stone", "delivered": {}, "progress": 0.0,
+        spec = self.upgrade_spec()
+        if spec is None:                  # cannot happen; can_upgrade just said so
+            return False
+        self.state["upgrade"] = {"to": spec[0], "delivered": {}, "progress": 0.0,
                                  "opened": float(now)}
         return True
 
@@ -919,7 +1192,11 @@ class Structure:
         up = self.state.get("upgrade")
         if not isinstance(up, dict):   # cannot happen; is_upgrading just said so
             return False
-        per = max(0.25, float(HUT_UPGRADE_WORK))
+        spec = self.upgrade_spec()
+        if spec is None:               # nor this; is_upgrading implies a spec
+            return False
+        to_default, _cost, work, new_max_hp = spec
+        per = max(0.25, float(work))
         prog = _as_float(up, "progress", 0.0)
         prog += (float(dt) * max(0.0, float(rate))) / per
         if prog < 1.0:
@@ -928,16 +1205,23 @@ class Structure:
         # Landed. This single assignment to state["material"] is the whole of
         # the sim's rendering obligation: renderer.py already passes the state
         # dict into atlas.get, and Atlas.resolve("hut", {"material": "stone"})
-        # answers "hut_stone". The kind stays "hut", so the growth ladder, the
-        # birth gate, capacity and every hut lookup keep working untouched.
+        # answers "hut_stone". The kind stays what it was, so the growth ladder,
+        # the birth gate, capacity, every hut lookup - and for a lookout, the
+        # tower census, `_free_tower` and the role staffing - keep working
+        # untouched. That is the entire argument for a material key over a kind.
         to = str(up.get("to") or "").strip().lower()
-        self.state["material"] = to if to in HUT_MATERIALS else "stone"
+        self.state["material"] = to if to in materials_for(self.kind) else to_default
         self.state.pop("upgrade", None)
-        self.max_hp = float(HUT_STONE_MAX_HP)
+        self.max_hp = float(new_max_hp)
         self.hp = self.max_hp        # the same full heal advance() gives
         # Stone does not burn. If it was alight when the last course went on,
         # it is not any more; from here `ignite` refuses outright.
         self.state.pop("burning", None)
+        # A tower that has just become rock is a tower that can hold rocks. The
+        # magazine starts EMPTY: the whole point of the feature is that someone
+        # has to haul the ammunition up, and a tower that upgraded into eight
+        # free rocks would make the stocking leg decorative.
+        self._seed_ammo()
         return True
 
     def cancel_upgrade(self) -> None:
@@ -949,6 +1233,127 @@ class Structure:
         an incentive to churn.
         """
         self.state.pop("upgrade", None)
+
+    # ----------------------------------------------------------- rock ammo --
+    # A rock tower's magazine. It lives in `Structure.state` and NOT in a new
+    # top-level save key, and that is not a stylistic preference: every new
+    # top-level key is 36 fresh hostile load cases in tools/smoke.py, a new
+    # junk-sweep surface, and a second source of truth about a building that
+    # already serialises its own state dict. `state` round-trips through
+    # `_json_safe` for free.
+    #
+    # Clamped on WRITE (here) as well as on LOAD (`_sanitise_ammo`), so a
+    # round-trip is a fixed point and nothing has to be added to smoke.py's
+    # CLAMPED_ON_LOAD list.
+    @property
+    def is_rock_tower(self) -> bool:
+        """A tower actually made of rock, so it can hold and drop them.
+
+        Written to short-circuit on the kind rather than as a straight call to
+        :func:`_holds_ammo`, because ``_tick_upkeep`` asks this of every
+        structure in the colony every tick: a hut, a grave or a firepit costs
+        one dict lookup and never touches the string work in
+        :meth:`material`.
+        """
+        spec = self.upgrade_spec()
+        if not spec or spec[0] != ROCK_MATERIAL:
+            return False
+        return self.material() == ROCK_MATERIAL
+
+    def ammo(self) -> int:
+        """Rocks stacked on the deck right now. 0..TOWER_AMMO_MAX, never raises.
+
+        Absent and zero mean the same thing, deliberately - see
+        :meth:`_set_ammo`, which pops rather than writing a 0.
+        """
+        raw = self.state.get("ammo")
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            return 0
+        try:
+            f = float(raw)
+        except (TypeError, ValueError):
+            return 0
+        if not math.isfinite(f) or f <= 0.0:
+            return 0
+        return min(int(f), int(TOWER_AMMO_MAX))
+
+    def ammo_missing(self) -> int:
+        """Rocks this tower has room for. 0 for anything that is not one."""
+        if not self.is_rock_tower:
+            return 0
+        return max(0, int(TOWER_AMMO_MAX) - self.ammo())
+
+    def _set_ammo(self, n: int) -> int:
+        """Write the magazine, clamped. Returns what it now holds.
+
+        Zero POPS the key rather than storing 0. Absent already reads as empty
+        everywhere, and popping means an emptied tower serialises to exactly the
+        dict a freshly upgraded one does - one less state shape to reason about,
+        and a stable round-trip.
+        """
+        try:
+            v = int(n)
+        except (TypeError, ValueError):
+            v = 0
+        v = max(0, min(int(TOWER_AMMO_MAX), v))
+        if v <= 0:
+            self.state.pop("ammo", None)
+        else:
+            self.state["ammo"] = v
+        return v
+
+    def _seed_ammo(self) -> None:
+        """Give a rock tower the cooldown clock it ticks on. Empty magazine."""
+        if not self.is_rock_tower:
+            return
+        self.state.setdefault("ammo", 0)
+        self._set_ammo(self.ammo())          # normalises the 0 straight back out
+        if not isinstance(self.state.get("rock_t"), (int, float)) \
+                or isinstance(self.state.get("rock_t"), bool):
+            self.state["rock_t"] = 0.0
+
+    def deliver_ammo(self, stone: int = 1) -> int:
+        """Load hauled stone as rocks. Returns the STONE units actually taken.
+
+        The unit mismatch is the point: a hauler carries stone, a tower drops
+        rocks, and one stone splits into :data:`TOWER_AMMO_PER_STONE` of them.
+        Returning stone rather than rocks is what lets the stocking handler debit
+        the stockpile by exactly what it handed over - the same contract
+        :meth:`deliver` and :meth:`deliver_upgrade` already have with the
+        builders.
+
+        Refuses everything on a tower that is not rock, not built or in rubble,
+        so a caller needs no guard of its own.
+        """
+        if not self.built or self.is_ruined or not self.is_rock_tower:
+            return 0
+        try:
+            units = int(stone)
+        except (TypeError, ValueError):
+            return 0
+        room = self.ammo_missing()
+        if units <= 0 or room <= 0:
+            return 0
+        per = max(1, int(TOWER_AMMO_PER_STONE))
+        # Ceiling division: the last stone is accepted even when it only half
+        # fills the rack, because the alternative is a tower that can never be
+        # topped to full on an odd shortfall and a hauler that walks back and
+        # forth forever.
+        take = min(units, (room + per - 1) // per)
+        self._set_ammo(self.ammo() + min(room, take * per))
+        return take
+
+    def spend_ammo(self, n: int = 1) -> bool:
+        """Consume `n` rocks. False - and nothing spent - if there are not `n`."""
+        try:
+            want = int(n)
+        except (TypeError, ValueError):
+            return False
+        have = self.ammo()
+        if want <= 0 or have < want:
+            return False
+        self._set_ammo(have - want)
+        return True
 
     # --------------------------------------------------------------- damage --
     @property
@@ -1017,6 +1422,11 @@ class Structure:
         # rebuilds at timber prices, which is slack - and chosen: a fire the
         # player could not prevent should not un-teach the colony masonry.
         self.state.pop("upgrade", None)
+        # The rocks DO go, unlike the masonry. They were stacked on a platform
+        # that is now on the floor. `material` staying put is what lets
+        # `_on_complete` hand the rebuilt tower an empty rack and its clock.
+        self.state.pop("ammo", None)
+        self.state.pop("rock_t", None)
 
     # ------------------------------------------------------------------ fire --
     def ignite(self) -> bool:
@@ -1405,6 +1815,8 @@ class Structure:
             self.state["glow"] = _clamp01(float(self.state.get("glow", 1.0)))
         if self.kind == "barricade" and self.built:
             self._tick_barricade(dt, world)
+        if self.built and self.is_rock_tower:
+            self._tick_rock_tower(dt, world)
 
     def _tick_fuel(self, dt: float, world: Any | None) -> None:
         """Spend a lit firepit's fuel. **Garbage first, wood only after.**
@@ -1473,9 +1885,15 @@ class Structure:
         method already documented that - and ``world.dragons`` is absent on
         every world loaded from a save written before dragons existed, which is
         the far more common case and must not cost the barricade its teeth.
+
+        The list of registries is :data:`SPIKED_TARGET_SOURCES`, append-only, and
+        ``"raiders"`` is already on it. That entry is free on a world that has no
+        raider registry - the ``getattr`` answers ``None``, ``alive`` is not
+        callable, the source contributes nothing - which is what lets the lane
+        that owns ``world.raiders`` land later without editing this file.
         """
         out: list[Any] = []
-        for attr in ("animals", "dragons"):
+        for attr in SPIKED_TARGET_SOURCES:
             reg = getattr(world, attr, None)
             alive = getattr(reg, "alive", None)
             if not callable(alive):
@@ -1531,6 +1949,74 @@ class Structure:
             except Exception:
                 continue
 
+    def _tick_rock_tower(self, dt: float, world: Any | None) -> None:
+        """A rock tower drops a rock on whatever walks under it. Never raises.
+
+        Modelled line for line on :meth:`_tick_barricade`, because it is the
+        same shape of thing - a built structure that passively hurts what comes
+        into range - and the barricade's shape has already had the bugs taken
+        out of it. Three differences, all of them deliberate:
+
+        * **It costs ammunition.** The barricade's spikes are free forever; this
+          spends one rock per drop out of a magazine capped at TOWER_AMMO_MAX
+          that somebody has to climb up and refill. That is what makes it a
+          burst rather than a siege engine, and it is the only reason a tower
+          that out-damages the spikes is not simply better than them.
+        * **It is on a cooldown, not a damage rate.** ROCK_DAMAGE is a discrete
+          blow every ROCK_COOLDOWN seconds, not hp/second, so the same wolf
+          walking the same path takes the same number of rocks whatever the
+          frame rate. `rock_t` is that clock and it is persisted, so a save
+          taken mid-reload resumes mid-reload rather than firing instantly.
+        * **The reach is tiny.** ROCK_DROP_RANGE is 46 px against the
+          barricade's spikes, and ROCK_DROP_CEILING is BELOW the deck, so a
+          rock falls and never rises. A tower covers its own footing: the man
+          standing on it, and the ladder he came up. Anything that wants to be
+          hit at distance has to be thrown at.
+
+        Passive, and that is a design choice with a cost attached: the tower
+        drops rocks whether or not a lookout is standing on it. Manning it would
+        read better, but it would also mean the drop had to ask the world for an
+        occupant every frame - and, worse, it would make the feature's output a
+        function of `assign_roles`, which draws off ``world.pyrng``. This branch
+        draws NOTHING from any stream, which is what keeps the rock drop
+        bit-identical against a world where no tower was ever upgraded.
+        """
+        if world is None or dt <= 0.0:
+            return
+        st = self.state
+        # The clock runs even with an empty rack, capped at the cooldown, so a
+        # tower that has stood idle for an hour is "loaded" rather than holding
+        # a 3600-second number - and so the first rock hauled up can be dropped
+        # at once rather than after another wait the player cannot see.
+        t = min(_as_float(st, "rock_t", 0.0) + float(dt), float(ROCK_COOLDOWN))
+        st["rock_t"] = t
+        if t < float(ROCK_COOLDOWN) or self.ammo() <= 0:
+            return
+        clearance = _clearance()
+        hurt = _hurt()
+        for a in self._spiked_targets(world):
+            try:
+                if abs(float(a.x) - self.x) > ROCK_DROP_RANGE:
+                    continue
+                if clearance(world, a) > ROCK_DROP_CEILING:
+                    continue      # too high up for something falling to reach it
+                if not self.spend_ammo(1):
+                    return        # rack emptied under us; nothing dropped
+                st["rock_t"] = 0.0
+                # Through combat_actions.hurt_animal, not a direct write to
+                # `hp`: that is the path that respects Dragon.hurt discarding
+                # damage while the dragon is unsated. A rock that set `hp`
+                # itself would be the only weapon in the game that kills an
+                # unfed dragon, and nothing would fail loudly to say so.
+                if hurt(world, a, float(ROCK_DAMAGE), None):
+                    kind = str(getattr(a, "kind", "") or "beast").strip().lower()
+                    self._chronicle(
+                        world, f"A rock from the tower finishes a {kind or 'beast'}."
+                    )
+                return            # one rock per cooldown, one target
+            except Exception:
+                continue
+
     @staticmethod
     def _chronicle(world: Any | None, text: str) -> None:
         """Route a line into the world's chronicle, whatever shape it takes.
@@ -1561,6 +2047,13 @@ class Structure:
 
     # ------------------------------------------------------------ serialise --
     def to_dict(self) -> dict[str, Any]:
+        # `_json_safe` hands back a fresh dict, so sanitising it here clamps the
+        # magazine on WRITE without touching the live structure. Doing it on both
+        # sides makes a save/load a fixed point, which is what keeps `ammo` out
+        # of smoke.py's CLAMPED_ON_LOAD list (currently exactly one entry) and
+        # keeps `test_roundtrip` green without a special case.
+        state = _json_safe(self.state) or {}
+        _sanitise_ammo(self.kind, state)
         return {
             "id": int(self.id),
             "kind": str(self.kind),
@@ -1574,7 +2067,7 @@ class Structure:
             "built": bool(self.built),
             "cost": {str(k): int(v) for k, v in self.cost.items()},
             "occupants": [int(a) for a in self.occupants],
-            "state": _json_safe(self.state) or {},
+            "state": state,
             "variant": int(self.variant),
             "standing_t": float(self.standing_t),
             "growth": float(self.growth),
@@ -1610,6 +2103,10 @@ class Structure:
             }
         _sanitise_bonfire(kind, state)
         _sanitise_upgrade(kind, state)
+        # AFTER `_sanitise_upgrade`, which canonicalises `material` - the ammo
+        # keys are only legal on a tower that is actually made of rock, so this
+        # has to read the cleaned value rather than the raw one.
+        _sanitise_ammo(kind, state)
         s = cls(
             id=_as_int(d, "id", 0),
             kind=kind,
@@ -1650,6 +2147,12 @@ class Structure:
         # than let advance_upgrade re-wall a building that is not there.
         if not s.built or s.is_ruined:
             s.state.pop("upgrade", None)
+            # Same reasoning for the magazine, and the same reason
+            # `_sanitise_ammo` cannot do it: rubble has no deck to stack rocks
+            # on. `collapse` already pops these, so this only ever fires for a
+            # hand-edited or half-flushed save.
+            s.state.pop("ammo", None)
+            s.state.pop("rock_t", None)
         # A save from before hut growth existed has no `growth`. Seeding it from
         # the age term (the store term is not knowable until the world hands us
         # a stockpile) stops every hut in an old colony visibly re-inflating
@@ -1740,10 +2243,11 @@ def _sanitise_upgrade(kind: str, state: dict[str, Any]) -> None:
     """
     if not isinstance(state, dict):
         return
+    mats = materials_for(kind)
     if "material" in state:
         raw = state.get("material")
         mat = raw.strip().lower() if isinstance(raw, str) else ""
-        if mat in HUT_MATERIALS:
+        if mat in mats:
             # Store the canonical spelling so the value the renderer strips and
             # the value `material()` compares are the same string on disk too.
             state["material"] = mat
@@ -1753,21 +2257,30 @@ def _sanitise_upgrade(kind: str, state: dict[str, Any]) -> None:
             # round-tripping its garbage back out to disk forever.
             state.pop("material", None)
     up = state.get("upgrade")
-    if not isinstance(up, dict) or kind != "hut":
-        # Only a hut can be re-walled. Anything else carrying the key is a
-        # corrupt save; drop it rather than let a grave report is_upgrading.
+    spec = UPGRADE_SPECS.get(kind) if isinstance(kind, str) else None
+    if not isinstance(up, dict) or spec is None:
+        # Only a kind with an entry in UPGRADE_SPECS can be upgraded. Anything
+        # else carrying the key is a corrupt save; drop it rather than let a
+        # grave report is_upgrading.
+        #
+        # This test USED to be `kind != "hut"`, and widening it is not optional
+        # once a second kind can be upgraded: leave it and every tower upgrade
+        # in flight is silently deleted on the next load, with the delivered
+        # stone sunk and the job re-opened from scratch on the following
+        # director pass. It would look like the feature simply never finished.
         state.pop("upgrade", None)
         return
+    to_default, cost = spec[0], spec[1]
     to = up.get("to")
     to = to.strip().lower() if isinstance(to, str) else ""
-    clean: dict[str, Any] = {"to": to if to in HUT_MATERIALS else "stone"}
+    clean: dict[str, Any] = {"to": to if to in mats else to_default}
     delivered: dict[str, int] = {}
     raw_delivered = up.get("delivered")
     if isinstance(raw_delivered, dict):
         for res, qty in raw_delivered.items():
             # Only resources the upgrade actually charges for: a save claiming
             # 40 delivered fibre must not make upgrade_missing() look satisfied.
-            if not isinstance(res, str) or res not in HUT_UPGRADE_COST:
+            if not isinstance(res, str) or res not in cost:
                 continue
             if isinstance(qty, bool) or not isinstance(qty, (int, float)):
                 continue
@@ -1779,7 +2292,7 @@ def _sanitise_upgrade(kind: str, state: dict[str, Any]) -> None:
             # in the (TypeError, ValueError) every other loader here catches.
             if not math.isfinite(fq) or fq <= 0.0:
                 continue
-            delivered[res] = min(int(fq), int(HUT_UPGRADE_COST[res]))
+            delivered[res] = min(int(fq), int(cost[res]))
     clean["delivered"] = delivered
     prog = up.get("progress")
     p = 0.0
@@ -1805,6 +2318,69 @@ def _sanitise_upgrade(kind: str, state: dict[str, Any]) -> None:
         if math.isfinite(fo) and fo >= 0.0:
             clean["opened"] = fo
     state["upgrade"] = clean
+
+
+def _sanitise_ammo(kind: str, state: dict[str, Any]) -> None:
+    """Make a rock tower's magazine keys in a ``state`` safe, in place.
+
+    Same rule as :func:`_sanitise_bonfire` and :func:`_sanitise_upgrade`:
+    *degrade to a plain building, never raise, and POP rather than coerce*. A
+    save carrying ``ammo: "loads"``, ``ammo: -4``, ``ammo: 1e9``, ``ammo: NaN``,
+    a rack on a grave, or a rack on a lookout that is still made of timber has
+    to load as a perfectly ordinary building, because the alternative - an
+    exception inside ``StructureRegistry.from_dict`` - loses the player's whole
+    settlement to a typo.
+
+    Popping rather than coercing to 0 matters more here than it looks. Absent
+    and empty already mean the same thing to :meth:`Structure.ammo`, and
+    :meth:`Structure._set_ammo` pops on zero too - so an emptied rack, a
+    freshly upgraded tower and a hand-edited ``ammo: "eight"`` all serialise to
+    the same dict, and a save/load round-trip is a fixed point. That is what
+    keeps this key out of ``tools/smoke.py``'s CLAMPED_ON_LOAD list.
+
+    Called from ``Structure.from_dict`` AFTER ``_sanitise_upgrade``, because it
+    reads the canonicalised ``material``, and from ``Structure.to_dict``, which
+    is the write half of the same clamp.
+    """
+    if not isinstance(state, dict):
+        return
+    raw_mat = state.get("material")
+    mat = raw_mat.strip().lower() if isinstance(raw_mat, str) else ""
+    if not _holds_ammo(kind, mat):
+        # Only a tower actually made of rock has a rack. Anything else carrying
+        # these keys is a corrupt or hand-edited save, or a tower that was
+        # rebuilt in timber; drop them rather than let a hut report ammo.
+        for key in ("ammo", "rock_t"):
+            state.pop(key, None)
+        return
+    raw = state.get("ammo")
+    n = 0
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        try:
+            f = float(raw)
+        except (TypeError, ValueError):
+            f = 0.0
+        if math.isfinite(f) and f > 0.0:
+            n = min(int(f), int(TOWER_AMMO_MAX))
+    if n <= 0:
+        state.pop("ammo", None)
+    else:
+        state["ammo"] = n
+    # The cooldown clock. Bounded at ROCK_COOLDOWN on purpose: `_tick_rock_tower`
+    # never lets it grow past that, so a larger value can only have come from
+    # outside, and an unbounded one would read as "ready" forever regardless.
+    t = state.get("rock_t")
+    ok = isinstance(t, (int, float)) and not isinstance(t, bool)
+    if ok:
+        try:
+            ft = float(t)
+            ok = math.isfinite(ft) and ft >= 0.0
+        except (TypeError, ValueError):
+            ok = False
+    if ok:
+        state["rock_t"] = min(float(t), float(ROCK_COOLDOWN))
+    else:
+        state.pop("rock_t", None)
 
 
 # ---------------------------------------------------------------- registry --

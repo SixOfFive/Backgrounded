@@ -16,6 +16,12 @@ sprite padding cannot desync the renderer. The renderer sets
 ``rect.midbottom = (st.x, st.y + 2)``, so a taller sprite grows *upward* from the
 ground line - every baker keeps its ground contact at the canvas bottom.
 
+Towers have a SECOND anchor, and it is not optional: the top surface of a
+lookout's deck must be baked exactly ``spec.height - TOWER_PERCH_RISE`` px above
+the ground line, because that is where ``sim/actions.py`` stands the man on
+watch. The canvas height is derived from it rather than authored - see
+:data:`TOWER_PERCH_RISE` for the eleven-px offset that shipped without it.
+
 Huts are the one kind with real growth: :func:`hut_dims` recomputes the geometry
 per scale instead of upscaling the small drawing, and the result is cached in
 :data:`HUT_GROWTH_BUCKETS` buckets across ``HUT_SCALE_MIN..HUT_SCALE_MAX`` so a
@@ -97,6 +103,9 @@ KIND_VARIANTS: dict[str, int] = {
     "barricade": 4,         # spiked palisades raised near the world edges
     "hermit_hut": 2,        # one man's lean-to, facing either way
     "hermit_fire": 2,       # his own scrape fire, two stone layouts
+    "lookout": 2,           # the colony's perimeter towers, one off each side
+    "lookout_rock": 2,      # alias: the same tower once it is stocked with rock
+    "hermit_lookout": 2,    # his own, out at the hut
 }
 
 #: Hut sprite kind -> the material its walls are drawn in.
@@ -114,6 +123,101 @@ HUT_KINDS: dict[str, str] = {
     "hut_stone": "stone",
 }
 _HUT_KIND_FOR_MATERIAL: dict[str, str] = {m: k for k, m in HUT_KINDS.items()}
+
+#: Lookout sprite kind -> the material the structure has been upgraded to.
+#:
+#: Exactly the :data:`HUT_KINDS` idiom one building along, and for the same
+#: reason: the rock tier is ``Structure.state["material"] = "rock"`` on a kind
+#: that must still BE a lookout everywhere in the sim - the role staffing, the
+#: free-tower search and the perch handler all key off ``kind == "lookout"``.
+#: So the upgrade becomes a *picture* here and nowhere else.
+TOWER_MATERIAL_KINDS: dict[str, str] = {
+    "lookout": "wood",
+    "lookout_rock": "rock",
+}
+_TOWER_KIND_FOR_MATERIAL: dict[str, str] = {
+    m: k for k, m in TOWER_MATERIAL_KINDS.items()
+}
+
+# ------------------------------------------------------------- tower decks --
+#: THE ONE NUMBER THE ART AND THE SIM MUST AGREE ON.
+#:
+#: ``sim/actions.py``'s ``_h_lookout`` stands a perched agent at
+#: ``Structure.top_y() + 6.0``, i.e. six px *below* the structure's declared
+#: top, and a stickman's ``y`` is its FEET. So the top surface of a tower's deck
+#: has to be baked exactly ``spec.height - 6`` px above the sprite's ground
+#: line, or the man on watch is drawn standing through it.
+#:
+#: The shipped watchtower did not do this and nobody noticed for the length of
+#: the project: ``KIND_SIZE["watchtower"]`` was (58, 116) with the plank at
+#: ``int(h * 0.34) - 5``, which put the deck's top surface at world y-79 against
+#: feet at y-68 - eleven px low, so the plank crossed him at the hip and his
+#: feet hung in open air *under* the platform. Found by measuring the BAKED
+#: PIXELS - the plank's rows in the finished sprite, mapped into world y through
+#: the renderer's own anchor rule - and then by looking at a rendered figure
+#: standing on it, because the arithmetic had already been checked twice by
+#: people who did not look.
+#:
+#: Mirrored as a literal rather than imported because ``render/`` never imports
+#: a sim handler module. If ``_h_lookout`` ever perches somewhere else this
+#: number moves with it, and the probe that found the bug will say so.
+TOWER_PERCH_RISE = 6
+
+#: kind -> the sim's ``StructureSpec.height``, in px.
+#:
+#: FALLBACKS ONLY. :func:`_sync_with_sim` overwrites every entry it can read off
+#: ``STRUCTURE_SPECS``, so the art is built to whatever the sim actually
+#: declares and a lane retuning a tower's height cannot silently desync the
+#: deck. The values here are what the kinds are specified at, and are what gets
+#: used on a partial checkout or before the sim-side kind exists.
+TOWER_SPEC_H: dict[str, float] = {
+    "watchtower": 74.0,
+    "lookout": 74.0,
+    "hermit_lookout": 62.0,
+}
+
+#: kind -> canvas width, and px of rail/roof/headroom baked ABOVE the deck.
+#:
+#: The canvas HEIGHT is not authored - it is ``deck + headroom + 2``, computed
+#: by :func:`_refresh_tower_sizes`. That is the whole fix to the offset above:
+#: there is no longer a hand-written sprite height that can drift away from
+#: ``spec.height``, and a new tower kind cannot inherit the old relationship.
+TOWER_ART: dict[str, tuple[int, int]] = {
+    # 40, not the 34 that reproduces the shipped roof row for row. The extra six
+    # px are the OTHER half of the deck fix: the old art placed the plank where
+    # the watchman's HIPS were, so the roofed box was only ever asked to clear a
+    # man from the waist up. Standing him on the deck instead puts a 26 px
+    # AGENT_HEIGHT figure inside a 28 px box with his scalp in the thatch.
+    "watchtower": (58, 40),
+    "lookout": (48, 30),
+    "hermit_lookout": (34, 20),
+}
+
+
+#: Sprite kind -> the tower kind whose geometry it shares. A rock tower is the
+#: same building with different cladding, so it must never compute its own deck,
+#: its own stage ladder or its own jitter stream.
+#:
+#: DERIVED from :data:`TOWER_MATERIAL_KINDS` rather than written out, so a second
+#: cladding cannot be added to one table and forgotten in the other - which
+#: would give it a 48x48 placeholder canvas and a deck nowhere near the perch.
+TOWER_ALIAS: dict[str, str] = {
+    kind: "lookout" for kind, material in TOWER_MATERIAL_KINDS.items()
+    if material != "wood"
+}
+
+
+def tower_deck_h(kind: str) -> int:
+    """Height in px, above the ground line, of a tower deck's TOP SURFACE."""
+    base = TOWER_ALIAS.get(kind, kind)
+    return max(8, int(round(TOWER_SPEC_H.get(base, 74.0))) - TOWER_PERCH_RISE)
+
+
+def tower_canvas_size(kind: str) -> tuple[int, int]:
+    """Sprite size for a tower kind, derived from the sim's own height."""
+    base = TOWER_ALIAS.get(kind, kind)
+    w, head = TOWER_ART.get(base, (48, 30))
+    return (int(w), tower_deck_h(base) + int(head) + 2)
 
 #: A crop is a prop, not a buildable, but its growth reads on the same *stage*
 #: axis the atlas already caches by: stage 0 is a freshly tilled seedling bed,
@@ -137,6 +241,9 @@ ART_STAGES: dict[str, int] = {
     "barricade": 3,
     "hermit_hut": 3,
     "hermit_fire": 2,
+    "lookout": 4,
+    "lookout_rock": 4,
+    "hermit_lookout": 3,
 }
 
 # kind -> number of build stages the simulation uses (stage 0 is stakes /
@@ -152,6 +259,12 @@ STRUCTURE_STAGES: dict[str, int] = {
     "grave": 2,
     "crop": CROP_ART_STAGES,   # crop growth is baked as staged art
     "barricade": 3,            # stakes -> framed -> full spiked palisade
+    # Fallbacks until sim.structures declares the kinds; _sync_with_sim adopts
+    # whatever it finds there. Four rungs mirrors the watchtower the colony's
+    # pair are built like, three mirrors the hermit's own hut.
+    "lookout": 4,
+    "lookout_rock": 4,
+    "hermit_lookout": 3,
 }
 
 
@@ -176,9 +289,44 @@ def _sync_with_sim() -> None:
             if 1 <= variants <= 16:
                 KIND_VARIANTS[kind] = max(KIND_VARIANTS.get(kind, 1), variants)
             ART_STAGES.setdefault(kind, min(4, stages))
+            # A tower's canvas is DERIVED from spec.height (see TOWER_PERCH_RISE)
+            # and must not be defaulted to the 48x48 placeholder, which would
+            # silently put the deck somewhere the sim never perches anybody.
+            if kind in TOWER_ART:
+                h = float(getattr(spec, "height", 0.0) or 0.0)
+                if 20.0 <= h <= 200.0:
+                    TOWER_SPEC_H[kind] = h
+                continue
             KIND_SIZE.setdefault(kind, (48, 48))
     except Exception:
         return
+
+
+def _refresh_tower_sizes() -> None:
+    """Recompute every tower canvas from the sim heights currently known.
+
+    Called at import and again from :func:`_sync_with_sim`, so the deck lands on
+    ``spec.height - TOWER_PERCH_RISE`` whatever the sim declares - including on
+    a checkout where the sim-side kind does not exist yet and the fallback in
+    :data:`TOWER_SPEC_H` is what is standing in for it.
+    """
+    for kind in list(TOWER_ART) + list(TOWER_ALIAS):
+        KIND_SIZE[kind] = tower_canvas_size(kind)
+
+
+def _mirror_tower_aliases() -> None:
+    """Give a clad tower the same registry numbers as the tower it clads.
+
+    The :func:`_mirror_hut_aliases` argument, one building along: a rock tower
+    is a lookout with different cladding, so a hardcoded row here would leave it
+    one build stage short of finished the moment somebody retunes the lookout
+    spec. The canvas is already shared through :data:`TOWER_ALIAS`.
+    """
+    for kind, base in TOWER_ALIAS.items():
+        KIND_VARIANTS[kind] = KIND_VARIANTS.get(base, 2)
+        STRUCTURE_STAGES[kind] = STRUCTURE_STAGES.get(base, 4)
+        ART_STAGES[kind] = ART_STAGES.get(base, 4)
+        KIND_SIZE[kind] = tower_canvas_size(kind)
 
 
 def _mirror_hut_aliases() -> None:
@@ -218,7 +366,16 @@ KIND_SIZE: dict[str, tuple[int, int]] = {
     "hut": (78, 64),
     "wall": (38, 44),
     "bridge": (108, 32),
-    "watchtower": (58, 116),
+    # The three tower canvases are OVERWRITTEN by _refresh_tower_sizes() below
+    # and are only written out here so nothing can ever read a missing entry and
+    # fall through to the 48x48 placeholder. They are the values that function
+    # computes from the shipped spec heights - watchtower 74 - 6 + 34 + 2 = 104.
+    # It was 116, with the deck 11 px above where the sim perches a man; see
+    # TOWER_PERCH_RISE for the measurement.
+    "watchtower": (58, 104),
+    "lookout": (48, 100),
+    "lookout_rock": (48, 100),
+    "hermit_lookout": (34, 78),
     "totem": (30, 90),
     "stockpile": (52, 38),
     "barricade": (60, 58),
@@ -1047,12 +1204,28 @@ def _bake_bridge(stage: int, rng: random.Random) -> pygame.Surface:
     return surf
 
 
+def _deck_row(kind: str, h: int) -> int:
+    """Canvas row of the TOP SURFACE of *kind*'s deck.
+
+    The sprite's ground line is row ``h - 2`` - the renderer anchors
+    ``midbottom`` at ``st.y + 2`` - so a deck standing ``tower_deck_h`` px above
+    the ground is that many rows up from there. Every tower baker measures its
+    platform from this and nothing else; see :data:`TOWER_PERCH_RISE` for what
+    goes wrong when a baker picks its own fraction of the canvas instead.
+    """
+    return (h - 2) - tower_deck_h(kind)
+
+
 def _bake_watchtower(stage: int, rng: random.Random) -> pygame.Surface:
     surf = _canvas("watchtower")
     w, h = surf.get_size()
     base = h - 2
     lx, rx = int(w * 0.16), int(w * 0.84)
-    plat = int(h * 0.34)
+    # The plank is drawn at ``plat - 5`` and is 6 px thick, so the platform line
+    # sits five rows under the deck's top surface. This used to be
+    # ``int(h * 0.34)``, a fraction of a hand-written canvas height that had
+    # drifted 11 px away from where the sim perches the lookout.
+    plat = _deck_row("watchtower", h) + 5
 
     if stage == 0:
         for x in (lx, rx, int(w * 0.34), int(w * 0.66)):
@@ -1061,7 +1234,7 @@ def _bake_watchtower(stage: int, rng: random.Random) -> pygame.Surface:
         _ellipse(surf, EARTH, w // 2, base, w * 0.44, 3.0)
         return surf
 
-    top_y = plat if stage >= 2 else int(h * 0.52)
+    top_y = plat if stage >= 2 else base - int((base - plat) * 0.72)
     _line(surf, WOOD_DARK, (lx, base), (int(w * 0.34), top_y), 4)
     _line(surf, WOOD_DARK, (rx, base), (int(w * 0.66), top_y), 4)
     _rim_line(surf, (lx - 1, base - 2), (int(w * 0.34) - 1, top_y), 100)
@@ -1094,6 +1267,161 @@ def _bake_watchtower(stage: int, rng: random.Random) -> pygame.Surface:
               (w // 2 + 4, int(h * 0.06) + 2), 2)
     _ellipse(surf, EARTH, w // 2, base, w * 0.44, 3.0)
     return surf
+
+
+def _bake_lookout_frame(kind: str, stage: int, rng: random.Random,
+                        rock: bool) -> pygame.Surface:
+    """The colony's perimeter lookout, in timber or clad in rock.
+
+    NOT A SECOND WATCHTOWER, and the silhouette has to say so from across the
+    frame, because these two buildings stand within a few hundred px of each
+    other and mean different things. The watchtower is the settlement's own
+    look: four splayed legs under a big thatched hip roof over an enclosed box,
+    and it reads as a *building on stilts*. This is the thing raised out at the
+    standoff line, behind the barricade, and it is:
+
+      * OPEN. No roof at all. A roof is the watchtower's whole outline and the
+        one shape this must not borrow;
+      * narrower - 48 px against 58 - on two heavy raked legs with an X brace
+        rather than the watchtower's ladder of horizontal rungs;
+      * topped by a signal pole and a rag pennant, which is the mark that reads
+        at any distance and in any light: a thin vertical spike above an open
+        platform, where the watchtower has a broad triangle.
+
+    ``rock`` is the F5 upgrade tier: the same frame with its legs banded in
+    stone, a stone lip round the deck and a cairn of rocks stacked on the
+    platform - so an upgraded tower is legibly the same building, the way a
+    stone hut is legibly the hut it grew out of, and the pile on the deck is the
+    ammunition somebody hauled up there.
+
+    The deck's top surface is placed by :func:`_deck_row` off the sim's own
+    ``spec.height``. It is not a fraction of the canvas; see
+    :data:`TOWER_PERCH_RISE`.
+    """
+    surf = _canvas(kind)
+    w, h = surf.get_size()
+    base = h - 2
+    deck = _deck_row(kind, h)
+    cx = w // 2
+    lx, rx = int(w * 0.12), int(w * 0.88)
+    inl, inr = int(w * 0.30), int(w * 0.70)
+
+    # Drawn before any stage branch, exactly as _bake_hermit_hut argues: a draw
+    # taken inside a branch makes the building change character as it is built.
+    lean = rng.uniform(-1.0, 1.0)
+    flag_right = rng.random() < 0.5
+    band_jit = [rng.uniform(-1.2, 1.2) for _ in range(4)]
+
+    _ellipse(surf, EARTH, cx, base, w * 0.46, 3.0)
+    if stage <= 0:
+        for x in (lx, rx):
+            _ellipse(surf, STONE_DARK, x, base - 2, 5.0, 3.5)
+            _line(surf, WOOD_DARK, (x, base), (x, base - 9), 3)
+        _line(surf, WOOD, (int(w * 0.24), base - 1), (int(w * 0.76), base - 2), 2, 190)
+        return surf
+
+    top = deck if stage >= 2 else base - int((base - deck) * 0.70)
+    tl = int(lx + (inl - lx) * (0.0 if stage >= 2 else 0.30))
+    tr = int(rx - (rx - inr) * (0.0 if stage >= 2 else 0.30))
+    leg_l = (int(inl + lean), top)
+    leg_r = (int(inr + lean), top)
+    if stage < 2:
+        leg_l, leg_r = (tl, top), (tr, top)
+
+    _line(surf, WOOD_DARK, (lx, base), leg_l, 4)
+    _line(surf, WOOD_DARK, (rx, base), leg_r, 4)
+    _rim_line(surf, (lx - 1, base - 2), (leg_l[0] - 1, top), 100)
+
+    # The X brace. The watchtower stacks horizontal rungs; this crosses, and at
+    # 48 px wide in the dark the crossing is the second thing that separates
+    # them after the missing roof.
+    if stage >= 1:
+        mid = (base + top) // 2
+        _line(surf, WOOD, (lx + 2, base - 4), (leg_r[0] - 1, top + 4), 1, 205)
+        _line(surf, WOOD, (rx - 2, base - 4), (leg_l[0] + 1, top + 4), 1, 205)
+        _line(surf, WOOD, (int(lx * 0.6 + leg_l[0] * 0.4), mid),
+              (int(rx * 0.6 + leg_r[0] * 0.4), mid), 2)
+
+    if stage >= 2:
+        # ladder, one side, lashed on rather than framed in
+        for i in range(5):
+            y = base - 7 - i * ((base - top) / 6.0)
+            _line(surf, WOOD_LIGHT, (cx - 5, y), (cx + 5, y), 1, 200)
+        _line(surf, WOOD, (cx - 5, base), (cx - 4, top), 1, 220)
+        _line(surf, WOOD, (cx + 5, base), (cx + 4, top), 1, 220)
+
+        # the deck itself: top surface exactly on `deck`
+        pygame.draw.rect(surf, _rgba(WOOD_DARK),
+                         pygame.Rect(int(w * 0.10), deck, int(w * 0.80), 5))
+        _rim_line(surf, (int(w * 0.10), deck), (int(w * 0.90), deck), 135)
+
+        if rock:
+            # A heavier course UNDER the planking, and a short stone cheek at
+            # each end of it. Deliberately not a kerb running the full width:
+            # the deck's top surface is where the sim stands a man, so nothing
+            # is allowed to sit proud of it across the middle - that is the
+            # exact class of mistake TOWER_PERCH_RISE documents, and a 2 px lip
+            # in front of his feet is how it would come back.
+            pygame.draw.rect(surf, _rgba(STONE_DARK),
+                             pygame.Rect(int(w * 0.08), deck + 5, int(w * 0.84), 3))
+            for x in (int(w * 0.11), int(w * 0.85)):
+                pygame.draw.rect(surf, _rgba(STONE), pygame.Rect(x, deck - 3, 4, 8))
+                _rim_line(surf, (x, deck - 3), (x + 3, deck - 3), 120)
+            for i, jit in enumerate(band_jit):
+                t = (i + 1) / (len(band_jit) + 1)
+                by = base - (base - top) * t + jit
+                _line(surf, STONE_DARK,
+                      (lx + (leg_l[0] - lx) * t - 3, by),
+                      (lx + (leg_l[0] - lx) * t + 3, by), 3)
+                _line(surf, STONE_DARK,
+                      (rx + (leg_r[0] - rx) * t - 3, by),
+                      (rx + (leg_r[0] - rx) * t + 3, by), 3)
+
+    if stage >= 3:
+        # waist rail, two posts a side and a top bar. Open at the front.
+        rail_y = deck - 11
+        for x in (int(w * 0.14), int(w * 0.34), int(w * 0.66), int(w * 0.86)):
+            _line(surf, WOOD, (x, deck), (x, rail_y), 2)
+        _line(surf, WOOD, (int(w * 0.13), rail_y), (int(w * 0.87), rail_y), 2)
+        _rim_line(surf, (int(w * 0.13), rail_y - 1), (int(w * 0.87), rail_y - 1), 95)
+
+        if rock:
+            # THE AMMUNITION, and the reason the upgrade is worth drawing: a
+            # cairn of rocks stacked on the deck where the man on watch can
+            # reach them. The COUNT is not baked - a sprite is cached per
+            # (kind, variant, stage) and has no ammo axis - it is on the stats
+            # panel. This says only "there is rock up here".
+            for i in range(5):
+                a = 0.18 + 0.16 * i
+                sx = int(w * a) + (2 if i % 2 else -1)
+                sy = deck - 3 - (2 if i in (1, 3) else 0)
+                r = 2.6 if i % 2 else 3.2
+                _ellipse(surf, STONE if i % 2 else STONE_LIGHT, sx, sy, r, r * 0.78)
+                _rim_arc(surf, sx, sy, r, r * 0.78, 3.2, 6.0, 80)
+
+        # The signal pole and its rag. The one mark that survives the dark - and
+        # set well off centre, because the sim stands the lookout at the tower's
+        # x and a pole through the middle of the deck is a pole through the
+        # middle of him.
+        off = max(6, int(w * 0.22))
+        pole_x = cx + (off if flag_right else -off)
+        head = TOWER_ART.get(TOWER_ALIAS.get(kind, kind), (48, 30))[1]
+        pole_top = max(3, deck - int(head * 0.80))
+        _line(surf, WOOD_LIGHT, (pole_x, deck - 1), (pole_x, pole_top), 2)
+        _rim_line(surf, (pole_x - 1, deck - 2), (pole_x - 1, pole_top), 120)
+        tip = pole_x + (11 if flag_right else -11)
+        _poly(surf, BERRY, [(pole_x, pole_top + 1), (tip, pole_top + 5),
+                            (pole_x, pole_top + 9)])
+        _rim_line(surf, (pole_x, pole_top + 1), (tip, pole_top + 5), 110)
+    return surf
+
+
+def _bake_lookout(stage: int, rng: random.Random) -> pygame.Surface:
+    return _bake_lookout_frame("lookout", stage, rng, rock=False)
+
+
+def _bake_lookout_rock(stage: int, rng: random.Random) -> pygame.Surface:
+    return _bake_lookout_frame("lookout_rock", stage, rng, rock=True)
 
 
 def _bake_totem(stage: int, rng: random.Random) -> pygame.Surface:
@@ -1503,6 +1831,88 @@ def _bake_hermit_hut(stage: int, rng: random.Random) -> pygame.Surface:
     return surf
 
 
+def _bake_hermit_lookout(stage: int, rng: random.Random) -> pygame.Surface:
+    """The hermit's own lookout: one leaning trunk with sticks lashed to it.
+
+    Same argument as ``_bake_hermit_hut`` and ``_bake_hermit_fire``, one
+    building along, and by now the rule is explicit: nothing he builds may read
+    as a thing the colony built. A lookout is the hardest of the three to keep
+    apart, because a tower is a tower - so this one is not a tower. It is a tree
+    he did not fell:
+
+      * ONE mast, leaning, with a single prop jammed against it. The colony's
+        lookout stands on two raked legs and is symmetric; this cannot be, and
+        the asymmetry is the whole silhouette at 34 px across;
+      * rungs are sticks LASHED ACROSS the mast at uneven spacing, not a framed
+        ladder between two stringers;
+      * the platform is three planks, no rail box - one bent branch as a
+        handhold on the open side;
+      * no signal pole and no pennant. He has nobody to signal.
+
+    34x78 against the colony lookout's 48x100, and it never grows. Three stages
+    on the sim's three, matching his hut. The deck's top surface is placed by
+    :func:`_deck_row` off the sim's ``spec.height``, like every other tower.
+    """
+    surf = _canvas("hermit_lookout")
+    w, h = surf.get_size()
+    base = h - 2
+    deck = _deck_row("hermit_lookout", h)
+    cx = w // 2
+    st = max(0, min(int(stage), 2))
+
+    # Up front, unconditionally: which way he leaned it, and how badly.
+    face_right = rng.random() < 0.5
+    lean = rng.uniform(2.0, 4.0) * (1.0 if face_right else -1.0)
+    rung_jit = [rng.uniform(-1.4, 1.4) for _ in range(5)]
+
+    mast_foot = cx - int(lean)
+    mast_top = max(2, deck - int((base - deck) * 0.18))
+    prop_foot = cx + int(lean * 2.2)
+
+    _ellipse(surf, EARTH, cx, base, w * 0.42, 2.6)
+
+    if st == 0:
+        # A trunk driven in and a spare laid beside it. Almost nothing, on
+        # purpose - the interesting part is one man carrying the rest of it out.
+        _stake(surf, mast_foot, base, base - (base - deck) * 0.45, 2.2,
+               lean=lean * 0.3, point=0.0)
+        _line(surf, WOOD, (int(w * 0.22), base - 1), (int(w * 0.74), base - 3), 2, 190)
+        _rim_line(surf, (mast_foot - 1, base - 2),
+                  (mast_foot - 1, base - (base - deck) * 0.45), 90)
+        return surf
+
+    _line(surf, WOOD_DARK, (mast_foot, base), (cx, mast_top), 4)
+    _rim_line(surf, (mast_foot - 1, base - 2), (cx - 1, mast_top), 105)
+    _line(surf, WOOD, (prop_foot, base), (int(cx + lean * 0.4), deck + 3), 3)
+
+    # Rungs: lashed across, uneven, and only up the mast.
+    for i, jit in enumerate(rung_jit):
+        t = (i + 1) / (len(rung_jit) + 1)
+        rx = mast_foot + (cx - mast_foot) * t
+        ry = base - (base - mast_top) * t + jit
+        side = 5.0 if face_right else -5.0
+        _line(surf, WOOD_LIGHT, (rx - side * 0.8, ry), (rx + side, ry), 1, 210)
+
+    if st == 1:
+        return surf
+
+    # Three planks, laid, not framed. Slightly ragged ends.
+    for i in range(3):
+        py = deck + i * 2
+        half = w * (0.34 - 0.03 * i)
+        pygame.draw.rect(surf, _rgba(WOOD if i else WOOD_DARK),
+                         pygame.Rect(int(cx - half), py, int(half * 2), 2))
+    _rim_line(surf, (int(cx - w * 0.34), deck), (int(cx + w * 0.34), deck), 130)
+
+    # One bent branch as a handhold, on the side he climbs up.
+    hx = int(cx + (w * 0.28 if face_right else -w * 0.28))
+    _line(surf, WOOD, (hx, deck), (int(hx - lean * 0.5), deck - 9), 2)
+    _line(surf, WOOD, (int(hx - lean * 0.5), deck - 9),
+          (int(cx + lean * 0.2), deck - 7), 2)
+    _rim_line(surf, (hx - 1, deck - 1), (int(hx - lean * 0.5) - 1, deck - 9), 95)
+    return surf
+
+
 _STRUCTURE_BAKERS = {
     "firepit": _bake_firepit,
     "hut": _bake_hut,
@@ -1515,10 +1925,17 @@ _STRUCTURE_BAKERS = {
     "barricade": _bake_barricade,
     "hermit_hut": _bake_hermit_hut,
     "hermit_fire": _bake_hermit_fire,
+    # A structure kind with no entry here bakes to `self._missing`, a 2x2
+    # transparent surface, and is INVISIBLE while looking perfectly wired up.
+    "lookout": _bake_lookout,
+    "lookout_rock": _bake_lookout_rock,
+    "hermit_lookout": _bake_hermit_lookout,
 }
 
 _sync_with_sim()
+_refresh_tower_sizes()     # again, in case sim.structures was not importable
 _mirror_hut_aliases()      # after the sync, so the aliases adopt the sim's numbers
+_mirror_tower_aliases()
 
 
 # --------------------------------------------------------------------------
@@ -1557,7 +1974,13 @@ class Atlas:
         survived: a forest that quietly reshuffles itself overnight just looks
         like a forest. Same trap and same fix as ``sim.props._name_variant``.
         """
-        tag = f"{kind}\x1f{int(variant)}\x1f{int(stage)}".encode("utf-8", "replace")
+        # A clad tower draws on the stream of the tower it clads. Both bakers
+        # take the same draws in the same order up front (which way the pennant
+        # flies, how the legs lean), so sharing the seed means an upgrade
+        # rebuilds the SAME tower in rock rather than a differently-leaning one
+        # whose flag has jumped to the other side while you watched.
+        base = TOWER_ALIAS.get(kind, kind)
+        tag = f"{base}\x1f{int(variant)}\x1f{int(stage)}".encode("utf-8", "replace")
         return random.Random((self.seed * 31 + zlib.crc32(tag)) & 0x7FFFFFFF)
 
     @staticmethod
@@ -1722,6 +2145,18 @@ class Atlas:
             except (TypeError, ValueError):
                 return kind
             return _HUT_KIND_FOR_MATERIAL.get(mat, kind)
+        if isinstance(state, dict) and kind == "lookout":
+            # F5's rock tier, exactly as the hut's stone tier above: the sim
+            # keeps the tower a "lookout" (its role staffing, the free-tower
+            # search and the perch handler all test that string) and records
+            # the upgrade as state["material"] = "rock". Anything missing or
+            # unrecognised stays a timber lookout, so a save written before the
+            # upgrade existed renders exactly as it did before.
+            try:
+                mat = str(state.get("material", "") or "").strip().lower()
+            except (TypeError, ValueError):
+                return kind
+            return _TOWER_KIND_FOR_MATERIAL.get(mat, kind)
         return kind
 
     @staticmethod

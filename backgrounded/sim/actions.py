@@ -39,6 +39,8 @@ from ..constants import (
     HERMIT_VISIT_MORALE_HOST,
     HERMIT_VISIT_PACE,
     HERMIT_VISIT_TIMEOUT,
+    KIND_HERMIT_LOOKOUT,
+    KIND_LOOKOUT,
     LITTER_CLUSTER_MIN,
     LITTER_CLUSTER_R,
     MAT_DIRT,
@@ -54,13 +56,15 @@ from ..constants import (
     MINE_YIELD_SEC,
     MINE_YIELD_STONE,
     RENDER_H,
-    RENDER_W,
     RES_COOKED,
     RES_FIBRE,
     RES_FOOD,
     RES_GARBAGE,
     RES_STONE,
     RES_WOOD,
+    TOWER_AMMO_MAX,
+    TOWER_AMMO_PER_STONE,
+    TOWER_KINDS,
     WALK_SPEED,
 )
 from .entities import GROUND_SNAP, STEP_DROP_MAX
@@ -101,7 +105,9 @@ CLIFF_LOOKAHEAD = 14.0
 #: burns a third of a run standing still, which is how "safe" pathing cost the
 #: colony two thirds of its buildings.
 BLOCKED_GIVE_UP = 2.0
-from .structures import Structure, StructureRegistry
+# Deliberately below the tuning block above rather than up with the rest of the
+# imports: the geometry note needs to sit next to the constants it explains.
+from .structures import Structure, StructureRegistry  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -119,7 +125,40 @@ __all__ = [
     "prop_alive", "hazards_of", "chronicle", "emit_speech",
     "celebrations_of", "push_celebration", "colony_center",
     "litter_clusters", "densest_litter", "free_litter_cluster",
+    # the hermit's third building, and the rock tower's restock premise
+    "hermit_lookout", "tower_needing_ammo", "tower_ammo", "tower_load_ammo",
 ]
+
+
+_COMBAT: Any = None
+_COMBAT_TRIED = False
+
+
+def _combat() -> Any | None:
+    """``sim.combat_actions``, imported on first use, or None. Never raises.
+
+    IT CANNOT BE A MODULE-SCOPE IMPORT. ``combat_actions`` imports this module
+    at its own top level, so ``actions -> combat_actions -> actions`` is a real
+    cycle and a cold start would die on it. Same shape and same reason as
+    ``structures._clearance_fn``: resolved once, cached in a module global,
+    because the only caller is the per-frame lookout watch phase and a
+    ``sys.modules`` lookup per tower per tick buys nothing.
+
+    Returning None is a supported answer, not a failure: until the combat lane
+    lands ``ranged_ready``/``ranged_target``/``ranged_fire`` the perched-attack
+    step resolves to nothing at all, which is exactly what makes this seam
+    bit-identical to the tree it was written against.
+    """
+    global _COMBAT, _COMBAT_TRIED
+    if not _COMBAT_TRIED:
+        _COMBAT_TRIED = True
+        try:
+            from . import combat_actions as _cx   # noqa: PLC0415 - see above
+            _COMBAT = _cx
+        except Exception:                          # pragma: no cover - cycle
+            log.debug("combat_actions unavailable to actions.py", exc_info=True)
+            _COMBAT = None
+    return _COMBAT
 
 # ------------------------------------------------------------------ tuning --
 CARRY_CAP = 8               # units a stickman can shoulder at once
@@ -181,8 +220,18 @@ ACTION_KINDS: tuple[str, ...] = (
     "BuildStructure", "RepairStructure", "Eat", "Sleep", "WarmAtFire",
     "CookFood", "PlantSapling", "Farm", "Mine", "Converse", "Celebrate",
     "Mourn", "FleeFrom", "ClimbTo", "Lookout", "FollowParent", "Panic",
-    "CleanLitter", "UpgradeStructure",
+    "CleanLitter", "UpgradeStructure", "StockTower",
 )
+
+#: Seconds the throwing pose is held after a shot from a tower deck.
+#:
+#: A shot off the deck is instantaneous - ``ranged_fire`` either puts a spear in
+#: the air or it does not - so without a hold the "chop" pose would last exactly
+#: one tick, 33 ms, and the one visible sign that the tower is doing anything
+#: would never be seen. Under THROW_COOLDOWN, so a lookout firing as fast as he
+#: is allowed still drops back to the watch pose between shots rather than
+#: reading as a man permanently mid-swing.
+LOOKOUT_SHOT_POSE = 0.5
 
 _TREE_KINDS = ("tree", "pine", "oak", "deadtree")
 _ROCK_KINDS = ("rock", "boulder", "stone", "outcrop")
@@ -733,7 +782,23 @@ def colony_center(world: Any) -> float:
 #: than the last, a runaway with a 760 px step. See also
 #: ``structures.NON_SETTLEMENT_KINDS``, which carries the same exclusion for the
 #: registry's own average (the camera's fallback, and stage_bounds').
-OUTWORK_KINDS = ("barricade", "hermit_hut", "hermit_fire")
+#:
+#: THE TWO LOOKOUT KINDS ARE HERE FOR THE BARRICADE'S REASON, SHARPENED. A
+#: ``lookout`` is sited LOOKOUT_STANDOFF (520 px) off ``settlement_center`` and
+#: ``settlement_center`` is the mean this tuple filters, so leaving it in makes
+#: the tower's own position an input to where the NEXT tower goes: stake the
+#: left one at centre-520 and the mean walks 520/n px left, so the right one is
+#: sited 520 px right of somewhere that is no longer the middle of the colony.
+#: That is the same runaway written out above, and it lands on top of the
+#: settlement rather than beside it. ``hermit_lookout`` is worse again, because
+#: ``hermit_home`` is derived from this mean and then anchors the tower.
+#:
+#: ``watchtower`` is deliberately NOT here: it is sited toward the centre on high
+#: ground and it genuinely is part of the settlement. See
+#: ``structures.NON_SETTLEMENT_KINDS``, which must carry the same two additions
+#: for the registry's own average - one copy without the other is trap 7.
+OUTWORK_KINDS = ("barricade", "hermit_hut", "hermit_fire",
+                 KIND_LOOKOUT, KIND_HERMIT_LOOKOUT)
 
 
 def settlement_center(world: Any) -> float:
@@ -882,13 +947,40 @@ def hermit_fire(world: Any, *, built_only: bool = False) -> Any | None:
     return _hermit_owned(world, "hermit_fire", built_only)
 
 
+def hermit_lookout(world: Any, *, built_only: bool = False) -> Any | None:
+    """The hermit's own tower, or None. Never raises.
+
+    The third and last of his buildings, and the only one that is not a need:
+    the fire is warmth and the hut is shelter, and this is what he does when he
+    has both and is bored. So it is deliberately LAST in ``hermit_worksite``
+    below - a hermit who has not eaten, not slept and has no roof does not start
+    a tower - and it is the one whose absence costs him nothing.
+
+    Same accessor shape as :func:`hermit_hut` and :func:`hermit_fire` rather
+    than a fourth inline ``kind ==`` sweep, because behaviour's hermit scorer
+    and this module's handler have to ask the IDENTICAL question. The scorer
+    asking "is there an unbuilt hermit_lookout" while the handler asks something
+    a shade different is the shape of the deadlock the hermit build loop was
+    rebuilt around once already (see ``behavior._hermit_bias``).
+    """
+    return _hermit_owned(world, KIND_HERMIT_LOOKOUT, built_only)
+
+
 def hermit_worksite(world: Any) -> Any | None:
     """The unfinished building at his camp he should be working on, or None.
 
-    FIRE FIRST, THEN WALLS, and that order is the whole of this function. The
-    fire is 4 wood against the hut's 12 and it is what replaced the deleted
-    HERMIT_FIRE_DAMP safety valve, so the cheap warmth has to land before the
-    expensive roof or a hermit appointed on the eve of a blizzard has neither.
+    FIRE FIRST, THEN WALLS, THEN THE TOWER, and that order is the whole of this
+    function. The fire is 4 wood against the hut's 12 and it is what replaced
+    the deleted HERMIT_FIRE_DAMP safety valve, so the cheap warmth has to land
+    before the expensive roof or a hermit appointed on the eve of a blizzard has
+    neither.
+
+    The tower is a third rung rather than a branch because it is a WANT and the
+    other two are needs. Anything that is only reached once both of those are
+    standing can never take material off them, so the ordering is the entire
+    gate - there is no separate "is he comfortable enough" test to keep in sync
+    with anything, and a hermit whose hut burns down goes straight back to the
+    hut with no rule anywhere saying he should.
     """
     fire = hermit_fire(world)
     if fire is not None and not getattr(fire, "built", False):
@@ -896,6 +988,9 @@ def hermit_worksite(world: Any) -> Any | None:
     house = hermit_hut(world)
     if house is not None and not getattr(house, "built", False):
         return house
+    tower = hermit_lookout(world)
+    if tower is not None and not getattr(tower, "built", False):
+        return tower
     return None
 
 
@@ -934,7 +1029,8 @@ def fire_for(agent: Any, world: Any) -> Any | None:
 #: The census sites get that for free because these are separate kinds; the
 #: sites that iterate over ALL structures do not, and they are the ones that
 #: need this tuple.
-HERMIT_KINDS: tuple[str, ...] = ("hermit_hut", "hermit_fire")
+HERMIT_KINDS: tuple[str, ...] = ("hermit_hut", "hermit_fire",
+                                 KIND_HERMIT_LOOKOUT)
 
 
 def is_hermit_built(st: Any) -> bool:
@@ -3046,10 +3142,21 @@ def _h_upgrade(a: Action, ag: Any, w: Any, dt: float) -> None:
         completed = s.advance_upgrade(dt, _work_rate(ag))
         if completed:
             name = getattr(ag, "name", "Someone")
-            chronicle(w, f"{name} re-walled the hut in stone.")
-            # "hut", not "hut_stone": the celebration table is keyed on sim
-            # kinds, and the sim kind never changes - only state["material"].
-            push_celebration(w, float(s.x), float(s.y), "hut")
+            # Kind-aware, because this handler stopped being hut-only. The
+            # upgrade machine went kind-agnostic and pick_upgrade learned to
+            # offer towers, and this line did not follow - so the one sentence
+            # a player actually reads when a lookout is faced in rock said
+            # "re-walled the hut in stone", and the hut's art fired over a
+            # tower. Both halves have to know what was rebuilt.
+            kind = str(getattr(s, "kind", "hut"))
+            if kind in TOWER_KINDS:
+                chronicle(w, f"{name} faced the lookout in rock.")
+            else:
+                chronicle(w, f"{name} re-walled the hut in stone.")
+            # The celebration table is keyed on SIM kinds, and the sim kind
+            # never changes - only state["material"] does - so the kind is
+            # passed through as-is rather than as "hut_stone" or "rock_tower".
+            push_celebration(w, float(s.x), float(s.y), kind)
             _adjust(ag, "morale", 0.18)
             a.done = True
         elif s.upgrade_missing():
@@ -3057,6 +3164,317 @@ def _h_upgrade(a: Action, ag: Any, w: Any, dt: float) -> None:
         return
 
     a.phase = "fetch"
+
+
+# ===========================================================================
+#  StockTower - carry stone to a rock tower and stack it in the rack
+#
+#  The magazine itself lives in `Structure.state` under the shape every lane
+#  agreed on: {"material": "rock", "ammo": int, "rock_t": float}. Nothing here
+#  invents a key outside it, which is what keeps the tower off the save's
+#  top-level surface and out of the junk sweep entirely.
+# ===========================================================================
+#: Seconds spent working the hoist once the stone is at the foot of the tower.
+#:
+#: On the ACTION, never on the structure. A progress field in `Structure.state`
+#: would be a fourth key in a three-key shape that five lanes are writing
+#: against, and it would need a load-time sanitiser of its own; the action's own
+#: `data` already round-trips and already dies with the errand, which is the
+#: correct lifetime for "how far up the rope this armful is".
+TOWER_HOIST_SEC = 1.6
+
+
+def _is_rock_tower(st: Any) -> bool:
+    """True for a standing tower that has been re-decked in stone. Never raises.
+
+    ``Structure.is_rock_tower`` is the authority and this defers to it: the
+    structures lane owns the material ladder, the upgrade spec table and the
+    load-time sanitiser, and a second opinion here about what counts as a
+    magazine would be the two-sources-of-truth failure this arc is full of
+    warnings about.
+
+    The fallback underneath it is the same question asked of the raw state -
+    a tower kind whose material is rock - and exists only so this module is not
+    ordered behind that one. It is bounded by ``TOWER_KINDS`` so "material" on
+    some future stone firepit can never read as a rack.
+    """
+    try:
+        flag = getattr(st, "is_rock_tower", None)
+        if isinstance(flag, bool):
+            return flag and bool(getattr(st, "built", False)) \
+                and not bool(getattr(st, "is_ruined", False))
+        if str(getattr(st, "kind", "")) not in TOWER_KINDS:
+            return False
+        if not getattr(st, "built", False) or getattr(st, "is_ruined", False):
+            return False
+        state = getattr(st, "state", None)
+        if not isinstance(state, dict):
+            return False
+        return str(state.get("material") or "").strip().lower() == "rock"
+    except Exception:
+        return False
+
+
+def tower_ammo(st: Any) -> int:
+    """Rocks in *st*'s rack, 0..TOWER_AMMO_MAX. Never raises.
+
+    Clamped on the way OUT as well as in, so a hand-edited or half-sanitised
+    save reads as a number in range everywhere rather than letting one reader
+    see 10**9 and another see 8.
+    """
+    try:
+        fn = getattr(st, "ammo", None)
+        if callable(fn):
+            return max(0, min(TOWER_AMMO_MAX, int(fn())))
+        state = getattr(st, "state", None)
+        if not isinstance(state, dict):
+            return 0
+        n = int(state.get("ammo") or 0)
+    except (TypeError, ValueError):
+        return 0
+    except Exception:
+        return 0
+    return max(0, min(TOWER_AMMO_MAX, n))
+
+
+def tower_load_ammo(st: Any, stone: int) -> int:
+    """Hand *stone* units up the hoist. Returns the STONE units actually taken.
+
+    The unit mismatch is deliberate and it is `Structure.deliver_ammo`'s
+    contract, not this module's invention: a hauler carries stone, a tower
+    stores rocks, and one stone splits into TOWER_AMMO_PER_STONE of them.
+    Returning stone is what lets the handler debit exactly what it handed over,
+    the same shape ``deliver`` and ``deliver_upgrade`` already have with the
+    builders.
+
+    CLAMPED AT WRITE as well as at load, which is why the fallback below bothers
+    to do the arithmetic rather than just adding. A value clamped only on load
+    makes `to_dict` and the reloaded `from_dict` disagree, and smoke.py's
+    round-trip then demands an entry in CLAMPED_ON_LOAD - a list with exactly
+    one member that nothing in this arc is allowed to grow.
+    """
+    try:
+        fn = getattr(st, "deliver_ammo", None)
+        if callable(fn):
+            return max(0, int(fn(int(stone))))
+        if not _is_rock_tower(st):
+            return 0
+        state = getattr(st, "state", None)
+        if not isinstance(state, dict):
+            return 0
+        units = max(0, int(stone))
+        room = max(0, TOWER_AMMO_MAX - tower_ammo(st))
+        if units <= 0 or room <= 0:
+            return 0
+        per = max(1, int(TOWER_AMMO_PER_STONE))
+        # Ceiling division: the last stone is accepted even when it only half
+        # fills the rack. The alternative is a rack that can never be topped up
+        # on an odd shortfall and a hauler walking back and forth for ever.
+        take = min(units, (room + per - 1) // per)
+        state["ammo"] = int(min(TOWER_AMMO_MAX, tower_ammo(st) + take * per))
+        return int(take)
+    except Exception:
+        return 0
+
+
+def tower_needing_ammo(world: Any, x: float | None = None) -> Structure | None:
+    """The rock tower a restock errand should be sent to, or None. Never raises.
+
+    THIS IS THE WHOLE PREMISE OF THE ERRAND, IN ONE PLACE, ON PURPOSE. The
+    director's score, the director's maker and `_h_stock_tower`'s own re-target
+    all call this and nothing else, so the three cannot disagree about whether
+    the job exists. That is not a style preference: an action whose scorer
+    believes something its handler does not is an action that is chosen and then
+    fails on its first update, and behaviour re-scores it into the identical
+    failure on the next tick. This project has shipped that loop before.
+
+    "Exists" means all four of:
+
+      * a tower that is built, unruined and has been upgraded to rock,
+      * with room in the rack (`ammo` below TOWER_AMMO_MAX),
+      * with at least one stone in the colony store to put in it - the handler's
+        fetch phase fails without one, so the premise has to include it,
+      * and nearest to *x* when several qualify.
+
+    Deliberately says nothing about who is asking. A restock is an errand
+    anybody can run, unlike the watch itself, and gating it on a role here would
+    put a second opinion next to the director's.
+    """
+    reg = structures_of(world)
+    if reg is None:
+        return None
+    try:
+        if stock_qty(world, RES_STONE) <= 0:
+            return None
+    except Exception:
+        return None
+    try:
+        ax = float(x) if x is not None else colony_center(world)
+        if not math.isfinite(ax):
+            ax = colony_center(world)
+    except (TypeError, ValueError):
+        ax = colony_center(world)
+    best: Any = None
+    best_d = float("inf")
+    try:
+        for st in reg:
+            if not _is_rock_tower(st):
+                continue
+            if tower_ammo(st) >= TOWER_AMMO_MAX:
+                continue
+            d = abs(float(st.x) - ax)
+            # Ties broken on id, so two towers equidistant from the middle of
+            # the colony are picked apart deterministically rather than by
+            # whichever the registry happened to yield first.
+            key = (d, int(getattr(st, "id", 0) or 0))
+            if best is None or key < (best_d, int(getattr(best, "id", 0) or 0)):
+                best, best_d = st, d
+    except Exception:
+        return None
+    return best
+
+
+def _stone_wanted(st: Any) -> int:
+    """Stone it would take to fill *st*'s rack, at TOWER_AMMO_PER_STONE a piece.
+
+    Ceiling division, matching ``Structure.deliver_ammo`` exactly: an odd
+    shortfall of one rock still costs a whole stone, because half a stone
+    cannot come back out of the rack. Fetching the floor instead is a rack
+    that stops one short and a hauler who is offered the errand for ever.
+    """
+    try:
+        fn = getattr(st, "ammo_missing", None)
+        short = int(fn()) if callable(fn) else max(0, TOWER_AMMO_MAX
+                                                   - tower_ammo(st))
+    except Exception:
+        short = max(0, TOWER_AMMO_MAX - tower_ammo(st))
+    per = max(1, int(TOWER_AMMO_PER_STONE))
+    return int(math.ceil(max(0, short) / float(per)))
+
+
+def _h_stock_tower(a: Action, ag: Any, w: Any, dt: float) -> None:
+    """Carry stone from the store to a rock tower. `_h_upgrade`'s machine.
+
+    fetch -> approach -> work, the same three legs and the same timeouts, over
+    the ammo rack instead of the upgrade half of the Structure API. It is its
+    own kind rather than a phase of UpgradeStructure for a re-phasing reason as
+    much as a tidiness one: reusing UpgradeStructure would make an existing
+    scored key go positive on ticks where it is zero today, which moves the
+    shared tiebreak stream for every unrelated candidate. A new key sits at 0.0
+    until a rock tower actually exists.
+
+    THE PHASE IS DERIVED, NOT REMEMBERED, and that is what makes this resumable
+    at zero cost: hands empty means fetch, hands full and far means approach,
+    hands full and close means work. A save taken at any instant reloads into
+    whichever of those the world says is true, and a stale `a.phase` from an
+    older build simply corrects itself on the first tick. The only thing carried
+    across in `data` is the hoist clock, which is allowed to reset.
+
+    No `_CLEANUP` entry, for `_h_upgrade`'s reason: nothing is claimed and
+    nothing is reserved. An abandoned errand leaves the stone in the villager's
+    hands and the rack where it was, and HaulToStockpile scores on a full pair
+    of hands, so the stone goes back to the store on its own.
+    """
+    s = structure_by_id(w, a.target)
+    if s is None or not _is_rock_tower(s):
+        # A reloaded action, a tower that burned down under the errand, or an
+        # upgrade that was cancelled. Re-ask the one premise question rather
+        # than failing, exactly as `_h_upgrade` re-reads the published job.
+        s = tower_needing_ammo(w, float(getattr(ag, "x", 0.0)))
+        if s is None:
+            a.failed = True
+            return
+        a.target = s.id
+
+    if tower_ammo(s) >= TOWER_AMMO_MAX:
+        # Somebody else filled it. Finished work, not failed work - failing
+        # would cost the agent the hysteresis bonus and read as a botched job.
+        a.done = True
+        return
+
+    carrying = getattr(ag, "carrying", None)
+    carry_qty = int(getattr(ag, "carry_qty", 0) or 0)
+    loaded = carrying == RES_STONE and carry_qty > 0
+    gap = abs(float(getattr(ag, "x", 0.0)) - float(s.x))
+    if not loaded:
+        a.phase = "fetch"
+    elif gap > REACH * 1.6:
+        a.phase = "approach"
+    else:
+        a.phase = "work"
+
+    if a.phase == "fetch":
+        want = min(_stone_wanted(s), CARRY_CAP)
+        have = stock_qty(w, RES_STONE)
+        if want <= 0 or have <= 0:
+            a.failed = True
+            return
+        sp = nearest_structure(w, "stockpile", ag.x, built_only=True)
+        tx = sp.x if sp is not None else colony_center(w)
+        a.pose = "walk"
+        rem = step_toward(ag, w, tx, dt)
+        if rem <= REACH:
+            # EMPTY THE HANDS FIRST, and this line is not tidiness. `_carry_add`
+            # puts anything that does not match the held resource into the
+            # action's `stash`, and the routing above looks at the HAND - so a
+            # villager who arrives holding wood would stash the stone, still
+            # read as unloaded on the next tick, walk back and draw another
+            # armful, for ever. `_h_build` and `_h_upgrade` both record that
+            # exact loop. They answer it by tracking the stash; this errand
+            # answers it by not creating one, which it can afford to do because
+            # it is standing at the stockpile when it happens and depositing is
+            # the honest thing to do with a load you are putting down anyway.
+            # `stock_add` is till-gated, so a hermit's armful goes to his own
+            # pile and not the colony's.
+            if getattr(ag, "carrying", None) or a.data.get("stash"):
+                _drop_all(ag, a, w)
+            got = stock_take(w, RES_STONE, min(want, have))
+            if got <= 0:
+                a.failed = True
+                return
+            _carry_add(ag, a, RES_STONE, got)
+            a.data["lt"] = 0.0
+            a.phase = "approach"
+        elif a.t > 90.0:
+            a.failed = True
+        return
+
+    if a.phase == "approach":
+        a.pose = "carry"
+        rem = step_toward(ag, w, float(s.x), dt, speed=WALK_SPEED * 0.92)
+        if rem <= REACH * 1.6:
+            a.data["lt"] = 0.0
+            a.phase = "work"
+        elif a.t > 120.0:
+            a.failed = True
+        return
+
+    # work: haul the armful up the hoist the upgrade's 6 wood paid for. The man
+    # stays on the ground - the rack is loaded from below, which is why this
+    # errand needs no perch, no ladder and no cleanup hook.
+    a.pose = "haul"
+    _halt(ag)
+    _face(ag, float(s.x) - float(ag.x))
+    _adjust(ag, "fatigue", 0.010 * dt)
+    lt = float(a.data.get("lt", 0.0)) + dt
+    a.data["lt"] = lt
+    if lt < TOWER_HOIST_SEC:
+        return
+
+    before = tower_ammo(s)
+    spent = tower_load_ammo(s, carry_qty)     # STONE in, STONE back
+    if spent > 0:
+        _carry_take(ag, spent)
+    a.data["lt"] = 0.0
+    rocks = tower_ammo(s) - before
+    if rocks > 0:
+        name = getattr(ag, "name", "Someone")
+        chronicle(w, f"{name} stacked {rocks} rocks in the tower.")
+    # `spent <= 0` is the anti-loop guard, not a theoretical one: a rack that
+    # refuses the load leaves the hands full and the distance zero, which is
+    # this same branch again on the next tick, for ever.
+    if spent <= 0 or tower_ammo(s) >= TOWER_AMMO_MAX:
+        a.done = True
 
 
 def _h_repair(a: Action, ag: Any, w: Any, dt: float) -> None:
@@ -3631,7 +4049,7 @@ def _h_converse(a: Action, ag: Any, w: Any, dt: float) -> None:
         a.pose = "walk"
         gap = float(other.x) - float(ag.x)
         want = float(other.x) - (TALK_REACH * 0.6) * (1.0 if gap > 0 else -1.0)
-        rem = step_toward(ag, w, want, dt)
+        step_toward(ag, w, want, dt)      # arrival is judged on the gap below
         if abs(float(other.x) - float(ag.x)) <= TALK_REACH:
             a.phase = "talk"
             a.data["st"] = 0.0
@@ -3894,9 +4312,32 @@ def _h_climb(a: Action, ag: Any, w: Any, dt: float) -> None:
         a.done = True
 
 
+def tower_kinds_for(agent: Any) -> tuple[str, ...]:
+    """The tower kinds *agent* is allowed to climb. THE MUTUAL GATE, for perches.
+
+    ``fire_kind_for`` applied to towers, and for the identical reason. The
+    hermit's own lookout is a separate kind, so a villager looking up
+    "watchtower" can never reach it by construction - but that argument stops
+    being true the instant anybody passes a kinds TUPLE to the search, which is
+    precisely what TOWER_KINDS exists to make people do. So the rule is written
+    out rather than left to the type of the argument:
+
+      * a HERMIT may climb his own tower and nothing else,
+      * anybody else may climb any tower that is not his.
+
+    ``reg.nearest`` takes ``kind: str | None`` and nothing wider, so every caller
+    of this feeds it through ``predicate=`` - see `_h_lookout`'s fallback search
+    and `behavior._free_tower`.
+    """
+    if is_hermit(agent):
+        return (KIND_HERMIT_LOOKOUT,)
+    return tuple(k for k in TOWER_KINDS if k not in HERMIT_KINDS)
+
+
 def _h_lookout(a: Action, ag: Any, w: Any, dt: float) -> None:
+    kinds = tower_kinds_for(ag)
     tower = structure_by_id(w, a.target)
-    if tower is None or tower.kind != "watchtower" or getattr(tower, "is_ruined", False):
+    if tower is None or tower.kind not in kinds or getattr(tower, "is_ruined", False):
         if a.phase in ("ascend", "watch", "descend"):
             # The tower went out from under them - put them back on the ground
             # rather than leaving a stickman hanging in mid-air.
@@ -3904,8 +4345,11 @@ def _h_lookout(a: Action, ag: Any, w: Any, dt: float) -> None:
             a.done = True
             return
         tower = nearest_structure(
-            w, "watchtower", ag.x, built_only=True,
-            predicate=lambda s: s.has_room() or int(getattr(ag, "id", -1)) in s.occupants,
+            w, None, ag.x, built_only=True,
+            predicate=lambda s: (
+                str(getattr(s, "kind", "")) in kinds
+                and (s.has_room() or int(getattr(ag, "id", -1)) in s.occupants)
+            ),
         )
         if tower is None:
             a.failed = True
@@ -3983,6 +4427,7 @@ def _h_lookout(a: Action, ag: Any, w: Any, dt: float) -> None:
         ag.facing = 1
     else:
         ag.facing = -1
+    _lookout_attack(a, ag, w, dt)
     _adjust(ag, "fatigue", 0.004 * dt)
     _adjust(ag, "warmth", 0.006 * dt)
     haz = hazards_of(w)
@@ -3999,6 +4444,78 @@ def _h_lookout(a: Action, ag: Any, w: Any, dt: float) -> None:
         return
     if a.data["wt"] >= float(a.data.get("dur", 120.0)):
         _start_climb_down(a, top)
+
+
+def _lookout_attack(a: Action, ag: Any, w: Any, dt: float) -> bool:
+    """Shoot from the deck. A SUB-STEP OF THE WATCH, NOT AN ACTION. Never raises.
+
+    Returns True on the tick a shot actually leaves the tower.
+
+    WHY IT LIVES HERE AND NOT IN A KIND OF ITS OWN. Two reasons, and both are
+    load-bearing:
+
+    * A separate ``TowerAttack`` kind would win `choose_action`, which calls
+      ``Action.abandon`` on the Lookout it replaced, which runs `_c_lookout`,
+      which `_plant`s the man on the ground. He is 68 px up. Gravity gets him at
+      about 350 px/s and that is over FALL_LETHAL_SPEED. The tower would kill
+      its own defender every time he fired.
+    * A lookout-role agent in this phase ALREADY owns the decision. `Lookout`
+      scores 0.85, which is under OVERRIDE_FLOOR, so it collects
+      HYSTERESIS_BONUS and comes out at 1.20 - above ThrowSpear's 0.985 and
+      everything else. `choose_action` then returns the running action
+      untouched. There is nothing to out-score, so there is nothing to add.
+
+    AND THAT IS WHY THIS COSTS NOTHING. No new key in the score dict means no
+    extra ``rng.uniform`` off ``world.pyrng``, which means every unrelated
+    candidate keeps the tiebreak value it would have had and the whole sim stays
+    bit-identical. The one existing draw in this machine - the watch duration at
+    the top of `_h_lookout` - is not touched here, and a spear's own scatter
+    comes off ``SpearRegistry.rng``, a different stream entirely. Anything added
+    to this function that reaches ``rng_of(w)`` forfeits that and must not.
+
+    The trio it calls is the combat lane's. Until that lands, every getattr
+    below comes back None and this resolves to nothing at all - which is the
+    property that lets the seam ship before its other half.
+    """
+    cx = _combat()
+    if cx is None:
+        return False
+    ready = getattr(cx, "ranged_ready", None)
+    pick = getattr(cx, "ranged_target", None)
+    fire = getattr(cx, "ranged_fire", None)
+    if not callable(ready) or not callable(pick) or not callable(fire):
+        return False
+
+    shot = False
+    try:
+        if ready(ag, w):
+            foe = pick(ag, w)
+            if foe is not None:
+                _face(ag, float(getattr(foe, "x", getattr(ag, "x", 0.0)))
+                      - float(getattr(ag, "x", 0.0)))
+                shot = bool(fire(ag, w, foe))
+    except Exception:
+        # A frame path. A combat lane mid-refactor must cost the colony a shot,
+        # never the watch and never the man standing on the tower.
+        log.debug("lookout ranged attack failed", exc_info=True)
+        return False
+
+    # Hold the throwing pose briefly. `ranged_fire` is instantaneous, so without
+    # this the one visible sign the tower is fighting would last a single 33 ms
+    # tick. "chop" is the overhead swing ThrowSpear and FireBfg already borrow -
+    # POSES is a closed tuple render/ switches on, so a new name here would draw
+    # nothing at all.
+    hold = float(a.data.get("ft", 0.0))
+    if shot:
+        hold = LOOKOUT_SHOT_POSE
+    else:
+        hold = max(0.0, hold - max(0.0, float(dt)))
+    if hold > 0.0:
+        a.data["ft"] = hold
+        a.pose = "chop"
+    else:
+        a.data.pop("ft", None)
+    return shot
 
 
 def _start_climb_down(a: Action, top: float) -> None:
@@ -4895,6 +5412,7 @@ _HANDLERS: dict[str, Callable[[Action, Any, Any, float], None]] = {
     "HaulToStockpile": _h_haul,
     "BuildStructure": _h_build,
     "UpgradeStructure": _h_upgrade,
+    "StockTower": _h_stock_tower,
     "RepairStructure": _h_repair,
     "Eat": _h_eat,
     "Sleep": _h_sleep,

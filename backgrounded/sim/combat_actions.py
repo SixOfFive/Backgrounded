@@ -216,6 +216,48 @@ try:                                    # pragma: no cover - trivial
 except ImportError:                     # pragma: no cover - trivial
     MELEE_CEILING = 44.0
 
+#: THE QUIVER. ``sim/throwing.py`` owns how many spears a stickman is carrying;
+#: this file only ever asks it questions. Three of its four pinned signatures:
+#:
+#: * ``spears_carried(agent) -> int``   - how many, clamped, never raises.
+#: * ``can_carry_more(agent) -> bool``  - room for another spear?
+#: * ``carry_spear(agent, n=1) -> int`` - hand one over, clamped; NEW count.
+#:
+#: (``drop_spear`` is the debit and belongs to the throw path, not to this
+#: file - ``SpearRegistry.throw`` calls it. Nothing here should ever spend a
+#: spear behind the registry's back.)
+#:
+#: THE FALLBACKS ARE NOT PLACEHOLDERS, they are the single-slot rule this file
+#: shipped with, spelled out. ``agent.weapon`` is one slot, so "carrying a
+#: spear" is a boolean and "room for another" is "not holding one". That means
+#: every gate below answers **identically before and after** the quiver lands,
+#: and the pickup relaxation is decided by ``PICKUP_WHEN_ARMED`` alone rather
+#: than by which half of the arc happens to be merged. A fallback that guessed
+#: at ``agent.spears`` instead would read 0 on a Stickman that has no such
+#: field and quietly uncap the pickup on a checkout with no cap to enforce.
+try:                                    # pragma: no cover - trivial
+    from .throwing import can_carry_more, carry_spear, spears_carried
+except ImportError:                     # pragma: no cover - trivial
+    def spears_carried(agent: Any) -> int:      # type: ignore[misc]
+        return (1 if str(getattr(agent, "weapon", WEAPON_NONE) or WEAPON_NONE)
+                == WEAPON_SPEAR else 0)
+
+    def can_carry_more(agent: Any) -> bool:     # type: ignore[misc]
+        return spears_carried(agent) < 1
+
+    def carry_spear(agent: Any, n: int = 1) -> int:   # type: ignore[misc]
+        if int(n) <= 0:
+            return spears_carried(agent)
+        try:
+            agent.weapon = WEAPON_SPEAR
+        except Exception:
+            # Report the failure through the RETURN VALUE, exactly as the real
+            # helper does. See _h_retrieve's take phase: the caller decides
+            # what to do about a spear it has already lifted, and it cannot do
+            # that if the two implementations disagree about how failure looks.
+            return spears_carried(agent)
+        return 1
+
 #: The wyrm-gun. Same arrangement as MELEE_CEILING above and for the same
 #: reason: constants.py belongs to the relics workstream, and this file has to
 #: import (and behave identically) in a checkout where that append has not
@@ -327,6 +369,9 @@ __all__ = [
     "make_throw_action",
     "install_makers",
     "under_attack",
+    # the ranged abstraction - actions._h_lookout's attack sub-step fires
+    # through these three and knows nothing about which weapon it is holding
+    "RANGED_KINDS", "ranged_ready", "ranged_target", "ranged_fire",
     # the relic half - behavior.py imports these to score what it cannot build
     "fetchable_relic", "raisable_grave",
     # animal accessor layer, reusable by behavior.py / events.py
@@ -411,6 +456,28 @@ RETRIEVE_TIMEOUT = 45.0
 CHILD_THROW_MIN_GAP = 72.0
 #: Child range multiplier, and the reason a child stands behind the adults.
 CHILD_RANGE_FRAC = 0.6
+#: May an already-armed colonist walk over and collect another spear?
+#:
+#: ONE SWITCH, ON PURPOSE, because this is the re-phasing half of the quiver.
+#: Nothing here adds or removes a scored candidate - ``RetrieveSpear`` is in
+#: ``score_throw``'s out-dict either way - but it goes **positive on ticks it
+#: used to be exactly 0.0**, and ``behavior.choose_action`` draws one
+#: ``rng.uniform(0, TIEBREAK)`` off ``world.pyrng`` per candidate scoring above
+#: zero. One extra draw shifts every downstream consumer of that stream: wolf
+#: spawns, vignettes, role assignment, planting. The last inert candidate added
+#: to it moved mean deaths 11.33 -> 13.17 with 0 of 24 seeds matching.
+#:
+#: So it is a module global rather than an inlined ``if``, for exactly the
+#: reason ``behavior.UNDER_ATTACK_OVERRIDE`` is one: a harness can set this in
+#: one process and the other arm in another and compare the two on one seed.
+#: Set it False and :func:`_pickup_blocked` is the shipped single-slot rule,
+#: character for character.
+#:
+#: NOTE it is orthogonal to how many spears fit. Until ``throwing`` grows the
+#: quiver, ``can_carry_more`` is "not holding one" and this flag changes
+#: nothing at all; the count and the relaxation are two separate measurements
+#: and must not be stacked into one.
+PICKUP_WHEN_ARMED: bool = True
 
 # ------------------------------------------------------------------- bfg --
 #: How many candidates deep the BFG scanner looks before giving up. Each one
@@ -1025,6 +1092,32 @@ def _combat_capable(agent: Any) -> bool:
     return _armed(agent) or _bfg(agent)
 
 
+def _pickup_blocked(agent: Any) -> bool:
+    """May *agent* NOT collect another spear off the ground?
+
+    The single gate behind the whole pickup half of the quiver, so the scorer
+    (:func:`score_throw`), the maker (:func:`make_throw_action`) and the
+    handler's own start phase cannot drift apart - which is the stated reason
+    :func:`_retrievable_spear` exists at all.
+
+    Two refusals, and they are different in kind:
+
+    * **The wyrm-gun, always.** ``_h_retrieve``'s take phase ends by arming the
+      agent with a spear, and ``agent.weapon`` is one slot, so a BFG carrier
+      reading as "has room" would trade the rarest item in the game for a stick
+      in the dirt. This one is not behind the flag and never will be.
+    * **A full quiver.** ``throwing.can_carry_more`` owns the number. With
+      ``PICKUP_WHEN_ARMED`` off this collapses back to plain ``_armed``, which
+      together with the line above is ``_combat_capable`` exactly - the
+      predicate this used to be.
+    """
+    if _bfg(agent):
+        return True
+    if not PICKUP_WHEN_ARMED:
+        return _armed(agent)
+    return not can_carry_more(agent)
+
+
 def _armoured(agent: Any) -> bool:
     try:
         return float(getattr(agent, "armour", 0.0) or 0.0) >= ARMOUR_LEATHER - 1e-9
@@ -1157,7 +1250,14 @@ def _craft_apply(kind: str, agent: Any) -> None:
     if kind == "CraftSpear":
         if _bfg(agent):
             return          # never over the wyrm-gun - see _craft_satisfied
-        agent.weapon = WEAPON_SPEAR
+        # Through the quiver's writer, not a bare ``agent.weapon =``. Once
+        # ``spears`` exists, ``weapon`` is its DERIVED mirror and Stickman's
+        # from_dict re-asserts that on every load: a craft that set the string
+        # without the count would arm a colonist who silently disarms himself
+        # the next time the game is saved and reloaded. Behaviour is unchanged
+        # today - ``_craft_satisfied`` still refuses the craft to anyone already
+        # holding one, so this only ever runs at a count of zero.
+        carry_spear(agent)
         return
     try:
         cur = float(getattr(agent, "armour", 0.0) or 0.0)
@@ -1512,7 +1612,60 @@ def _throw_range(agent: Any) -> float:
     return THROW_MAX_RANGE * (CHILD_RANGE_FRAC if _role(agent) == "child" else 1.0)
 
 
-def _throw_target(agent: Any, world: Any) -> Any | None:
+def _ranged_scan(agent: Any, world: Any, reach: float, min_range: float,
+                 accept: Callable[[Any, float, float], bool],
+                 scan_cap: int = 0) -> Any | None:
+    """The candidate walk every ranged weapon shares. Nearest first, first yes.
+
+    This is the common half of :func:`_throw_target` and :func:`_bfg_target`,
+    which were written independently and came out the same shape line for line:
+    one ``throw_targets`` sweep, the three cheap filters (too close, already
+    leaving, not hostile), and the weapon's own expensive test dead last.
+    Keeping two copies of that meant a new weapon - or a fix to one of the three
+    filters - was a coin toss about whether it landed in both.
+
+    *accept* is the weapon's own tail, ``(foe, foe_x, gap) -> bool``. It is
+    called only for candidates that survived the cheap filters, and the first
+    one it accepts is the answer.
+
+    *scan_cap* bounds how many survivors get that far, for a weapon whose tail
+    is expensive enough to need bounding (the BFG's is a full corridor sweep;
+    the spear's is one ``flight_clear``). Zero means no bound, which is what the
+    spear has always had - the counter still runs, it just never trips, so this
+    is arithmetic and not a behaviour change.
+
+    Order is load-bearing and matches both originals exactly: the cap is tested
+    BEFORE the candidate is examined, and the counter is incremented AFTER the
+    cheap filters and BEFORE *accept*. ``throw_targets`` is sorted by distance
+    with a stable ``n`` tiebreak, so "first accepted" is reproducible across a
+    save and its reload.
+    """
+    try:
+        ax = float(getattr(agent, "x", 0.0))
+    except (TypeError, ValueError):
+        return None
+    seen = 0
+    for foe in throw_targets(world, ax, reach):
+        if scan_cap and seen >= scan_cap:
+            break
+        try:
+            fx = float(getattr(foe, "x", ax))
+        except (TypeError, ValueError):
+            continue
+        gap = abs(fx - ax)
+        if gap < min_range:
+            continue
+        if animal_leaving(foe):
+            continue
+        if getattr(foe, "hostile", True) is False:
+            continue
+        seen += 1
+        if accept(foe, fx, gap):
+            return foe
+    return None
+
+
+def _throw_target(agent: Any, world: Any, *, perched: bool = False) -> Any | None:
     """What this agent should throw at, or None. The scorer and the action's
     start phase both go through here, so an agent never commits to a throw it
     would not have scored.
@@ -1537,50 +1690,53 @@ def _throw_target(agent: Any, world: Any) -> Any | None:
     choose_action calls, 63 of them with an animal inside 240 px, and only 11
     that scored a throw above zero. Two throws in fifteen minutes is not a
     mechanic, it is a rumour. The band is now 110-240 px.
+
+    ``perched`` - the one exemption, and where it may come from
+    -----------------------------------------------------------
+    A man on a tower deck is not "under personal attack" in the sense the adult
+    doctrine means, because the thing at the foot of his ladder is not between
+    him and anywhere. Left as it stands, the FLEE_RADIUS refusal is the reason a
+    lookout with a wolf 60 px below him does not throw: elevation makes throwing
+    strictly *worse* today, in this one line.
+
+    It is a keyword with a False default on purpose. ``score_throw`` and
+    ``make_throw_action`` call this with the default, so **the scored value of
+    ThrowSpear is unchanged for every agent in the game, perched or not**, and
+    no scored candidate crosses zero. Only :func:`ranged_target` - the seam the
+    tower's own attack phase fires through, which is not part of
+    ``choose_action`` at all - passes True. That is what keeps the whole
+    fire-from-a-lookout feature off ``world.pyrng``.
     """
     try:
         ax = float(getattr(agent, "x", 0.0))
     except (TypeError, ValueError):
         return None
     child = _role(agent) == "child"
-    reach = _throw_range(agent)
 
-    if not child:
+    if not child and not perched:
         # Under personal attack: keep the spear in your hand. Note this also
         # implies every candidate below is at least FLEE_RADIUS away, which is
         # why there is no second distance test for adults.
         if nearest_animal(world, ax, max_dist=FLEE_RADIUS) is not None:
             return None
 
-    for foe in throw_targets(world, ax, reach):
-        try:
-            fx = float(getattr(foe, "x", ax))
-        except (TypeError, ValueError):
-            continue
-        gap = abs(fx - ax)
-        if gap < THROW_MIN_RANGE:
-            continue
-        if animal_leaving(foe):
-            continue
-        if getattr(foe, "hostile", True) is False:
-            continue
+    def accept(foe: Any, fx: float, gap: float) -> bool:
         if child:
-            if gap < CHILD_THROW_MIN_GAP:
-                # Too close to spend the wind-up on. Run instead.
-                continue
-            return foe
+            # Too close to spend the wind-up on. Run instead.
+            return gap >= CHILD_THROW_MIN_GAP
         # Dragons are not in nearest_animal (deliberately - see dragons_of), so
-        # the FLEE_RADIUS pre-check above did not see this one. Apply it here.
-        if _reachable(world, foe) and gap < FLEE_RADIUS:
-            continue
+        # the FLEE_RADIUS pre-check above did not see this one. Apply it here -
+        # and skip it from a deck, for the same reason the pre-check is skipped.
+        if not perched and _reachable(world, foe) and gap < FLEE_RADIUS:
+            return False
         # Last, because it is the expensive one: is there actually an arc from
         # here to there that misses the hillside? See throwing.flight_clear -
         # without this, terrain ate four throws in five.
         x0, y0 = launch_point(agent, fx)
-        if not flight_clear(world, x0, y0, foe):
-            continue
-        return foe
-    return None
+        return flight_clear(world, x0, y0, foe)
+
+    return _ranged_scan(agent, world, _throw_range(agent), THROW_MIN_RANGE,
+                        accept)
 
 
 def _h_throw(a: Action, ag: Any, w: Any, dt: float) -> None:
@@ -1657,15 +1813,16 @@ def _retrievable_spear(agent: Any, world: Any) -> Any | None:
     nothing may be standing over it. Fetching a spear from under a wolf is how
     an unarmed colonist walks into the one place on the map they must not be.
 
-    ``_combat_capable`` and not ``_armed`` for the same reason CraftSpear uses
-    it - constants.py's note on WEAPON_BFG names both paths, and this is the
-    second one. ``_h_retrieve`` ends with ``ag.weapon = WEAPON_SPEAR``, so a BFG
-    carrier reading as unarmed here would walk over to a stick on the ground and
-    trade the wyrm-gun for it. Identical to ``_armed`` for anybody who has never
-    held a relic.
+    The first gate is :func:`_pickup_blocked` and not ``_combat_capable``. It
+    used to be the latter, and that one word was the entire reason an armed
+    colonist would step over a spear he had just thrown: "can you hurt
+    anything?" is not the same question as "have you room for another?". The
+    wyrm-gun clause survives inside it verbatim - constants.py's note on
+    WEAPON_BFG names both paths and this is the second one - because
+    ``_h_retrieve`` ends by arming the agent with a spear.
     """
     try:
-        if _combat_capable(agent):
+        if _pickup_blocked(agent):
             return None
         ax = float(getattr(agent, "x", 0.0))
         if nearest_animal(world, ax, max_dist=FLEE_RADIUS) is not None:
@@ -1692,8 +1849,8 @@ def _h_retrieve(a: Action, ag: Any, w: Any, dt: float) -> None:
         return
 
     if a.phase == "start":
-        if _combat_capable(ag):
-            a.done = True                   # somebody handed them one
+        if _pickup_blocked(ag):
+            a.done = True                   # full, or holding the wyrm-gun
             return
         sp = reg.nearest_on_ground(float(getattr(ag, "x", 0.0)))
         if sp is None:
@@ -1733,12 +1890,22 @@ def _h_retrieve(a: Action, ag: Any, w: Any, dt: float) -> None:
         if sp is None or not reg.take(sp):
             a.failed = True
             return
+        before = spears_carried(ag)
         try:
-            ag.weapon = WEAPON_SPEAR
+            got = carry_spear(ag)
         except Exception:
-            # Arming failed after the spear was lifted. Put it back rather than
-            # deleting it: a spear that vanishes out of the world costs the
-            # colony wood and stone it has no way of knowing it lost.
+            got = before
+        if got <= before:
+            # THE COUNT DID NOT GO UP and the spear is already off the ground:
+            # reg.take() removed it. Checked on the return value and not only
+            # on an exception, because ``throwing.carry_spear`` logs a write
+            # failure and hands back the OLD total rather than raising - so a
+            # bare try/except here would catch nothing and delete the spear out
+            # of the world. Put it back instead: a spear that vanishes costs
+            # the colony wood and stone it has no way of knowing it lost.
+            #
+            # This also covers a full quiver, which start-phase would have
+            # refused but a save rehydrated straight into "take" never saw.
             reg.add(sp)
             a.failed = True
             return
@@ -2169,31 +2336,19 @@ def _bfg_target(agent: Any, world: Any) -> Any | None:
     The last gate is the sweep itself rather than a cheaper approximation of it,
     so a shot is never scored that the terrain would eat - and so the scorer and
     the trigger can never disagree about what is hittable.
+
+    Note what is NOT here: any equivalent of the spear's FLEE_RADIUS refusal.
+    The gun has no wind-up cost you can be robbed of and does not leave your
+    hand, so there is nothing to keep back - which is why :func:`ranged_target`
+    hands the perched exemption to the weapon's own picker rather than applying
+    it centrally. Weapons differ; the walk over the candidates does not.
     """
-    try:
-        ax = float(getattr(agent, "x", 0.0))
-    except (TypeError, ValueError):
-        return None
-    seen = 0
-    for foe in throw_targets(world, ax, BFG_RANGE):
-        if seen >= BFG_SCAN:
-            break
-        try:
-            fx = float(getattr(foe, "x", ax))
-        except (TypeError, ValueError):
-            continue
-        gap = abs(fx - ax)
-        if gap < BFG_MIN_RANGE:
-            continue
-        if animal_leaving(foe):
-            continue
-        if getattr(foe, "hostile", True) is False:
-            continue
-        seen += 1
+    def accept(foe: Any, fx: float, gap: float) -> bool:
         x0, y0, tx, ty = _beam_ends(agent, world, foe)
-        if any(o is foe for o, _ in beam_sweep(world, agent, x0, y0, tx, ty)):
-            return foe
-    return None
+        return any(o is foe for o, _ in beam_sweep(world, agent, x0, y0, tx, ty))
+
+    return _ranged_scan(agent, world, BFG_RANGE, BFG_MIN_RANGE, accept,
+                        scan_cap=BFG_SCAN)
 
 
 def _bfg_hurt(world: Any, obj: Any, side: str, by: Any) -> bool:
@@ -2452,6 +2607,193 @@ def score_bfg(agent: Any, world: Any) -> dict[str, float]:
     except Exception:
         log.debug("score_bfg failed", exc_info=True)
     return out
+
+
+# ===========================================================================
+#  The ranged abstraction - ranged_ready / ranged_target / ranged_fire
+#
+#  Three questions any ranged weapon can answer, and the ONLY three a caller
+#  outside this file needs:
+#
+#      ranged_ready(agent, world)          may this person shoot at all?
+#      ranged_target(agent, world)         at what, if anything?
+#      ranged_fire(agent, world, target)   loose it. True if it went.
+#
+#  WHO THIS IS FOR. ``actions._h_lookout`` - the tower machine, in a file this
+#  lane does not own - gains an attack sub-step inside its watch phase, and it
+#  must not care which weapon the man on the deck happens to have. Everything
+#  weapon-shaped is a row in _RANGED_WEAPONS below; adding a third weapon is
+#  adding a row, and the tower learns to use it with no edit at all.
+#
+#  WHY IT IS A PHASE AND NOT AN ACTION KIND, recorded here because the reflex
+#  is the other way round. A lookout-role agent in the watch phase already WINS
+#  choose_action outright: Lookout scores 0.85, which is under OVERRIDE_FLOOR
+#  (0.95), so it collects HYSTERESIS_BONUS (0.35) for a total of 1.20 - above
+#  ThrowSpear's 0.985 and FightAnimal's 0.99 - and the loop then returns the
+#  running machine untouched. A new scored key would lose to the very action it
+#  was meant to extend, and a new *action kind* would trip Action.abandon ->
+#  _c_lookout -> _plant, which is a 68 px drop at ~350 px/s. Firing from inside
+#  the machine that already owns the agent adds no candidate, draws nothing off
+#  world.pyrng, and cannot re-phase anything.
+#
+#  WHAT IT DELIBERATELY DOES NOT DECIDE: whether shooting is a good idea.
+#  ranged_ready is the mechanical gate - armed, upright, off cooldown - and the
+#  caller owns policy (a child, a man at 20% health, a hermit who would rather
+#  not). That split is copied straight from throwing.can_throw, whose docstring
+#  gives the reason: the scorer and the trigger must share the *legality* test
+#  or they can disagree about who is allowed to shoot.
+# ===========================================================================
+#: Every weapon string that can be fired at range. Supersedes the two-term
+#: ``_armed or _bfg`` union for RANGED questions only; ``_armed`` stays
+#: spear-only for MELEE, deliberately - see its docstring, and note that a BFG
+#: carrier walking into a wolf to hit it with a relic is what that split exists
+#: to prevent. One entry per row of :data:`_RANGED_WEAPONS`.
+RANGED_KINDS: tuple[str, ...] = (WEAPON_SPEAR, WEAPON_BFG)
+
+
+def _perched(agent: Any) -> bool:
+    """True while *agent* is being held up by a platform rather than the dirt.
+
+    ``Stickman.perch_y`` is the one field that means this and it is persisted,
+    so a save taken with a man up his tower reloads still up it. Duck-typed
+    like everything else here: a world whose agents have no such field simply
+    has nobody perched.
+    """
+    y = getattr(agent, "perch_y", None)
+    if isinstance(y, bool) or not isinstance(y, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(y))
+    except (TypeError, ValueError):
+        return False
+
+
+def _spear_ready(agent: Any, world: Any) -> bool:
+    return can_throw(agent, world)
+
+
+def _spear_target(agent: Any, world: Any) -> Any | None:
+    # The perched exemption lives here and nowhere else. See _throw_target's
+    # ``perched`` note for why it must not reach the scorer.
+    return _throw_target(agent, world, perched=_perched(agent))
+
+
+def _spear_fire(agent: Any, world: Any, target: Any) -> bool:
+    reg = ensure_registry(world)
+    if reg is None or target is None:
+        return False
+    if reg.throw(world, agent, target) is None:
+        # Out of range now, or the solve had no answer. Not an error - it is a
+        # shot not taken, and the agent still has the spear.
+        return False
+    # The same debit _h_throw's release phase applies, and no more: the spear,
+    # the cooldown and the stat all happen inside reg.throw.
+    _adjust(agent, "fatigue", 0.010)
+    return True
+
+
+def _bfg_row_ready(agent: Any, world: Any) -> bool:
+    return _bfg(agent) and _bfg_ready(agent, world)
+
+
+def _bfg_fire(agent: Any, world: Any, target: Any) -> bool:
+    if target is None:
+        return False
+    out = _bfg_shoot(agent, world, target)
+    _adjust(agent, "fatigue", 0.008)
+    # "held" is the engagement gate declining with a colonist in the corridor
+    # and "nostream" is a world with no relic registry; neither spent a shot.
+    # A misfire very much did.
+    return str(out.get("shot")) in ("fired", "misfire")
+
+
+#: One row per weapon: (ready, target, fire). The whole of "which weapon".
+_RANGED_WEAPONS: dict[str, tuple[
+    Callable[[Any, Any], bool],
+    Callable[[Any, Any], Any],
+    Callable[[Any, Any, Any], bool],
+]] = {
+    WEAPON_SPEAR: (_spear_ready, _spear_target, _spear_fire),
+    WEAPON_BFG: (_bfg_row_ready, _bfg_target, _bfg_fire),
+}
+
+
+def _ranged_row(agent: Any) -> tuple[
+        Callable[[Any, Any], bool],
+        Callable[[Any, Any], Any],
+        Callable[[Any, Any, Any], bool]] | None:
+    """The weapon row for whatever *agent* is holding, or None."""
+    w = str(getattr(agent, "weapon", WEAPON_NONE) or WEAPON_NONE)
+    if w not in RANGED_KINDS:
+        return None
+    return _RANGED_WEAPONS.get(w)
+
+
+def ranged_ready(agent: Any, world: Any) -> bool:
+    """True when *agent* could loose a ranged weapon right now.
+
+    Mechanical only: holding something in :data:`RANGED_KINDS`, upright, not
+    indoors, off that weapon's cooldown. Says nothing about whether there is
+    anything worth shooting - ask :func:`ranged_target` - and nothing about
+    whether shooting is wise. Never raises; it runs on the per-tick path.
+    """
+    try:
+        row = _ranged_row(agent)
+        if row is None:
+            return False
+        if not getattr(agent, "alive", True) or getattr(agent, "taken", False):
+            return False
+        if getattr(agent, "inside", None) is not None:
+            return False
+        return bool(row[0](agent, world))
+    except Exception:
+        log.debug("ranged_ready failed", exc_info=True)
+        return False
+
+
+def ranged_target(agent: Any, world: Any) -> Any | None:
+    """What *agent* should shoot with whatever it is holding, or None.
+
+    Goes through the weapon's own picker, so the spear keeps its throwing
+    doctrine and the gun keeps its corridor sweep. The one thing this adds over
+    calling those directly is the **perched exemption**: a thrower on a tower
+    deck is not held back by the adult "nothing inside FLEE_RADIUS" rule, which
+    is the single line that today makes elevation a downgrade rather than an
+    advantage. The exemption is applied here and not in the scorer, so no
+    scored candidate anywhere changes value. Never raises.
+    """
+    try:
+        row = _ranged_row(agent)
+        if row is None:
+            return None
+        return row[1](agent, world)
+    except Exception:
+        log.debug("ranged_target failed", exc_info=True)
+        return None
+
+
+def ranged_fire(agent: Any, world: Any, target: Any) -> bool:
+    """Loose the weapon at *target*. True when the shot was actually spent.
+
+    No wind-up: the caller owns the pose and the timing, because a tower's
+    attack sub-step and a ThrowSpear action want very different ones. The
+    caller is expected to have asked :func:`ranged_ready` on the same tick -
+    the weapon re-checks anyway (``SpearRegistry.throw`` calls ``can_throw``
+    itself), so a stale target is a refused shot and not a corrupt one.
+
+    False means nothing left the hand and nothing was consumed: out of range,
+    the solve had no answer, the gun's engagement gate declined the line. True
+    means the agent has paid - one spear gone, or one BFG cooldown started, or
+    the relic came apart in his hands. Never raises.
+    """
+    try:
+        row = _ranged_row(agent)
+        if row is None:
+            return False
+        return bool(row[2](agent, world, target))
+    except Exception:
+        log.debug("ranged_fire failed", exc_info=True)
+        return False
 
 
 # ===========================================================================

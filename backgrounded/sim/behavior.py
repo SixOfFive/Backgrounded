@@ -74,9 +74,14 @@ from ..constants import (
     HERMIT_VISIT_URGE,
     HERMIT_WOODPILE,
     HERMIT_WOODPILE_URGE,
+    KIND_HERMIT_LOOKOUT,
+    KIND_LOOKOUT,
     LADDER_MIN_RISE,
     LADDER_MIN_W,
     LADDER_SLOPE,
+    LOOKOUT_EDGE_FRAC,
+    LOOKOUT_MIN_POP,
+    LOOKOUT_STANDOFF,
     MAT_DIRT,
     MAT_GRASS,
     MAT_LAVA,
@@ -110,10 +115,12 @@ from ..constants import (
     SURPLUS_RISE_SEC,
     SURPLUS_STEP_SEC,
     SURPLUS_THRIFT_FLOOR,
+    TOWER_KINDS,
     WALK_SPEED,
     WORLD_W,
 )
 from .actions import (
+    tower_needing_ammo,
     CARRY_CAP,
     TALK_REACH,
     Action,
@@ -170,6 +177,38 @@ from .structures import (
     structure_spec,
 )
 
+try:                                # pragma: no cover - lane-order shim
+    from .actions import hermit_lookout
+except ImportError:                 # pragma: no cover - lane-order shim
+    def hermit_lookout(world: Any, *, built_only: bool = False) -> Any | None:
+        """The hermit's own tower, or None. Never raises.
+
+        The handlers lane owns `actions.hermit_lookout` and it is imported
+        above whenever it is there. This fallback asks the IDENTICAL question -
+        lowest id wins, ruins are never returned, `built_only` filters - so the
+        score in `_hermit_bias` and the handler in `actions` cannot disagree
+        about whether he has a tower, which is the standing rule for every
+        score in that function and the deadlock this project has hit before.
+        """
+        reg = structures_of(world)
+        if reg is None:
+            return None
+        best = None
+        try:
+            for s in reg:
+                if str(getattr(s, "kind", "")) != KIND_HERMIT_LOOKOUT:
+                    continue
+                if getattr(s, "is_ruined", False):
+                    continue
+                if built_only and not getattr(s, "built", False):
+                    continue
+                sid = int(getattr(s, "id", 0) or 0)
+                if best is None or sid < int(getattr(best, "id", 0) or 0):
+                    best = s
+        except Exception:
+            return None
+        return best
+
 log = logging.getLogger(__name__)
 
 __all__ = [
@@ -179,6 +218,7 @@ __all__ = [
     "assign_roles",
     "next_build_kind",
     "stone_surplus",
+    "pick_upgrade",
     "pick_hut_upgrade",
     "find_chasm",
     "chasm_in_reach",
@@ -240,6 +280,49 @@ UNDER_ATTACK_OVERRIDE = True
 _ANIMAL_BUSY_KINDS = frozenset((
     "FightAnimal", "FleeAnimal", "ThrowSpear", "FireBfg",
 ))
+#: ...and the fifth, handed over by the combat lane, behind its own switch.
+#:
+#: A man on a tower deck IS the response to an animal once `_h_lookout` can
+#: shoot from up there, so he belongs in the set above on the merits. He is
+#: kept separate for one reason: unlike the other four he is reachable TODAY,
+#: on the watchtower that already exists, so flipping him in is the one part of
+#: this lane that moves the RNG phase on a world with no new structure in it.
+#:
+#: The move is a SUBTRACTION, and that is worth writing down because it is the
+#: opposite of the usual one. `emergency_override` returning False means
+#: `choose_action` is never called for that agent on that tick, so the ~20
+#: `rng.uniform` tiebreaks it would have drawn - and thrown away, because
+#: `Lookout` + HYSTERESIS_BONUS wins anyway and `:2715` returns the running
+#: machine untouched - are not drawn at all. Every one of those draws is
+#: currently spent to re-derive the answer the agent already had.
+#:
+#: Two things it buys: the NON-lookout-role agent stops being torn off the deck
+#: mid-watch (`Lookout` scores 0.063 for him, so `ThrowSpear` at 0.985 wins,
+#: `Action.abandon` runs `_c_lookout` and `_plant` drops him 68 px), and the
+#: lookout-role agent stops paying for a re-decision every AI tick for as long
+#: as a wolf stands under his tower.
+#: TODO(backlog): belongs in constants.py, beside UNDER_ATTACK_OVERRIDE.
+#: Appetite for hauling stone up to a rock tower's magazine. Below the build
+#: and upgrade urges deliberately: a tower with an empty rack is a job worth
+#: doing, never a reason to stop raising the building it is guarding.
+STOCK_TOWER_URGE = 0.34
+
+LOOKOUT_IS_ANIMAL_BUSY = True
+_ANIMAL_BUSY_KINDS_WITH_LOOKOUT = _ANIMAL_BUSY_KINDS | {"Lookout"}
+
+
+def _animal_busy_kinds() -> frozenset[str]:
+    """The set `emergency_override` actually consults.
+
+    A function rather than a second module constant so the A/B is settable in
+    ONE process: a harness flips `LOOKOUT_IS_ANIMAL_BUSY` between two runs and
+    both arms see the change, which a frozenset captured at import time cannot
+    do.
+    """
+    return (_ANIMAL_BUSY_KINDS_WITH_LOOKOUT if LOOKOUT_IS_ANIMAL_BUSY
+            else _ANIMAL_BUSY_KINDS)
+
+
 DIRECTOR_PERIOD = 2.0       # seconds between director passes
 MAX_CONCURRENT_SITES = 2    # unfinished buildings the colony tolerates at once
 #: Raised 6 -> 7 with MAX_POP 10 -> 20, and it is not a taste change: growth is
@@ -251,8 +334,34 @@ MAX_CONCURRENT_SITES = 2    # unfinished buildings the colony tolerates at once
 #: back where the constant says it is.
 MAX_HUTS = 7
 MAX_WALLS = 4
+MAX_LOOKOUTS = 2            # one per approach; see `_lookout_site`
 TOTEM_POP = 8
 TREE_TARGET = 10            # below this, someone plants saplings
+
+#: The colony's two edge towers, on their own switch. See §5 of the arc's
+#: contract: this is a phase-MOVING feature (a staked site costs one pyrng draw
+#: through `reg.create`, and a second manned tower makes `Lookout` positive for
+#: a second agent), so it gets a flag of its own and is never measured in the
+#: same run as HERMIT_LOOKOUT_ENABLED below.
+#: TODO(backlog): belongs in constants.py.
+LOOKOUT_TOWERS_ENABLED = True
+#: The hermit's own tower, on a second switch, for the same reason and so the
+#: two re-phases can be attributed separately.
+#: TODO(backlog): belongs in constants.py.
+HERMIT_LOOKOUT_ENABLED = True
+#: What the hermit's tower is worth to him, and it is the smallest urge in
+#: `_hermit_bias` on purpose. The user's word for it was "when bored", and bored
+#: in this codebase is not an action - it is `Wander`'s 0.10 floor and the
+#: vignette engine that fires under DOWNTIME_PEAK (0.62). So this sits ABOVE the
+#: floor (he climbs rather than mills about) and BELOW everything else he owns -
+#: HERMIT_COOK_URGE 0.42, HERMIT_WOODPILE_URGE 0.50, HERMIT_STOKE_URGE 0.52,
+#: HERMIT_FELL_URGE 0.58, HERMIT_BUILD_URGE 0.66 - and below HERMIT_HOMESICK
+#: (0.45), so drifting home still beats the view. Well under DOWNTIME_PEAK, so a
+#: standing tower does not silently switch his cartwheels off.
+#: A third urge, as the contract requires; HERMIT_BUILD_URGE and
+#: HERMIT_FIRE_URGE are not retuned.
+#: TODO(backlog): belongs in constants.py, with the other HERMIT_* urges.
+HERMIT_LOOKOUT_URGE = 0.20
 #: How far from the colony centre a site may be.
 #:
 #: Raised 300 -> 500 for MAX_POP 20. Twenty people want seven huts (was four);
@@ -538,6 +647,14 @@ KIND_PRIORITY: dict[str, float] = {
     "barricade": 0.60,
     "wall": 0.58,
     "watchtower": 0.54,
+    # THE SAME NUMBER AS THE TOWER IT IS A COPY OF, deliberately. `_mk_build`
+    # pools everything within 0.06 of the head priority and then sends the
+    # CLOSEST builder, which is the whole reason two towers on opposite edges
+    # need no scheduling of their own: each one attracts the man nearest it for
+    # free. Equal priority is what keeps them in the same pool; a lookout rated
+    # above the watchtower would pull both builders across the settlement to
+    # whichever edge was staked first.
+    "lookout": 0.54,
     "totem": 0.40,
 }
 
@@ -1229,7 +1346,12 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
         s["Lookout"] = 0.0
 
     # ---------------------------------------------------------- climb -------
-    if role == "lookout" and tower is None and (reg is None or reg.count("watchtower") == 0):
+    # ...and the same widening here. `reg.count("watchtower")` was the fifth of
+    # the six hardcoded literals; left alone it would tell a lookout with two
+    # lookout-towers standing that the colony has no tower at all, and send him
+    # up a hillside instead of up the ladder.
+    if role == "lookout" and tower is None and _tower_count(
+            reg, COLONY_TOWER_KINDS) == 0:
         s["ClimbTo"] = 0.25
     else:
         s["ClimbTo"] = 0.0
@@ -1261,6 +1383,27 @@ def score_actions(agent: Any, world: Any) -> dict[str, float]:
     # it has to lose to a wolf combat_actions just scored and beat everything
     # the colony was calmly getting on with. See _score_raise.
     _score_raise(s, agent, world, danger)
+
+    # StockTower is scored HERE, after the combat merge and after the two
+    # overwriting scorers above, and the position is the whole point.
+    # `choose_action` iterates `scores` in dict-insertion order and draws one
+    # `rng.uniform` off world.pyrng per candidate scoring > 0.0 - so a key
+    # inserted anywhere but last shifts every existing candidate onto the next
+    # tiebreak value. Declared unconditionally (0.0 when there is no job) so
+    # the presence of the key never costs a draw either.
+    #
+    # Without this the whole rock-tower leg is DEAD CODE. `_h_stock_tower`,
+    # `tower_load_ammo`, `deliver_ammo`, `ammo_missing`, `Structure._seed_ammo`
+    # and the HUD's ammo row were all built and wired to each other, and
+    # nothing scored the errand - so it could never be chosen. Measured before
+    # this line existed: two 3600 sim-second colonies, tier unlocked, four
+    # towers standing, ZERO StockTower actions and ZERO rock towers. That is
+    # the same fingerprint as RELIC_PICKUP_R, which shipped 16 of 16 seeds
+    # bit-identical to the feature being switched off.
+    s["StockTower"] = 0.0
+    tower = tower_needing_ammo(world, float(getattr(agent, "x", 0.0)))
+    if tower is not None and role not in ("child", ROLE_HERMIT):
+        s["StockTower"] = STOCK_TOWER_URGE
     # And the hermit, last of all and for the same reason as those two: he has
     # to be able to lose to the wolf combat_actions has just scored - his pull
     # home must never outrank running away - and to beat everything the colony
@@ -1300,6 +1443,49 @@ def _tree_in_reach(world: Any, agent: Any) -> bool:
                          claimant=getattr(agent, "id", None)) is not None
     except Exception:
         return False
+
+
+#: The rise `_mk_climb` asks for, spelled out here so the score and the maker
+#: cannot drift apart. `_mk_climb` sets ``ty = ground_y(ax) - 110.0``.
+_CLIMB_RISE = 110.0
+
+
+def _rise_in_reach(world: Any, agent: Any) -> bool:
+    """Is there ground within reach that is `_CLIMB_RISE` higher than here?
+
+    The premise for handing `ClimbTo` back to the hermit, and it exists because
+    `_h_climb` has no distance budget of its own: it walks `_uphill_dir` at
+    60 px/s until the ground is high enough, it gets stuck, or 30 s elapse -
+    which on flat ground is 1800 px of a hermit marching away from his camp.
+    Section 2 of `_hermit_bias` is the record of what that costs; a hermit who
+    strays is a hermit who strip-mines.
+
+    So the score asks the question the ACTION will answer: is there really
+    a `_CLIMB_RISE` rise inside HERMIT_FELL_REACH of where he is standing? If
+    there is, the walk terminates inside that radius. If there is not, he never
+    picks the job, which on flat ground is the honest outcome - there is
+    nothing to climb.
+
+    Sampled at 24 px, both ways, which is ~35 `ground_y` calls on the AI
+    cadence rather than the frame cadence. Never raises.
+    """
+    try:
+        ax = float(getattr(agent, "x", 0.0))
+        here = float(ground_y(world, ax))
+    except (TypeError, ValueError):
+        return False
+    want = here - _CLIMB_RISE
+    step = 24.0
+    d = step
+    while d <= HERMIT_FELL_REACH:
+        for cx in (_clamp_x(ax - d), _clamp_x(ax + d)):
+            try:
+                if float(ground_y(world, cx)) <= want:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        d += step
+    return False
 
 
 def _stash_appetite(world: Any, res: str) -> float:
@@ -1597,6 +1783,46 @@ def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
     if (hermit_stash_qty(world, RES_WOOD) < HERMIT_WOODPILE
             and _tree_in_reach(world, agent)):
         s["GatherWood"] = max(s.get("GatherWood", 0.0), HERMIT_WOODPILE_URGE)
+
+    # 6d. AND THE VIEW FROM HIS OWN TOWER, which is the last thing on his list
+    #     and is the whole of "when he is bored". Both keys were zeroed at the
+    #     top of this function and both come back CONDITIONALLY, in the
+    #     BuildStructure/CookFood shape: only with the premise the handler will
+    #     check already true, so he never picks a job that fails on its first
+    #     update.
+    #
+    #     BORED IS NOT A NEW ACTION, and that is a constraint rather than a
+    #     preference. `choose_action` draws one `rng.uniform` per SCORED
+    #     candidate, so a "Bored" key would re-phase the world stream for every
+    #     colonist on every tick and move unrelated outcomes ~16% - the thing
+    #     this function's own docstring exists to forbid. Bored already has two
+    #     expressions and this uses both: `Wander`'s 0.10 floor, which
+    #     HERMIT_LOOKOUT_URGE (0.20) is set just above, and `_maybe_vignette`,
+    #     whose gate is DOWNTIME_PEAK (0.62) - so 0.20 does not close it and his
+    #     cartwheels survive the tower being built.
+    #
+    #     Both keys already EXIST in `s` at their original positions (the base
+    #     scorer wrote them, this function zeroed them), so making one positive
+    #     moves nothing in insertion order. The cost is exactly one extra draw
+    #     on the ticks it is positive, and it is positive only on a world where
+    #     he actually has a tower - which is what §5 of the arc's contract
+    #     budgets for F3, to the letter.
+    if HERMIT_LOOKOUT_ENABLED:
+        # HIS tower, never the colony's: `_free_tower` routes a hermit through
+        # `_tower_kinds_for`, which is the mutual gate `fire_for` is for the two
+        # firepits. A watchtower 700 px away can never come back here.
+        own_tower = _free_tower(world, agent)
+        if (own_tower is not None
+                and str(getattr(own_tower, "kind", "")) == KIND_HERMIT_LOOKOUT):
+            s["Lookout"] = HERMIT_LOOKOUT_URGE
+        elif hermit_lookout(world) is not None and _rise_in_reach(world, agent):
+            # The frame is up but the deck is not. He wants the view and has
+            # nowhere to get it, so he walks up the hill instead - the same
+            # substitution the colony's lookout makes at `_score_wants`' ClimbTo
+            # line when no tower stands. Gated on the tower being STAKED so that
+            # a world which has never had one draws exactly what it drew before,
+            # and on `_rise_in_reach` so the climb ends near his camp.
+            s["ClimbTo"] = HERMIT_LOOKOUT_URGE
 
     site = hermit_worksite(world)
     if site is not None:
@@ -1898,11 +2124,78 @@ def _free_hut(world: Any, agent: Any) -> Structure | None:
     )
 
 
+#: Every tower kind that is NOT the hermit's. Derived from TOWER_KINDS rather
+#: than spelled out, so a sixth kind added to the contract is picked up here
+#: without an edit - which is the failure mode trap 4 in the arc's contract is
+#: about ("hardcoded in six places and the reflex is to fix five").
+COLONY_TOWER_KINDS: tuple[str, ...] = tuple(
+    k for k in TOWER_KINDS if k != KIND_HERMIT_LOOKOUT
+)
+
+
+def _kind_available(kind: str) -> bool:
+    """Has the structures lane landed a real spec for `kind` yet?
+
+    `structure_spec` answers `_DEFAULT_SPEC` - "unknown", 4 wood, 24x24,
+    capacity 0 - for a kind it has never heard of, and it does it silently.
+    Staking a `lookout` against that would put a 24 px shed on the edge of the
+    map that nobody can climb (capacity 0 means `has_room()` is False, so
+    `_free_tower` would never see it) and that the atlas cannot draw.
+
+    So every new-kind path in this file is gated on this, and the gate is not
+    scaffolding to be removed later: it is what makes the director's answer
+    identical to today's on a tree where the kind does not exist, which is the
+    only reason this lane can land before the structures lane does.
+    """
+    try:
+        return str(getattr(structure_spec(kind), "kind", "")) == kind
+    except Exception:
+        return False
+
+
+def _tower_kinds_for(agent: Any) -> tuple[str, ...]:
+    """Which towers this agent is allowed on. The mutual gate, as `fire_for`.
+
+    The hermit's tower is his and the colony's towers are theirs, in both
+    directions - the same rule `actions.fire_for` applies to the two firepits,
+    and for the same reason. Without it the hermit's 74 px of timber on the far
+    hillside would show up in `assign_roles`' count as a post the colony has to
+    man, and a villager would walk the whole standoff to stand on it.
+    """
+    if is_hermit(agent):
+        return (KIND_HERMIT_LOOKOUT,)
+    return COLONY_TOWER_KINDS
+
+
+def _tower_count(reg: StructureRegistry | None, kinds: tuple[str, ...]) -> int:
+    """Built, unruined towers of any of `kinds`. Never raises."""
+    if reg is None:
+        return 0
+    n = 0
+    for k in kinds:
+        try:
+            n += int(reg.count(k, built_only=True))
+        except Exception:
+            continue
+    return n
+
+
 def _free_tower(world: Any, agent: Any) -> Structure | None:
+    """The nearest tower this agent could climb, or None.
+
+    Widened off the literal ``"watchtower"`` onto `_tower_kinds_for`, and the
+    widening had to go through `predicate` rather than through the `kind`
+    argument: ``StructureRegistry.nearest`` takes ``kind: str | None`` and has
+    no tuple form, so passing one silently matches nothing (``s.kind !=
+    ("watchtower", "lookout")`` is True for every structure on the map) and the
+    Lookout score would sit at 0.0 forever with nothing raised.
+    """
     aid = int(getattr(agent, "id", -1))
+    kinds = _tower_kinds_for(agent)
     return nearest_structure(
-        world, "watchtower", float(getattr(agent, "x", 0.0)), built_only=True,
-        predicate=lambda s: s.has_room() or aid in s.occupants,
+        world, None, float(getattr(agent, "x", 0.0)), built_only=True,
+        predicate=lambda s: (str(getattr(s, "kind", "")) in kinds
+                             and (s.has_room() or aid in s.occupants)),
     )
 
 
@@ -2432,6 +2725,22 @@ def _mk_build(agent: Any, world: Any) -> Action | None:
     return make_action("BuildStructure", target=pick.get("id"))
 
 
+def _mk_stock_tower(agent: Any, world: Any) -> Action | None:
+    """Target the rock tower with room in its rack, or nothing at all.
+
+    Returns None when there is no job, following `_mk_upgrade` and `_mk_clean`:
+    a stale score can then never launch an action with no premise. Asks
+    `actions.tower_needing_ammo` - the SAME call the score makes and the same
+    call `_h_stock_tower` makes when its target has gone - so the three cannot
+    drift apart. A scorer and a maker that answer "is there a job?" separately
+    is exactly how the relic pickup shipped inert.
+    """
+    tower = tower_needing_ammo(world, float(getattr(agent, "x", 0.0)))
+    if tower is None:
+        return None
+    return make_action("StockTower", target=int(getattr(tower, "id", 0)))
+
+
 def _mk_upgrade(agent: Any, world: Any) -> Action | None:
     """Target the hut the director published, or nothing at all.
 
@@ -2563,6 +2872,7 @@ _MAKERS: dict[str, Callable[[Any, Any], Action | None]] = {
     "ClimbTo": _mk_climb,
     "FollowParent": _mk_follow,
     "CleanLitter": _mk_clean,
+    "StockTower": _mk_stock_tower,
 }
 
 
@@ -2634,7 +2944,7 @@ def emergency_override(agent: Any, world: Any) -> bool:
         # Measured: of 424 agent-seconds where an armed colonist scored
         # FightAnimal above the floor, 77.6% were locked inside an unfinished
         # non-combat action and 0.9% were free to switch.
-        if UNDER_ATTACK_OVERRIDE and kind not in _ANIMAL_BUSY_KINDS:
+        if UNDER_ATTACK_OVERRIDE and kind not in _animal_busy_kinds():
             try:
                 from .combat_actions import under_attack
                 if under_attack(agent, world):
@@ -2819,6 +3129,7 @@ def update_director(world: Any, dt: float) -> None:
     # director down with it.
     _ensure_hermit_hut(world, reg)
     _ensure_hermit_fire(world, reg)
+    _ensure_hermit_lookout(world, reg)
     _tick_hermit_visit(world)
 
     try:
@@ -2983,6 +3294,14 @@ def next_build_kind(world: Any, reg: StructureRegistry | None = None,
         except Exception:
             return 0
 
+    # The pair of edge towers is asked for on TWO lines with growth between
+    # them, exactly as the barricade is, and never on one `< 2` line. See the
+    # note at the second one for what a single line actually does.
+    lookouts_wanted = (LOOKOUT_TOWERS_ENABLED
+                       and pop >= LOOKOUT_MIN_POP
+                       and _kind_available(KIND_LOOKOUT)
+                       and want(KIND_LOOKOUT))
+
     # Blocking work first, ahead of even the firepit. Everything below this line
     # is expansion - nicer, warmer, bigger - and none of it is worth anything
     # while a villager is stranded on the far side of a 300 px drop or the
@@ -3027,6 +3346,13 @@ def next_build_kind(world: Any, reg: StructureRegistry | None = None,
         return "wall"
     if pop >= 5 and built("watchtower") < 1 and want("watchtower"):
         return "watchtower"
+    # THE FIRST EDGE TOWER. Behind the central watchtower, which is still the
+    # colony's first eye and is a third of the price of the pair, and ahead of
+    # the expedition bridge, the totem and the extra walls - the same slot the
+    # first barricade takes relative to the huts: interleaved with expansion,
+    # not deferred behind all of it.
+    if lookouts_wanted and built(KIND_LOOKOUT) < 1:
+        return KIND_LOOKOUT
     # The one line in this order that had no population floor and no notion of
     # where the colony lives, sitting between two that have both. It is also the
     # most expensive thing the order ever asks for. A colony too small for a
@@ -3042,12 +3368,45 @@ def next_build_kind(world: Any, reg: StructureRegistry | None = None,
         return "bridge"
     if pop >= TOTEM_POP and built("totem") < 1 and want("totem"):
         return "totem"
+    # THE SECOND EDGE TOWER, and it is a SEPARATE LINE from the first on
+    # purpose. `built("lookout") < 2` written once, up where the first one is,
+    # does not build two towers: `_stake_out_site` bails on
+    # ``if any(s.kind == kind for s in pending): return`` the moment the first
+    # stake exists, so for the whole minute-or-more that 22 wood and 8 stone
+    # takes to arrive, that one line is the answer to "what next" and the
+    # entire order below it - the huts the colony sleeps in included - is never
+    # reached. Two lines with the ordinary growth between them is what the
+    # barricade does (`built("barricade") < 1` then, four lines later,
+    # `< 2`), and it is the same fix for the same reason: the colony raises
+    # one, gets on with living, and comes back for the other.
+    #
+    # It sits above `want_walls` and not below it, and that placement is
+    # measured rather than chosen: at the bottom of the order, seed 1 at 45
+    # sim-minutes had one lookout built and the second line unreached, because
+    # `want_walls` is ``min(4, pop // 3)`` and an eleven-strong colony is still
+    # asking for its third wall. The second approach would have stood open for
+    # the whole run. Above the walls it is reached; below the totem it is still
+    # a thing the colony does once it is comfortable.
+    if lookouts_wanted and built(KIND_LOOKOUT) < MAX_LOOKOUTS:
+        return KIND_LOOKOUT
     want_walls = min(MAX_WALLS, pop // 3)
     if built("wall") < want_walls and want("wall"):
         return "wall"
     if built("firepit") < min(2, 1 + pop // 6) and want("firepit"):
         return "firepit"
     return None
+
+
+#: The hermit's own buildings, as `_colony_sites` sees them.
+#:
+#: This is the FOURTH copy of this list in the tree - `actions.OUTWORK_KINDS`,
+#: `structures.NON_SETTLEMENT_KINDS` and `actions.HERMIT_KINDS` are the other
+#: three - and it used to be an inline literal inside `_colony_sites`, which is
+#: precisely why it is the one that gets missed. Named, so a grep for
+#: "hermit_lookout" finds it.
+_HERMIT_SITE_KINDS: tuple[str, ...] = (
+    "hermit_hut", "hermit_fire", KIND_HERMIT_LOOKOUT,
+)
 
 
 def _colony_sites(reg: StructureRegistry) -> list[Structure]:
@@ -3071,7 +3430,7 @@ def _colony_sites(reg: StructureRegistry) -> list[Structure]:
     """
     try:
         return [s for s in reg.incomplete()
-                if str(getattr(s, "kind", "")) not in ("hermit_hut", "hermit_fire")]
+                if str(getattr(s, "kind", "")) not in _HERMIT_SITE_KINDS]
     except Exception:
         return []
 
@@ -3877,6 +4236,130 @@ def _ensure_hermit_fire(world: Any, reg: StructureRegistry) -> None:
         log.debug("hermit fire staking failed", exc_info=True)
 
 
+#: How far off the hut's door the hermit's tower goes, and which way.
+#:
+#: OUTWARD, away from the settlement, where the fire goes 34 px INWARD. Two
+#: reasons and they agree. The camp then reads left-to-right as village, fire,
+#: hut, tower - the fire in the sheltered elbow and the watch out on the point,
+#: which is what a lookout is for. And it puts 80 px between the fire and the
+#: tower, comfortably more than either footprint, so the two never overlap on
+#: screen the way two buildings staked off one anchor otherwise would.
+HERMIT_LOOKOUT_OFFSET = 46.0
+#: The orphan radius, the same 260 px `_ensure_hermit_fire` uses. Deliberately
+#: the same number: both are answering "is this still one camp", and a codebase
+#: with two answers to that question has a fire that follows a moved hut and a
+#: tower that does not.
+HERMIT_LOOKOUT_ORPHAN = 260.0
+
+
+def _ensure_hermit_lookout(world: Any, reg: StructureRegistry) -> None:
+    """Stake his own tower at his camp when he has none. Never raises.
+
+    The firepit's sibling, and everything `_ensure_hermit_fire` says applies
+    here word for word: it is STAKED rather than conjured (he raises it himself,
+    out of wood he cut himself), `_colony_sites` hides it from the colony's
+    build queue and concurrency cap, it is ANCHORED TO THE HUT rather than to
+    `hermit_home` so a resited camp takes it along, it DOES NOT RE-SITE ITSELF
+    (the orphan test below collapses it and a fresh one is staked at the new
+    door), and it refuses to be built into a hazard.
+
+    THREE THINGS THAT ARE ITS OWN:
+
+    1. IT IS GATED ON `_kind_available`. Until the structures lane lands a
+       `hermit_lookout` spec, `structure_spec` answers the 24x24 capacity-0
+       fallback, and staking against that would give him a shed he cannot climb
+       and the atlas cannot draw. So this function does nothing at all on a tree
+       without the spec, which is also what makes it free: no stake, no
+       `reg.create`, no rng draw, no phase move. §5 of the arc's contract says
+       F3 re-phases "only on worlds with a hermit lookout built", and this gate
+       plus the two in `_hermit_bias` are what make that literally true.
+
+    2. IT WAITS FOR BOTH THE HUT AND THE FIRE, and for them to be STANDING
+       rather than merely staked. The order of the camp is shelter, then
+       warmth, then the view. `actions.hermit_worksite` is the handler side of
+       that and it only offers the tower once the other two are built, so
+       staking on a weaker premise would put a third frame on the hillside that
+       he is not allowed to work on - the score and the action disagreeing,
+       which is the deadlock this whole loop was rebuilt around once already.
+       Asking the identical question here means the tower is staked on exactly
+       the tick it becomes his next job.
+
+    3. RUBBLE IS NOT A COOLDOWN, exactly as for the fire, and for the same
+       reason: the spec is `flammable=False` (trap 14 - a flammable tower
+       inside BURN_NEIGHBOUR_DIST of his hut would draw off `world.rng`, the
+       numpy stream, every tick the hut burned), so the only thing that ruins it
+       is a hazard this function already refuses to build into.
+
+    Costs one draw from the seeded stream (the variant roll in ``reg.create``)
+    and only on the tick a tower is staked.
+    """
+    if not (HERMIT_HUT and HERMIT_LOOKOUT_ENABLED):
+        return
+    if not _kind_available(KIND_HERMIT_LOOKOUT):
+        return
+    try:
+        herm = living_hermit(world)
+        if herm is None:
+            return
+        house = hermit_hut(world)
+        tower = hermit_lookout(world)
+        if tower is not None:
+            # ORPHANED? The fire's test, verbatim, including the part that was
+            # a bug fix: a STANDING hut wins over rubble, but rubble still
+            # counts as a camp, so a dragon burning his hut down does not
+            # silently delete the tower beside it in the same second.
+            try:
+                anchor_x = (float(house.x) if house is not None else None)
+            except (TypeError, ValueError):
+                anchor_x = None
+            near_camp = False
+            if anchor_x is not None:
+                near_camp = abs(anchor_x - float(tower.x)) <= HERMIT_LOOKOUT_ORPHAN
+            else:
+                for s in reg:
+                    if str(getattr(s, "kind", "")) != "hermit_hut":
+                        continue
+                    try:
+                        if abs(float(s.x) - float(tower.x)) <= HERMIT_LOOKOUT_ORPHAN:
+                            near_camp = True
+                            break
+                    except (TypeError, ValueError):
+                        continue
+            if not near_camp:
+                tower.collapse("moved")
+                tower.state["ruin_cause"] = "moved"
+            return
+        if house is None or not getattr(house, "built", False):
+            return                      # no doorstep yet
+        if hermit_fire(world, built_only=True) is None:
+            return                      # warmth before the view - see (2) above
+        try:
+            hx = float(house.x)
+        except (TypeError, ValueError):
+            return
+        # Away from town, so the hut sits between the fire and the tower.
+        # Falls back to the near side if the outward one is unwalkable, exactly
+        # as the fire falls back to the far one.
+        outward = 1.0 if hx > float(_hermit_base(world)) else -1.0
+        x = _clamp_x(hx + outward * HERMIT_LOOKOUT_OFFSET)
+        if abs(slope_at(world, x)) > MAX_SLOPE_WALK:
+            x = _clamp_x(hx - outward * HERMIT_LOOKOUT_OFFSET)
+        for h in hazards_of(world):
+            try:
+                hzx = float(h.get("x", 0.0))
+                r = float(h.get("radius", 0.0) or 0.0)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if abs(hzx - x) <= max(40.0, r) + 40.0:
+                return
+        reg.create(KIND_HERMIT_LOOKOUT, x, float(ground_y(world, x)),
+                   rng=rng_of(world))
+        chronicle(world, f"{getattr(herm, 'name', 'The hermit')} began raising a "
+                         f"platform above his camp, to watch the wilds from.")
+    except Exception:
+        log.debug("hermit lookout staking failed", exc_info=True)
+
+
 def hermit_guest(world: Any) -> Any | None:
     """The colonist currently walking out to see the hermit, or None."""
     v = getattr(world, "hermit_visit", None)
@@ -4048,10 +4531,95 @@ def stone_surplus(world: Any, reg: StructureRegistry | None = None) -> int:
     return have - owed
 
 
-def pick_hut_upgrade(
+def _upgrade_stone(s: Any) -> int:
+    """Stone this structure's next tier costs, off its own spec. Never raises.
+
+    ``upgrade_cost()`` is a Structure method and is already kind-agnostic
+    against the API the haulers use, so this needs no ``kind ==`` test and
+    picks up the tower's price the moment the structures lane lands it. The
+    fallback is the hut's price, which is what this line asked for before it
+    was a function.
+    """
+    try:
+        return int(s.upgrade_cost().get(RES_STONE, 0))
+    except Exception:
+        return int(sum(HUT_UPGRADE_COST.values()))
+
+
+def _upgrade_rank(s: Any) -> int:
+    """Upgrade priority class. Higher wins. Never raises.
+
+    1 for anything an agent can stand on and fight from, 0 for everything else.
+    See `pick_upgrade` for why: the channel is concurrency-1 and was ordered on
+    age alone, so towers - always younger than the founding huts - never got a
+    turn.
+    """
+    try:
+        return 1 if str(getattr(s, "kind", "")) in TOWER_KINDS else 0
+    except Exception:
+        return 0
+
+
+def _upgrade_affordable(world: Any, s: Any, surplus: int) -> bool:
+    """Can the colony pay for EVERY resource this tier charges, not just stone?
+
+    ``stone_surplus`` is the only budget the upgrade channel ever consulted,
+    which was correct while the hut was the only upgradeable thing: its tier
+    costs stone and nothing else. The rock tower charges 6 wood as well, and
+    `stone_surplus` cannot see wood at all.
+
+    What that cost, measured: a lookout with 60 stone and ZERO wood in the
+    store was staked, swallowed its 12 stone up front, and then sat at
+    ``upgrade_missing == {'wood': 6}`` for the rest of the session.
+    ``advance_upgrade`` refuses to finish, and rule 2 of ``pick_upgrade``
+    ("if s.is_upgrading: return s") pins the colony-wide channel to it - so a
+    perfectly affordable hut upgrade queued behind it never ran either. It
+    self-clears once wood reaches the store, so it is a stall rather than a
+    deadlock, but a stall that can outlast a colony is not much better.
+
+    Wood is priced off the plain store rather than a surplus, because there is
+    no wood equivalent of ``stone_surplus`` and inventing one here would be a
+    second budget nobody else consults. The stone arm keeps the surplus, so
+    stocking a tower still cannot starve a build that is already under way.
+    """
+    try:
+        cost = s.upgrade_cost()
+    except Exception:
+        return surplus >= int(sum(HUT_UPGRADE_COST.values()))
+    if surplus < int(cost.get(RES_STONE, 0)):
+        return False
+    for res, need in cost.items():
+        if res == RES_STONE:
+            continue
+        if int(stock_qty(world, res)) < int(need):
+            return False
+    return True
+
+
+def pick_upgrade(
     world: Any, reg: StructureRegistry | None = None
 ) -> Structure | None:
-    """The one hut the colony should be re-walling in stone, or None.
+    """The one structure the colony should be upgrading, or None.
+
+    Was `pick_hut_upgrade`, and the rename is the whole of this lane's part in
+    the rock tower: the *decision* about which building goes up a tier is not
+    hut-specific and never was. What is hut-specific lives in
+    ``Structure.can_upgrade`` (the structures lane's file), so a tower becomes
+    a candidate here the moment that method accepts one, with no edit on this
+    side. Until then `cands` is exactly the list it was and every number below
+    is unchanged.
+
+    Two things are read off the candidate rather than off HUT_UPGRADE_COST now:
+
+    * the price, via ``s.upgrade_cost()``, which is the kind-agnostic API the
+      haulers already use. For a hut that is ``{stone: 10}``, which is the
+      number the old ``sum(HUT_UPGRADE_COST.values())`` produced, so the hut
+      path is bit-identical.
+    * and only its STONE component, because that is the currency
+      `stone_surplus` counts. Summing a tower's ``{wood: 6, stone: 12}`` would
+      demand 18 stone for a 12-stone job and the tier would look unaffordable
+      forever. The hut is a single-resource upgrade, so sum and stone agree
+      there and the change is invisible on it.
 
     The step order below is load-bearing, and step 2 in particular:
 
@@ -4079,16 +4647,59 @@ def pick_hut_upgrade(
         cands = [s for s in reg.all() if s.can_upgrade()]
         if not cands:
             return None
-        if stone_surplus(world, reg) < sum(HUT_UPGRADE_COST.values()):
+        # AFFORDABILITY IS PER CANDIDATE, and it is `stone_surplus` rather than
+        # the raw store for the reason that function documents at length: the
+        # surplus is what is left AFTER every incomplete site and every other
+        # in-flight upgrade has been costed, so stocking a tower can never
+        # starve a real build. Filtering the list rather than bailing on the
+        # first price means an unaffordable rock tower does not hide an
+        # affordable hut behind it.
+        surplus = stone_surplus(world, reg)
+        cands = [s for s in cands if _upgrade_affordable(world, s, surplus)]
+        if not cands:
             return None
-        # The oldest hut standing turns to stone first: the founding house being
-        # rebuilt, which reads as the settlement returning to its own origin
-        # rather than as a random hut changing colour. Tie-broken on the lowest
-        # id so two huts raised in the same tick still order deterministically.
-        return max(cands, key=lambda s: (s.standing_t, -s.id))
+        # DEFENCES BEFORE COMFORT, then oldest-first inside each group.
+        #
+        # The rule under this used to be oldest-standing-first outright, and its
+        # comment said "the oldest HUT standing turns to stone first: the
+        # founding house being rebuilt, which reads as the settlement returning
+        # to its own origin". That was written when the hut was the only
+        # upgradeable thing in the game, so it was never a choice between a hut
+        # and anything else - and the moment a tower could be upgraded too, the
+        # founding huts won every turn of a concurrency-1 channel simply by
+        # being older than the towers.
+        #
+        # Measured: 10 colonies x 60 sim-min, tier unlocked on five of them.
+        # ONE rock tower in the whole sample, against 26 stone huts - and the
+        # one that got through proved the leg works end to end (346 StockTower
+        # ticks, magazine full at TOWER_AMMO_MAX). The feature was not broken,
+        # it was queued behind cosmetics for ever.
+        #
+        # A rock tower is a weapon the colony can only use if it exists before
+        # the thing it is for arrives; a stone hut is warmth and pride. Ordering
+        # is a deterministic max() over the candidate list and draws nothing, so
+        # this costs no rng phase - only which building gets the next turn.
+        # Oldest-first still holds inside each group, so the founding house is
+        # still the first HUT to be rebuilt.
+        return max(cands, key=lambda s: (_upgrade_rank(s), s.standing_t, -s.id))
     except Exception:
-        log.debug("pick_hut_upgrade failed", exc_info=True)
+        log.debug("pick_upgrade failed", exc_info=True)
         return None
+
+
+def pick_hut_upgrade(
+    world: Any, reg: StructureRegistry | None = None
+) -> Structure | None:
+    """Deprecated spelling of :func:`pick_upgrade`, kept for `__all__`."""
+    return pick_upgrade(world, reg)
+
+
+#: The chronicle line for each kind's upgrade, keyed by structure kind. Falls
+#: back to the hut's line, which is what this said before it was a table.
+_UPGRADE_LINES: dict[str, str] = {
+    "hut": "They have stone enough to re-wall the hut.",
+    KIND_LOOKOUT: "They have stone enough to face the tower in rock.",
+}
 
 
 def _stake_upgrade(world: Any, reg: StructureRegistry) -> None:
@@ -4107,24 +4718,34 @@ def _stake_upgrade(world: Any, reg: StructureRegistry) -> None:
     a saved copy would be a second source of truth that can disagree with the
     first.
     """
-    s = pick_hut_upgrade(world, reg)
+    s = pick_upgrade(world, reg)
     if s is None:
         world.upgrade_job = None
         return
+    kind = str(getattr(s, "kind", "hut"))
     if not s.is_upgrading:
         s.start_upgrade(float(getattr(world, "world_time", 0.0)))
         # Only on the frame the job actually opens - never on the resume path,
         # or a reload would re-announce an upgrade the colony started an hour
         # ago and the chronicle would read as a stutter.
-        chronicle(world, "They have stone enough to re-wall the hut.")
+        chronicle(world, _UPGRADE_LINES.get(
+            kind, "They have stone enough to re-wall the hut."))
     up = s.state.get("upgrade") or {}
     world.upgrade_job = {
         "id": int(s.id),
-        "kind": "hut",
+        # THE STRUCTURE'S OWN KIND, not the literal "hut" this used to write.
+        # `actions._h_upgrade` reads the job to decide what it is hauling to and
+        # the HUD reads it to name the work; a rock tower announced as a hut is
+        # the quiet half of a feature that ships looking wired up.
+        "kind": kind,
         "x": float(s.x),
         "y": float(s.y),
         "completion": float(s.upgrade_completion()),
         "priority": HUT_UPGRADE_PRIORITY,
+        # Straight off `upgrade_missing()`, which is per-kind in the structures
+        # lane's file, so a tower's {wood, stone} shortfall reaches
+        # `update_director`'s `short` dict and the gather scores send somebody
+        # for the timber as well as the stone. Nothing here is stone-only.
         "needs": {k: int(v) for k, v in s.upgrade_missing().items()},
         # Carried through from the structure, which is the only copy that
         # survives a reload - this dict is rebuilt every director pass.
@@ -4209,6 +4830,15 @@ def pick_site(
     # differs; the caller still creates it as a normal unbuilt Structure.
     if kind == "barricade":
         return _barricade_site(world, reg)
+
+    # ...and neither does an edge lookout, for the same reason and at its own
+    # distance. One line, beside the barricade's, because that is the whole of
+    # the hand-off: `_lookout_site` bypasses the generic sweep below entirely -
+    # the soft spacing penalty, the "stay close to home" term and the high-
+    # ground bonus are all wrong for an outwork whose whole job is to be 520 px
+    # out on a named side.
+    if kind == KIND_LOOKOUT:
+        return _lookout_site(world, reg)
 
     lo = max(24.0, center - SITE_RANGE)
     hi = min(float(WORLD_W - 24), center + SITE_RANGE)
@@ -4298,17 +4928,29 @@ def _is_cliff(world: Any, x: float) -> bool:
     return abs(slope_at(world, float(x))) > MAX_SLOPE_CLIMB
 
 
-def _barricade_site(
-    world: Any, reg: StructureRegistry
+def _per_side_site(
+    world: Any, reg: StructureRegistry, kind: str,
+    standoff: float, edge_frac: float,
 ) -> tuple[float, float, dict[str, Any]] | None:
-    """A site for a barricade, hard against whichever approach has none yet.
+    """A site for an outwork of `kind`, on whichever approach has none yet.
 
-    A barricade wants to sit in the band within ``BARRICADE_EDGE_FRAC *
-    RENDER_W`` of the point where an incursion first becomes visible, on
-    non-cliff ground, as close to that point as the terrain allows so it bites
-    the moment the animal lands. Near approach is filled first, then the far.
-    Returns ``(x, y, {})`` in the same shape as :func:`pick_site`, or None if
-    both sides are covered or the band is nothing but cliff.
+    Lifted out of `_barricade_site` unchanged so the lookout gets the SAME
+    answer to the same question rather than a second, subtly different one.
+    Everything below was written about barricades and is true of any paired
+    outwork: two of them, one per approach, as far out as the terrain allows,
+    on camera, measured from `settlement_center`. Only the distance
+    (`standoff`) and the band width (`edge_frac`) differ per kind.
+
+    The one thing a caller must NOT vary is the has-test: it counts structures
+    of THIS `kind` only, so a barricade already standing on the left approach
+    does not persuade the director that the left approach has a lookout.
+
+    A `kind` wants to sit in the band within ``edge_frac * RENDER_W`` of the
+    point where an incursion first becomes visible, on non-cliff ground, as
+    close to that point as the terrain allows so it bites the moment the animal
+    lands. Near approach is filled first, then the far. Returns ``(x, y, {})``
+    in the same shape as :func:`pick_site`, or None if both sides are covered
+    or the band is nothing but cliff.
 
     THE EDGE IS THE COLONY'S EDGE, NOT THE MAP'S. This used to read "the animals
     cross in at x = 0 and x = RENDER_W", which was true only while the world and
@@ -4337,7 +4979,7 @@ def _barricade_site(
     from, and ``colony_center`` averages it in. See that function for the
     measurement.
     """
-    band = max(24.0, BARRICADE_EDGE_FRAC * float(RENDER_W))
+    band = max(24.0, float(edge_frac) * float(RENDER_W))
     mid = settlement_center(world)
 
     # Which approaches already hold a barricade (built or still going up)?
@@ -4354,7 +4996,7 @@ def _barricade_site(
     # two and then stops, rather than a fence post every time it wanders.
     left_has = right_has = False
     try:
-        for s in reg.of_kind("barricade"):
+        for s in reg.of_kind(kind):
             if abs(float(s.x) - mid) > STAGE_HALF:
                 continue
             if float(s.x) <= mid:
@@ -4378,8 +5020,8 @@ def _barricade_site(
     # x=178 would otherwise run [-622, -366], i.e. nowhere. The `mid -/+ 24`
     # cap then stops a slid band crossing the settlement and being mistaken for
     # the other side's barricade by the has-test above.
-    left_edge = max(4.0, mid - BARRICADE_STANDOFF)
-    right_edge = min(float(WORLD_W - 4), mid + BARRICADE_STANDOFF)
+    left_edge = max(4.0, mid - float(standoff))
+    right_edge = min(float(WORLD_W - 4), mid + float(standoff))
     candidates: list[tuple[float, float, float]] = []
     if not left_has:
         candidates.append((left_edge, min(left_edge + band, mid - 24.0),
@@ -4413,6 +5055,45 @@ def _barricade_site(
             return best_x, float(ground_y(world, best_x)), {}
 
     return None
+
+
+def _barricade_site(
+    world: Any, reg: StructureRegistry
+) -> tuple[float, float, dict[str, Any]] | None:
+    """A site for a barricade, hard against whichever approach has none yet.
+
+    The mechanism is `_per_side_site`; this names the two numbers it is asked
+    with. Kept as its own function because `pick_site` reads better naming the
+    kind than naming a distance, and because the pair of them is now the
+    project's one answer to "one on each approach" - see `_lookout_site`.
+    """
+    return _per_side_site(world, reg, "barricade",
+                          BARRICADE_STANDOFF, BARRICADE_EDGE_FRAC)
+
+
+def _lookout_site(
+    world: Any, reg: StructureRegistry
+) -> tuple[float, float, dict[str, Any]] | None:
+    """A site for an edge lookout: one per approach, inside its own spikes.
+
+    The same machine as the barricade, at LOOKOUT_STANDOFF (520) instead of
+    BARRICADE_STANDOFF (640). That ordering is the point and it is not
+    incidental: the tower stands 120 px BEHIND the spikes on its own side, so
+    an animal walking in meets the barricade first and is already taking
+    BARRICADE_DAMAGE by the time it is under the man throwing at it. A tower in
+    front of the barricade is a manned structure on the wrong side of the only
+    passive defence the colony has.
+
+    Reusing `_per_side_site` rather than copying it is deliberate. Everything
+    the barricade learned the hard way - anchor on `settlement_center` not
+    `colony_center`, ignore an outwork stranded past STAGE_HALF by a colony
+    that moved, clamp the anchor into the map before cutting the band so a
+    colony seated near a rim still gets a site, cap the band at `mid +/- 24` so
+    a slid band cannot be mistaken for the other side's - is behaviour this
+    inherits for free and would otherwise have to rediscover.
+    """
+    return _per_side_site(world, reg, KIND_LOOKOUT,
+                          LOOKOUT_STANDOFF, LOOKOUT_EDGE_FRAC)
 
 
 # ===========================================================================
@@ -6150,23 +6831,50 @@ def assign_roles(world: Any, dt: float) -> None:
                               f"apart, as the hermit.")
 
     # --- someone watches from the tower -------------------------------------
-    towers = 0
-    if reg is not None:
-        try:
-            towers = reg.count("watchtower", built_only=True)
-        except Exception:
-            towers = 0
+    # THE ONE THAT DECIDES WHETHER ANY OF THIS IS VISIBLE. This count is what
+    # mints the "lookout" role, and the role is what turns the Lookout score
+    # from 0.18 * aff (0.063 for a gatherer) into 0.85. Left reading the bare
+    # literal, two edge towers would go up, be manned by nobody, and nothing
+    # would fail: trap 4 in the arc's contract, and the shape nine features in
+    # this project have shipped in.
+    #
+    # COLONY towers only. The hermit's is excluded by construction (it is not in
+    # COLONY_TOWER_KINDS), because counting it would appoint a villager to a
+    # post 700 px past the settlement that `_tower_kinds_for` will never let
+    # him climb - a lookout role that can never find a tower, standing down and
+    # being re-minted every pass.
+    towers = _tower_count(reg, COLONY_TOWER_KINDS)
     lookouts = [a for a in adults if _role(a) == "lookout"]
     if towers >= 1:
-        if not lookouts:
+        # ONE PER TOWER, and it used to be one FULL STOP. The shipped shape was
+        # `if not lookouts: appoint` / `else: demote the surplus`, which is
+        # correct at one tower and silently wrong at two: with two towers
+        # standing and one man on a deck, `lookouts` is non-empty, so the
+        # appointing arm is never reached again and the second tower is manned
+        # by nobody, for ever. MEASURED, not deduced - seed 1 at 45 sim-minutes
+        # with the towers enabled and this line unchanged: two towers, one
+        # "lookout" in the roster.
+        #
+        # Written as demote-then-fill rather than as two arms so the two cases
+        # cannot disagree about the count. Identical to the old code at
+        # `towers <= 1`: an empty `lookouts` demotes nothing and appoints one, a
+        # single lookout demotes nothing and appoints nothing, and a surplus
+        # demotes down to `towers` and then wants none - which are exactly the
+        # three outcomes above.
+        for extra in lookouts[towers:]:
+            _set_role(extra, _worker_role(world))
+        for _ in range(max(0, towers - len(lookouts))):
             pool = [a for a in adults if _role(a) in ("gatherer", "builder")]
-            if pool:
-                pick = pool[rng.randrange(len(pool))]
-                if _set_role(pick, "lookout"):
-                    chronicle(world, f"{getattr(pick, 'name', 'Someone')} took the watch.")
-        else:
-            for extra in lookouts[towers:]:
-                _set_role(extra, _worker_role(world))
+            if not pool:
+                break
+            # Recomputed inside the loop: the man appointed on the previous
+            # turn is a "lookout" now and must not be drawn a second time, and
+            # `rng.randrange` over a list that still contained him would do
+            # exactly that.
+            pick = pool[rng.randrange(len(pool))]
+            if not _set_role(pick, "lookout"):
+                break
+            chronicle(world, f"{getattr(pick, 'name', 'Someone')} took the watch.")
     else:
         for a in lookouts:
             _set_role(a, _worker_role(world))

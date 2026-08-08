@@ -93,8 +93,17 @@ import zlib
 from dataclasses import dataclass
 from typing import Any, Iterator
 
-from ..constants import WEAPON_NONE, WEAPON_SPEAR, WORLD_W
+from ..constants import WEAPON_BFG, WEAPON_NONE, WEAPON_SPEAR, WORLD_W
 from .entities import GRAVITY as _FALL_GRAVITY
+
+try:
+    from ..constants import SPEAR_CARRY_MAX
+except ImportError:                                   # pragma: no cover
+    # The quiver cap lives in constants.py and is owned there. The fallback is
+    # the SAME literal, so this module behaves identically whether or not that
+    # declaration has landed yet - a missing constant must not change how many
+    # spears a colonist can hold, it must only stop being editable in one place.
+    SPEAR_CARRY_MAX = 6
 
 log = logging.getLogger(__name__)
 
@@ -103,6 +112,9 @@ __all__ = [
     "can_throw", "throw_targets", "registry_of", "ensure_registry", "clearance",
     "flight_clear", "launch_point",
     "spears_of", "nearest_spear",
+    "THROW_TARGET_SOURCES",
+    "spears_carried", "can_carry_more", "carry_spear", "drop_spear",
+    "armed_with_spear", "SPEAR_CARRY_MAX",
     "THROW_DAMAGE", "THROW_SPEED", "THROW_MIN_RANGE", "THROW_MAX_RANGE",
     "THROW_COOLDOWN", "THROW_AIM_ERR", "THROW_AIM_ERR_CHILD", "THROW_LEAD_ERR",
     "THROW_HIT_RADIUS", "SPEAR_LIFE_SEC", "MAX_SPEARS", "RETRIEVE_RADIUS",
@@ -154,6 +166,22 @@ RETRIEVE_RADIUS = 18.0
 #: Projectile gravity. See the module docstring - this is NOT entities.GRAVITY
 #: and the difference is load-bearing, not cosmetic.
 SPEAR_GRAVITY = 320.0
+
+#: The ``world`` attribute names :func:`throw_targets` unions, IN ORDER.
+#:
+#: APPEND-ONLY, NEVER REORDERED, and the reason is subtle enough to be worth the
+#: paragraph. ``throw_targets`` increments a tiebreak counter ``n`` once per
+#: object it walks - in range or not - and sorts on ``(distance, n)`` so that a
+#: world and its reload pick the same one of two equidistant targets. Insert a
+#: source anywhere but the END and every object after it is renumbered, which
+#: changes that pick on worlds that have nothing to do with the new source.
+#:
+#: ``"raiders"`` is here from day one and costs exactly nothing on a world that
+#: has no raider registry: ``getattr`` yields None, ``_registry_list(None)``
+#: returns ``[]``, and the loop body - including ``n += 1`` - never executes.
+#: That is what lets the raider lane land its registry without touching this
+#: file and without re-phasing anything on the way.
+THROW_TARGET_SOURCES: tuple[str, ...] = ("animals", "dragons", "raiders")
 
 #: Sanity check, evaluated at import: the flat-ground maximum range of this
 #: projectile. If either number is ever retuned and this stops covering
@@ -340,21 +368,25 @@ def _registry_list(src: Any) -> list[Any]:
 
 def throw_targets(world: Any, x: float,
                   max_range: float = THROW_MAX_RANGE) -> list[Any]:
-    """Animals **and** dragons within *max_range* of world-x *x*, nearest first.
+    """Everything in :data:`THROW_TARGET_SOURCES` within *max_range* of *x*.
 
-    The one place in this workstream where the two registries are unified. They
+    The one place in this workstream where those registries are unified. They
     are deliberately kept apart everywhere else - ``animals.danger_at`` and
     ``behavior._danger_for`` stay one-dimensional and stay animal-only, because
     widening those is how a dragon cruising overhead puts the whole colony into
     permanent flight.
+
+    The source list is a module constant rather than a literal tuple here so a
+    later lane can add a hostile registry without editing this function. A name
+    the world does not carry costs nothing at all - see THROW_TARGET_SOURCES.
     """
     out: list[tuple[float, int, Any]] = []
     try:
         px = _f(x, 0.0)
         r = max(0.0, _f(max_range, THROW_MAX_RANGE))
         n = 0
-        for src in (getattr(world, "animals", None), getattr(world, "dragons", None)):
-            for obj in _registry_list(src):
+        for _src_name in THROW_TARGET_SOURCES:
+            for obj in _registry_list(getattr(world, _src_name, None)):
                 d = abs(_f(getattr(obj, "x", px), px) - px)
                 if d <= r:
                     # n is a stable tiebreaker so two targets at the same
@@ -491,8 +523,17 @@ class SpearRegistry:
         # Never an unseeded Random: a world that reloads into a different
         # sequence of aim errors is a world that does not replay, which is the
         # bug animals._record_seed exists to document.
-        self.rng = random.Random(int(seed) if seed is not None
-                                 else zlib.crc32(b"spears"))
+        #
+        # KEPT, not just used. Until this field existed the seed was write-only
+        # - ``to_dict`` did not carry it, so every save/load re-derived one from
+        # ``_record_seed``, whose inputs (next_id, t, spear positions) change on
+        # every tick. A colony therefore landed on a DIFFERENT aim-error stream
+        # after every single reload, silently, and no seeded comparison spanning
+        # a save could be trusted. Persisting it is the whole fix on this side;
+        # the other half is world.py threading its own offset through the
+        # loader, the way it already does for relics.
+        self.seed: int = int(seed) if seed is not None else zlib.crc32(b"spears")
+        self.rng = random.Random(self.seed)
         #: Last ``world.tick_count`` this registry advanced on. See :meth:`tick`.
         self._last_frame: int = -1
 
@@ -638,10 +679,16 @@ class SpearRegistry:
             self.add(sp)
 
             # The cost of the mechanic, applied unconditionally and before
-            # anything else can fail: an agent who released is unarmed whatever
-            # happens to the spear afterwards.
+            # anything else can fail: an agent who released has one fewer spear
+            # whatever happens to it afterwards, and is unarmed at zero.
+            #
+            # This used to be a flat ``agent.weapon = WEAPON_NONE``. It still is
+            # for a colonist carrying one, which is every colonist until the
+            # pickup gate in combat_actions relaxes - drop_spear clears the hand
+            # slot on the same line it takes the count to zero, so the two
+            # spellings are the same instruction at a cap of one.
             try:
-                agent.weapon = WEAPON_NONE
+                drop_spear(agent)
             except Exception:
                 pass
             try:
@@ -807,11 +854,33 @@ class SpearRegistry:
             "next_id": int(self.next_id),
             "t": float(self.t),
             "cooldowns": {str(k): float(v) for k, v in self.cooldowns.items()},
+            # The stream this registry throws on. Additive - a save written
+            # before this key existed simply has none and falls back to exactly
+            # the behaviour it had. SAVE_VERSION stays 1.
+            "seed": int(self.seed),
         }
 
     @classmethod
     def from_dict(cls, d: Any, seed: int | None = None) -> "SpearRegistry":
-        """Defensive load: an unreadable record is dropped, not fatal."""
+        """Defensive load: an unreadable record is dropped, not fatal.
+
+        Seed precedence is caller, then record, then ``_record_seed``. The
+        caller wins because ``World.from_dict`` is entitled to pin every
+        subsystem to the world's own seed - that is what makes a hand-edited
+        section load onto the world's stream instead of onto crc32 of the junk.
+        The record comes second so a save taken by this build replays itself,
+        and ``_record_seed`` is the floor for saves written before the key.
+
+        Stays non-raising ON PURPOSE, which is why the seed has to be threaded
+        rather than left to ``World._sub``'s fallback: a loader that never
+        raises means that fallback is unreachable and cannot be the fix.
+        """
+        if seed is None and isinstance(d, dict) and "seed" in d:
+            raw = d.get("seed")
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                got = _i(raw, -1)
+                if 0 <= got <= 0xFFFFFFFF:
+                    seed = got
         reg = cls(seed=_record_seed(d) if seed is None else int(seed))
         if not isinstance(d, dict):
             return reg
@@ -1041,6 +1110,124 @@ def nearest_spear(world: Any, x: float,
     return s if abs(s.x - _f(x, s.x)) <= _f(max_dist, float("inf")) else None
 
 
+# ================================================================= quiver ==
+# How many spears a colonist is carrying, and the four calls that move that
+# number. Everything outside this module goes through these rather than
+# touching ``agent.spears``, for the reason set out in the note on the legacy
+# encoding below: the field alone is not the whole answer.
+#
+# THE ENCODING, stated once. ``agent.spears`` is the TOTAL carried, the one in
+# the hand included. ZERO with ``weapon == WEAPON_SPEAR`` means ONE - it is the
+# pre-quiver encoding, and it is not a corner case that will age out: the field
+# is new, every save written before it exists lacks the key, and there are live
+# writers of ``agent.weapon`` outside this lane (``combat_actions._craft_apply``
+# and ``_h_retrieve``) that may set the string without the count. Reading the
+# raw field instead of calling :func:`spears_carried` therefore reports an armed
+# colonist as unarmed, which is the exact shape of a feature that ships inert.
+#
+# The other direction - a count above zero with no spear in the hand - is not
+# encoded here at all. ``Stickman.from_dict`` settles it on load, which is the
+# only place that sees the count, the weapon string and the relic together.
+
+
+def spears_carried(agent: Any) -> int:
+    """How many spears *agent* is carrying, 0 .. :data:`SPEAR_CARRY_MAX`.
+
+    Total. Never raises, never negative, and never above the cap however the
+    field got its value. See the note above for why a bare ``agent.spears`` is
+    not the same question.
+    """
+    try:
+        n = int(getattr(agent, "spears", 0) or 0)
+    except Exception:
+        n = 0
+    if n <= 0:
+        # The legacy encoding: the hand slot is the only record there is.
+        return 1 if _in_hand(agent) == WEAPON_SPEAR else 0
+    return n if n <= SPEAR_CARRY_MAX else SPEAR_CARRY_MAX
+
+
+def can_carry_more(agent: Any) -> bool:
+    """True when *agent* has room for another spear.
+
+    At ``SPEAR_CARRY_MAX = 1`` this is exactly "is not already holding one",
+    which is the single-slot rule this colony shipped with. That equivalence is
+    the whole point of the cap being a constant: the plumbing can land and be
+    proved neutral at 1 before the number goes to 6.
+    """
+    return spears_carried(agent) < SPEAR_CARRY_MAX
+
+
+def carry_spear(agent: Any, n: int = 1) -> int:
+    """Add *n* spears to the quiver, clamped. Returns the NEW total.
+
+    Puts one in the hand as well, because ``weapon`` is the derived mirror of
+    this count - but never over the top of the wyrm-gun, which owns the same
+    slot and is not something a colonist puts down to throw a stick.
+    """
+    have = spears_carried(agent)
+    want = have + (int(n) if isinstance(n, (int, float)) else 0)
+    new = 0 if want < 0 else (SPEAR_CARRY_MAX if want > SPEAR_CARRY_MAX else want)
+    try:
+        agent.spears = int(new)
+    except Exception:
+        log.debug("carry_spear could not write the count", exc_info=True)
+        return have
+    if new > 0 and _in_hand(agent) != WEAPON_BFG:
+        try:
+            agent.weapon = WEAPON_SPEAR
+        except Exception:
+            log.debug("carry_spear could not set the hand slot", exc_info=True)
+    return new
+
+
+def drop_spear(agent: Any, n: int = 1) -> bool:
+    """Spend *n* spears. False when there were not that many to spend.
+
+    Clearing the hand slot is NOT conditional on the return value. The quiver
+    emptying and the hand emptying are the same event, and this function is
+    called from :meth:`SpearRegistry.throw` at the point where the cost of the
+    mechanic is applied before anything else can fail - a path that leaves an
+    agent holding a spear he has already thrown is worse than one that spends a
+    spear he did not have.
+    """
+    want = int(n) if isinstance(n, (int, float)) else 1
+    have = spears_carried(agent)
+    left = have - want
+    if left < 0:
+        left = 0
+    try:
+        agent.spears = int(left if left <= SPEAR_CARRY_MAX else SPEAR_CARRY_MAX)
+    except Exception:
+        log.debug("drop_spear could not write the count", exc_info=True)
+    if left <= 0 and _in_hand(agent) == WEAPON_SPEAR:
+        try:
+            agent.weapon = WEAPON_NONE
+        except Exception:
+            log.debug("drop_spear could not clear the hand slot", exc_info=True)
+    return want > 0 and have >= want
+
+
+def armed_with_spear(agent: Any) -> bool:
+    """True when there is a spear in the hand AND something behind it.
+
+    The shared predicate :func:`can_throw` asks instead of comparing the weapon
+    string itself. Not one of the four helpers the other lanes code against; it
+    exists because "which slot is in use" and "how many are left" became two
+    questions the moment the quiver did, and only this module should be joining
+    them back up.
+    """
+    return _in_hand(agent) == WEAPON_SPEAR and spears_carried(agent) > 0
+
+
+def _in_hand(agent: Any) -> str:
+    """``agent.weapon`` as a plain string. Never raises, never None."""
+    try:
+        return str(getattr(agent, "weapon", WEAPON_NONE) or WEAPON_NONE)
+    except Exception:
+        return WEAPON_NONE
+
+
 def can_throw(agent: Any, world: Any) -> bool:
     """True when *agent* is in a state where a throw is legal at all.
 
@@ -1056,7 +1243,7 @@ def can_throw(agent: Any, world: Any) -> bool:
             return False
         if getattr(agent, "inside", None) is not None:
             return False
-        if str(getattr(agent, "weapon", WEAPON_NONE) or WEAPON_NONE) != WEAPON_SPEAR:
+        if not armed_with_spear(agent):
             return False
         reg = registry_of(world)
         if reg is not None and reg.cooldown_left(agent) > 0.0:

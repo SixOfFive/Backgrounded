@@ -2430,3 +2430,241 @@ MAX_RELICS        = 6
 #: opposite mistake - somebody reading "9.2%, 4th cause" and deciding the boots
 #: are not worth their slot.
 FALL_SURVIVED_DAMAGE = 30.0
+
+# ------------------------------------------ lookouts, quivers and raiders --
+# The shared vocabulary for the quiver / lookout / raider arc, landed AHEAD of
+# every feature that uses it. Nothing in the package reads a single name below
+# yet, and that is the point: a constant with no reader cannot move a sim
+# outcome, so this file can be frozen and referenced by seven parallel hands
+# without any of them owning it. Everything here is additive - SAVE_VERSION
+# stays 1, no scored candidate is added or removed, and behavior.choose_action's
+# shared rng stream is not re-phased by anything in this block.
+#
+# Two rules that outlive the arc and belong with the names rather than with the
+# code that will eventually read them:
+#
+#   * a raider is NOT a colonist. It must never land on
+#     ``world.population.agents``, or ``World.reconcile``'s residual
+#     (births + returned - deaths - abducted - alive) stops being zero and
+#     ``_clamp_roster`` / ``_rebase_books`` both need a new term. See UFO_WARD_AT
+#     for the last time this project paid for a roster that half-counted somebody.
+#   * ammo lives in ``Structure.state``, never in a new top-level save key.
+#     A new world key is a new junk-sweep surface and a new way for from_dict to
+#     be handed something it did not write.
+
+# --- F1: the quiver --------------------------------------------------------
+#: How many spears one stickman may carry. A hunting party that has to walk home
+#: after every throw is not a hunting party, and today a thrower is disarmed by
+#: his own first attack - ``weapon`` is a single slot, so the spear leaves the
+#: hand and the man becomes prey until he crafts another.
+#:
+#: DO NOT CONFUSE THIS WITH ``throwing.MAX_SPEARS`` (12). That one is a global
+#: cap on Spear OBJECTS - things in flight or lying in the dirt, each with an x,
+#: a lifetime and a per-tick cost. A carried spear is not an object, it is an
+#: integer on the agent, so the two numbers count different nouns and must not be
+#: "reconciled". Raising MAX_SPEARS to 6 * roster is the reflexive mistake.
+#:
+#: 6 against SPEAR_COST ({wood 2, stone 1}) is 12 wood and 6 stone for a full
+#: quiver - about half a watchtower, per person - which is why the count is
+#: worth having at all: it is a real claim on the material economy and the
+#: colony has to keep paying it.
+#:
+#: The load path must clamp through ``entities._count(..., lo=0,
+#: hi=SPEAR_CARRY_MAX)`` and never bare ``int()``: a save carrying a NaN, a
+#: negative or a hand-edited 10**9 must come back as a number in range rather
+#: than raising inside a subsystem's from_dict.
+#:
+#: USEFUL PROPERTY FOR THE A/B: at SPEAR_CARRY_MAX = 1 the whole feature - the
+#: field, the serialisation, the debit and the armed/capable predicates - is
+#: bit-identical to today's single-slot behaviour. So the plumbing can be landed
+#: and proved neutral first, and only then does this number go to 6.
+SPEAR_CARRY_MAX: int = 6
+
+# --- F2/F3: the new structure kinds ---------------------------------------
+#: The colony's own pair of towers, one off each side of the settlement, and the
+#: hermit's single tower out at his hut.
+#:
+#: These are NEW KINDS rather than more watchtowers, and that is a deliberate
+#: choice with a cost. The existing "watchtower" is sited toward the centre on
+#: high ground (behavior's ``_watchtower_site``) and the ask here is explicitly
+#: *outside each side*; extending the one kind would mean rewriting the siting
+#: rule under the tower that already exists, so every measurement of the old
+#: tower's behaviour would stop being comparable mid-arc. Two new kinds leave the
+#: shipped watchtower untouched, which is what makes the before/after honest.
+KIND_LOOKOUT: str = "lookout"
+KIND_HERMIT_LOOKOUT: str = "hermit_lookout"
+#: Kinds an agent can be perched on top of. Replaces every literal
+#: "watchtower" test in behavior.py and actions.py.
+#:
+#: There are five of them and they are not optional. The Lookout score, the
+#: free-tower search, the perch handler's own guard, its target search, and -
+#: the one that decides whether any of this is visible - ``assign_roles``' tower
+#: count, which is what mints a "lookout" role in the first place. A literal
+#: left behind in that last one is how the feature ships 100% inert: two towers
+#: get built, nobody is ever assigned to climb them, and nothing fails.
+#:
+#: Written as literals rather than as ``(WATCHTOWER, KIND_LOOKOUT, ...)`` for
+#: one reason: there is no WATCHTOWER constant, the string is spelled out in
+#: structures' spec table, and inventing one here would mean editing that table
+#: in the same breath - which is another lane's file.
+TOWER_KINDS: tuple[str, ...] = ("watchtower", "lookout", "hermit_lookout")
+
+# --- F2: siting ------------------------------------------------------------
+#: px from settlement_center. Deliberately INSIDE BARRICADE_STANDOFF (640) so a
+#: lookout stands behind its own side's spikes rather than in front of them.
+#:
+#: That ordering is the whole siting rule. A tower in front of the barricade is
+#: a manned structure on the wrong side of the colony's only passive defence:
+#: the animal reaches the lookout first, and the barricade - which does
+#: BARRICADE_DAMAGE 22 hp/s to anything within BARRICADE_RANGE 48 of it - only
+#: gets its bite after the fight is already over. 520 puts 120 px of open ground
+#: between the spikes and the ladder, which is where the man on top is supposed
+#: to be spending his throws.
+#:
+#: It also keeps both towers on camera by arithmetic rather than by luck:
+#: 520 plus a 30 px-wide tower's half-width is 535, comfortably inside
+#: STAGE_HALF (800), so a camera centred on the colony frames the left tower,
+#: the right tower and everything between them. Nine features in this project
+#: have shipped correct and invisible; a defence you cannot watch working is one
+#: of them.
+LOOKOUT_STANDOFF: float = 520.0
+#: Fraction of RENDER_W for the inward band, mirroring BARRICADE_EDGE_FRAC.
+#:
+#: Identical to BARRICADE_EDGE_FRAC (0.16) on purpose, for the reason MINE_KEEP_OUT
+#: gives about the quarry: "toward the edge" must mean ONE thing in this codebase
+#: rather than two. A lookout and the barricade it stands behind are answering the
+#: same question - which way do the animals come in - so they are allowed to
+#: disagree about distance and are not allowed to disagree about direction.
+LOOKOUT_EDGE_FRAC: float = 0.16
+#: Colonists before the colony will stake a lookout. The same gate the existing
+#: watchtower already carries in the build order, and one above BARRICADE_MIN_POP
+#: (4), because this is TWO builds and not one: at 22 wood and 8 stone apiece a
+#: pair of towers is a bigger claim on the store than anything else the colony
+#: raises at this size, and a four-person camp that spends it has spent its huts.
+LOOKOUT_MIN_POP: int = 5
+
+# --- F5: the rock tower ----------------------------------------------------
+#: Rocks a tower holds. 8 * ROCK_DAMAGE is 240 hp of stored violence: four
+#: wolves (58 each), a bear (140) with change, or two thirds of a wyvern (180).
+#: Enough that a full magazine decides an ordinary incursion, and NOT enough that
+#: a stocked tower is a turret which has stopped needing anybody - the haul is
+#: the feature, so the tower has to run dry.
+TOWER_AMMO_MAX: int = 8
+#: Rocks per stone hauled up the ladder. A full magazine is therefore 4 stone -
+#: a third of the upgrade's own stone cost, deliberately cheap, because a restock
+#: is meant to be an errand somebody runs between other jobs and not a second
+#: build project. Restocking that cost as much as building would simply mean
+#: nobody ever restocked and the upgrade read as a one-shot.
+TOWER_AMMO_PER_STONE: int = 2
+#: What it costs to turn a finished lookout into a rock tower.
+#:
+#: Sized ABOVE HUT_UPGRADE_COST ({stone: 10}) and it has to be. Behaviour's
+#: upgrade picker gates on ``stone_surplus(...) >= sum(cost.values())`` - stone
+#: that no pending build has a claim on - so a tower upgrade priced under a hut's
+#: would win that comparison first on every tick where both are available, and
+#: the masonry ladder would stall behind it. That ladder is not cosmetic: two
+#: standing STONE huts is the dragon gate, so an under-priced rock tower would
+#: quietly push dragons later in every colony that built one.
+#:
+#: Wood as well as stone, unlike the hut, because the thing being modified is a
+#: timber deck - the 6 wood is the hoist and the rack, and it keeps the tower
+#: from being a pure stone sink competing head-on with the huts.
+TOWER_UPGRADE_COST: dict[str, int] = {RES_WOOD: 6, RES_STONE: 12}
+#: Seconds of applied work once the material is on site. Between the
+#: watchtower's own 11 s per build stage and HUT_UPGRADE_WORK's 14 s: re-walling
+#: a hut is the whole building, a rock tower is a rack bolted to a deck that
+#: already exists.
+TOWER_UPGRADE_WORK: float = 12.0
+#: Damage one dropped rock does. A single blow rather than the barricade's
+#: 22 hp/s of contact damage, and a shade over SPEAR_DAMAGE (26): a rock is
+#: about a spear's worth of harm that you did not have to walk into reach to
+#: deliver. What you pay for that is range - see ROCK_DROP_RANGE, which is
+#: narrower than the spikes below the tower.
+#:
+#: IT MUST BE DEALT THROUGH ``combat_actions.hurt_animal``. Two lines in this
+#: codebase bypass the dragon feeding rule by writing ``health``/``hp``/``alive``
+#: straight onto the target - ``Dragon.hurt`` discards ALL damage while ``sated``
+#: is False, and every existing weapon inherits that refusal only because they
+#: all end up there. A rock that reaches a raw setattr becomes the one weapon in
+#: the game that can kill an unfed dragon, the gorge window stops being the
+#: fight, and NOTHING FAILS LOUDLY.
+ROCK_DAMAGE: float = 30.0
+#: px, horizontal half-width the rock lands in. Between DRAGON_MAW_REACH (30)
+#: and BARRICADE_RANGE, so a tower covers its own footing and no more.
+#:
+#: Narrower than the barricade it stands behind, deliberately. A tower that
+#: outranged the spikes would make the spikes redundant, and the colony would
+#: have two defences where one does all the work - the same failure the quarry
+#: siting rules exist to avoid, pointed at combat.
+ROCK_DROP_RANGE: float = 46.0
+#: px. Above this a target is too high for a dropped rock to reach it.
+#: Deliberately BELOW the deck height so a rock falls, never rises.
+#:
+#: The deck is the watchtower spec's 74 px, so 40 is a real drop with 34 px of
+#: margin. It is also the SHORTEST of the three altitude gates in this file -
+#: under MELEE_CEILING (44) and well under BARRICADE_SPIKE_H (58) - which is what
+#: keeps the rock tower out of the dragon fight it should not be in: a wyvern on
+#: its 180 px cruise and a flyover at 360 are untouchable, and only a serpent
+#: (alt 9) or a quadruped that has actually landed for its siege is ever under it.
+ROCK_DROP_CEILING: float = 40.0
+#: Seconds between drops. Rather over twice SPEAR_COOLDOWN (1.1), because a man
+#: lifting a rock over a rail is slower than a man throwing. It is also what
+#: makes TOWER_AMMO_MAX a burst rather than a siege: 8 rocks at 2.4 s is 19 s of
+#: fire, against ANIMAL_LEAVE_SEC (90) and DRAGON_SIEGE_SEC (150), so a full
+#: magazine is an opening volley inside an engagement and never the whole of it.
+ROCK_COOLDOWN: float = 2.4
+
+# --- F6: raiders -----------------------------------------------------------
+#: XOR offset off world.seed. Distinct from every offset already taken:
+#: 0x5EED pyrng, 0x513 events, 0xA17 animals, 0x71F ufo, 0xD4A dragons,
+#: 0x59EA spears, 0x2E11 relics.
+#:
+#: Checked against the tree rather than against the list: those seven, plus
+#: 0x0F0 (the ufo's and the dragon registry's internal Random), 0xA5 and
+#: 0x1D1EA5 (props), 0x5EED again inside terrain, and 0x7 (vignettes). 0x2A1D
+#: collides with none of them. A collision would not crash - it would silently
+#: correlate two subsystems' streams on every seed for ever, which is exactly
+#: the class of bug that is invisible until somebody diffs two processes.
+#:
+#: USE IT IN BOTH PLACES. ``World.__init__`` and the ``_sub`` FALLBACK in
+#: ``World.from_dict``, identically. A section that fails to load and rehydrates
+#: on an unseeded ``random.Random()`` is the Ufo.from_dict bug this project has
+#: already fixed once: same seed, two separate processes, different worlds.
+RAIDER_SEED_OFFSET: int = 0x2A1D
+#: Cause string for a colonist killed by raiders. It must be REGISTERED in
+#: ``names.DEATH_KINDS`` *with a template*, both together - see
+#: CAUSE_DISINTEGRATED for the two halves of that mistake: an unregistered cause
+#: falls through to the generic "was lost to raided", and a registered kind with
+#: no template renders as "Something happened."
+CAUSE_RAIDED: str = "raided"
+#: Raiders on the map at once, ever. The same ceiling as ANIMAL_MAX_ALIVE and for
+#: the same reason - past four the colony is not defending, it is being deleted -
+#: but deliberately NOT MAX_DRAGONS_ALIVE's 1, because a raiding party of one is
+#: not a party. This is the number that keeps the event rare; the intervals below
+#: only space the starts.
+MAX_RAIDERS_ALIVE: int = 4
+#: Sim-seconds of grace after raiders arm before the first party may appear. Ten
+#: minutes, so the raid that opens the account lands on a colony that has
+#: something worth taking rather than on the two-person camp that has just
+#: satisfied whatever gate armed it.
+RAID_FIRST_DELAY: float = 600.0
+#: Seconds between attempts thereafter, 20 to 50 minutes. Rarer than animals
+#: (150-420 s) by roughly an order of magnitude and rarer than the UFO
+#: (420-1500 s) by two to three times, which puts raiders at the top of the
+#: rarity ladder below dragons. They are the only threat that carries weapons,
+#: fights back at spear range and can be beaten by a colony that stands - so a
+#: raid has to be an event somebody remembers, not weather.
+RAID_INTERVAL_MIN: float = 1200.0
+RAID_INTERVAL_MAX: float = 3000.0
+#: Party size, drawn per raid. The ceiling is exactly MAX_RAIDERS_ALIVE so that
+#: one party can be the whole allowance and two overlapping raids can never put
+#: eight of them on the map; the floor is 2 because a lone raider reads as a
+#: wandering animal that happens to be shaped like a man.
+RAIDER_PARTY_MIN: int = 2
+RAIDER_PARTY_MAX: int = 4
+#: Spears each raider carries in - well under SPEAR_CARRY_MAX, so a raider is
+#: armed but is not a better-equipped colonist. It is also the SALVAGE: the dead
+#: drop what they carried, so a party of four beaten to the last man leaves up to
+#: 8 spears in the dirt. That is the colony's payoff for standing, and it is why
+#: the number is a real one rather than 1.
+RAIDER_SPEARS: int = 2

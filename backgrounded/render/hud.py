@@ -34,6 +34,26 @@ from ..constants import (
 )
 from ..sim.names import ROLE_HERMIT, role_label
 
+try:                                            # pragma: no cover - lane seam
+    from ..constants import SPEAR_CARRY_MAX, TOWER_AMMO_MAX
+except ImportError:                             # standalone / partial checkout
+    SPEAR_CARRY_MAX, TOWER_AMMO_MAX = 6, 8
+
+try:                                            # pragma: no cover - lane seam
+    # THE quiver read, and it is not ``agent.spears``. A save written before the
+    # count existed encodes one carried spear as the weapon string alone, and
+    # this is the one function that knows that; reading the field raw would show
+    # every legacy colonist as unarmed on the panel while he is standing there
+    # holding a spear. Guarded so a partial checkout still draws a panel.
+    from ..sim.throwing import spears_carried as _spears_carried
+except ImportError:                             # pragma: no cover
+    def _spears_carried(agent) -> int:          # type: ignore[misc]
+        try:
+            n = int(getattr(agent, "spears", 0) or 0)
+        except Exception:
+            return 0
+        return max(0, min(n, int(SPEAR_CARRY_MAX)))
+
 log = logging.getLogger(__name__)
 
 PANEL_W = 268
@@ -231,6 +251,18 @@ _ACTIVITY_BY_PHASE: dict[tuple[str, str], str] = {
     ("CraftArmour", "work"): "making armour",
     ("FightAnimal", "approach"): "closing in",
     ("FightAnimal", "fight"): "fighting",
+    ("Lookout", "descend"): "climbing down",
+    # Hauling stone up to a rock tower's rack. Three legs, exactly the shape of
+    # BuildStructure's, and phrased to match it - the errand reads on the panel
+    # as a haul rather than as a build, which is what it is.
+    ("StockTower", "fetch"): "fetching stone",
+    ("StockTower", "approach"): "hauling stone up",
+    ("StockTower", "work"): "loading the tower",
+    ("UpgradeStructure", "fetch"): "fetching stone",
+    ("UpgradeStructure", "approach"): "hauling to site",
+    ("UpgradeStructure", "work"): "upgrading",
+    ("RetrieveSpear", "walk"): "after a spear",
+    ("RetrieveSpear", "take"): "picking up a spear",
 }
 
 #: Fallback per kind, used whenever the phase is one the table above does not
@@ -262,6 +294,11 @@ _ACTIVITY: dict[str, str] = {
     "CraftArmour": "making armour",
     "FightAnimal": "fighting",
     "FleeAnimal": "running away",
+    "UpgradeStructure": "upgrading",
+    "StockTower": "loading a tower",
+    "RetrieveSpear": "after a spear",
+    "ThrowSpear": "throwing a spear",
+    "CleanLitter": "clearing up",
     "Vignette": "idling",          # only reached if the vignette lost its label
 }
 
@@ -326,6 +363,16 @@ def activity_of(agent) -> str:
         if not kind:
             return "idle"
         phase = str(getattr(act, "phase", "") or "")
+        # THE ONE PLACE THE POSE OUTRANKS THE PHASE. Firing from a tower deck is
+        # a pose change inside the watch phase and not a phase of its own (a
+        # separate phase would have to be entered and left, and leaving it is
+        # what `_c_lookout` turns into a fall). So the only signal that the
+        # tower is doing anything at all is `pose == "chop"`, held for
+        # LOOKOUT_SHOT_POSE seconds after each shot - and "keeping watch" over
+        # a man putting spears into a wolf is the plate lying about the feature.
+        if kind == "Lookout" and phase == "watch":
+            if str(getattr(act, "pose", "") or "") == "chop":
+                return "shooting from the tower"
         phrase = _ACTIVITY_BY_PHASE.get((kind, phase))
         if phrase is None:
             phrase = _ACTIVITY.get(kind)
@@ -651,6 +698,16 @@ def _content_key(world, show_roster: bool) -> tuple:
         # hermit is first appointed.
         tuple(sorted(_stash_of(world).items())),
         sum(1 for a in agents if _is_hermit(a)),
+        # The quiver and the magazines. Both are drawn INTO the cached panel,
+        # so both have to be in the fingerprint or the numbers freeze: a
+        # colonist would keep showing "sp 3" after throwing them and a tower
+        # would keep showing a full magazine it had already emptied, for up to a
+        # whole rebuild period and in practice for as long as nothing else on
+        # the panel happened to change. Summed rather than listed per agent -
+        # this runs every frame, and the total moves on every throw and every
+        # pickup, which is exactly when the row needs redrawing.
+        sum(_spears_carried(a) for a in agents),
+        _tower_ammo(world)[:2],
         show_roster,
         # The follow ring is drawn into the cached panel, so the id it was
         # drawn for has to be part of the fingerprint. Without this the ring
@@ -844,6 +901,16 @@ def _agent_tip(a) -> tuple[str, tuple[str, ...]]:
         qty = int(getattr(a, "carry_qty", 0) or 0)
         if carrying and qty > 0:
             body.append(f"carrying {qty} x {carrying}")
+        # The quiver. Worth its own line rather than folding into "carrying"
+        # above: a colonist's carried RESOURCE is one stack of one thing on its
+        # way to the stockpile, and spears are neither - they are his own, they
+        # are what he throws, and the number is the difference between a man who
+        # can fight a wolf off and a man who gets one shot.
+        spears = _spears_carried(a)
+        if spears > 0:
+            full = " (full)" if spears >= int(SPEAR_CARRY_MAX) else ""
+            body.append(f"{_plural(spears, 'spear', 'spears')} carried: "
+                        f"{spears}/{int(SPEAR_CARRY_MAX)}{full}")
         if getattr(a, "holds_candle", False):
             body.append("holding a candle")
         body.append("")
@@ -888,6 +955,52 @@ def _is_hermit(a) -> bool:
         return str(getattr(a, "role", "")) == ROLE_HERMIT
     except Exception:
         return False
+
+
+def _tower_ammo(world) -> tuple[int, int, int]:
+    """``(rock towers standing, rocks stacked on them, total capacity)``.
+
+    Read-only and never raises: this is on the panel's rebuild path and is also
+    handed stub worlds by the probe and by ``tools/smoke.py``.
+
+    Asked of ``Structure.is_rock_tower`` rather than of the kind string, because
+    a *lookout* is only a rock tower once ``state["material"]`` says so - an
+    un-upgraded one holds nothing and must not appear on the panel at all. The
+    ``getattr`` guard is what lets this ship before the sim-side upgrade does:
+    on a build without it every structure answers False and the row is simply
+    never drawn.
+    """
+    n = ammo = 0
+    try:
+        for s in world.structures.all():
+            try:
+                if not getattr(s, "is_rock_tower", False):
+                    continue
+                n += 1
+                ammo += int(s.ammo())
+            except Exception:
+                continue
+    except Exception:
+        return (0, 0, 0)
+    return (n, ammo, n * int(TOWER_AMMO_MAX))
+
+
+def _ammo_tip(n: int, ammo: int, cap: int) -> tuple[str, tuple[str, ...]]:
+    body = [f"{n} {_plural(n, 'tower has', 'towers have')} been upgraded to rock",
+            f"between them they hold {ammo} of {cap} rocks",
+            ""]
+    if ammo <= 0:
+        body.append("empty - they drop nothing until somebody")
+        body.append("hauls stone up the ladder")
+    elif ammo < cap:
+        body.append("a tower drops a rock on anything that comes")
+        body.append("under it, and stops when its rocks run out")
+    else:
+        body.append("full magazines - each tower drops a rock on")
+        body.append("anything that comes under it")
+    body += ["", "the haul is the feature: they run dry and",
+             "somebody has to carry more stone up"]
+    return (f"Rock towers - {ammo}/{cap}", tuple(body))
 
 
 def _stash_of(world) -> dict:
@@ -976,11 +1089,19 @@ def _build(world, show_roster: bool,
     # because appended to "pop/gen/built/lost" it runs off the panel edge.
     ufo_line = taken > 0
 
+    # The rock towers' magazines, on the same terms as the ufo row above: the
+    # line exists only once there is something to say. Most colonies never
+    # upgrade a lookout, and a permanently "0/0" row is pure noise on a panel
+    # that is already fighting for height.
+    towers, ammo, ammo_cap = _tower_ammo(world)
+    ammo_line = towers > 0
+
     # Footer now wraps to two lines, so reserve LINE * 3 for it (divider +
     # two text lines) instead of LINE * 2.
     def _height_for(extra_rows: int) -> int:
         return (PAD * 2 + LINE * 3 + 6 + (rows * (LINE + 9)) + LINE * 3 + 8
                 + (LINE - 2 if show_roster else 0) + (LINE if ufo_line else 0)
+                + (LINE if ammo_line else 0)
                 + extra_rows * (LINE - 3))
 
     # THE STASH LINE IS AFFORDABLE OR IT IS NOT, and this is the fix to a claim
@@ -1086,6 +1207,25 @@ def _build(world, show_roster: bool,
                       title, body))
         at += len(part) + 1
     y += LINE
+
+    if ammo_line:
+        # Deliberately UNDER the stockpile line and in its vocabulary: this is
+        # the one store in the game that is not in the stockpile and cannot be
+        # spent from it - the rocks are already up the ladder. Colour follows
+        # the magazine, because an empty tower looks identical to a full one on
+        # screen and that is exactly what the panel is for.
+        col = BAD if ammo <= 0 else (GOOD if ammo >= ammo_cap else WARN)
+        at_text = f"rock {_plural(towers, 'tower', 'towers')} {towers}"
+        as_text = f"ammo {ammo}/{ammo_cap}"
+        a_s = _text(at_text + "  ", DIM, 11)
+        panel.blit(a_s, (PAD, y))
+        panel.blit(_text(as_text, col, 11), (PAD + a_s.get_width(), y))
+        zones.append((pygame.Rect(PAD, y,
+                                  a_s.get_width() + _text(as_text, col, 11).get_width(),
+                                  LINE),
+                      *_ammo_tip(towers, ammo, ammo_cap)))
+        y += LINE
+
     if show_roster:
         # hp is called out separately from the three needs because it is the one
         # bar on the row where a full bar is good news.
@@ -1155,6 +1295,26 @@ def _build(world, show_roster: bool,
             role = str(getattr(a, "role", ""))[:9]
             rs = _text(role, DIM, 9)
             panel.blit(rs, (PANEL_W - PAD - rs.get_width(), y - 2))
+
+            # THE QUIVER, on the row rather than only in the tooltip. Six
+            # spears and one spear draw as the same stickman (render/creatures
+            # tests `weapon` for equality and gets a boolean), so without a
+            # number on the panel the whole carry feature is invisible unless
+            # you happen to hover the right man at the right moment.
+            #
+            # It goes in the gap the fourth bar left behind: the bars end at
+            # `bx` and the right-aligned role starts at PANEL_W - PAD - its
+            # width, which on a nine-character role is ~57 px of clear panel.
+            # Drawn only if it actually fits, because the role label's width is
+            # decided by a font the system picks at runtime and a collision
+            # here would overprint two live values.
+            nsp = _spears_carried(a)
+            if nsp > 0:
+                sp_col = GOOD if nsp >= int(SPEAR_CARRY_MAX) else DIM
+                sp_s = _text(f"sp {nsp}", sp_col, 9)
+                sp_x = PANEL_W - PAD - rs.get_width() - 6 - sp_s.get_width()
+                if sp_x >= bx + 2:
+                    panel.blit(sp_s, (sp_x, y - 2))
             y += 11
 
             # ---- and, for the one man who has one, his stash ---------------

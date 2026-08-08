@@ -126,6 +126,24 @@ ANIMAL_REACH = 20.0
 #: Pursuit only breaks off past reach x this, so a target shuffling one pixel
 #: does not flip the animal between approach and attack every tick.
 REACH_HYSTERESIS = 1.6
+#: Px an animal can reach ABOVE itself. ``ANIMAL_REACH`` is horizontal and was
+#: the only gate there was, which made the bite height-blind - and that turned
+#: a lookout tower into a gallows.
+#:
+#: Measured before this existed: a wolf standing 18.8 px from the foot of a
+#: tower bit the man on the deck 68 px above it for 375 consecutive ticks and
+#: he could not answer one of them. Not for want of a spear - the bands do not
+#: overlap. An animal breaks off past ``ANIMAL_REACH * REACH_HYSTERESIS`` =
+#: 32 px, and ``throwing.THROW_MIN_RANGE`` is 34, so there is no horizontal
+#: distance at which a perched man may both be bitten and throw back. Arming
+#: him changed nothing; he died in phase "watch" without the action ever
+#: advancing. Widening the throw band was the other candidate fix and is worse:
+#: it lets every colonist stab at arm's length and it leaves the real absurdity
+#: - a wolf mauling someone two body-heights over its head - in place.
+#:
+#: 24 px clears a man on a boulder or on the high side of a step, and refuses
+#: nothing that is standing on the same ground as the animal.
+ANIMAL_VERT_REACH = 24.0
 #: Fraction of max health below which an animal gives up and runs.
 FLEE_HEALTH = 0.30
 
@@ -345,6 +363,32 @@ def _ward_x(world: Any) -> float | None:
         return _f(getattr(fire, "x", 0.0))
     except Exception:
         return None
+
+
+def _out_of_reach_above(a: Any, agent: Any) -> bool:
+    """Is *agent* standing on something too high for *a* to bite?
+
+    Keyed on ``perch_y`` and not on raw dy, because the terrain produces the
+    same arithmetic for an entirely innocent reason: on a slope at
+    ``MAX_SLOPE_CLIMB`` a target 20 px away in x is legitimately 52 px higher,
+    and refusing that would make every hillside chase unwinnable.
+    ``Stickman.perch`` is the only writer of ``perch_y`` - it means a platform
+    is holding the man off the ground - and it is renewed every tick under
+    ``PERCH_LEASE``, so the flag cannot go stale under a dead action.
+
+    A FILTER, like ``_warded``, and deliberately so: a filter degrades
+    correctly when the unreachable man is the last one alive, because
+    ``_approach_step`` gets None and walks the animal off the map. A damage
+    exemption would instead leave the pack milling at the foot of the tower
+    forever.
+    """
+    try:
+        if getattr(agent, "perch_y", None) is None:
+            return False
+        return (_f(getattr(a, "y", 0.0), 0.0)
+                - _f(getattr(agent, "y", 0.0), 0.0)) > ANIMAL_VERT_REACH
+    except Exception:
+        return False
 
 
 def _warded(agent: Any, ward: float | None) -> bool:
@@ -1124,6 +1168,20 @@ class AnimalRegistry:
             self._enter(a, STATE_APPROACH)
             return
 
+        # Climbed out of reach mid-fight. Checked here as well as in
+        # _pick_target for exactly the reason the ward is: an animal that
+        # closed on him at ground level otherwise goes on biting after he has
+        # gone up the ladder, and the one moment a tower is supposed to be
+        # worth having is the one it would never cover. The target is dropped
+        # rather than re-approached - approaching something it can never reach
+        # is how you get a wolf parked at the foot of a tower for the rest of
+        # the session.
+        if _out_of_reach_above(a, target):
+            a.target_id = None
+            a.vx = 0.0
+            self._enter(a, STATE_APPROACH)
+            return
+
         # He made it back to his fire. Break off - the ward has to be checked
         # here as well as in `_pick_target`, or an animal that closed on him in
         # the open goes on biting inside the light, and the one moment the ward
@@ -1274,6 +1332,8 @@ class AnimalRegistry:
                 continue          # already tried them; they were wearing scale
             if _warded(ag, self._ward):
                 continue          # stood at a lit hermit fire; wolves will not
+            if _out_of_reach_above(a, ag):
+                continue          # up a tower; nothing here can climb
             score = abs(_f(getattr(ag, "x", 0.0)) - a.x)
             score += FOCUS_PENALTY * self._attackers_on(aid, a.id)
             if a.target_id is not None and aid == int(a.target_id):

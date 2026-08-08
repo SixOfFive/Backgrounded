@@ -78,8 +78,17 @@ from ..constants import (
     WALK_SPEED,
     WEAPON_BFG,
     WEAPON_NONE,
+    WEAPON_SPEAR,
     WORLD_W,
 )
+
+try:
+    from ..constants import SPEAR_CARRY_MAX
+except ImportError:                                   # pragma: no cover
+    # Same literal as constants.py declares. A missing constant must not change
+    # how many spears a save is allowed to bring back; it must only stop the
+    # number being editable in one place. See sim/throwing.py for the twin.
+    SPEAR_CARRY_MAX = 6
 from .names import (
     ADULT_ROLES,
     ROLE_BUILDER,
@@ -549,6 +558,30 @@ class Stickman:
     # simply alive or not.
     health: float = MAX_HEALTH
     weapon: str = WEAPON_NONE          # "" | "spear"
+
+    #: How many spears this colonist is carrying, the one in hand included.
+    #: 0 .. ``constants.SPEAR_CARRY_MAX``.
+    #:
+    #: A DECLARED FIELD, and for the reason ``beamed`` and ``relic`` below are:
+    #: an ad-hoc attribute on this dataclass is not seen by :meth:`to_dict` and
+    #: evaporates on the next save, silently, with nothing in the game able to
+    #: show it. This one is also written by another module (sim/throwing.py's
+    #: quiver helpers), which is exactly the shape that lost the relic slot once.
+    #:
+    #: ``weapon`` is the DERIVED MIRROR of this count, not a second copy of it:
+    #: ``weapon == WEAPON_SPEAR`` iff ``spears > 0`` and the relic is not the
+    #: wyrm-gun, which owns the same hand slot. The count is authoritative for
+    #: HOW MANY and the string for WHICH SLOT, and :meth:`from_dict` is the one
+    #: place that sees both plus the relic and can settle a save that disagrees.
+    #:
+    #: ZERO WITH A SPEAR IN HAND MEANS ONE. That is the pre-quiver encoding and
+    #: it is load-bearing rather than transitional: every save written before
+    #: this field lacks the key, and ``combat_actions`` sets the weapon string
+    #: on paths that predate the count. Read it through
+    #: ``throwing.spears_carried``, never raw - a raw read calls an armed
+    #: colonist unarmed. This module cannot import throwing (throwing imports
+    #: this one), which is why the coercion here is a bare ``_count``.
+    spears: int = 0
     armour: float = ARMOUR_NONE        # 0..1 fraction of damage absorbed
     attack_cd: float = 0.0             # seconds until the next swing lands
     target_animal: int | None = None   # animal id this agent is fighting
@@ -1413,6 +1446,14 @@ class Stickman:
             "holds_torch": bool(self.holds_torch),
             "health": float(self.health),
             "weapon": str(self.weapon),
+            # The quiver. This dict is HAND-WRITTEN, not derived from the
+            # dataclass fields, so a new field is invisible in the save until
+            # its line is here - which is how a carried quantity gets lost.
+            # Written RAW, deliberately: from_dict settles the count against the
+            # weapon string, and emitting a settled value here instead would
+            # make to_dict disagree with the live agent and move a field on the
+            # first round of tools/smoke.py's roundtrip check.
+            "spears": int(self.spears),
             "armour": float(self.armour),
             "attack_cd": float(self.attack_cd),
             "target_animal": self.target_animal,
@@ -1481,6 +1522,12 @@ class Stickman:
         s.holds_torch = _b(d.get("holds_torch"), True)
         s.health = _f(d.get("health"), MAX_HEALTH)
         s.weapon = _s(d.get("weapon"), WEAPON_NONE) if "_s" in globals() else str(d.get("weapon") or WEAPON_NONE)
+        # _count, never a bare int(): `int(float("nan"))` RAISES, and inside
+        # this classmethod that is not a lost field, it is a lost COLONIST -
+        # Population.from_dict catches and skips the whole record. _count
+        # coerces and bounds in one move and cannot raise, so a hand-edited
+        # 10**9 comes back as a full quiver rather than as a missing person.
+        s.spears = _count(d.get("spears"), 0, lo=0, hi=SPEAR_CARRY_MAX)
         s.armour = _f(d.get("armour"), ARMOUR_NONE)
         s.attack_cd = _f(d.get("attack_cd"), 0.0)
         # ``int(float("nan"))` RAISES, and this used to be a bare int(). Inside
@@ -1508,6 +1555,27 @@ class Stickman:
             s.armour = max(s.armour, ARMOUR_DRAGONSCALE)
         elif s.relic == RELIC_BFG:
             s.weapon = WEAPON_BFG
+        # ...and settle the quiver against the hand slot, which only this line
+        # can do: the count, the weapon string and the relic are three separate
+        # persisted fields and this is the only place that has all three.
+        #
+        # ONE DIRECTION ONLY, and the asymmetry is deliberate. A save carrying
+        # spears with an empty hand is unreachable from a live world - the
+        # throwing helpers set the string on the same call that raises the count
+        # - so it can only come from a hand edit or a truncated write, and left
+        # alone it strands a colonist with a quiver he can never draw from
+        # (nothing puts a spear in his hand, and the pickup gate reads him as
+        # full). Fixing it here costs nothing on an honest save.
+        #
+        # The mirror image - a spear in hand with a count of zero - is NOT
+        # settled here, and must not be: it is the ordinary state of every save
+        # written before this field, and of every colonist armed by a code path
+        # that predates the count. Writing 1 into it would move a field between
+        # tools/smoke.py's first and second roundtrip and turn a green check red
+        # for a value that is already read correctly. throwing.spears_carried
+        # resolves that encoding at the point of use instead.
+        if s.spears > 0 and s.relic != RELIC_BFG and s.weapon != WEAPON_SPEAR:
+            s.weapon = WEAPON_SPEAR
         s.fall_saves = _count(d.get("fall_saves"), 0)
         s.taken = _b(d.get("taken"), False)
         s.lift_t = _f(d.get("lift_t"), 0.0)
