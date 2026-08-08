@@ -54,6 +54,8 @@ from ..constants import (
     LADDER_MAX_W,
     HERMIT_BUILD_URGE,
     HERMIT_COOK_URGE,
+    HERMIT_STASH_CAP,
+    HERMIT_STASH_TAPER,
     HERMIT_EDGE_MARGIN,
     HERMIT_FELL_REACH,
     HERMIT_FELL_URGE,
@@ -1300,6 +1302,39 @@ def _tree_in_reach(world: Any, agent: Any) -> bool:
         return False
 
 
+def _stash_appetite(world: Any, res: str) -> float:
+    """0..1 appetite for putting MORE *res* into the hermit's own pile.
+
+    1.0 while there is room to spare, easing over the last
+    ``HERMIT_STASH_TAPER`` units, and exactly 0.0 at ``HERMIT_STASH_CAP``.
+
+    The colony has had this since ``_stock_state`` - its ``glut`` arm is the
+    same idea against a per-head target. The hermit had nothing: his cap was
+    enforced only at the till, in ``hermit_stash_add``, which quietly returns 0
+    and drops the goods. So every score that sends him to make something was
+    flat right up to the cap and past it, and the work he did there was
+    destroyed on arrival rather than stored.
+
+    Multiplied into a score rather than tested as a gate, because
+    ``choose_action`` SKIPS any candidate at or below 0.0 without drawing its
+    tiebreak - so a hard gate changes the number of draws the moment it trips
+    and re-phases the shared world stream for every colonist. A taper still
+    reaches 0 at the cap and still re-phases there, which is unavoidable and is
+    the point, but it does not do it over the whole approach.
+
+    Never raises; an unreadable stash reads as empty, which keeps him working.
+    """
+    try:
+        have = max(0, int(hermit_stash_qty(world, res)))
+    except Exception:
+        return 1.0
+    room = max(0, int(HERMIT_STASH_CAP) - have)
+    if room <= 0:
+        return 0.0
+    span = max(1.0, float(HERMIT_STASH_TAPER))
+    return _clamp01(room / span)
+
+
 def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
                  fatigue: float, warmth: float, carry_qty: int, carrying: Any,
                  danger: bool) -> None:
@@ -1445,6 +1480,16 @@ def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
     if carry_qty >= CARRY_CAP and carrying in (RES_FOOD, RES_COOKED):
         s["ForageBerries"] = 0.0
         s["Farm"] = 0.0
+    else:
+        # Full HANDS were the only thing that ever stopped him gathering; a full
+        # PILE did not, so he foraged into a stash that refused the berries and
+        # binned them. Same bug as the cook above and found by the same probe -
+        # both scores were flat at every stash level up to and past the cap.
+        # He can still Eat: that reads the stash, and a full stash is the one
+        # state in which eating is certain to work.
+        room = _stash_appetite(world, RES_FOOD)
+        s["ForageBerries"] = float(s.get("ForageBerries", 0.0)) * room
+        s["Farm"] = float(s.get("Farm", 0.0)) * room
 
     if danger:
         # This function runs AFTER the danger clamp - it has to, or the combat
@@ -1495,10 +1540,17 @@ def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
     #     stash arm THERE is unreachable, which is how a feature ships inert: he
     #     banks berries, never scores a cook against them, and `ck` stays 0 on
     #     the panel forever.
+    #     AND ONLY WHILE THE PILE HAS ROOM FOR THE MEAL. `hermit_stash_add`
+    #     refuses a resource at HERMIT_STASH_CAP and returns 0, so a cook at the
+    #     cap does not merely waste his afternoon - `_h_cook` takes the raw food
+    #     and the till then throws the meal away. Measured before this line
+    #     existed: twelve food units destroyed in four sim-minutes, and the
+    #     score sat at a flat 0.42 whether he held 0 cooked or 65. See
+    #     `_stash_appetite`.
     if own_fire is not None and bool(getattr(own_fire, "fire_active", False)):
         if ((carry_qty > 0 and carrying == RES_FOOD)
                 or hermit_stash_qty(world, RES_FOOD) > 0):
-            s["CookFood"] = HERMIT_COOK_URGE
+            s["CookFood"] = HERMIT_COOK_URGE * _stash_appetite(world, RES_COOKED)
 
     # 6b. TENDING IT. A fire nobody feeds is out inside a quarter of an hour,
     #     and a hermit whose fire is always out is a hermit with a cold ring of

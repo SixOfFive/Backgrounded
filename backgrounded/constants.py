@@ -1612,6 +1612,24 @@ HERMIT_COOK_URGE = 0.42
 #: through the stash) and would show if it ever filled; there is nothing here to
 #: fix, only something not to expect.
 HERMIT_STASH_CAP = 60
+#: Units of headroom over which his appetite for MAKING MORE of something eases
+#: off, reaching zero exactly at :data:`HERMIT_STASH_CAP`.
+#:
+#: This exists because the cap was enforced at the till and nowhere else.
+#: ``hermit_stash_add`` refuses goods once a resource is at 60 and returns 0,
+#: and nothing upstream ever asked - so the scores that send him to work were
+#: flat all the way to the cap and past it. Measured on seed 4242 with a lit
+#: fire: CookFood scored 0.420 at 0 cooked, at 60, and at 65, and
+#: ForageBerries/Farm scored 0.343/0.265 whatever was in the pile. Four
+#: sim-minutes at the cap with twelve raw food in the stash ended with twelve
+#: food units GONE - he cooked them, the till refused the meals, and they were
+#: destroyed. Not merely a man wasting his afternoon; a man burning the larder.
+#:
+#: A taper rather than a cliff, for the reason every other gate in this file is
+#: a taper: a hard switch at 59/60 makes him thrash between cooking and not
+#: cooking as he eats one meal. 12 is a fifth of the cap and four cooks' worth
+#: (``_h_cook`` moves 3 at a time), so he coasts to a stop instead of slamming.
+HERMIT_STASH_TAPER = 12.0
 #: HOW MUCH WOOD HE LIKES TO HAVE BY THE DOOR, and what filling the pile is
 #: worth. This is the fuel economy fix the longer standoff needed, and it exists
 #: because the first measurement of the new band said so: with a stash he could
