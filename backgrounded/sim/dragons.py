@@ -485,11 +485,18 @@ GORGE_MAX_SEC = DRAGON_GORGE_SEC + 40.0
 #:
 #: The other half of the bar is the escapees, not the kills: the ones that get
 #: away now leave hurt rather than untouched, which is the "usually escapes,
-#: wounded" the brief asked for. Quadruped is there. Skeletal is the one kind
-#: still more likely to die than not - 60.5% - and that is a judgement call
-#: nobody has made rather than a bug: it is sated at birth, so it never "feeds"
-#: in the sense the rule means, and the 39.5% that do get away leave at 0.37 of
-#: their bar.
+#: wounded" the brief asked for. Quadruped is there.
+#:
+#: SKELETAL IS DELIBERATELY LEFT AT 60.5%, the one kind still likelier to die
+#: than to escape. Asked and answered on 2026-08-08 rather than left hanging,
+#: because a number that sits outside the stated bar with no note next to it
+#: reads as an oversight and invites somebody to "fix" it. The undead kind is
+#: `sated = True` at birth, so it never feeds in the sense the rule means and
+#: the "a dragon gets one of you first" bar was never really about it; the
+#: 39.5% that do get away leave at 0.37 of their bar, which is the wounded
+#: escape the brief wanted. It dies more often than the others because it is
+#: the thing that robs graves and the colony objects. That is character, not
+#: balance - do not tune it back without asking.
 DRAGON_FLEE_FRAC = 0.30
 
 #: The committed errands. A dragon in one of these is working to a clock it
