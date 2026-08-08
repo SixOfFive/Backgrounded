@@ -1358,12 +1358,46 @@ class Ufo:
 
     @classmethod
     def from_dict(cls, d: Any) -> "Ufo":
-        """Defensive load: junk gives an idle ufo, never an exception."""
-        u = cls()
+        """Rebuild from a save section, or RAISE so the caller can regenerate.
+
+        Raising is this method's contract, not a lapse in defensiveness. It is
+        the same contract EventSystem.from_dict spells out at length, and this
+        was the last section in the save path still getting it wrong.
+
+        ``World.from_dict`` loads every subsystem through ``_sub(key, loader,
+        fallback)``, which calls ``fallback`` only when ``loader`` RAISES. The
+        fallback here is ``Ufo(seed=w.seed ^ 0x71F)`` - deliberately SEEDED,
+        because a bare ``Ufo()`` takes its seed from the global ``random``
+        module (see ``__init__``) and therefore comes back different in every
+        process. Handing back a half-built object from here did not merely lose
+        the saucer's position: it defeated that seeded fallback outright. Two
+        processes loading the same save disagreed about ``seed`` and
+        ``next_in`` from the first tick, so the abduction landed at a different
+        minute in each - and since who gets taken changes who dies, no seeded
+        comparison of a long run could be trusted. It also swallowed _sub's
+        "save section %r unusable; regenerating" warning, so nothing said a
+        word about any of it.
+
+        Three separate leaks are closed here, and each one was sufficient on
+        its own: a non-dict returned ``cls()``; a dict with no usable "seed"
+        fell back to ``cls()``'s random one; and the except arm returned
+        ``cls()`` while eating the exception ``_sub`` was waiting for.
+        """
         if not isinstance(d, dict):
-            return u
+            raise TypeError(f"ufo section is {type(d).__name__}, not a dict")
+        raw_seed = d.get("seed")
+        if isinstance(raw_seed, bool) or not isinstance(raw_seed, (int, float)):
+            raise ValueError(f"ufo section has no usable seed: {raw_seed!r}")
+
+        # Constructed only now, and only with a seed off the save. cls() with
+        # no argument would both invent an unreproducible seed and advance the
+        # global random stream - which every other subsystem is careful never
+        # to touch - as a side effect of merely trying to read a save.
+        u = cls(seed=_i(raw_seed, 0))
         try:
-            u.seed = _i(d.get("seed"), u.seed)
+            # Reset rather than trust __init__'s: the constructor spends one
+            # draw on next_in, so this puts the loaded stream at a known
+            # position no matter what the save turns out to hold.
             u._rng = random.Random(u.seed ^ 0x0F0)
 
             phase = d.get("phase")
@@ -1428,8 +1462,11 @@ class Ufo:
                 # and the phase is the one that drives the tick.
                 u.wrecked = True
         except Exception:
-            log.warning("ufo save unreadable; starting idle", exc_info=True)
-            return cls()
+            # Re-raised, never swallowed. _sub is listening for exactly this
+            # and answers it with a seeded Ufo; returning cls() here instead
+            # would hand back the unseeded object this method exists to avoid.
+            log.warning("ufo save unreadable; regenerating", exc_info=True)
+            raise
         return u
 
 
@@ -1584,16 +1621,34 @@ if __name__ == "__main__":   # pragma: no cover - headless, runs a real World
     blob = u.to_dict()
     clone = Ufo.from_dict(blob)
     assert clone.to_dict() == blob, "round-trip mismatch"
-    assert Ufo.from_dict(None).phase == PHASE_IDLE
-    assert Ufo.from_dict({"phase": "nonsense", "abducted": [1, "x"]}).phase == PHASE_IDLE
-    assert Ufo.from_dict({"phase": PHASE_BEAM, "target_id": None}).phase == PHASE_DEPART
+    # The contract is "raise, so World._sub can regenerate a SEEDED ufo".
+    # Anything that cannot yield a reproducible saucer has to raise rather than
+    # improvise one off the global random module.
+    for _bad in (None, [], "ufo", 7, {}, {"seed": None}, {"seed": "x"},
+                 {"seed": True}, {"phase": PHASE_BEAM}):
+        try:
+            Ufo.from_dict(_bad)
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError(f"from_dict({_bad!r}) should have raised")
+
+    # With a seed present it still normalises every bit of junk it used to.
+    assert Ufo.from_dict({"seed": 5, "phase": "nonsense",
+                          "abducted": [1, "x"]}).phase == PHASE_IDLE
+    assert Ufo.from_dict({"seed": 5, "phase": PHASE_BEAM,
+                          "target_id": None}).phase == PHASE_DEPART
     # A wreck has no target by construction, so it must NOT be normalised into
     # a depart the way an orphaned beam is - that would fly the hull back up.
-    _wr = Ufo.from_dict({"phase": PHASE_WRECK, "target_id": None})
+    _wr = Ufo.from_dict({"seed": 5, "phase": PHASE_WRECK, "target_id": None})
     assert _wr.phase == PHASE_WRECK and _wr.wrecked, _wr.summary()
     _wr.tick(object(), 0.05)               # and it must still tick worldless
-    junk = Ufo.from_dict({"x": float("nan"), "t": "boom", "next_in": None})
+    junk = Ufo.from_dict({"seed": 5, "x": float("nan"), "t": "boom",
+                          "next_in": None})
     assert junk.phase == PHASE_IDLE and math.isfinite(junk.x)
+    # The property the unseeded cls() destroyed: the same section loaded twice
+    # has to give the same saucer, seed and next_in included.
+    assert Ufo.from_dict(blob).to_dict() == Ufo.from_dict(blob).to_dict()
     print("round-trip ok;", clone.summary())
 
     print("-- never raises -------------------------------------------------")
