@@ -178,6 +178,61 @@ from .structures import (
 )
 
 try:                                # pragma: no cover - lane-order shim
+    from ..constants import (
+        HERMIT_EXODUS_URGE,
+        HERMIT_FORAGE_REACH,
+        HERMIT_LARDER,
+        HERMIT_LARDER_URGE,
+        HERMIT_TOWN_RADIUS,
+        KIND_HERMIT_WORKBENCH,
+    )
+except ImportError:                 # pragma: no cover - lane-order shim
+    # THE SAME LITERALS the constants lane landed, so behaviour is identical
+    # before and after that file arrives. A separate try-block rather than six
+    # more names in the big import above, because one missing name there takes
+    # the WHOLE module down and the hermit is a garnish.
+    HERMIT_TOWN_RADIUS = 420.0
+    HERMIT_EXODUS_URGE = 0.90
+    KIND_HERMIT_WORKBENCH = "hermit_workbench"
+    HERMIT_LARDER = 24
+    HERMIT_LARDER_URGE = 0.51
+    HERMIT_FORAGE_REACH = 720.0
+
+
+try:                                # pragma: no cover - lane-order shim
+    from .actions import hermit_workbench
+except ImportError:                 # pragma: no cover - lane-order shim
+    def hermit_workbench(world: Any, *, built_only: bool = False) -> Any | None:
+        """His crafting bench, or None. Never raises.
+
+        `hermit_lookout`'s shim word for word, and for the identical reason:
+        the score in `_hermit_bias`, the target in `_mk_build` and the handler
+        in `actions` have to ask the SAME question - lowest id wins, ruins are
+        never returned, `built_only` filters - or the score and the action
+        disagree, which is the deadlock this build loop was rebuilt around once
+        already.
+        """
+        reg = structures_of(world)
+        if reg is None:
+            return None
+        best = None
+        try:
+            for s in reg:
+                if str(getattr(s, "kind", "")) != KIND_HERMIT_WORKBENCH:
+                    continue
+                if getattr(s, "is_ruined", False):
+                    continue
+                if built_only and not getattr(s, "built", False):
+                    continue
+                sid = int(getattr(s, "id", 0) or 0)
+                if best is None or sid < int(getattr(best, "id", 0) or 0):
+                    best = s
+        except Exception:
+            return None
+        return best
+
+
+try:                                # pragma: no cover - lane-order shim
     from .actions import hermit_lookout
 except ImportError:                 # pragma: no cover - lane-order shim
     def hermit_lookout(world: Any, *, built_only: bool = False) -> Any | None:
@@ -398,6 +453,151 @@ HERMIT_LOOKOUT_ENABLED = True
 #: HERMIT_FIRE_URGE are not retuned.
 #: TODO(backlog): belongs in constants.py, with the other HERMIT_* urges.
 HERMIT_LOOKOUT_URGE = 0.20
+
+# ------------------------------------------- the hermit stops going to town --
+# FIVE SWITCHES, ONE PER CHANGE, and that is not tidiness - it is the only way
+# any of them can be believed. Each one RE-PHASES the shared world stream (see
+# `_hermit_bias`' docstring: `choose_action` draws one `rng.uniform` per scored
+# candidate, and a re-weight that changes which action wins changes what every
+# colonist draws for the rest of the run), so three landing together give one
+# number that cannot be attributed to any of them. A harness flips these in ONE
+# process and measures each arm against the same control.
+#
+# They are module globals rather than constants.py entries for exactly the
+# reason UNDER_ATTACK_OVERRIDE and LOOKOUT_IS_ANIMAL_BUSY are: an A/B has to be
+# settable between two runs inside one process, which an import-time constant
+# cannot do.
+# TODO(backlog): once they have been measured, the pair of urges belongs in
+# constants.py beside HERMIT_EXODUS_URGE; the switches stay here.
+
+#: (1) THE EXODUS. Inside HERMIT_TOWN_RADIUS of the settlement he is late
+#: leaving, and `Wander` - which for a hermit already walks to `hermit_home`
+#: rather than from where he stands - is re-weighted to HERMIT_EXODUS_URGE
+#: instead of HERMIT_HOMESICK. A RE-WEIGHT OF AN EXISTING KEY, never a new one:
+#: see HERMIT_EXODUS_URGE in constants.py for why a "GoHome" verb is forbidden.
+#:
+#: IT IS OFF, AND THAT IS THE MEASUREMENT OVERRULING THE DESIGN. It was written
+#: on for the best reason in the brief - 128 colonies x 75 sim-min said HALF of
+#: all in-colony hermit time is a man promoted while standing among the huts who
+#: has never walked out at all, and nothing in `_hermit_bias` ever told him to
+#: leave. Then it was A/B'd against itself, 32 seeds x 75 sim-min, every other
+#: switch held at its shipped value:
+#:
+#:     arm         in-town ticks   hermit deaths   starved   promotions
+#:     exodus ON           79125              33        18           87
+#:     exodus OFF          64847              22        15           75
+#:     per-seed        18-/3=/11+          8-/4+      5-/4+       9-/8+
+#:     sign p               0.265           0.388     1.000        1.000
+#:
+#: NOT SIGNIFICANT, AND CONSISTENTLY THE WRONG WAY. Nothing here clears the
+#: drift floor this project measures at ~16% (see `emergency_override`), so the
+#: honest reading is "buys nothing", not "does harm" - but it does not buy
+#: nothing for free: it is 22% MORE time in the settlement, not less.
+#:
+#: THE MECHANISM IS IN THE ACTION MIX AND IT IS THE ONE THING NOBODY COSTED. The
+#: in-town rows swap `GatherWood` 26839 for `Wander` 42256. Both are the walk
+#: home - `_h_gather` anchors a hermit's timber search on HERMIT_HOME, so 98.5%
+#: of the trees he was walking to were OUTSIDE the ward - but `_h_gather`
+#: approaches at full WALK_SPEED and fells a tree at the end of it, while
+#: `_h_wander` walks at 0.72x and arrives with nothing. Outranking the fell
+#: replaced a fast, useful walk home with a slow, empty one.
+#:
+#: LEFT IN, NOT DELETED, because one handoff turns it round: `actions._h_wander`
+#: walking a hermit at full speed while he is inside the ward would take those
+#: 42256 ticks to ~30400 and put the arm level on ticks with a strictly better
+#: action mix (he is LEAVING rather than erranding). Until that lands, off.
+HERMIT_EXODUS_ENABLED = False
+#: (2) THE SLEEP CLAMP, and it is a separate switch because it is a separate
+#: measured row (58363 established ticks + 42158 fresh). Diagnosed, not assumed:
+#: 71% of in-ward Sleep ticks are `actions._h_sleep_rough` in its "no built hut"
+#: arm, i.e. a tired man lying down exactly where he stands, which in that
+#: column is the middle of somebody else's village. The other 26% is the walk
+#: home to a hut he does have, which is already pointing the right way.
+#:
+#: Clamped rather than zeroed, for two reasons that agree. `choose_action` SKIPS
+#: a candidate at or below 0.0 WITHOUT drawing its tiebreak, so zeroing changes
+#: the draw count on every in-ward tick and re-phases far more than the hermit;
+#: a positive clamp costs the same one draw it always cost. And it must lose to
+#: the exodus (0.90) while still beating the 0.10 Wander floor, so that with
+#: switch (1) off he still has a reason to move.
+#:
+#: SAFE IN A WAY CLAMPING EAT OR WARMATFIRE WOULD NOT BE:
+#: `entities._tick_attrition` kills on hunger and on cold and DOES NOT KILL ON
+#: FATIGUE. A man kept walking for the ~160 s it takes to get home loses morale
+#: and nothing else. Do not copy this onto the other two.
+HERMIT_TOWN_SLEEP_CLAMP = True
+HERMIT_TOWN_SLEEP_CAP = 0.35
+#: (3) THE BENCH THE USER ASKED FOR. Stakes a `hermit_workbench` at his camp
+#: once the rest of it is standing, hides it from the colony's queue, and makes
+#: it the last rung of his build order. See `_ensure_hermit_workbench`.
+#:
+#: Free on a tree without a `hermit_workbench` spec: `_kind_available` gates
+#: every path, so no stake, no `reg.create`, no rng draw, no phase move.
+HERMIT_WORKBENCH_ENABLED = True
+#: (4) AND ITS USE. With this on, `CraftSpear`/`CraftArmour` are zeroed for a
+#: hermit who has no BUILT bench of his own - because `combat_actions._h_craft`
+#: has exactly one approach target, `nearest_structure(w, "stockpile")` falling
+#: back to `colony_center(w)`, so every spear he has ever made was made standing
+#: in the middle of the settlement.
+#:
+#: ITS OWN SWITCH BECAUSE IT IS THE ONE CHANGE HERE THAT CAN GET HIM KILLED. It
+#: disarms him for as long as it takes to raise fire, hut, tower and bench, and
+#: a hermit already dies about three times per colony per 75 sim-min. It is also
+#: the smallest row in the table by two orders of magnitude - 311 established
+#: ticks against Eat's 103495 - so if the death rate moves at all, this is the
+#: switch to turn off and the rest still stands.
+#:
+#: Gated on `_kind_available` as well, so on a tree with no bench spec he arms
+#: himself exactly as he does today rather than never arming himself at all.
+#:
+#: ON, AND THE DISARM COSTS NOTHING - MEASURED, not assumed, because the whole
+#: worry about this switch was that it might. 32 seeds x 75 sim-min against the
+#: otherwise identical arm:
+#:
+#:     metric              off     on     per-seed      sign p
+#:     CraftSpear, estab   451      0        1-/0+       -
+#:     in-town ticks     79125  79421     0-/31=/1+     1.000
+#:     hermit deaths        33     33      0-/32=/0+    1.000
+#:     mauled                4      4      0-/32=/0+    1.000
+#:
+#: THIRTY-ONE OF THIRTY-TWO SEEDS CAME BACK BIT-IDENTICAL. That is the shape of
+#: a switch that is nearly inert, and "nearly" is the point: on the one seed
+#: where an established hermit did walk in to whittle a spear, the row went to
+#: zero and nothing else moved. Not one extra mauling in 32 colonies, which is
+#: the number that had to be checked - the objection to this switch was that it
+#: leaves him unarmed until fire, hut, bench and tower are up.
+#:
+#: IT STAYS ON EVEN THOUGH `actions.craft_site` MAKES IT REDUNDANT, and that is
+#: deliberate belt-and-braces rather than duplication. `craft_site` answers HIS
+#: CAMP for a hermit with no bench and the bench once he has one - but
+#: `combat_actions._h_craft` has to actually CALL it, and on the tree this was
+#: measured on it still walks to `nearest_structure(w, "stockpile")`. If that
+#: handoff is dropped this switch is the only thing closing the row; if it lands
+#: this switch is free, which is exactly what the table above says.
+HERMIT_BENCH_ONLY_CRAFT = True
+#: (5) THE LARDER, and it is the switch that has to be ON before the handlers
+#: lane's change is survivable. That lane has already deleted `_h_eat`'s last
+#: rung - the walk into town to eat somebody else's dinner - and its own
+#: docstring names the two things it needs from this file by constant:
+#: HERMIT_LARDER and HERMIT_LARDER_URGE.
+#:
+#: WITHOUT THIS HE DOES NOT MERELY GO HUNGRY, HE SPINS. `_score_wants` scores
+#: Eat off ``food_in_store(world)`` - the COLONY'S pile - and forces it to 1.0
+#: past 0.85 hunger, so a starving hermit beside a well-stocked village scores
+#: Eat at 1.0, `_h_eat` finds his own stash empty and FAILS on the first update,
+#: and the same 1.0 wins the re-decision. He fails an Eat once an AI tick for
+#: the rest of his short life, and ForageBerries at 0.51 never gets a look in.
+#: So this switch does two things at once: it makes Eat read HIS food, and it
+#: gives him a standing reason to go and pick some.
+#:
+#: WHY HIS PILE RAN DRY IS NOT WHAT IT LOOKS LIKE - it was never short of
+#: berries, it was short of a REASON. `_score_wants` computes ForageBerries as
+#: ``aff["gather"] * food_urg + hunger * 0.30`` where `food_urg` is the COLONY'S
+#: shortfall damped by the COLONY'S surplus, so a hermit beside a full granary
+#: scores his own larder at almost nothing. See HERMIT_LARDER in constants.py.
+HERMIT_LARDER_ENABLED = True
+
+# ------------------------------------------------------ back to the colony --
 #: How far from the colony centre a site may be.
 #:
 #: Raised 300 -> 500 for MAX_POP 20. Twenty people want seven huts (was four);
@@ -1488,6 +1688,110 @@ def _tree_in_reach(world: Any, agent: Any) -> bool:
         return False
 
 
+def _in_town(world: Any, agent: Any) -> bool:
+    """Is he loitering INSIDE the settlement? Never raises.
+
+    THE SAME BAND THE MEASUREMENT USED, and that is the whole justification for
+    the number: the 128-colony table this work is built against counted ticks
+    within +/-420 px of `settlement_center`, and HERMIT_TOWN_RADIUS is that same
+    420. A ward set anywhere else would be measured by a ruler that disagrees
+    with it, which is how a fix ships looking better than it is.
+
+    ...AND NOT AT HIS OWN DOOR, which is the second half and is not decoration.
+    A camp inside the ward would otherwise make the exodus fire while he is
+    standing on his own doorstep - `Wander` pinned at HERMIT_EXODUS_URGE for
+    ever, a hermit who can never do anything but walk home while already home.
+    HERMIT_ROAM is the radius the rest of this file already means by "at his
+    camp" (`_hermit_bias`'s homesick arm computes the identical `away`), so the
+    two cannot disagree about where home stops.
+
+    Measured, before it was written: over 32 colonies x 75 sim-min the camp was
+    inside the ward for ZERO ticks, so this guard is insurance rather than a
+    live path - which is exactly when a guard is cheap and its absence is a
+    silent lock-up on the one seed that sites the camp short.
+
+    False on any world that will not answer, which is the state this function
+    had before it existed and leaves the role behaving as it does today.
+    """
+    try:
+        ax = float(getattr(agent, "x", 0.0))
+        if abs(ax - float(settlement_center(world))) > float(HERMIT_TOWN_RADIUS):
+            return False
+        return abs(ax - float(hermit_home(world))) > float(HERMIT_ROAM)
+    except (TypeError, ValueError):
+        return False
+
+
+def _hermit_site(world: Any) -> Any | None:
+    """The unfinished building at his camp he should be working on, or None.
+
+    `actions.hermit_worksite`, WITH A BENCH RUNG UNDER WHATEVER IT ANSWERS. One
+    accessor, called by both the score in `_hermit_bias` and the target in
+    `_mk_build`, because a scorer and a maker that answer "which frame?"
+    separately is the deadlock this loop was rebuilt around once already (see
+    `actions._deposit_step`, which spends a paragraph on the seed-7 run where
+    they named different buildings and both frames finished at stage 0).
+
+    ON THE TREE THIS SHIPPED WITH, THE FALLBACK IS NEVER REACHED. The handlers
+    lane's `hermit_worksite` already reads fire, walls, BENCH, tower, so this is
+    a plain alias and both callers ask exactly one question. The fallback is the
+    lane-order insurance, and the point worth stating is that it CANNOT
+    DISAGREE with `actions._deposit_step` even if it does fire: that function
+    hand-delivers a load to `hermit_worksite(world)`, and this one only ever
+    ADDS a site where that call already answered None. So either both name the
+    same frame, or `_deposit_step` banks his wood in the stash instead - which
+    `_h_build`'s hermit fetch draws straight back out with no walk in it. The
+    ring closes through the pile rather than through his hands; it does not
+    open.
+
+    Degrades to nothing at all on a tree with no bench spec (`_kind_available`),
+    which is what makes the whole bench feature inert rather than broken if the
+    structures lane is reverted.
+    """
+    site = hermit_worksite(world)
+    if site is not None:
+        return site
+    if not (HERMIT_WORKBENCH_ENABLED and _kind_available(KIND_HERMIT_WORKBENCH)):
+        return None
+    bench = hermit_workbench(world)
+    if bench is not None and not getattr(bench, "built", False):
+        return bench
+    return None
+
+
+def _bush_in_reach(world: Any, agent: Any) -> bool:
+    """Is there a bush near HIS CAMP for him to pick? Never raises.
+
+    `_tree_in_reach`'s twin, and it exists for the identical reason: it asks the
+    same question `actions._h_gather` will ask when it picks the target -
+    nearest bush to HERMIT_HOME, not to him, inside HERMIT_FORAGE_REACH - so the
+    score and the action can never disagree and he never picks a job that fails
+    on sight. The two reaches differ (720 against timber's 420) because there is
+    measurably less food than wood out where he lives; see HERMIT_FORAGE_REACH.
+    """
+    try:
+        return find_prop(world, _BUSH_KINDS, hermit_home(world),
+                         max_dist=HERMIT_FORAGE_REACH,
+                         claimant=getattr(agent, "id", None)) is not None
+    except Exception:
+        return False
+
+
+def _hermit_larder(world: Any) -> int:
+    """Units of food in his own pile, raw and cooked together. Never raises.
+
+    Both, because `actions.hermit_stash_food` prefers cooked and either one
+    feeds him, so a man with 24 cooked meals banked is not short of anything.
+    Counting only RES_FOOD would send him out foraging past a full larder every
+    time he cooked one, which is HERMIT_STASH_CAP's waste bug wearing a hat.
+    """
+    try:
+        return (int(hermit_stash_qty(world, RES_FOOD))
+                + int(hermit_stash_qty(world, RES_COOKED)))
+    except Exception:
+        return 0
+
+
 #: The rise `_mk_climb` asks for, spelled out here so the score and the maker
 #: cannot drift apart. `_mk_climb` sets ``ty = ground_y(ax) - 110.0``.
 _CLIMB_RISE = 110.0
@@ -1689,22 +1993,66 @@ def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
     if fatigue > 0.93 or warmth > 0.90:
         s["Sleep"] = 1.0
 
+    # 3a. ...BUT NOT IN SOMEBODY ELSE'S VILLAGE. Read `HERMIT_TOWN_SLEEP_CLAMP`
+    #     for the measurement; the short version is that 71% of the Sleep ticks
+    #     in the settlement are `_h_sleep_rough`'s "no built hut" arm, which beds
+    #     him down exactly where he is standing, and the two forcing lines just
+    #     above are what makes that certain - past 0.93 fatigue Sleep is 1.0 and
+    #     outranks every reason he has to leave, including the exodus.
+    #
+    #     Clamped here rather than at the top so it lands after both forcing
+    #     lines, and BEFORE the `danger` branch below, which clamps the same key
+    #     harder (0.35 is HERMIT_TOWN_SLEEP_CAP, so the two agree by construction
+    #     and a hermit fleeing through town cannot lie down in it either way).
+    in_town = HERMIT_EXODUS_ENABLED or HERMIT_TOWN_SLEEP_CLAMP
+    in_town = in_town and _in_town(world, agent)
+    if HERMIT_TOWN_SLEEP_CLAMP and in_town:
+        s["Sleep"] = min(s["Sleep"], HERMIT_TOWN_SLEEP_CAP)
+
+    # HIS FOOD, AND ONLY HIS, IS WHAT EAT IS WORTH. Two arms, and the second one
+    # is new; read them together, because between them they are the whole of
+    # "the scorer must read HIS food rather than the colony's" that
+    # `actions._h_eat`'s docstring now depends on.
+    #
     # HIS STASH IS FOOD HE CAN GET AT, so it scores like food in his hands. The
-    # colony arm of `_score_wants` already raises Eat on `food_qty > 0`, i.e. on
-    # the COLONY'S store, which a hermit reaches only by the long walk `_h_eat`
-    # keeps as a last resort. Without this line a hermit with a full larder
-    # banked ten paces away and nothing in his hands would score Eat off a store
-    # he does not want to use - or, on a colony whose own store is empty, score
-    # it at 0.12 and go hungry beside his own pile. `max`, never an assignment:
-    # this can only ever raise the score, so it cannot weaken the guard above it.
-    if hermit_stash_food(world)[0] is not None:
-        try:
-            hunger = float(getattr(agent, "hunger", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            hunger = 0.0
+    # colony arm of `_score_wants` raises Eat on `food_qty > 0`, i.e. on the
+    # COLONY'S store; without this line a hermit with a full larder banked ten
+    # paces away and nothing in his hands would score Eat off a store he does
+    # not want to use, or - on a colony whose own store is empty - score it at
+    # 0.12 and go hungry beside his own pile. `max`, never an assignment: this
+    # arm can only ever raise the score, so it cannot weaken the guard above it.
+    try:
+        hunger = float(getattr(agent, "hunger", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        hunger = 0.0
+    own_food = (hermit_stash_food(world)[0] is not None
+                or (carry_qty > 0 and carrying in (RES_FOOD, RES_COOKED)))
+    if own_food:
         s["Eat"] = max(float(s.get("Eat", 0.0)), _clamp01(hunger * hunger))
         if hunger > 0.85:
             s["Eat"] = 1.0
+    elif HERMIT_LARDER_ENABLED:
+        # ...AND WHEN HE HAS NOTHING ANYWHERE, EAT IS NOT A JOB. This arm is a
+        # REPLACEMENT for the colony's, not a raise on top of it, and it is the
+        # half of the larder switch that stops a spin rather than the half that
+        # fills a pile.
+        #
+        # `_score_wants` scored Eat off ``food_in_store(world)`` and forced it to
+        # 1.0 past 0.85 hunger. That was survivable while `_h_eat`'s last rung
+        # was a walk to the colony's stockpile, because the 1.0 was TRUE - there
+        # was food, and he could reach it. The handlers lane has deleted that
+        # rung, so the same 1.0 is now a promise nothing can keep: `_h_eat` finds
+        # his hands and his pile both bare and FAILS on its first update, and the
+        # unchanged 1.0 wins the re-decision. A starving hermit beside a
+        # well-stocked village would fail an Eat once an AI tick until he died,
+        # with ForageBerries at 0.51 never once reached.
+        #
+        # The 0.12 is `_score_wants`' own "there is nothing to eat" multiplier,
+        # borrowed rather than invented so the two answers have the same shape:
+        # at 0.9 hunger it is 0.097, which loses to the larder urge and to every
+        # other chore, and is still positive - so the candidate is not skipped
+        # and the tiebreak draw count does not move.
+        s["Eat"] = _clamp01(hunger * hunger * 0.12)
 
     if carry_qty >= CARRY_CAP and carrying in (RES_FOOD, RES_COOKED):
         s["ForageBerries"] = 0.0
@@ -1720,6 +2068,32 @@ def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
         s["ForageBerries"] = float(s.get("ForageBerries", 0.0)) * room
         s["Farm"] = float(s.get("Farm", 0.0)) * room
 
+    # 5a. AND THE WORKBENCH HE IS WALKING TO IS THE COLONY'S. §1 above says
+    #     `_h_craft` is deliberately NOT zeroed - "a hermit who will not defend
+    #     himself is just a slow death" - and that stays true; what changes is
+    #     that there is now somewhere else to do it. `combat_actions._h_craft`
+    #     has exactly ONE approach target for both crafts,
+    #     `nearest_structure(w, "stockpile")` falling back to `colony_center(w)`,
+    #     so until he owns a bench every spear he makes is made in the square.
+    #
+    #     ABOVE THE `danger` RETURN, and that is where it belongs rather than a
+    #     convenience. The danger clamp at the top of `_score_wants` runs BEFORE
+    #     the combat merge, so `score_combat` writes CraftSpear at up to 0.87
+    #     over the top of it: the craft is at its LOUDEST with a wolf on the map,
+    #     which is precisely the tick a hermit must not set off for the village.
+    #
+    #     He is not disarmed on a tree without the bench spec - `_kind_available`
+    #     is the gate, so this is inert until the structures lane lands, and the
+    #     switch is separate because this is the one change here that can cost
+    #     him his life. Keys are only overwritten where `score_combat` already
+    #     wrote them, so no candidate is added and no draw appears.
+    if (HERMIT_BENCH_ONLY_CRAFT
+            and _kind_available(KIND_HERMIT_WORKBENCH)
+            and hermit_workbench(world, built_only=True) is None):
+        for craft in ("CraftSpear", "CraftArmour"):
+            if craft in s:
+                s[craft] = 0.0
+
     if danger:
         # This function runs AFTER the danger clamp - it has to, or the combat
         # merge would put the workbench back on his list - so it has to reapply
@@ -1734,6 +2108,29 @@ def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
         away = 0.0
     if away > HERMIT_ROAM:
         s["Wander"] = HERMIT_HOMESICK
+        # 4a. AND INSIDE THE SETTLEMENT HE IS NOT DRIFTING, HE IS LATE LEAVING.
+        #     The same key, re-weighted again - never a new one; see
+        #     HERMIT_EXODUS_URGE in constants.py for the arithmetic of what 0.90
+        #     deliberately beats (every job he has) and what it deliberately
+        #     does not (Eat forced to 1.0 off his own stash, WarmAtFire forced to
+        #     1.0 at his own fire, anything combat, and a Mourn already running,
+        #     which carries HYSTERESIS_BONUS to 1.03 and is the whole of the
+        #     permitted exception).
+        #
+        #     HALF THE MEASURED TABLE IS THIS LINE'S ABSENCE. A successor takes
+        #     the title while standing among the huts and carries on being a
+        #     villager; `Wander` at HERMIT_HOMESICK (0.45) loses to the fell
+        #     (0.58) and the build (0.66) he picks up on the way out, so he
+        #     reached his camp by errand, and every tick of that journey was a
+        #     tick in the settlement.
+        #
+        #     It also closes the Vignette row without saying anything about
+        #     vignettes: `_maybe_vignette` fires only when the peak score is
+        #     under DOWNTIME_PEAK (0.62), and a hermit whose best in-town job was
+        #     the 0.58 fell was BY DEFINITION idle enough to turn cartwheels in
+        #     the square. The peak is now 0.90.
+        if HERMIT_EXODUS_ENABLED and in_town:
+            s["Wander"] = HERMIT_EXODUS_URGE
 
     # 6. HIS OWN HOUSE, which is the only building in the colony he is allowed
     #    to touch. Both keys below were zeroed at the top of this function and
@@ -1827,6 +2224,40 @@ def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
             and _tree_in_reach(world, agent)):
         s["GatherWood"] = max(s.get("GatherWood", 0.0), HERMIT_WOODPILE_URGE)
 
+    # 6c-bis. AND THE LARDER, WHICH IS THE WOODPILE FOR FOOD. Same shape, same
+    #     reasoning, one rung up the ladder: a `max` onto ForageBerries, gated on
+    #     the pile being under HERMIT_LARDER and on there being a bush inside
+    #     HERMIT_FORAGE_REACH OF THE CAMP - the same question `_h_gather` asks
+    #     when it picks the target, so the score and the action cannot disagree.
+    #
+    #     0.50 woodpile < 0.51 LARDER < 0.52 stoke, and the two 0.01 gaps are
+    #     orderings rather than magnitudes (nothing reads the difference). Above
+    #     the woodpile because spare fuel is the lowest-priority job he has that
+    #     is not idling and, now that town is closed, a larder is not spare
+    #     anything. Below the stoke because a fire under HERMIT_STOKE_BELOW has
+    #     about seven minutes left in it and a larder under 24 has three quarters
+    #     of an hour of meals: the fire is the emergency, the larder is the
+    #     chore, and getting that round the wrong way puts him outside the ward
+    #     to fill a pile that was not empty.
+    #
+    #     NOT WITH HIS HANDS ALREADY FULL OF FOOD, which is the one line of §5
+    #     this must not undo: `_deposit_step` banks food now, so a full-handed
+    #     forage is a job that picks one berry, trips the CARRY_CAP test and goes
+    #     straight to deliver. Harmless, but it is the thrash §5 exists to remove
+    #     and the `max` would put it back.
+    #
+    #     If a camp lands with no bush inside the reach he simply does not score
+    #     the job, which is the honest outcome HERMIT_FELL_REACH already
+    #     documents for timber. What he must NOT do is fall through to the
+    #     colony: that is the rung the handlers lane has closed.
+    if (HERMIT_LARDER_ENABLED
+            and not (carry_qty >= CARRY_CAP
+                     and carrying in (RES_FOOD, RES_COOKED))
+            and _hermit_larder(world) < int(HERMIT_LARDER)
+            and _bush_in_reach(world, agent)):
+        s["ForageBerries"] = max(s.get("ForageBerries", 0.0),
+                                 float(HERMIT_LARDER_URGE))
+
     # 6d. AND THE VIEW FROM HIS OWN TOWER, which is the last thing on his list
     #     and is the whole of "when he is bored". Both keys were zeroed at the
     #     top of this function and both come back CONDITIONALLY, in the
@@ -1867,7 +2298,12 @@ def _hermit_bias(s: dict[str, float], agent: Any, world: Any, night: bool,
             # and on `_rise_in_reach` so the climb ends near his camp.
             s["ClimbTo"] = HERMIT_LOOKOUT_URGE
 
-    site = hermit_worksite(world)
+    # `_hermit_site`, not `hermit_worksite`: the same ladder with the bench as a
+    # fourth rung under the tower. It rides HERMIT_BUILD_URGE exactly as the hut
+    # and the tower do - see HERMIT_WORKBENCH_WORK in constants.py for why there
+    # is deliberately no fifth hermit urge - and `_mk_build` asks the identical
+    # question, so the score and the target cannot name different frames.
+    site = _hermit_site(world)
     if site is not None:
         try:
             need_now = site.missing_for_stage()
@@ -2788,8 +3224,11 @@ def _mk_build(agent: Any, world: Any) -> Action | None:
         # was never staked) is the `_mk_clean`/`_mk_upgrade` pattern: no premise,
         # no action, and he drops through to the next-best thing this tick
         # instead of spending a decision cycle on one that fails immediately.
-        # His fire first, then his walls - see `actions.hermit_worksite`.
-        site = hermit_worksite(world)
+        # His fire first, then his walls, then the tower, then the bench - see
+        # `_hermit_site`, which is the ONE accessor `_hermit_bias` scores off
+        # too. Two callers asking the question separately is the deadlock this
+        # loop was rebuilt around once already.
+        site = _hermit_site(world)
         if site is None:
             return None
         return make_action("BuildStructure", target=int(site.id))
@@ -3212,6 +3651,7 @@ def update_director(world: Any, dt: float) -> None:
     _ensure_hermit_hut(world, reg)
     _ensure_hermit_fire(world, reg)
     _ensure_hermit_lookout(world, reg)
+    _ensure_hermit_workbench(world, reg)
     _tick_hermit_visit(world)
 
     try:
@@ -3486,8 +3926,17 @@ def next_build_kind(world: Any, reg: StructureRegistry | None = None,
 #: three - and it used to be an inline literal inside `_colony_sites`, which is
 #: precisely why it is the one that gets missed. Named, so a grep for
 #: "hermit_lookout" finds it.
+#:
+#: THE BENCH IS IN HERE AND THAT IS NOT COSMETIC. Left out, `_colony_sites`
+#: hands his workbench to `update_director`, which puts it in the colony's build
+#: QUEUE and its `build_needs` totals - so the nearest villager walks the whole
+#: standoff to raise the hermit's bench for him out of the village's wood, which
+#: is the opposite of the point of him, AND it counts against
+#: MAX_CONCURRENT_SITES, so the settlement stops staking huts while it is open.
+#: Both failures are silent. The other three copies of this list are somebody
+#: else's file; see the handoffs.
 _HERMIT_SITE_KINDS: tuple[str, ...] = (
-    "hermit_hut", "hermit_fire", KIND_HERMIT_LOOKOUT,
+    "hermit_hut", "hermit_fire", KIND_HERMIT_LOOKOUT, KIND_HERMIT_WORKBENCH,
 )
 
 
@@ -4440,6 +4889,138 @@ def _ensure_hermit_lookout(world: Any, reg: StructureRegistry) -> None:
                          f"platform above his camp, to watch the wilds from.")
     except Exception:
         log.debug("hermit lookout staking failed", exc_info=True)
+
+
+#: How far off the hut's door the bench goes, and which way.
+#:
+#: OUTWARD, past the tower, and the number is footprint arithmetic rather than
+#: taste. The camp already reads village, fire (-34), hut (0), tower (+46); the
+#: tower is 74 px of timber, so it occupies roughly +9..+83 of that axis. A
+#: bench at +100 clears its far edge with room to spare and cannot be staked on
+#: top of it the way two buildings hung off one anchor otherwise are.
+#:
+#: The far side rather than the near one for the same reason the tower is out
+#: there: the workbench is the LAST errand that used to walk him into town, and
+#: putting the thing that replaces that walk on the town-facing side of his hut
+#: would be an odd place to end the story. It also keeps the sheltered elbow
+#: between fire and hut clear, which is where he actually stands.
+#: Px from the hut. 60, and the number is pinned by two other constants rather
+#: than chosen for looks - it has to sit under BOTH or it quietly breaks them.
+#:
+#: * ``structures.BURN_NEIGHBOUR_DIST`` is 70, and the bench is ``flammable``.
+#:   The spec's own comment justifies that flag by saying the bench "stands well
+#:   inside 70 px of a flammable hermit_hut" - which at 100 was simply untrue.
+#:   Measured: a burning hut caught the bench in 0 of 5 seeds at 100 px, and in
+#:   4 of 5 at both 60 and 69. The flag and the sentence defending it disagreed
+#:   by 30 px, and the fire could never make the crossing.
+#: * ``HERMIT_ROAM`` is 80, which is what the rest of the file means by "at his
+#:   camp". At 100 the bench was the first hermit structure sited OUTSIDE it, so
+#:   ``_hermit_bias``'s homesick arm fired whenever he stood at his own bench -
+#:   harmless only while nothing sent him there, and live the moment
+#:   ``craft_site`` was wired.
+#:
+#: 60 clears both with room, and is still far enough out that the bench does not
+#: draw on top of the hut. The lookout at 46 was always inside; this kind was
+#: the exception.
+HERMIT_WORKBENCH_OFFSET = 60.0
+
+
+def _ensure_hermit_workbench(world: Any, reg: StructureRegistry) -> None:
+    """Stake his crafting bench at his camp when he has none. Never raises.
+
+    THE THING THE USER ASKED FOR, and the reason it has to exist is one line of
+    somebody else's handler: `combat_actions._h_craft`'s approach phase walks to
+    ``nearest_structure(w, "stockpile")`` and falls back to ``colony_center(w)``.
+    Every spear the hermit has ever made was made standing in the middle of the
+    settlement, because there was nowhere else in the world to make one.
+
+    The tower's sibling, and everything `_ensure_hermit_lookout` says applies
+    here word for word: STAKED rather than conjured (he raises it himself out of
+    wood he cut himself), `_colony_sites` hides it from the colony's build queue
+    and its concurrency cap, it is ANCHORED TO THE HUT so a resited camp takes it
+    along, it does not re-site itself (the orphan test below collapses it and a
+    fresh one is staked at the new door), it refuses to be built into a hazard,
+    and it is gated on `_kind_available` so a tree with no `hermit_workbench`
+    spec stakes nothing, draws nothing and moves no rng phase.
+
+    ONE THING THAT IS ITS OWN: IT DOES NOT WAIT FOR THE TOWER, and that is the
+    handlers lane's ordering rather than a guess. `actions.hermit_worksite` now
+    reads fire, walls, BENCH, tower - the bench above the tower because the
+    tower is a view (HERMIT_LOOKOUT_URGE 0.20, the bottom of his ladder) while
+    the bench is the last errand that walks him into somebody else's village,
+    and because it is the cheaper of the two anyway (8 wood against 14). So the
+    premise here is the tower's premise exactly - hut BUILT, fire BUILT - and
+    the two frames may stand together with `hermit_worksite` deciding which he
+    picks up first. Gating this on "nothing else outstanding" would have
+    inverted that order and made him raise the view before the workshop.
+
+    Costs one draw from the seeded stream (the variant roll in ``reg.create``)
+    and only on the tick a bench is staked.
+    """
+    if not (HERMIT_HUT and HERMIT_WORKBENCH_ENABLED):
+        return
+    if not _kind_available(KIND_HERMIT_WORKBENCH):
+        return
+    try:
+        herm = living_hermit(world)
+        if herm is None:
+            return
+        house = hermit_hut(world)
+        bench = hermit_workbench(world)
+        if bench is not None:
+            # ORPHANED? The tower's test, verbatim, including the part of it
+            # that was a bug fix: a STANDING hut wins over rubble, but rubble
+            # still counts as a camp, so a dragon burning his hut down does not
+            # silently delete the bench beside it in the same second.
+            try:
+                anchor_x = (float(house.x) if house is not None else None)
+            except (TypeError, ValueError):
+                anchor_x = None
+            near_camp = False
+            if anchor_x is not None:
+                near_camp = abs(anchor_x - float(bench.x)) <= HERMIT_LOOKOUT_ORPHAN
+            else:
+                for s in reg:
+                    if str(getattr(s, "kind", "")) != "hermit_hut":
+                        continue
+                    try:
+                        if abs(float(s.x) - float(bench.x)) <= HERMIT_LOOKOUT_ORPHAN:
+                            near_camp = True
+                            break
+                    except (TypeError, ValueError):
+                        continue
+            if not near_camp:
+                bench.collapse("moved")
+                bench.state["ruin_cause"] = "moved"
+            return
+        if house is None or not getattr(house, "built", False):
+            return                      # no doorstep yet
+        if hermit_fire(world, built_only=True) is None:
+            return                      # warmth before the workshop
+        try:
+            hx = float(house.x)
+        except (TypeError, ValueError):
+            return
+        # Away from town, past the tower. Falls back to the near side if the
+        # outward one is unwalkable, exactly as the tower falls back.
+        outward = 1.0 if hx > float(_hermit_base(world)) else -1.0
+        x = _clamp_x(hx + outward * HERMIT_WORKBENCH_OFFSET)
+        if abs(slope_at(world, x)) > MAX_SLOPE_WALK:
+            x = _clamp_x(hx - outward * HERMIT_WORKBENCH_OFFSET)
+        for h in hazards_of(world):
+            try:
+                hzx = float(h.get("x", 0.0))
+                r = float(h.get("radius", 0.0) or 0.0)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if abs(hzx - x) <= max(40.0, r) + 40.0:
+                return
+        reg.create(KIND_HERMIT_WORKBENCH, x, float(ground_y(world, x)),
+                   rng=rng_of(world))
+        chronicle(world, f"{getattr(herm, 'name', 'The hermit')} set a trestle "
+                         f"and a flat stone by his camp, to work at.")
+    except Exception:
+        log.debug("hermit workbench staking failed", exc_info=True)
 
 
 def hermit_guest(world: Any) -> Any | None:

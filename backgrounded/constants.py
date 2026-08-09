@@ -1824,6 +1824,297 @@ HERMIT_VISIT_GIFT = 3
 HERMIT_VISIT_URGE = 0.72
 HERMIT_HOST_URGE = 0.70
 
+# ------------------------------------------- the hermit stops going to town --
+# THE ASK, IN THE USER'S WORDS: "get it to make its own workbench for crafting
+# as well so it never goes to the colony, ever." Asked afterwards which action
+# was allowed to survive that, he named exactly one: MOURN. So the bar this
+# block is written against is a single sentence - THE ONLY ACTION THE HERMIT
+# EVER HOLDS INSIDE THE SETTLEMENT IS MOURN - and every number below is chosen
+# against it rather than against taste.
+#
+# MEASURED BEFORE A LINE WAS WRITTEN, 128 colonies x 75 sim-min. Ticks a hermit
+# spent within HERMIT_TOWN_RADIUS of `actions.settlement_center` while more than
+# 300 px from his own hut, split by whether he had ever walked out to his camp:
+#
+#     action            not-left-yet   established
+#     GatherWood            100409         50145
+#     Eat                    17202        103495
+#     Sleep                  42158         58363
+#     BuildStructure         43318         22246
+#     FleeFrom                9430         11906
+#     Wander                 16474          9312
+#     Vignette               14260          9780
+#     WarmAtFire             10649          8647
+#     ForageBerries           4652          2381
+#     CraftSpear              2392           311
+#     Mourn                      0             0
+#
+# READ THE LAST TWO ROWS FIRST. CraftSpear - the row the workbench closes, and
+# the only thing that was actually asked for - is ONE TENTH OF ONE PERCENT of an
+# established hermit's time in town. Mourn, the one thing he is permitted to be
+# there for, has never once happened. A lane that lands the bench and stops has
+# fixed 0.1% of this table and left the rest exactly where it found it. The
+# bench is in here because it was requested and because it closes its row
+# permanently; it is not the fix and must not be mistaken for one.
+#
+# THE TABLE IS TWO DIFFERENT BUGS WITH TWO DIFFERENT FIXES.
+#
+#   * The not-left-yet column - HALF OF EVERYTHING - is not a commute at all. A
+#     successor takes the title while standing among the huts, and nothing in
+#     `_hermit_bias` ever tells a new hermit to LEAVE: `Wander` is re-weighted
+#     to HERMIT_HOMESICK (0.45) and loses to the fell (0.58) and the build
+#     (0.66) he picks up on the way out. He gets to his camp eventually, by
+#     errand, and every tick of the journey is a tick in the settlement.
+#   * The established column IS the walk back, and three rows are 76% of it:
+#     Eat 37%, Sleep 21%, GatherWood 18%. Eat is the deliberate colony-till
+#     exemption (`actions.colony_till`); Sleep is `_h_sleep_rough` letting a
+#     tired man lie down wherever he is standing, which in that column is the
+#     middle of somebody else's village; GatherWood is the front half of a walk
+#     to timber that is near HIS camp, so it is already pointing the right way.
+#
+# WHAT CLOSES EACH ROW, so no lane has to guess which constant is theirs:
+#
+#     Eat            the larder trio, and only then the till exemption
+#     Sleep          HERMIT_TOWN_RADIUS, as a clamp on `Sleep` in the ward
+#     GatherWood     HERMIT_EXODUS_URGE outranks it; the target was never in town
+#     BuildStructure the same, and it was already camp-anchored
+#     Vignette       HERMIT_EXODUS_URGE clears DOWNTIME_PEAK; see there
+#     ForageBerries  HERMIT_FORAGE_REACH anchors the bush search at his camp
+#     CraftSpear     KIND_HERMIT_WORKBENCH
+#     WarmAtFire     nothing. It already resolves to HIS fire (`actions.fire_for`)
+#                    and the walk it starts is the walk home.
+#     FleeFrom       nothing, ever. `_hermit_bias` returns before the pull home
+#                    is applied while `danger` is set, and that stays true.
+#     Mourn          nothing. It is the permitted exception.
+
+#: THE BENCH THE USER ASKED FOR, and the reason it has to exist is one line of
+#: somebody else's handler: `combat_actions._h_craft`'s approach phase walks to
+#: ``nearest_structure(w, "stockpile")`` and falls back to ``colony_center(w)``.
+#: Every spear the hermit has ever made was made standing in the middle of the
+#: settlement, because there was nowhere else in the world to make one.
+#:
+#: ITS OWN KIND, for the fourth time, and the same argument as `hermit_hut`,
+#: `hermit_fire` and `hermit_lookout` - see the notes in `sim/structures.py`,
+#: which are the record of the three times this was got right. The tempting
+#: shortcut here is worse than any of theirs: the natural way to give him a
+#: crafting spot is to let him stake a ``stockpile``, and a stockpile at his camp
+#: is found by `nearest_structure(w, "stockpile")` for EVERYBODY. Villagers would
+#: haul the colony's harvest three thousand pixels into the wilderness, `_h_eat`'s
+#: approach would send a starving man to a pile he may not draw from, and nothing
+#: would fail loudly. A kind of its own is found by nobody who is not looking for
+#: it.
+#:
+#: It lives here rather than in the F2/F3 KIND_ block further down because
+#: everything else about the hermit lives in this section; grep KIND_HERMIT_ and
+#: both of his kinds come back together.
+KIND_HERMIT_WORKBENCH: str = "hermit_workbench"
+#: What it costs him to raise it. WOOD ONLY, for the reason the hut and the fire
+#: are wood only and it is not aesthetic: MINE_KEEP_OUT sites quarries in town,
+#: `_hermit_bias` zeroes GatherStone and Mine to stop him strip-mining the map,
+#: and the till gate bills every withdrawal to his own stash. A stone line on
+#: this bill is a bench he can never pay for and therefore never builds - a
+#: feature that ships 100% inert, which this project has now done nine times.
+#:
+#: EIGHT IS EXACTLY ``actions.CARRY_CAP``. One full armful, one trip, no banked
+#: surplus needed, which is the same rule that sized HERMIT_FIRE_WOOD at 4: a
+#: hermit has no stockpile and nobody hauls for him, so anything he builds has to
+#: be payable out of what one man can carry from one walk. Between the fire's 4
+#: and the hut's 12 (and the tower's 14), which is also the order he should want
+#: them in.
+HERMIT_WORKBENCH_COST: dict[str, int] = {RES_WOOD: 8}
+#: Seconds of applied work, ONE STAGE - so this is the whole build, not a slice
+#: of it. Between `hermit_fire`'s 5.0 and a `hermit_hut` stage's 8.0: it is a
+#: trestle and a flat stone, more than a ring of rocks and less than a wall.
+#:
+#: NO FOURTH URGE, DELIBERATELY. `actions.hermit_worksite` is "fire first, then
+#: walls, then the tower" and that ORDERING IS THE WHOLE GATE - the bench becomes
+#: a rung in it (fire, hut, bench, tower: it goes above the tower because the
+#: tower is a view and the bench is the last errand that walks him into town) and
+#: rides HERMIT_BUILD_URGE like the hut and the tower do. Adding a fifth hermit
+#: urge between 0.42 and 0.68 would mean re-proving the ladder those six numbers
+#: already sit in, to buy nothing a rung does not.
+HERMIT_WORKBENCH_WORK: float = 7.0
+
+#: THE WARD, in px from `actions.settlement_center`: inside this he is in town
+#: and everything below applies; outside it he is on his way somewhere and the
+#: role behaves exactly as it does today.
+#:
+#: 420 IS THE MEASUREMENT'S OWN BAND, and that is the entire justification. The
+#: table at the top of this section counted ticks inside +/-420 px, so the number
+#: the mechanism uses and the number the acceptance metric is read off are THE
+#: SAME NUMBER. A ward set anywhere else would be measured by a ruler that
+#: disagrees with it, which is how a fix ships looking better than it is.
+#:
+#: It is the settlement's CORE, not its perimeter, and that is on purpose. The
+#: colony sites buildings out to 500 px (`behavior`'s site radius), the lookouts
+#: stand at LOOKOUT_STANDOFF 520 and the barricades at 640. So the outermost
+#: 80 px of the built area is outside the ward - he may cross the outskirts
+#: without the ward firing, which is what makes this a rule about LOITERING
+#: rather than about trespass. Widening it to 640 would put the ward's edge
+#: where the animals come in and start clamping his Sleep in open ground.
+#:
+#: TWO READERS, and the second is the one that is easy to miss. It re-weights
+#: `Wander` (see HERMIT_EXODUS_URGE), and it CLAMPS `Sleep`, because
+#: `actions._h_sleep_rough` beds a hermit down "where he lies" and 58363 of the
+#: established column is him doing exactly that between somebody's huts. Clamping
+#: sleep is safe in a way clamping Eat or WarmAtFire would not be:
+#: `entities._tick_attrition` kills on hunger and on cold and DOES NOT KILL ON
+#: FATIGUE, so a man kept walking for the ~160 s it takes to get home loses
+#: morale and nothing else. Do not clamp the other two.
+HERMIT_TOWN_RADIUS: float = 420.0
+#: What GOING HOME is worth to him while he is inside that ward. `Wander` is the
+#: key it is written onto - the same key HERMIT_HOMESICK re-weights - because
+#: `actions._h_wander` already walks a hermit to `hermit_home` rather than
+#: wandering from where he stands, so the pull home is an action that already
+#: exists. THAT IS NOT A CONVENIENCE, IT IS THE CONSTRAINT: `choose_action` draws
+#: one tiebreak per SCORED candidate and skips candidates at 0.0 without drawing,
+#: so a new "GoHome" would re-phase the shared stream for every colonist in every
+#: colony (~16% on unrelated outcomes) and `_hermit_bias`'s standing promise -
+#: re-weight existing keys, never add one - would be broken to buy a verb.
+#:
+#: 0.90, AND THE LADDER IT SITS AT THE TOP OF:
+#:
+#:     0.20 lookout   0.42 cook      0.45 homesick   0.50 woodpile
+#:     0.51 larder    0.52 stoke     0.58 fell       0.66 build
+#:     0.68 fire      0.70 host      0.72 visit      0.90 EXODUS
+#:
+#: It beats every job he has, which is the point: a hermit standing in the
+#: settlement is never at leisure and never mid-chore, he is late leaving.
+#:
+#: WHAT IT DELIBERATELY DOES NOT BEAT, with the arithmetic, because "survival
+#: still wins" is a claim and not a hope:
+#:
+#:   * EAT. `_hermit_bias` forces Eat to 1.0 past 0.85 hunger whenever his stash
+#:     has food, and his stash is reachable from anywhere (it is world state, not
+#:     a building), so a hungry hermit eats and does not first walk home to do it.
+#:   * WARMATFIRE. Forced to 1.0 at warmth > 0.9 with fuel, and it resolves to
+#:     HIS fire, so the answer to freezing is a walk home anyway.
+#:   * ANYTHING COMBAT. `_hermit_bias` returns before the pull home is written
+#:     while `danger` is set. FleeFrom's 11906 ticks are a man running for his
+#:     life through a village and they stay.
+#:   * A MOURN ALREADY RUNNING. Mourn scores 0.68 and loses to this at pick time,
+#:     so he does not START one in town - but he starts it at his camp, where
+#:     `Wander` is the ordinary 0.10, and `choose_action` gives the action already
+#:     running HYSTERESIS_BONUS (0.35) while it is under OVERRIDE_FLOOR (0.95):
+#:     0.68 + 0.35 = 1.03 against this 0.90. THE FUNERAL SURVIVES THE WALK IN AND
+#:     THE STANDING AT THE GRAVE. That is the whole of the permitted exception and
+#:     it is bought by three numbers in behavior.py, so a lane retuning any of
+#:     them owns this sentence.
+#:
+#: ABOVE DOWNTIME_PEAK (0.62), which is worth its own line because it is a row of
+#: the table nobody would think to attribute here. `_maybe_vignette` fires when
+#: the peak score is below 0.62, and a hermit whose best job in town is the fell
+#: at 0.58 is BY DEFINITION idle - so he turns cartwheels in the square. 14260
+#: and 9780 ticks of Vignette are that, and they close because the peak is now
+#: 0.90 rather than because anything was said about vignettes.
+#:
+#: AND BELOW OVERRIDE_FLOOR (0.95), also on purpose: going home is urgent, not an
+#: emergency. Under the floor it respects the MIN_COMMIT_SEC (7 s) commitment
+#: window, so he finishes the swing he is mid-way through and then leaves, which
+#: is a man walking off rather than a man teleporting mid-animation.
+#:
+#: THE COST, stated because it is a real one and it is not fixed here.
+#: `_h_wander` walks at 0.72 * WALK_SPEED (24.5 px/s) and gives up after 30 s, so
+#: from 3500 px out the exodus is about five legs and ~160 s, against ~103 s if
+#: the fell had walked him at full speed. He leaves slower and empty-handed. That
+#: is still 160 s of leaving against a measured 260k ticks of erranding, and if
+#: it wants fixing the lever is the hermit arm of `_h_wander`'s speed, NOT this
+#: number - raising this cannot make him walk faster.
+HERMIT_EXODUS_URGE: float = 0.90
+
+#: HOW MUCH FOOD HE LIKES TO HAVE BY THE DOOR, and this is the constant that has
+#: to land BEFORE `actions.colony_till`'s eat rung is deleted. Read the docstring
+#: there first: that rung is a STARVING hermit walking into town to eat somebody
+#: else's dinner, it is reached only when his hands AND his pile are both empty,
+#: and it was written down as a deliberate decision rather than left to omission.
+#: The user has overruled it. Pulling it out without this in place does not make
+#: him self-sufficient, it makes him a man who starves on principle - and he
+#: already dies about three times per colony per 75 sim-min.
+#:
+#: THIS IS NOT HERMIT_LARDER_HAND COMING BACK. That one was about his HANDS, it
+#: was pinned to CARRY_CAP by the code that read it, its branch never executed
+#: once in 16 seeds, and it is gone for good (see the note further up). This is
+#: about his PILE, and the pile is the thing `_h_eat`'s second rung actually
+#: feeds him from.
+#:
+#: WHY HIS PILE RUNS DRY, WHICH IS NOT WHAT IT LOOKS LIKE. His larder is not
+#: short of berries, it is short of a REASON. `_score_wants` computes
+#: ForageBerries as ``aff["gather"] * food_urg + hunger * 0.30`` where `food_urg`
+#: is the COLONY'S shortfall damped by the COLONY'S surplus, and `_hermit_bias`
+#: only multiplies that by his own stash headroom. So a hermit beside a
+#: well-stocked colony scores foraging at almost nothing - his appetite for
+#: filling his own larder is driven by a store he is forbidden to touch - and
+#: then walks into that colony to eat when he is hungry. 103495 ticks of Eat is
+#: that loop, and it is mostly the approach phase: the walk, not the meal.
+#:
+#: 24 UNITS, in raw-food equivalents (count RES_FOOD and RES_COOKED together -
+#: `hermit_stash_food` already prefers cooked and either one feeds him). Three
+#: full carries at CARRY_CAP 8, twelve raw meals at one unit each, and a meal is
+#: -0.52 hunger against HUNGER_PER_SEC's 1/420, so the floor is about 44 sim-min
+#: of eating banked - longer if any of it is cooked (-0.78). Sized against the
+#: gap it has to cover rather than against the cap: bushes hold 0..3 berries and
+#: REGROW_BUSH_SEC is a 60 s mean when short, so the failure this buffers is a
+#: stripped neighbourhood regrowing, not a famine. Well under HERMIT_STASH_CAP
+#: (60) and under the 48 where HERMIT_STASH_TAPER starts easing him off, so the
+#: floor and the ceiling never argue.
+#:
+#: IT IS A FIRST CUT AND THE ACCEPTANCE METRIC IS NOT THE LARDER LEVEL, IT IS THE
+#: DEATH RATE. Hermit deaths per hermit-hour, against the arm with the till rung
+#: still in. If closing the rung raises it, this number is wrong or the reach
+#: below is wrong; if it cannot be made to hold, LEAVE THE RUNG IN and say so.
+HERMIT_LARDER: int = 24
+#: What filling it is worth while it is under the floor. Exactly the shape of
+#: HERMIT_WOODPILE_URGE - a `max` onto ForageBerries, gated on the pile being
+#: short and on there being a bush within HERMIT_FORAGE_REACH of the CAMP - and
+#: it is placed in the one slot the existing ladder leaves for it:
+#:
+#:     0.50 woodpile  <  0.51 LARDER  <  0.52 stoke
+#:
+#: Above the woodpile because laying in spare fuel is the lowest-priority job he
+#: has that is not idling, and now that town is closed a larder is not spare
+#: anything. Below the stoke because a fire under HERMIT_STOKE_BELOW has about
+#: seven minutes of burn left and a larder under 24 has three quarters of an hour
+#: of meals in it - the fire is the emergency and the larder is the chore, and
+#: getting that backwards puts the ward out to fill a pile that was not empty.
+#: Above HERMIT_COOK_URGE (0.42) so a short pile is restocked before what little
+#: is in it is cooked, and above HERMIT_HOMESICK (0.45) for the woodpile's own
+#: reason: a standing job that loses to drifting home never happens.
+#:
+#: The 0.01 gaps are the grain of this ladder, not a slip - HERMIT_WOODPILE_URGE
+#: and HERMIT_STOKE_URGE are already 0.02 apart. They are orderings, not
+#: magnitudes; nothing reads the difference between them.
+HERMIT_LARDER_URGE: float = 0.51
+#: How far FROM HIS CAMP - not from him - a bush may be for him to go and pick
+#: it. HERMIT_FELL_REACH's twin, and it exists for the same measured reason:
+#: without a camp anchor `find_prop` hands him the nearest bush to HIMSELF, so a
+#: hermit standing in the settlement forages the settlement's bushes, which is
+#: the ForageBerries row of the table above and is also him competing with the
+#: colony for the food he is not supposed to be taking.
+#:
+#: 720 px, and it is NOT a free number - it is three existing ones agreeing:
+#: `find_prop`'s own ``max_dist`` default, `props.REGROW_REACH`, and the "720 px
+#: forage reach" the HERMIT_FIRE_WARD note already measures him over. That
+#: matters more than tidiness: `props._reach_bands` opens the regrow bands within
+#: REGROW_REACH of EVERY living agent, the hermit included, so the ground he
+#: strips at this radius is exactly the ground that recovers for him. Set it
+#: wider and he harvests land that is not regrowing for him; narrower and he
+#: leaves food standing in his own regrow band.
+#:
+#: WIDER THAN HERMIT_FELL_REACH (420) ON PURPOSE, and the reason is measured, not
+#: symmetric-looking: within his reach there are 6.02 food harvestables per
+#: 1000 px against the colony's 10.49 (see HERMIT_FIRE_WARD, which also records
+#: that starvation APPEARED as a cause of death when the camp moved out). He is
+#: in ordinary wild land, not a desert, but it is thinner than the farmed and
+#: regrown ground the village stands on, so the radius has to be the full one the
+#: world is already regrowing for him. Timber does not need the same help - 6.26
+#: trees per 1000 px within 420 px, against the colony's 1.88.
+#:
+#: If a camp ever does land with no bush inside this, the honest outcome is the
+#: one HERMIT_FELL_REACH already documents for timber: he does not score the job
+#: rather than picking one that fails on sight. What he must NOT do is fall
+#: through to the colony - that is the rung being closed.
+HERMIT_FORAGE_REACH: float = 720.0
+
 # ------------------------------------------------------------------ scenes --
 SCENE_NIGHT_STORM = "night_storm"
 SCENE_CLEAR = "clear"

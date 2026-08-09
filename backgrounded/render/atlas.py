@@ -387,6 +387,10 @@ KIND_SIZE: dict[str, tuple[int, int]] = {
     # good deal lower: see _bake_hermit_fire for why a scrape must not resolve
     # to the settlement's hearth.
     "hermit_fire": (30, 20),
+    # His workbench, against the stockpile's (52, 38). A trestle and a flat
+    # stone - see _bake_hermit_workbench for why a bench must never resolve to
+    # the settlement's goods pile.
+    "hermit_workbench": (34, 24),
 }
 
 SCALE_BUCKET = 20.0              # scales quantise to 1/20 = 0.05 steps
@@ -1639,6 +1643,72 @@ def _bake_barricade(stage: int, rng: random.Random) -> pygame.Surface:
     return surf
 
 
+def _bake_hermit_workbench(stage: int, rng: random.Random) -> pygame.Surface:
+    """The hermit's bench: a trestle he knocked together, NOT a goods pile.
+
+    Third in the same argument as ``_bake_hermit_hut`` and
+    ``_bake_hermit_fire``. Every one of his buildings has to read as one man
+    living alone at the edge of the frame; the moment any of them borrows the
+    settlement's silhouette, what the player sees out there is a second village.
+    The trap for this kind is specific and was called out when the handoff was
+    written: it must not reuse the stockpile art. The whole reason the sim
+    gained a separate kind is that a bench is not a heap of goods, and that has
+    to be true on screen as well as in the code.
+
+    So it is built out of the two things the pile is not - LEGS and a LINE:
+
+      * (34, 24) against the stockpile's (52, 38). Smaller, and wider than it is
+        tall, because a bench is a horizontal thing and a pile is a mound.
+      * two splayed trestle legs and a straight plank across them. A pile has no
+        straight edges anywhere; this is almost nothing but straight edges.
+      * a flat stone on the top at the finished stage - the anvil he knaps
+        against - and a few pale shavings on the ground under it, which is the
+        only cue that says "things are made here" rather than "things are kept
+        here".
+
+    Two stages, matching the sim: the bare trestle, then the bench in use.
+    ``rng`` is seeded per ``(kind, variant, stage)`` by ``Atlas._rng``, so each
+    variant keeps its own leg splay across both stages.
+    """
+    surf = _canvas("hermit_workbench")
+    w, h = surf.get_size()
+    base = h - 3
+    st = max(0, min(int(stage), 1))
+    top_y = base - 11.0
+    left = w * 0.22
+    right = w * 0.78
+
+    # Turned earth under it, the same scrape the fire stands on - he cleared a
+    # patch to work on, he did not lay a floor.
+    _ellipse(surf, EARTH, w * 0.5, base + 1, w * 0.40, 3.0)
+
+    # Two splayed legs per end. Splayed, not vertical: a trestle somebody lashed
+    # together leans, and a right angle would read as carpentry the colony has
+    # not invented yet.
+    for foot_x in (left, right):
+        spread = rng.uniform(2.4, 4.0)
+        _line(surf, WOOD_DARK, (foot_x - spread, base), (foot_x, top_y), 2)
+        _line(surf, WOOD_DARK, (foot_x + spread, base), (foot_x, top_y), 2)
+
+    # The plank. One straight line across the whole width, which is the shape
+    # the goods pile can never have.
+    _line(surf, WOOD, (left - 4.0, top_y), (right + 4.0, top_y), 3)
+    _rim_line(surf, (left - 4.0, top_y - 1.5), (right + 4.0, top_y - 1.5), 92)
+
+    if st >= 1:
+        # The knapping stone, sat on the plank rather than balanced on the end.
+        sx = w * 0.5 + rng.uniform(-2.0, 2.0)
+        _ellipse(surf, STONE, sx, top_y - 2.6, 4.6, 2.6)
+        _rim_arc(surf, sx, top_y - 2.6, 4.6, 2.6, 3.3, 6.1, 88)
+        # Shavings on the ground. Pale, short, scattered - the by-product that
+        # says work happens here.
+        for _ in range(4):
+            px = w * 0.5 + rng.uniform(-w * 0.30, w * 0.30)
+            py = base - rng.uniform(0.0, 2.0)
+            _line(surf, STONE_LIGHT, (px, py), (px + rng.uniform(1.5, 3.5), py), 1)
+    return surf
+
+
 def _bake_hermit_fire(stage: int, rng: random.Random) -> pygame.Surface:
     """The hermit's fire: a scrape with stones round it, and NOT a firepit.
 
@@ -1925,6 +1995,7 @@ _STRUCTURE_BAKERS = {
     "barricade": _bake_barricade,
     "hermit_hut": _bake_hermit_hut,
     "hermit_fire": _bake_hermit_fire,
+    "hermit_workbench": _bake_hermit_workbench,
     # A structure kind with no entry here bakes to `self._missing`, a 2x2
     # transparent surface, and is INVISIBLE while looking perfectly wired up.
     "lookout": _bake_lookout,

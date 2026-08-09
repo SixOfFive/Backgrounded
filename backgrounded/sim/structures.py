@@ -75,6 +75,23 @@ except ImportError:                             # pragma: no cover - see above
     TOWER_UPGRADE_COST = {RES_WOOD: 6, RES_STONE: 12}
     TOWER_UPGRADE_WORK = 12.0
 
+# The hermit's workbench numbers are the constants lane's, in the same file this
+# module is not allowed to edit. Separate try block rather than folded into the
+# one above on purpose: a single block falls back as a UNIT, so one missing name
+# would quietly swap the tower's tuning out too. Same discipline as above - the
+# fallbacks are the SAME literals, so the spec below is identical whether or not
+# that commit has landed, and a merge order cannot change what a bench costs.
+try:                                            # pragma: no cover - see above
+    from ..constants import (
+        HERMIT_WORKBENCH_COST,
+        HERMIT_WORKBENCH_WORK,
+        KIND_HERMIT_WORKBENCH,
+    )
+except ImportError:                             # pragma: no cover - see above
+    KIND_HERMIT_WORKBENCH = "hermit_workbench"
+    HERMIT_WORKBENCH_COST = {RES_WOOD: 8}
+    HERMIT_WORKBENCH_WORK = 7.0
+
 log = logging.getLogger(__name__)
 
 
@@ -220,8 +237,17 @@ CROSSING_KINDS: tuple[str, ...] = ("bridge", "ladder")
 #: drags the mean ~150 px outward - and then the next site, the camera fallback,
 #: the quarry keep-out, the barricade band and hermit_home all move with it,
 #: every pass, outward again. The hermit's is further out still.
+#:
+#: ``hermit_workbench`` is here for the plain version of the hut's reason and it
+#: is not optional. It is staked AT his camp, so it is one more x in the mean
+#: that ``actions.hermit_home`` is derived from - leave it out and every
+#: director pass sites the next camp a little further into the wilderness than
+#: the last, which is the runaway the hut's entry above describes with a smaller
+#: step and the same sign. It is also the kind most likely to be missed, because
+#: it is the only one of his four that nothing else in the sim looks up by name.
 NON_SETTLEMENT_KINDS: tuple[str, ...] = (
     "grave", "hermit_hut", "hermit_fire", "lookout", "hermit_lookout",
+    KIND_HERMIT_WORKBENCH,
 )
 
 #: Kinds that BEHAVE like a fire - they hold fuel, they can be lit and stoked,
@@ -262,6 +288,7 @@ KIND_LABELS: dict[str, str] = {
     "hermit_hut": "hermit's hut",
     "hermit_fire": "hermit's fire",
     "hermit_lookout": "hermit's lookout",
+    KIND_HERMIT_WORKBENCH: "hermit's workbench",
     "lookout": "lookout",
     "firepit": "firepit",
 }
@@ -562,6 +589,62 @@ STRUCTURE_SPECS: dict[str, StructureSpec] = {
         "hermit_lookout", 2, 80.0, {RES_WOOD: HERMIT_LOOKOUT_WOOD},
         width=24.0, height=62.0, capacity=1, flammable=False,
         build_time=9.0, spacing=34.0, variants=2,
+    ),
+    # HIS WORKBENCH, AND IT IS ITS OWN KIND FOR THE FOURTH TIME. The three
+    # notes above are the record of getting this right three times; this one is
+    # the case where the tempting shortcut is worse than any of theirs.
+    #
+    # WHY IT EXISTS AT ALL is one line of somebody else's handler:
+    # `combat_actions._h_craft`'s approach phase walks to
+    # `nearest_structure(w, "stockpile")` and falls back to `colony_center(w)`.
+    # Every spear the hermit has ever made was made standing in the middle of
+    # the settlement, because there was nowhere else in the world to make one.
+    #
+    # THE SHORTCUT THAT LOOKS FREE is to let him stake an ordinary `stockpile`
+    # at his camp and let that same line find it. Do not. `nearest_structure(w,
+    # "stockpile")` is asked by EVERYBODY:
+    #
+    #   haulers        a stockpile 3000 px out in the wilderness is a legal
+    #                  destination for the colony's harvest, and the nearest one
+    #                  to a forager working the far treeline IS his.
+    #   `_h_eat`       its approach resolves a pile to walk to. A starving
+    #                  villager would be sent to a pile he may not draw from -
+    #                  the till (`actions._TILL_ACTOR`) refuses him and nothing
+    #                  errors, so he walks, is refused, and walks again.
+    #   behavior       the build ladder counts stockpiles. One at the hermitage
+    #                  and the colony stops raising its own.
+    #
+    # None of those fail loudly. A kind of its own is found by nobody who is not
+    # looking for it, which is the whole trick, and it is why this is the fourth
+    # kind rather than the first flag.
+    #
+    # IT HOLDS NOTHING, and `capacity=0` is only half of that. `_on_complete`
+    # deliberately does NOT seed `state["shown"]` for it the way it does for a
+    # `stockpile`: a bench is a surface to work on, not a container, and the
+    # goods gate lives at the till, never on a building. He crafts out of his
+    # own stash and the spear goes back into it.
+    #
+    # One stage, wood only, 8 = `actions.CARRY_CAP` (see HERMIT_WORKBENCH_COST):
+    # one armful, one trip, no banked surplus, because nobody hauls for him.
+    #
+    # `flammable=True`, MATCHING HIS HUT rather than his fire or his tower, and
+    # the cost of that is worth writing down because the `hermit_lookout` note
+    # above declines it: `StructureRegistry.update` draws one `rng.random()` off
+    # `world.rng` per (burning structure x in-range flammable candidate) pair
+    # inside BURN_NEIGHBOUR_DIST (70 px), and this bench stands well inside 70 px
+    # of a `flammable=True` hermit_hut. So while his hut burns, this kind adds a
+    # draw per frame to the shared numpy stream. That is accepted here where it
+    # was refused for the tower for one reason: the tower was fireproof anyway
+    # for the colony lookout's reason, and this is a wooden trestle standing in
+    # the open beside a burning house. A dragon that razes the hermitage should
+    # not leave the bench untouched, and he rebuilds it out of one armful the
+    # same way he rebuilds the hut. The extra draws are confined to colonies that
+    # have a hermit whose camp is alight - a colony with no hermit has no bench
+    # and draws exactly what it drew before.
+    KIND_HERMIT_WORKBENCH: StructureSpec(
+        KIND_HERMIT_WORKBENCH, 1, 45.0, dict(HERMIT_WORKBENCH_COST),
+        width=26.0, height=16.0, capacity=0, flammable=True,
+        build_time=float(HERMIT_WORKBENCH_WORK), spacing=30.0, variants=2,
     ),
     "wall": StructureSpec(
         "wall", 2, 170.0, {RES_STONE: 14, RES_WOOD: 4},
@@ -2898,3 +2981,192 @@ if __name__ == "__main__":  # pragma: no cover - smoke test
     for _ in range(60):
         w.tick(1.0 / 30.0)
     print("ok, disabled subsystems:", w._disabled or "none")
+
+    # ------------------------------------------------ the hermit's workbench --
+    # Every assertion below has a CONTROL that fails if the separate-kind trick
+    # is not actually doing the work - a `stockpile` staked at the same spot,
+    # which is the shortcut the spec's note refuses. If the bench were a flagged
+    # stockpile, the control and the bench would print the same numbers.
+    WB = KIND_HERMIT_WORKBENCH
+    print("hermit workbench:")
+    wb_spec = structure_spec(WB)
+    print(f"  spec: kind={wb_spec.kind} stages={wb_spec.max_stage}"
+          f" cost={wb_spec.cost} work={wb_spec.build_time}s hp={wb_spec.max_hp}"
+          f" cap={wb_spec.capacity} flammable={wb_spec.flammable}"
+          f" {wb_spec.width:.0f}x{wb_spec.height:.0f}")
+    assert wb_spec.kind == WB, "workbench fell through to the unknown-kind spec"
+    assert WB in STRUCTURE_KINDS, "workbench is not in STRUCTURE_KINDS"
+
+    # ...builds out of one armful, in one stage.
+    bench_reg = StructureRegistry()
+    bench = bench_reg.create(WB, 3400.0, 600.0)
+    print("  stage cost", bench.stage_cost(), "missing", bench.missing_for_stage(),
+          "total", bench.total_remaining_cost())
+    print("  work with no wood on site advances nothing:", bench.advance(5.0),
+          f"progress={bench.progress:.3f}")
+    assert not bench.built, "a bench built itself with nothing delivered"
+    took = bench.deliver(RES_WOOD, 8)
+    wb_ticks = 0
+    while not bench.built and wb_ticks < 5000:
+        wb_ticks += 1
+        bench.advance(1.0 / 30.0)
+    print(f"  delivered {took} wood -> built in {wb_ticks / 30.0:.2f}s"
+          f" (spec says {wb_spec.build_time})  built={bench.built}"
+          f" stage={bench.stage}/{bench.max_stage} label={bench.label()!r}")
+    assert bench.built and took == 8, "one armful did not raise the bench"
+    print("  holds nothing: capacity", bench.capacity(),
+          "state keys", sorted(bench.state), "has_room", bench.has_room())
+    assert "shown" not in bench.state, "the bench seeded a stockpile's goods dict"
+    assert bench.capacity() == 0 and not bench.has_room(), "the bench admits people"
+
+    # ...and is invisible to every colony census, where a stockpile is not.
+    ctrl = bench_reg.create("stockpile", 3400.0, 600.0, built=True)
+    print(f"  census: count(hut)={bench_reg.count('hut')}"
+          f" count(firepit)={bench_reg.count('firepit')}"
+          f" count(stockpile)={bench_reg.count('stockpile')}"
+          f" count({WB})={bench_reg.count(WB)}")
+    assert bench_reg.count("stockpile") == 1, "control: the stockpile is not counted"
+    assert bench_reg.count("hut") == 0 and bench_reg.count("firepit") == 0, \
+        "the bench answered somebody else's census"
+
+    # colony_center: the bench must not drag it, the control must.
+    town = StructureRegistry()
+    for tx in (600.0, 640.0, 680.0):
+        town.create("hut", tx, 600.0, built=True)
+    base_c = town.colony_center()
+    town.create(WB, 3400.0, 600.0, built=True)
+    with_bench = town.colony_center()
+    town.create("stockpile", 3400.0, 600.0, built=True)
+    with_ctrl = town.colony_center()
+    print(f"  colony_center: {base_c:.1f} -> +bench {with_bench:.1f}"
+          f" -> +stockpile at the same x {with_ctrl:.1f}")
+    assert with_bench == base_c, "the bench dragged the settlement into the wild"
+    assert with_ctrl > base_c + 100.0, "control: a real building did not move the mean"
+
+    # ...it burns, the way his hut does and his fire does not.
+    from .events import _FLAMMABLE  # noqa: PLC0415 - smoke test only
+    print(f"  events._FLAMMABLE: bench={WB in _FLAMMABLE}"
+          f" hermit_hut={'hermit_hut' in _FLAMMABLE}"
+          f" hermit_fire={'hermit_fire' in _FLAMMABLE}")
+    assert WB in _FLAMMABLE, "the bench is not in the derived flammable set"
+    assert "hermit_fire" not in _FLAMMABLE, "control: his fire became flammable"
+
+    class _CampWorld:
+        def __init__(self, seed: int) -> None:
+            self.rng = random.Random(seed)
+            self.lines: list[str] = []
+
+        def log_event(self, text: str) -> None:
+            self.lines.append(text)
+
+    camp = StructureRegistry()
+    camp_hut = camp.create("hermit_hut", 3400.0, 600.0, built=True)
+    camp_bench = camp.create(WB, 3430.0, 600.0, built=True)
+    camp_fire = camp.create("hermit_fire", 3434.0, 600.0, built=True)
+    cw = _CampWorld(11)
+    camp_hut.ignite()
+    for _ in range(40):
+        camp.update(1.0, cw)
+    print(f"  dragon burns the camp: hut ruined={camp_hut.is_ruined}"
+          f" bench caught={camp_bench.is_burning or camp_bench.is_ruined}"
+          f" bench ruined={camp_bench.is_ruined}"
+          f" fire caught={camp_fire.is_burning or camp_fire.is_ruined}")
+    assert camp_bench.is_ruined, "fire beside the bench never reached it"
+    assert not (camp_fire.is_burning or camp_fire.is_ruined), \
+        "control: the fireproof scrape fire caught alight"
+    print("  he rebuilds it:", camp_bench.repair(1.0) > 0.0,
+          "built", camp_bench.built, "-> redeliver", camp_bench.deliver(RES_WOOD, 8))
+
+    # ...and round-trips, including mid-build and out of a hand-edited save.
+    half = StructureRegistry().create(WB, 3400.0, 600.0)
+    half.deliver(RES_WOOD, 5)
+    blob_wb = half.to_dict()
+    back_wb = Structure.from_dict(blob_wb)
+    print(f"  mid-build save: kind={back_wb.kind} built={back_wb.built}"
+          f" delivered={back_wb.delivered} missing={back_wb.missing_for_stage()}"
+          f" cost={back_wb.cost} max_stage={back_wb.max_stage}")
+    assert back_wb.to_dict() == blob_wb, "workbench save/load is not a fixed point"
+    done_wb = Structure.from_dict(bench.to_dict())
+    print(f"  finished save: built={done_wb.built} hp={done_wb.hp:.0f}"
+          f" label={done_wb.label()!r} growth={done_wb.growth}"
+          f" scale={done_wb.scale():.3f} cap={done_wb.capacity()}")
+    assert done_wb.growth == 0.0, "a bench started growing like a hut"
+    nasty = Structure.from_dict({
+        "kind": WB, "built": True, "x": "over there", "hp": float("nan"),
+        "state": {"shown": {"food": 99}, "material": "sponge", "ammo": 40,
+                  "garbage": 12, "upgrade": {"to": "stone"}, "capacity": 9},
+    })
+    # `shown` and `capacity` survive, and that is PRE-EXISTING behaviour this
+    # kind inherits rather than introduces: `Structure.capacity` honours a
+    # `state["capacity"]` override for every kind, and nothing outside this
+    # module reads `shown` at all. Both are inert on a bench - no code path
+    # looks up a `hermit_workbench` to stand in or to draw goods on - and
+    # popping them here would change how a hand-edited HUT loads, which is not
+    # this lane's to change. The keys that carry real machinery are gone.
+    print("  hand-edited save loads:", nasty.kind, "state", sorted(nasty.state),
+          "upgrading", nasty.is_upgrading, "ammo", nasty.ammo(),
+          "material", nasty.material(), "x", nasty.x, "hp", nasty.hp)
+    assert not nasty.is_upgrading and nasty.ammo() == 0, \
+        "a bench loaded somebody else's state keys"
+    assert "ammo" not in nasty.state and "garbage" not in nasty.state, \
+        "a bench kept a magazine or a bonfire"
+    print("  registry round trip:", len(StructureRegistry.from_dict(camp.to_dict())),
+          "kinds", sorted({s.kind for s in StructureRegistry.from_dict(camp.to_dict())}))
+
+    # ...and a real World, ticked with the bench standing in it, never counts it
+    # as colony business. The control is the SAME World ticked without one.
+    def _camp_world(with_bench: bool) -> "World":
+        ww = World(seed=7)
+        bx = min(WORLD_W - 40.0, ww.structures.colony_center() + 900.0)
+        if with_bench:
+            ww.structures.create(WB, bx, ww.terrain.ground_y(bx), built=True)
+        for _ in range(600):
+            ww.tick(1.0 / 30.0)
+        return ww
+
+    w_ctrl, w_wb = _camp_world(False), _camp_world(True)
+    for tag, ww in (("no bench", w_ctrl), ("bench at +900", w_wb)):
+        rec = ww.reconcile()
+        colony_xs = [s.x for s in ww.structures.all()
+                     if s.kind not in NON_SETTLEMENT_KINDS and not s.is_ruined]
+        mean = sum(colony_xs) / len(colony_xs) if colony_xs else float("nan")
+        print(f"  real World ({tag}): colony_center"
+              f" {ww.structures.colony_center():.1f} (mean of the"
+              f" {len(colony_xs)} colony buildings = {mean:.1f})"
+              f" huts={ww.structures.count('hut')}"
+              f" firepits={ww.structures.count('firepit')}"
+              f" stockpiles={ww.structures.count('stockpile')}"
+              f" benches={ww.structures.count(WB)}"
+              f" pop={rec['alive']} residual={rec['residual']} ok={rec['ok']}"
+              f" disabled={ww._disabled or 'none'}")
+        assert rec["ok"] == 1 and rec["residual"] == 0, "reconcile residual moved"
+        assert abs(ww.structures.colony_center() - mean) < 1e-9, \
+            "colony_center is not the mean of the colony's own buildings"
+    assert w_wb.structures.count(WB) == 1, "the bench vanished over 20 sim-seconds"
+    assert (w_ctrl.structures.count("hut"), w_ctrl.structures.count("firepit"),
+            w_ctrl.structures.count("stockpile")) == \
+           (w_wb.structures.count("hut"), w_wb.structures.count("firepit"),
+            w_wb.structures.count("stockpile")), \
+        "the bench changed what the colony built for itself"
+    print("  colony census identical with and without the bench:", True)
+
+    # WIRING LEDGER, because a kind nothing looks up is a kind that ships inert
+    # and this repo has done that twice. Three of the five lists that have to
+    # know about this kind live in files this lane may not touch; a bench with
+    # `actions.OUTWORK_KINDS` still unpatched drags `settlement_center` 465 px
+    # and moves where the colony lays its first firepit by 545 px (measured,
+    # seed 7). Printed and not asserted, so this smoke test passes both before
+    # and after the integrator applies the handoffs - what it must never do is
+    # go quiet about them.
+    from . import actions as _acts    # noqa: PLC0415 - smoke test only
+    from . import behavior as _beh    # noqa: PLC0415 - smoke test only
+    print(f"  wiring ledger for {WB!r}:")
+    for _name, _seq in (
+        ("structures.NON_SETTLEMENT_KINDS", NON_SETTLEMENT_KINDS),
+        ("structures.KIND_LABELS", tuple(KIND_LABELS)),
+        ("structures.STRUCTURE_SPECS", STRUCTURE_KINDS),
+        ("actions.OUTWORK_KINDS", tuple(_acts.OUTWORK_KINDS)),
+        ("actions.HERMIT_KINDS", tuple(_acts.HERMIT_KINDS)),
+        ("behavior._HERMIT_SITE_KINDS", tuple(_beh._HERMIT_SITE_KINDS)),
+    ):
+        print(f"    {'ok  ' if WB in _seq else 'TODO'}  {_name}")

@@ -168,12 +168,11 @@ from .actions import (
     _face,
     _halt,
     chronicle,
-    colony_center,
+    craft_site,
     emit_speech,
     hermit_stash_qty,
     is_hermit,
     make_action,
-    nearest_structure,
     step_toward,
     stock_add,
     stock_qty,
@@ -1346,9 +1345,25 @@ def _h_craft(a: Action, ag: Any, w: Any, dt: float) -> None:
 
     if a.phase == "approach":
         a.pose = "walk"
-        sp = nearest_structure(w, "stockpile", ag.x, built_only=True)
-        tx = float(sp.x) if sp is not None else colony_center(w)
-        rem = step_toward(ag, w, tx, dt)
+        # WHERE A CRAFTER STANDS IS `actions.craft_site`, not this call site.
+        # The two lines this replaces are why every spear the hermit ever made
+        # was made in the middle of the settlement: there was nowhere else in
+        # the world to make one. craft_site answers "his own bench, else his own
+        # camp" for a hermit and returns this same stockpile for everybody else,
+        # so no villager's walk changes by a pixel.
+        #
+        # It is one function rather than a rule two call sites are each trusted
+        # to remember, because `score_combat` has to ask the same question the
+        # handler asks or he scores a craft the walk cannot deliver. It never
+        # returns "nowhere" - a fallback reaching the stockpile would be this
+        # bug with an extra step in it, and a failure would be a job that fails
+        # on its first update.
+        #
+        # Measured before this line existed, on the merged tree: 700 hermit
+        # craft ticks, 0 of them at his bench, 700 of them nearer the colony
+        # stockpile, 211 standing in it. The bench was built in 31 of 32
+        # colonies and used in none.
+        rem = step_toward(ag, w, craft_site(ag, w), dt)
         if rem <= REACH:
             if not _pay(w, a, cost):
                 a.failed = True        # somebody else spent it while we walked
