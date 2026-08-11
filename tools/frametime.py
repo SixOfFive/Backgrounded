@@ -31,7 +31,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-os.environ.setdefault("SDL_VIDEODRIVER", "windib")
+# Windows only - see the same guard in tools/probe.py. Frame timings need a
+# real driver rather than "dummy", and off Windows SDL picks that itself.
+if sys.platform == "win32":
+    os.environ.setdefault("SDL_VIDEODRIVER", "windib")
 
 import pygame  # noqa: E402
 

@@ -28,7 +28,7 @@ import time
 from ctypes import wintypes
 from pathlib import Path
 
-from .. import paths
+from .. import host, paths
 
 log = logging.getLogger(__name__)
 
@@ -100,11 +100,19 @@ except Exception as _exc:                                     # pragma: no cover
     log.error("Pillow unavailable (%s); wallpaper output disabled", _exc)
 
 # ---------------------------------------------------------------- win32 ABI --
+#
+# Conditional because ``ctypes.WinDLL`` does not exist off Windows - it is an
+# AttributeError at import, which would take the whole app down before it drew
+# a frame. Where ``host.WALLPAPER_SUPPORTED`` is false the class below never
+# starts its thread and none of this is reached; see :meth:`WallpaperWriter.start`.
 
-user32 = ctypes.WinDLL("user32", use_last_error=True)
-user32.SystemParametersInfoW.restype = wintypes.BOOL
-user32.SystemParametersInfoW.argtypes = [
-    wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT]
+if host.WALLPAPER_SUPPORTED:
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.SystemParametersInfoW.restype = wintypes.BOOL
+    user32.SystemParametersInfoW.argtypes = [
+        wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT]
+else:
+    user32 = None
 
 SPI_SETDESKWALLPAPER = 0x0014
 SPI_GETDESKWALLPAPER = 0x0073
@@ -319,6 +327,12 @@ class WallpaperWriter:
         Returns the original path (possibly loaded from the persisted record),
         or None if none is known yet.
         """
+        if not host.WALLPAPER_SUPPORTED:
+            # Nothing was ever taken, so there is nothing to remember. Guarded
+            # here rather than left to fail through _read_current_wallpaper,
+            # which would log a warning about a query it was never going to be
+            # able to make, on every single launch.
+            return None
         record = _load_record()
         rec_original = record.get("original")
         rec_backup = record.get("backup")
@@ -349,7 +363,17 @@ class WallpaperWriter:
     # ----------------------------------------------------------- lifecycle --
 
     def start(self) -> None:
-        """Start the writer thread. Idempotent."""
+        """Start the writer thread. Idempotent.
+
+        The platform check comes before the Pillow one so that a machine with
+        no desktop-wallpaper API says nothing at all, rather than complaining
+        about a dependency it would have no use for. Everything else on this
+        class is already safe with the thread never started: submit() drops the
+        frame, restore() has nothing recorded to put back, and stats() reports
+        the zeroes it was initialised with.
+        """
+        if not host.WALLPAPER_SUPPORTED:
+            return
         if Image is None:
             log.error("wallpaper writer not started: Pillow is missing")
             return
@@ -520,6 +544,12 @@ class WallpaperWriter:
         Tries the real original in its real location first; if that file is gone
         (the user moved or deleted it), falls back to our own byte copy, which is
         what makes the restore survive anything short of losing both at once."""
+        if not host.WALLPAPER_SUPPORTED:
+            # The counterpart to capture_original's guard: without it every
+            # clean exit ends on "no original wallpaper available to restore",
+            # which is true and completely uninteresting.
+            self._restored = True
+            return
         if self._restored:
             return
         self._restored = True

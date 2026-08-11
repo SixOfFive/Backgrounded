@@ -32,24 +32,39 @@ import uuid
 from ctypes import wintypes
 from typing import Any, Callable
 
+from .. import host
 from ..constants import RENDER_SIZE, SCENES, SCENE_LABELS, SCENE_ROTATE_SEC
 
 log = logging.getLogger(__name__)
 
 # --------------------------------------------------------------- win32 ABI --
-
-user32 = ctypes.WinDLL("user32", use_last_error=True)
-shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+#
+# Everything from here to the end of the file is Windows, and off Windows this
+# module is imported only so that ``from .shell.tray import Tray`` keeps
+# working - :meth:`Tray.start` then returns without spawning a thread and the
+# rest is dead code. Two names have to be bound conditionally to get that far,
+# because they are the ones that do not merely *fail* on another platform but
+# do not exist at all: ``ctypes.WinDLL`` and ``ctypes.WINFUNCTYPE``. Everything
+# else here - including the whole of ``ctypes.wintypes``, which is pure
+# type aliases - imports fine anywhere CPython runs.
 
 LRESULT = ctypes.c_ssize_t
 HCURSOR = wintypes.HANDLE
 LPVOID = ctypes.c_void_p
 
-WNDPROC = ctypes.WINFUNCTYPE(
-    LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
-)
+if host.IS_WINDOWS:
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    WNDPROC = ctypes.WINFUNCTYPE(
+        LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+    )
+else:
+    user32 = shell32 = gdi32 = kernel32 = None
+    WNDPROC = ctypes.CFUNCTYPE(
+        LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+    )
 
 # messages
 WM_DESTROY = 0x0002
@@ -259,7 +274,10 @@ def _bind() -> None:
     kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 
 
-_bind()
+# There are no DLLs to describe when the four handles above are None, and
+# nothing will ever call the functions this would have annotated.
+if host.IS_WINDOWS:
+    _bind()
 
 
 # ------------------------------------------------------------ icon drawing --
@@ -477,7 +495,15 @@ class Tray:
     # ----------------------------------------------------------- lifecycle --
 
     def start(self) -> None:
-        """Spawn the tray thread and wait briefly for the window to exist."""
+        """Spawn the tray thread and wait briefly for the window to exist.
+
+        A no-op where there is no notification area to put an icon in. Silent
+        rather than a warning: on those platforms the app is its window and the
+        absence of a tray is the design, not a degraded mode. Every other
+        method is already safe with ``self._thread`` left at None.
+        """
+        if not host.TRAY_SUPPORTED:
+            return
         if self._thread is not None and self._thread.is_alive():
             return
         self._stopping = False

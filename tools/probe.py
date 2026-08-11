@@ -18,7 +18,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-os.environ.setdefault("SDL_VIDEODRIVER", "windib")
+# Windows only: naming a driver off Windows would just pick the wrong one, and
+# SDL's own auto-selection (x11, wayland, or dummy under a headless session) is
+# already right there. Still a setdefault, so SDL_VIDEODRIVER=dummy in the
+# environment wins on any platform.
+if sys.platform == "win32":
+    os.environ.setdefault("SDL_VIDEODRIVER", "windib")
 
 import numpy as np  # noqa: E402
 import pygame  # noqa: E402

@@ -1,18 +1,33 @@
-"""Filesystem locations. Everything user-writable lives under %LOCALAPPDATA%."""
+"""Filesystem locations. Everything user-writable lives under one app dir:
+``%LOCALAPPDATA%\\Backgrounded`` on Windows, ``$XDG_DATA_HOME/Backgrounded``
+(i.e. ``~/.local/share/Backgrounded``) everywhere else."""
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
+from . import host
+
 APP_NAME = "Backgrounded"
 
 
-def _local_appdata() -> Path:
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/AppData/Local")
+def _app_base() -> Path:
+    """The per-user data root this platform expects an app to write into.
+
+    Both branches read their environment variable first and only then fall
+    back to the conventional path. That is not merely politeness towards an
+    unusual setup: tools/probe.py and tools/smoke.py isolate a test run by
+    pointing the variable at a scratch directory, so a hard-coded home path
+    here would send probe worlds into the real save.
+    """
+    if host.IS_WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/AppData/Local")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
     return Path(base)
 
 
-APP_DIR: Path = _local_appdata() / APP_NAME
+APP_DIR: Path = _app_base() / APP_NAME
 SAVE_PATH: Path = APP_DIR / "save.json"
 CORRUPT_SAVE_PATH: Path = APP_DIR / "save.corrupt.json"
 CONFIG_PATH: Path = APP_DIR / "config.json"
@@ -39,7 +54,18 @@ CHRONICLE_PATH: Path = APP_DIR / "chronicle.txt"
 # Pictures rather than Temp: if the process dies without restoring, the desktop
 # keeps showing the last frame instead of going black when a cleanup tool
 # reclaims Temp.
-WALLPAPER_DIR: Path = Path(os.path.expanduser("~")) / "Pictures" / APP_NAME
+#
+# None of the above applies where the desktop background is not an output at
+# all (see backgrounded.host). The constant still has to exist and still has to
+# be a real path, because WallpaperWriter names it when it is constructed even
+# on a platform where it will never run - but it points inside the app dir
+# there, and ensure_dirs does not create it, so a Linux run leaves nothing at
+# all in the user's Pictures folder.
+WALLPAPER_DIR: Path = (
+    Path(os.path.expanduser("~")) / "Pictures" / APP_NAME
+    if host.WALLPAPER_SUPPORTED else
+    APP_DIR / "wallpaper"
+)
 WALLPAPER_A: Path = WALLPAPER_DIR / "wallpaper_a.jpg"
 WALLPAPER_B: Path = WALLPAPER_DIR / "wallpaper_b.jpg"
 
@@ -68,4 +94,5 @@ def ensure_dirs() -> None:
     """Create every directory the app writes into. Safe to call repeatedly."""
     APP_DIR.mkdir(parents=True, exist_ok=True)
     CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
-    WALLPAPER_DIR.mkdir(parents=True, exist_ok=True)
+    if host.WALLPAPER_SUPPORTED:
+        WALLPAPER_DIR.mkdir(parents=True, exist_ok=True)

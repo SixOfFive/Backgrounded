@@ -11,6 +11,11 @@ Two rules make this module fiddlier than it looks:
   toggle it with ``ShowWindow`` on its raw HWND instead.
 * Clicking the window's X must hide it, not quit. The app lives in the tray;
   the window is a peripheral.
+
+The second rule is a *Windows* rule, and off Windows it inverts: with no tray
+there is nothing to bring a hidden window back from, so App treats the close as
+a quit. This module still only reports the close either way - see
+``pump_events``'s ``closed`` - it does not decide what it means.
 """
 from __future__ import annotations
 
@@ -24,11 +29,20 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 import pygame
 
+from .. import host
+
 log = logging.getLogger(__name__)
 
-user32 = ctypes.WinDLL("user32", use_last_error=True)
-user32.ShowWindow.restype = wintypes.BOOL
-user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+# ctypes.WinDLL does not exist off Windows - referencing it is an AttributeError
+# at import time, not a graceful failure - so the binding is conditional and
+# _apply_visibility routes around it. (ctypes.wintypes, by contrast, imports
+# fine everywhere on CPython 3, so the annotations above need no guard.)
+if host.IS_WINDOWS:
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+else:
+    user32 = None
 
 SW_HIDE = 0
 SW_SHOW = 5
@@ -46,6 +60,11 @@ class Preview:
 
         self._screen: pygame.Surface | None = None
         self._hwnd: int = 0
+        #: The SDL window behind the display surface, off Windows only. Held
+        #: for the process lifetime rather than fetched per call - a proxy that
+        #: goes out of scope is one more chance for a binding to decide it owns
+        #: the window it wraps.
+        self._sdl_win = None
         self._visible: bool = False
         self._created: bool = False
         self._caption: str = CAPTION
@@ -181,7 +200,10 @@ class Preview:
             # With the HIDDEN flag SDL never maps the window, so it never
             # flashes on screen; without it we hide immediately below.
             self._visible = bool(visible) or not hidden_flag
-            self._hwnd = self._get_hwnd()
+            # Only the Windows branch of _apply_visibility has any use for a
+            # raw handle, and asking for one under Wayland just logs a warning
+            # about a window id that would never be read.
+            self._hwnd = self._get_hwnd() if host.IS_WINDOWS else 0
             # Before this, _letterbox stayed None until the first present(), and
             # _image_rect's fallback is the raw window size - so every pointer
             # and drag conversion in the first frame used a rect wider than the
@@ -203,7 +225,41 @@ class Preview:
             log.warning("preview: no window handle available: %s", exc)
             return 0
 
+    def _sdl_window(self):
+        """pygame-ce's handle on the display-module window, or None.
+
+        Only used off Windows. ``from_display_module`` wraps the window
+        ``set_mode`` already made rather than creating a second one, which is
+        the whole point: the video context and every Surface derived from it
+        stay exactly as they were.
+        """
+        if self._sdl_win is None:
+            cls = getattr(pygame, "Window", None)
+            factory = getattr(cls, "from_display_module", None) if cls else None
+            if factory is None:
+                return None
+            try:
+                self._sdl_win = factory()
+            except Exception as exc:
+                log.warning("preview: no SDL window handle available: %s", exc)
+                return None
+        return self._sdl_win
+
     def _apply_visibility(self, visible: bool) -> None:
+        if not host.IS_WINDOWS:
+            # SDL_ShowWindow/SDL_HideWindow, which is what ShowWindow amounts
+            # to anyway. Note that a compositor is entitled to ignore a show
+            # request (nothing on Wayland guarantees a raise), so self._visible
+            # remains the app's *intent*, not an assertion about the screen -
+            # the same thing it has always been on the branch below.
+            win = self._sdl_window()
+            if win is not None:
+                try:
+                    win.show() if visible else win.hide()
+                except Exception as exc:
+                    log.warning("preview: SDL show/hide failed: %s", exc)
+            self._visible = visible
+            return
         if not self._hwnd:
             self._hwnd = self._get_hwnd()
         if not self._hwnd:
@@ -1468,6 +1524,9 @@ class Preview:
         self._visible = False
         self._screen = None
         self._hwnd = 0
+        # Dropped before display.quit(), not after: the proxy refers to a
+        # window that is about to stop existing.
+        self._sdl_win = None
         try:
             pygame.display.quit()
         except Exception as exc:

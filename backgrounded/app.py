@@ -4,6 +4,13 @@ Thread ownership (see docs/ARCHITECTURE.md section 1):
   main       pygame render loop, fixed-timestep sim, command dispatch
   tray       Win32 message pump, pushes commands onto cmd_q
   wallpaper  blocking disk + SystemParametersInfoW writes
+
+Off Windows there are no worker threads: neither the tray nor the wallpaper has
+a counterpart there (see backgrounded.host), both start() calls return without
+spawning anything, and the program is exactly its window. The three places that
+changes behaviour rather than merely skipping work are marked with
+``host.WINDOW_IS_THE_APP``, ``host.WALLPAPER_SUPPORTED`` and the POSIX branch of
+:func:`_acquire_single_instance`.
 """
 from __future__ import annotations
 
@@ -18,7 +25,7 @@ import time
 
 import pygame
 
-from . import paths, persist
+from . import host, paths, persist
 from .config import Config
 from .constants import (
     AUTOSAVE_SEC, FOLLOW_PICK_RADIUS, RENDER_SIZE, SCENES, SIM_ACCUM_MAX_SEC,
@@ -89,6 +96,9 @@ def _free_name(prefix: str):
 _MUTEX_NAME = "Local\\BackgroundedSingleInstance"
 _QUIT_EVENT_NAME = "Local\\BackgroundedQuitRequest"
 _INSTANCE_RECORD = "instance.json"
+#: The POSIX stand-in for the mutex above: a file held under flock for the life
+#: of the process. See :func:`_acquire_posix_lock`.
+_LOCK_NAME = "instance.lock"
 
 #: How long an arriving copy waits for the running one to save and go. A clean
 #: exit writes the world; a kill costs up to AUTOSAVE_SEC of colony history, so
@@ -342,6 +352,53 @@ def _take_over() -> bool:
             k.CloseHandle(proc)
 
 
+def _acquire_posix_lock() -> bool:
+    """The single-instance check where there are no named kernel objects.
+
+    ``flock`` rather than a pid file, because the kernel drops the lock when
+    the process dies however it dies - a kill -9 or a power cut leaves a stale
+    pid file behind, and every pid-file scheme then has to guess whether pid
+    4471 is still the colony or somebody else's shell.
+
+    Deliberately NOT the takeover the Windows path does. Takeover exists there
+    because two copies fight over the desktop wallpaper and because a copy
+    living in the tray with its window hidden is easy to lose track of - a copy
+    you cannot see should not beat the one you just launched. Neither is true
+    here: there is no wallpaper to contend for, and the other copy is a window
+    on screen. So the newcomer stands down and says where the running one is.
+
+    The file object is left open on purpose - closing it releases the lock, so
+    it has to outlive this function, and the process holds it until it exits.
+    """
+    import fcntl
+
+    try:
+        paths.APP_DIR.mkdir(parents=True, exist_ok=True)
+        fh = open(paths.APP_DIR / _LOCK_NAME, "a+")
+    except Exception:
+        log.debug("could not open the instance lock; starting anyway",
+                  exc_info=True)
+        return True
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return False
+    except Exception:
+        fh.close()
+        log.debug("instance lock unusable; starting anyway", exc_info=True)
+        return True
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"{os.getpid()}\n")
+        fh.flush()
+    except Exception:
+        pass                                  # the lock is what matters, not the pid
+    globals()["_INSTANCE_LOCK"] = fh
+    return True
+
+
 def _acquire_single_instance(takeover: bool = True) -> bool:
     """Make this the one running copy, displacing an older one if asked.
 
@@ -356,6 +413,8 @@ def _acquire_single_instance(takeover: bool = True) -> bool:
     The winning handle is deliberately leaked; it lives as long as the process
     and Windows frees it on exit.
     """
+    if not host.IS_WINDOWS:
+        return _acquire_posix_lock()
     try:
         h, first = _grab_mutex()
         if h is None:
@@ -373,12 +432,28 @@ def _acquire_single_instance(takeover: bool = True) -> bool:
 
 
 def _screen_size() -> tuple[int, int]:
+    """The desktop's pixel size - what a wallpaper frame is resized to.
+
+    Only the wallpaper writer reads this, so off Windows it is answering a
+    question nobody asks; it is kept honest anyway rather than stubbed, because
+    a wrong number here would be a silent one. pygame's answer needs the
+    display module initialised, which it is by the time App constructs the
+    writer.
+    """
+    if host.IS_WINDOWS:
+        try:
+            u = ctypes.windll.user32
+            u.SetProcessDPIAware()
+            return int(u.GetSystemMetrics(0)), int(u.GetSystemMetrics(1))
+        except Exception:
+            return (1920, 1080)
     try:
-        u = ctypes.windll.user32
-        u.SetProcessDPIAware()
-        return int(u.GetSystemMetrics(0)), int(u.GetSystemMetrics(1))
+        sizes = pygame.display.get_desktop_sizes()
+        if sizes and sizes[0][0] > 0 and sizes[0][1] > 0:
+            return int(sizes[0][0]), int(sizes[0][1])
     except Exception:
-        return (1920, 1080)
+        log.debug("could not read the desktop size", exc_info=True)
+    return (1920, 1080)
 
 
 class App:
@@ -406,6 +481,21 @@ class App:
         if args.no_wallpaper:
             self.cfg.wallpaper_enabled = False
             self._cli_keys.add("wallpaper_enabled")
+        if not host.WALLPAPER_SUPPORTED and self.cfg.wallpaper_enabled:
+            # Through _cli_keys, not by writing the config, and for the same
+            # reason: this is a fact about the machine the app happens to be
+            # running on, not a preference the user expressed. Persisting it
+            # would silently turn the wallpaper off in a config.json that is
+            # later opened on Windows.
+            self.cfg.wallpaper_enabled = False
+            self._cli_keys.add("wallpaper_enabled")
+        if args.hide and host.WINDOW_IS_THE_APP:
+            # --hide is a Windows convenience (the app carries on in the tray).
+            # Here it leaves a process with nothing on screen and no icon to
+            # bring it back, which is only ever wanted alongside --exit-after.
+            log.warning("--hide leaves no visible window and no tray icon on "
+                        "this platform; kill the process or pair it with "
+                        "--exit-after")
 
         self.running = True
         self.cmd_q: queue.Queue = queue.Queue()
@@ -902,9 +992,18 @@ class App:
         if step:
             self._nudge_hud_scale(int(step))
         if pointer.get("closed"):
-            self.cfg.show_window = False
-            self.preview.ensure_window(False)
-            self._save_config("show_window")
+            if host.WINDOW_IS_THE_APP:
+                # The X means what it says here. Hiding is only a sensible
+                # answer to it when something else is still on screen offering
+                # a way back; with no tray icon this would strand a running
+                # colony behind an invisible window. Out through the normal
+                # door, so _shutdown saves the world.
+                log.info("window closed; exiting")
+                self.running = False
+            else:
+                self.cfg.show_window = False
+                self.preview.ensure_window(False)
+                self._save_config("show_window")
 
         # fixed-timestep sim, scaled by the speed setting
         if not self.cfg.paused:
@@ -1574,9 +1673,14 @@ def main(argv: list[str] | None = None) -> int:
         # copy is gone, so by the time the renderer captures the "original"
         # wallpaper the other instance has already restored the real one.
         if not _acquire_single_instance():
-            log.error("Backgrounded is already running and could not be taken "
-                      "over - look for the tray icon. Use --allow-multi to "
-                      "run a second copy anyway.")
+            if host.WINDOW_IS_THE_APP:
+                log.error("Backgrounded is already running - look for its "
+                          "window. Close it, or use --allow-multi to run a "
+                          "second copy against the same save.")
+            else:
+                log.error("Backgrounded is already running and could not be "
+                          "taken over - look for the tray icon. Use "
+                          "--allow-multi to run a second copy anyway.")
             return 2
         _write_instance_record()
         _listen_for_quit()

@@ -1,7 +1,9 @@
 # Backgrounded
 
-A Windows system-tray program that runs a small stickman civilisation and
-paints it onto your desktop wallpaper.
+A small stickman civilisation that carries on whether or not you're watching.
+On Windows it lives in the system tray and paints itself onto your desktop
+wallpaper. On Linux there is no wallpaper and no tray — it's simply a window,
+and closing the window stops it.
 
 It opens at night, in a storm. The world is almost black. One stickman carries
 a candle, and the pool of warm light around them is the only thing you can
@@ -17,20 +19,28 @@ died getting there.
 
 ## Running it
 
-Double-click **`Backgrounded.bat`**. It checks Python and the three packages,
-offers to install them if they're missing, then starts the app with no console
-window. Running it twice is harmless - the second copy sees the single-instance
-mutex and exits.
+**Windows** — double-click **`Backgrounded.bat`**. It checks Python and the
+three packages, offers to install them if they're missing, then starts the app
+with no console window. It lives in the system tray; the live view window is
+shown by default. Running it twice is harmless - the second copy sees the
+single-instance mutex and exits.
 
-Or from a terminal:
+**Linux** — run **`./backgrounded.sh`** from the project folder. Same idea: it
+finds Python, puts the three packages in a virtualenv under
+`~/.local/share/Backgrounded/venv` (distro Python is externally managed, so it
+will not install into it), and starts the app. It stays in the foreground so
+you can see the log; `--detach` gives your prompt back, and `--setup` installs
+the packages without launching. There is no tray, so **closing the window ends
+the run** — the world is saved on the way out, and so it is on Ctrl+C.
+
+Or, on either platform, from a terminal with the packages already available:
 
 ```bash
 python run.pyw
 ```
 
-It lives in the system tray; the live view window is shown by default.
-
-Useful flags while poking at it:
+Useful flags while poking at it (after a `--` if you're going through
+`backgrounded.sh`):
 
 ```bash
 python run.pyw --fresh --scene night_storm --no-wallpaper
@@ -40,12 +50,17 @@ python run.pyw --fresh --scene night_storm --no-wallpaper
 |---|---|
 | `--fresh` | Ignore the saved world and generate a new one |
 | `--scene <name>` | Opening scene (`night_storm`, `wildfire`, `blizzard`, …) |
-| `--hide` | Start with the live view hidden |
-| `--no-wallpaper` | Never touch the desktop wallpaper |
+| `--hide` | Start with the live view hidden (Windows; on Linux it leaves nothing on screen) |
+| `--no-wallpaper` | Never touch the desktop wallpaper (Windows; always the case on Linux) |
 | `--capture N` | Save N PNG frames to the captures folder |
 | `--exit-after N` | Quit after N simulated seconds |
 
 ## Tray menu
+
+Windows only — the notification area is `user32`/`shell32` and has no portable
+counterpart, so on Linux the settings below are whatever `config.json` and the
+command line say, and the mouse and keyboard controls in the window title bar
+are the whole live control surface.
 
 Right-click the tray icon:
 
@@ -85,6 +100,11 @@ A colony at its cap of twenty, mid-upgrade: some huts still timber, some
 already rebuilt in stone. Losses in the chronicle are red, arrivals green.
 
 ## Your wallpaper
+
+Windows only. Setting a desktop background is a different command on every
+Linux desktop and impossible on most Wayland compositors, so there the picture
+lives in the window and your desktop is never touched — nothing is read, backed
+up or restored.
 
 The program records your current wallpaper at startup and puts it back when it
 exits. If it's ever killed hard enough to skip that (Task Manager, power loss),
@@ -138,7 +158,8 @@ back — same name, same colour, thoroughly rattled.
 
 ## Where it keeps things
 
-`%LOCALAPPDATA%\Backgrounded\`
+`%LOCALAPPDATA%\Backgrounded\` on Windows, `~/.local/share/Backgrounded/`
+(i.e. `$XDG_DATA_HOME`) on Linux.
 
 | File | Contents |
 |---|---|
@@ -146,18 +167,22 @@ back — same name, same colour, thoroughly rattled.
 | `config.json` | Your settings |
 | `chronicle.txt` | Readable log of everything notable that happened |
 | `backgrounded.log` | Diagnostics |
-| `wallpaper_a.bmp` / `_b.bmp` | Alternating wallpaper output |
+| `instance.lock` | Held open so a second copy knows to stand down (Linux) |
+| `wallpaper_a.bmp` / `_b.bmp` | Alternating wallpaper output (Windows, and in `~/Pictures/Backgrounded` — the shell refuses to load a wallpaper out of `%LOCALAPPDATA%`) |
 
 ## Requirements
 
-Python 3.11+ on Windows, plus:
+Python 3.11+ on Windows or Linux, plus:
 
 ```bash
 pip install pygame-ce pillow numpy
 ```
 
 No `pywin32` and no `pystray` — the tray icon and wallpaper handling are done
-directly through `ctypes`.
+directly through `ctypes`, and both are skipped entirely off Windows. There is
+no extra dependency for the Linux build; it is the same three packages and the
+same code, with `backgrounded/host.py` deciding which parts of the desktop
+shell exist.
 
 ## Development
 
