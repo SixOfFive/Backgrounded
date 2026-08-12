@@ -55,26 +55,32 @@ python run.pyw --fresh --scene night_storm --no-wallpaper
 | `--capture N` | Save N PNG frames to the captures folder |
 | `--exit-after N` | Quit after N simulated seconds |
 
-## Tray menu
+## The menu
 
-Windows only — the notification area is `user32`/`shell32` and has no portable
-counterpart, so on Linux the settings below are whatever `config.json` and the
-command line say, and the mouse and keyboard controls in the window title bar
-are the whole live control surface.
+Two ways in, offering the same things:
 
-Right-click the tray icon:
+- **In the window** — press **`M`**, or click the gear in the bottom-right
+  corner. This is the only menu on Linux, where there's no tray to put one in.
+  Escape or a click on the scene closes it.
+- **In the tray** — right-click the tray icon. Windows only.
 
-- **Show Window** — the live view the wallpaper is rendered from (on by default)
-- **Wallpaper Output** — stop/start writing to the desktop
-- **Scene** — force a specific scene
-- **Speed** — 0.5× / 1× / 2× / 4×
+- **Scene** — force a specific scene, and turn off the automatic rotation
+- **Speed** — 0.5× up to 16×
+- **Window Size** — 50% to 150% of the 1600×1000 render surface
+- **Show** — the stats panel, name plates, activity plates, chronicle log
 - **Pause**
+- **Wallpaper Output** — stop/start writing to the desktop (Windows only)
 - **New Landscape** — new terrain and scenery, same people (they keep their
   names, colours and history; buildings don't survive the move)
 - **Clear Graves** — sweep the headstones away
-- **Start Over** — brand new world *and* colony
 - **Save Now**
-- **Exit** — restores your original wallpaper on the way out
+- **Start Over** — brand new world *and* colony. In the window menu this one
+  asks twice, because it's the only entry that destroys a colony you can't get
+  back and it sits a few pixels from *Save Now*.
+- **Quit** — saves on the way out, and restores your original wallpaper
+
+Only the tray offers **Show Window**: a button inside the window that hides the
+window is a trap when there's no icon left to bring it back.
 
 ## Reading the stats panel
 

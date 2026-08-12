@@ -3,6 +3,59 @@
 Newest first. This file starts on 2026-08-11; everything before that date is in
 `git log`, which is where the earlier history of the project lives.
 
+## 2026-08-12
+
+### Added
+
+- **An in-window settings menu** — press `M` or click the gear in the
+  bottom-right corner. It exists because the Linux port left no runtime control
+  surface at all: the tray menu was the only way to reach scene, speed, window
+  size, the HUD toggles, pause, and the world actions, and off Windows there is
+  no tray.
+- `backgrounded/render/menu.py` (layout, hit-test, drawing) and
+  `backgrounded/shell/menu.py` (`MenuController`), split the same way
+  `render/toolbar.py` and `shell/tools.py` already are — geometry lives beside
+  the drawing so the hit-test cannot disagree with what is on screen.
+  - **It is a second producer for `cmd_q`, not a second implementation.** It
+    emits exactly the `(verb, payload)` tuples the tray emits and takes the
+    same `(cmd_q, get_state)` pair `Tray` takes, so `App._handle` needed no
+    change at all and a verb added there is reachable from both menus at once.
+  - Flat panel of chips rather than the tray's four nested popups: a submenu
+    that opens on hover is miserable over a moving scene, and the flat form
+    answers "what is the speed right now?" without opening anything.
+  - **`Start over` asks twice.** It is the only entry in the panel that
+    destroys a colony that cannot be got back, and it sits four chips from
+    `Save now`. The tray never needed a confirm because reaching it meant
+    walking a popup; here it is one click. It also carries a red border at all
+    times, not only on hover — a colour that appears under the cursor tells you
+    what you are about to click, which is too late to be the point.
+  - Clicks that land on the menu are **consumed**, like `App._roster_click`:
+    the panel is painted over the scene, so every pixel of it also has a
+    perfectly good world position underneath, and letting one through would
+    change the speed *and* strike lightning wherever the chip was sitting. A
+    click on empty scene closes the panel and is spent doing so, rather than
+    also planting a tree.
+  - The gear button is drawn only where there is no tray. `M` works on both,
+    because a second way in costs nothing, but Windows does not grow a button
+    for a menu it already has.
+
+### Changed
+
+- `SPEEDS` and `WINDOW_SCALES` moved from `shell/tray.py` (Windows-only code)
+  to `constants.py`. Both menus dispatch by index into them, so they have to be
+  one list rather than two that drift — a speed the tray offers and the panel
+  does not is a setting a Windows user can reach and a Linux user cannot.
+- `Preview` reports two new flags, `menu_toggle` (`M`) and `menu_close`
+  (`Escape`, once fullscreen has had its claim on the key). Reported rather
+  than applied, like `reset_view` and `hud_scale` — the window does not own the
+  menu's state.
+- The window title now leads with `m=menu`. It is the one place a first-time
+  user is already looking, and "where do I change the scene now?" was the first
+  question the Linux build got.
+- `render/toolbar.py` asks for DejaVu/Liberation as well as Segoe UI and Arial.
+  Neither Windows name exists on a stock Linux box, so tool tooltips were
+  silently falling through to pygame's builtin font.
+
 ## 2026-08-11
 
 ### Added

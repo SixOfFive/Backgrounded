@@ -1323,6 +1323,10 @@ class Preview:
         """
         out = {"closed": False, "fullscreen": getattr(self, "_fullscreen", False),
                "zoom": self.zoom, "pointer": [], "reset_view": False,
+               # M opens the settings panel, Escape closes it. Both are
+               # reported for the app to act on; this window does not know the
+               # menu exists beyond these two flags.
+               "menu_toggle": False, "menu_close": False,
                # World px a right/middle drag asked for and the frame could not
                # absorb. Accumulated across every MOUSEMOTION in this pump, not
                # overwritten: one frame can carry several motion events and
@@ -1351,6 +1355,15 @@ class Preview:
                         out["fullscreen"] = self.toggle_fullscreen()
                     elif ev.key == pygame.K_ESCAPE and getattr(self, "_fullscreen", False):
                         out["fullscreen"] = self.toggle_fullscreen()
+                    elif ev.key == pygame.K_ESCAPE:
+                        # Leaving fullscreen has first claim on Escape - it is
+                        # the more urgent thing to be able to get out of.
+                        out["menu_close"] = True
+                    elif ev.key == pygame.K_m:
+                        # Reported, not applied, like reset_view and hud_scale
+                        # below: the menu is the app's state, and this window
+                        # has no business owning it.
+                        out["menu_toggle"] = True
                     elif ev.key in (pygame.K_0, pygame.K_HOME):
                         self.reset_view()
                         # Reported, not applied: resuming follow means touching

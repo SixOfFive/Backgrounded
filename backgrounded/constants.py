@@ -2162,6 +2162,39 @@ SCENE_LABELS = {
     SCENE_VOLCANO:     "Volcanic Eruption",
 }
 
+# --------------------------------------------------------------- menu dials --
+# The two lists below are here rather than beside a menu because there are now
+# TWO menus offering them - the Windows tray (shell/tray.py) and the in-window
+# panel (render/menu.py, shell/menu.py) - and they have to agree. A speed the
+# tray offers and the panel does not is a setting a Windows user can reach and
+# a Linux user cannot.
+
+#: Sim speed multipliers offered in the menus. The list is the whole of the
+#: menu: entries are appended, radio-checked and dispatched by INDEX, so adding
+#: a row here is all that is needed.
+#:
+#: 8x and 16x are honest offers rather than aspirations, and what makes them
+#: honest is App._advance_sim: the frame loop ticks against a wall-clock budget
+#: instead of a fixed step count, so a speed the machine cannot fully deliver
+#: comes out a little under - measurably and on purpose - rather than silently
+#: losing sim time behind a cap. 16.0 is also exactly config.SIM_SPEED_MAX, so
+#: the menus reach the top of the range the config has always permitted.
+SPEEDS: tuple[tuple[str, float], ...] = (
+    ("0.5x", 0.5),
+    ("1x", 1.0),
+    ("2x", 2.0),
+    ("4x", 4.0),
+    ("8x", 8.0),
+    ("16x", 16.0),
+)
+
+#: Preview window size, as a multiple of the render surface. Offered as fixed
+#: steps rather than a free number because a menu has no way to type one, and
+#: because the useful range is bounded at both ends: below 50% the name plates
+#: stop being readable, above 150% a 1600x1000 frame no longer fits a 1080p
+#: screen. Dragging the window border still works and is not tracked here.
+WINDOW_SCALES: tuple[float, ...] = (0.5, 0.75, 1.0, 1.25, 1.5)
+
 # ------------------------------------------------------------------ saving --
 SAVE_VERSION = 1
 

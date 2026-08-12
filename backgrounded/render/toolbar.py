@@ -120,7 +120,11 @@ def _tooltip(surf: pygame.Surface, text: str, r: pygame.Rect) -> None:
     if _font is None:
         if not pygame.font.get_init():
             pygame.font.init()
-        _font = pygame.font.SysFont("segoeui,arial", 13)
+        # segoeui and arial are Windows names and neither exists on a stock
+        # Linux box, where SysFont silently fell through to pygame's builtin.
+        # The DejaVu/Liberation pair is what Debian and Fedora actually ship.
+        _font = pygame.font.SysFont(
+            "segoeui,arial,dejavusans,liberationsans,notosans", 13)
     label = _font.render(text, True, _INK)
     pad = 5
     box = pygame.Rect(r.right + 8, r.centery - label.get_height() // 2 - pad,

@@ -34,6 +34,7 @@ from .constants import (
 )
 from .render import toolbar
 from .render.renderer import Renderer
+from .shell.menu import MenuController
 from .shell.preview import Preview
 from .shell.tools import ToolController
 from .shell.tray import Tray
@@ -549,6 +550,14 @@ class App:
         # without this the camera opens at world x 0 and eases in at 220 px/s.
         self._cut_camera()
         self.tools = ToolController()
+        # The in-window settings panel. It takes the same (queue, state) pair
+        # the tray does and emits the same verbs, so _handle serves both.
+        #
+        # The gear button is drawn only where there is no tray. On Windows the
+        # panel is still there on M - a second way in costs nothing - but the
+        # window does not grow a button the tray already renders unnecessary.
+        self.menu = MenuController(self.cmd_q, self._tray_state,
+                                   show_gear=not host.TRAY_SUPPORTED)
 
         # --- threads -----------------------------------------------------
         self.wallpaper = WallpaperWriter(_screen_size())
@@ -979,6 +988,14 @@ class App:
         # refusal (it only acts when NO tool is selected, so it can never take
         # a click a tool wanted), then the tools take it as they always have.
         events = self._to_world(pointer.get("pointer"))
+        # The settings panel gets first refusal, ahead of even the roster,
+        # because it is painted on top of everything - including the stats
+        # panel. Whatever it consumes is gone; see MenuController.handle.
+        if pointer.get("menu_toggle"):
+            self.menu.toggle()
+        if pointer.get("menu_close"):
+            self.menu.close()
+        events = self.menu.handle(events, self._window_size())
         # A click that landed on the roster is CONSUMED here and never reaches
         # the tools. It has to be, and not merely deprioritised: the stats panel
         # is drawn in window px on top of the scene, so a click on a name also
@@ -1470,6 +1487,26 @@ class App:
         except Exception:
             log.debug("window hud draw failed", exc_info=True)
         self.tools.draw_overlay(screen)
+        # Last, so nothing is drawn over it. It is modal in spirit even though
+        # the world keeps running underneath, and a chip half-buried under the
+        # stats panel would still be clickable, which is the worst of both.
+        self.menu.draw_overlay(screen)
+
+    def _window_size(self) -> tuple[int, int]:
+        """The window's pixel size - the space the overlays are laid out in.
+
+        Read from the live display surface rather than from cfg.window_scale,
+        because the two disagree the moment the user drags the window border or
+        maximises it, and a menu hit-tested against the wrong size is a menu
+        whose chips are not where they are drawn.
+        """
+        surf = self.preview.surface
+        if surf is not None:
+            try:
+                return surf.get_size()
+            except Exception:
+                pass
+        return RENDER_SIZE
 
     def _bake_hud(self, frame: pygame.Surface) -> None:
         """Bake the HUD into the world frame, at most once per frame.
@@ -1510,7 +1547,12 @@ class App:
                 # "roam" and "follow" rather than "pan" and "reset": WASD now
                 # walks the camera across a world four frames wide, and 0 does
                 # not merely undo a zoom, it hands the colony back to follow().
-                f"[wheel=zoom wasd=roam []=text 0=follow F11=full]")
+                #
+                # m=menu leads the list where the gear is the only way in. The
+                # title bar is the one place a first-time user is already
+                # looking, and "where do I change the scene now?" was the first
+                # question the Linux build got.
+                f"[m=menu wheel=zoom wasd=roam []=text 0=follow F11=full]")
 
     def _save_capture(self, frame: pygame.Surface) -> None:
         self._captures += 1

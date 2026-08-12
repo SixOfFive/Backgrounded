@@ -33,7 +33,9 @@ from ctypes import wintypes
 from typing import Any, Callable
 
 from .. import host
-from ..constants import RENDER_SIZE, SCENES, SCENE_LABELS, SCENE_ROTATE_SEC
+from ..constants import (
+    RENDER_SIZE, SCENES, SCENE_LABELS, SCENE_ROTATE_SEC, SPEEDS, WINDOW_SCALES,
+)
 
 log = logging.getLogger(__name__)
 
@@ -128,31 +130,9 @@ ID_SCENE_BASE = 2000
 ID_SPEED_BASE = 3000
 ID_SCALE_BASE = 4000
 
-#: Sim speed multipliers offered in the tray. The list is the whole of the
-#: menu: entries are appended, radio-checked and dispatched by INDEX off
-#: ID_SPEED_BASE, so adding a row here is all that is needed.
-#:
-#: 8x and 16x are honest offers rather than aspirations, and what makes them
-#: honest is App._advance_sim: the frame loop ticks against a wall-clock budget
-#: instead of a fixed step count, so a speed the machine cannot fully deliver
-#: comes out a little under - measurably and on purpose - rather than silently
-#: losing sim time behind a cap. 16.0 is also exactly config.SIM_SPEED_MAX, so
-#: the menu now reaches the top of the range the config has always permitted.
-SPEEDS: tuple[tuple[str, float], ...] = (
-    ("0.5x", 0.5),
-    ("1x", 1.0),
-    ("2x", 2.0),
-    ("4x", 4.0),
-    ("8x", 8.0),
-    ("16x", 16.0),
-)
-
-# Preview window size, as a multiple of the render surface. Offered as fixed
-# steps rather than a free number because the tray has no way to type one, and
-# because the useful range is bounded at both ends: below 50% the name plates
-# stop being readable, above 150% a 1600x1000 frame no longer fits a 1080p
-# screen. Dragging the window border still works and is not tracked here.
-WINDOW_SCALES: tuple[float, ...] = (0.5, 0.75, 1.0, 1.25, 1.5)
+# SPEEDS and WINDOW_SCALES moved to constants.py when the in-window menu
+# arrived - both menus dispatch by INDEX into them, so they have to be one
+# list rather than two that drift.
 
 ICON_SIZE = 32
 TOOLTIP = "Backgrounded"
